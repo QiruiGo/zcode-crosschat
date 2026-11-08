@@ -1,0 +1,817 @@
+/**
+ * M3 tools：7 个 xc_* MCP 工具（DESIGN.md §2.8）+ §2.6 全部硬校验。
+ *
+ * 分层：createToolCore(deps) 返回与 SDK 无关的 7 个操作（单测直接驱动，内部经
+ * runCore 映射一切异常为 ToolResult 信封，永不抛出）；registerTools(server, deps)
+ * 把它们接到 @modelcontextprotocol/sdk 的 stdio server。
+ *
+ * 身份 = 连接绑定（identity.ts）：所有工具一律不接受 from/caller 参数；身份类
+ * 工具（dispatch/claim/report/message/check_inbox）未注册即结构化报错
+ * {error:"not_registered"}；仅 xc_status 豁免（未注册调用省略个人字段）。
+ *
+ * 并发纪律（§2.7）：变更操作一律 withTeamLock(stateRoot, teamId, fn)（M1 组合锁 =
+ * 进程内 promise 链 + 跨进程 O_EXCL lockfile，15s 等待 → LockBusyError）内
+ * 「重读 → 校验 → 变更 → 写盘」；慢操作（证据 sha256、唤醒 spawn）在锁外；
+ * attemptWake 只准在团队锁外调用（M2 内部会短暂重取锁补盖章，持锁调用会死锁）；
+ * 推送唤醒失败只降级 mailbox，不丢消息（§2.5 邮箱为真、唤醒为优化）。
+ *
+ * 硬校验分工：M1 teamstate 提供纯函数校验（reportTransitionError/applyReport/
+ * unsatisfiedDependencies/memberOpenTasks），本模块按 §2.6 硬校验表先做带结构化
+ * 错误码的前置检查，再调用 M1 纯函数兜底复核。
+ */
+
+import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
+import { connectionKeyOf, identityStore, xcRegister } from "./identity.js";
+import {
+  invalidParamsError,
+  errorResult,
+  mapToolError,
+  okResult,
+  staleAttemptError,
+  ToolError,
+  type ToolResult,
+} from "./protocol.js";
+import {
+  renderClaim,
+  renderDispatch,
+  renderInbox,
+  renderMessage,
+  renderRegister,
+  renderReport,
+  renderStatusTable,
+  writeSnapshot,
+  type StatusSnapshot,
+} from "./render.js";
+import { resolveStateRoot } from "../core/paths.js";
+import { LockBusyError, withTeamLock } from "../core/lock.js";
+import { sanitizeKey } from "../core/sanitize.js";
+import { DEFAULT_TEAM_ID, TERMINAL_TASK_STATUSES } from "../core/types.js";
+import type { EvidenceItem, MemberRole, TeamMessage, TeamState } from "../core/types.js";
+import {
+  appendTaskHistory,
+  applyReport,
+  beginTaskAttempt,
+  getTask,
+  makeTask,
+  memberOpenTasks,
+  newTeamState,
+  readTeam,
+  reportTransitionError,
+  unsatisfiedDependencies,
+  writeTeam,
+} from "../core/teamstate.js";
+import {
+  acknowledgeMailbox,
+  appendMailbox,
+  createMessage,
+  isCurrentMail,
+  readCurrentMailboxLocked,
+  readMailbox,
+  readUnreadMailbox,
+} from "../core/mailbox.js";
+import { logEngineEvent } from "../core/log.js";
+import { attemptWake, findDuplicateMail } from "../engine/wake.js";
+
+/** v1 单队固定 default（DESIGN §2.2）。 */
+const TEAM_ID = DEFAULT_TEAM_ID;
+
+/** createMessage 可携带的投递快照字段。 */
+type MessageExtras = Partial<
+  Pick<TeamMessage, "taskId" | "attemptId" | "sourceTaskId" | "sourceAttemptId" | "sourceTaskStatus" | "deliveryClaimedAt">
+>;
+
+export interface ToolDeps {
+  /** 状态根 <workspace>/.crosschat（§2.2；server.ts 用 process.cwd() 解析）。 */
+  stateRoot: string;
+  /** 工作区绝对路径（传给 M2 作为 --cwd）。 */
+  workspace: string;
+  /** 进程环境（XC_WAKE_ENABLED 等，V7：仅 "true" 视为开启）。 */
+  env: NodeJS.ProcessEnv;
+}
+
+// ---------------------------------------------------------------------------
+// zod 入参 schema（§2.8 参数表；无 from/caller 参数——身份≡连接绑定）
+// ---------------------------------------------------------------------------
+
+export const RegisterShape = {
+  name: z.string().min(1).describe("要注册的名字（sanitizeKey 归一为 agentKey）"),
+  sessionId: z.string().min(1).describe("本会话的 sessionId（hook 注入的上下文里有）"),
+  role: z.enum(["peer", "worker"]).optional().describe("缺省 peer；worker=值班执行"),
+  wakeToken: z.string().optional().describe("无头回合的唤醒令牌；缺省走 hook 锚定路径"),
+};
+export const DispatchShape = {
+  to: z.string().min(1).describe("目标成员名"),
+  title: z.string().min(1).describe("任务标题"),
+  prompt: z.string().min(1).describe("任务内容（要做什么）"),
+  acceptance: z.string().optional().describe("验收标准（可检验）"),
+  dependsOn: z.array(z.string()).optional().describe("依赖的任务 id 列表"),
+};
+export const ClaimShape = { taskId: z.string().min(1).describe("要认领的任务 id") };
+export const ReportShape = {
+  taskId: z.string().min(1),
+  attemptId: z.string().min(1).describe("xc_claim 返回的 attempt 令牌；不匹配即硬拒"),
+  status: z.enum(["in_progress", "completed", "failed"]),
+  result: z.string().optional().describe("completed 必填"),
+  error: z.string().optional().describe("failed 建议填写"),
+  evidence: z
+    .array(
+      z.object({
+        path: z.string().min(1).describe("证据文件绝对路径"),
+        sha256: z.string().nullable().optional().describe("缺省时由工具对文件现算"),
+        note: z.string().optional(),
+      }),
+    )
+    .optional()
+    .describe("completed 必须至少 1 条"),
+};
+export const MessageShape = {
+  to: z.string().min(1),
+  content: z.string().min(1),
+  sourceTaskId: z.string().optional().describe("与 sourceAttemptId 必须成对出现"),
+  sourceAttemptId: z.string().optional(),
+};
+export const StatusShape = { teamId: z.string().optional() };
+
+type RegisterArgs = z.infer<z.ZodObject<typeof RegisterShape>>;
+type DispatchArgs = z.infer<z.ZodObject<typeof DispatchShape>>;
+type ClaimArgs = z.infer<z.ZodObject<typeof ClaimShape>>;
+type ReportArgs = z.infer<z.ZodObject<typeof ReportShape>>;
+type MessageArgs = z.infer<z.ZodObject<typeof MessageShape>>;
+type StatusArgs = z.infer<z.ZodObject<typeof StatusShape>>;
+
+// ---------------------------------------------------------------------------
+// 工具核心公共件
+// ---------------------------------------------------------------------------
+
+/** core 层统一入口：LockBusyError → {error:"busy"}，其余经 protocol.mapToolError。 */
+async function runCore(fn: () => Promise<ToolResult>): Promise<ToolResult> {
+  try {
+    return await fn();
+  } catch (err) {
+    if (err instanceof LockBusyError) return errorResult(err.toStructured());
+    return mapToolError(err);
+  }
+}
+
+function requireMember(team: TeamState, agentKey: string): void {
+  if (!team.members.some((m) => m.key === agentKey)) {
+    throw new ToolError({
+      error: "not_a_member",
+      agentKey,
+      message: `"${agentKey}" is not a member of team "${team.teamId}"; register first (xc_register)`,
+    });
+  }
+}
+
+/** 任务票文本：派发消息/唤醒 prompt 共用的稳定载荷（不含 taskId，保证重复派发幂等可判）。 */
+function ticketText(args: DispatchArgs): string {
+  return JSON.stringify({
+    type: "task-assignment",
+    teamId: TEAM_ID,
+    title: args.title.trim(),
+    prompt: args.prompt,
+    acceptance: args.acceptance?.trim() || "",
+  });
+}
+
+/** 回执消息内容：机器可解析 JSON，attempt 关联保留在此（见 xc_report 内注释）。 */
+function receiptText(taskId: string, attemptId: string, status: string, task: TeamState["tasks"][number]): string {
+  return JSON.stringify({
+    type: "task-receipt",
+    teamId: TEAM_ID,
+    taskId,
+    attemptId,
+    status,
+    result: task.result,
+    error: task.error,
+    evidence: task.evidence,
+  });
+}
+
+/** 文件类证据现算 sha256（§2.8：极简版 artifacts 思路；文件缺失 → null）。 */
+async function sha256File(path: string): Promise<string | null> {
+  try {
+    const buf = await readFile(path);
+    return createHash("sha256").update(buf).digest("hex");
+  } catch {
+    return null;
+  }
+}
+
+/** 当前未读（未读 ∧ 未丢弃 ∧ isCurrentMail）计数，xc_status 与 inbox 共用。 */
+function countUnread(team: TeamState, messages: TeamMessage[]): number {
+  return messages.filter((m) => !m.readAt && !m.discardedAt && isCurrentMail(team, m)).length;
+}
+
+// ---------------------------------------------------------------------------
+// 工具核心（SDK 无关，供 registerTools 与单测共用）
+// ---------------------------------------------------------------------------
+
+export interface ToolCore {
+  xc_register(args: RegisterArgs, connectionKey: string): Promise<ToolResult>;
+  xc_dispatch(args: DispatchArgs, connectionKey: string): Promise<ToolResult>;
+  xc_check_inbox(args: Record<string, never>, connectionKey: string): Promise<ToolResult>;
+  xc_claim(args: ClaimArgs, connectionKey: string): Promise<ToolResult>;
+  xc_report(args: ReportArgs, connectionKey: string): Promise<ToolResult>;
+  xc_message(args: MessageArgs, connectionKey: string): Promise<ToolResult>;
+  xc_status(args: StatusArgs, connectionKey: string): Promise<ToolResult>;
+}
+
+export function createToolCore(deps: ToolDeps): ToolCore {
+  const { stateRoot, workspace } = deps;
+
+  /**
+   * 推送唤醒（必须已在团队锁外；M2 决策 wake|mailbox 并 fire-and-forget，§2.5）。
+   * 目标无 sessionId（理论上注册路径必有）→ 直接 mailbox 兜底。
+   */
+  async function wake(
+    toAgentKey: string,
+    toSessionId: string | null,
+    reason: string,
+    receiptIds: readonly string[],
+    ticket: string,
+  ): Promise<{ delivered: "wake" | "mailbox"; wakeLog?: string; note?: string }> {
+    if (toSessionId === null) {
+      return { delivered: "mailbox", note: "target has no sessionId on file" };
+    }
+    const res = await attemptWake({
+      stateRoot,
+      teamId: TEAM_ID,
+      toAgentKey,
+      toSessionId,
+      workspace,
+      reason,
+      receiptIds,
+      ticket,
+      env: deps.env,
+    });
+    return { delivered: res.delivered, wakeLog: res.wakeLog, note: res.note };
+  }
+
+  return {
+    async xc_register(args, connectionKey) {
+      return runCore(async () => {
+        const outcome = await xcRegister(stateRoot, args, connectionKey);
+        return okResult(
+          renderRegister(sanitizeKey(args.name), args.sessionId, outcome.teamId, outcome.roster, outcome.warnings),
+          {
+            sessionKey: outcome.sessionKey,
+            teamId: outcome.teamId,
+            roster: outcome.roster,
+            protocolDigest: outcome.protocolDigest,
+            via: outcome.via,
+            ...(outcome.warnings.length ? { warnings: outcome.warnings } : {}),
+          },
+        );
+      });
+    },
+
+    async xc_dispatch(args, connectionKey) {
+      return runCore(async () => {
+        const me = identityStore.require(connectionKey);
+        const toKey = sanitizeKey(args.to);
+        if (toKey === me.agentKey) throw invalidParamsError("cannot dispatch to yourself");
+        const now = Date.now();
+
+        const prepared = await withTeamLock(stateRoot, me.teamId, async () => {
+          // 锁内重读重验（§2.7-4）。
+          let team = await readTeam(stateRoot, me.teamId);
+          if (team === undefined) {
+            // 防御分支：注册路径已建队；首个派发者自动建队并成为 founder（§2.2）。
+            team = newTeamState({ teamId: me.teamId, name: me.teamId, founderKey: me.agentKey, now });
+          }
+          requireMember(team, toKey); // §2.6：to 必须是已注册成员
+          for (const dep of args.dependsOn ?? []) {
+            if (getTask(team, dep) === undefined) {
+              throw invalidParamsError(`dependsOn references unknown task "${dep}"`);
+            }
+          }
+
+          const ticket = ticketText(args);
+          // duplicate 幂等判定（移植 dsh tools.js:2088-2093）。与 M2 findDuplicateMail
+          // 的差异：派发消息带新 taskId（重试时无法预知，t2≠t1），故幂等键不含 taskId
+          // 比较——同 from+同票+同源字段+仍在效期+未被消费 即判重复。
+          const existing = await readMailbox(stateRoot, me.teamId, toKey);
+          const myOpen = memberOpenTasks(team.tasks, me.agentKey)[0];
+          const dup = existing.find(
+            (m) =>
+              m.from === me.agentKey &&
+              m.to === toKey &&
+              m.content === ticket &&
+              m.attemptId === undefined &&
+              m.sourceTaskId === myOpen?.id &&
+              m.sourceAttemptId === myOpen?.attemptId &&
+              isCurrentMail(team, m) &&
+              m.readAt === undefined,
+          );
+          if (dup !== undefined) {
+            const task = getTask(team, dup.taskId ?? "");
+            return {
+              kind: "duplicate" as const,
+              taskId: dup.taskId ?? "",
+              status: task?.status ?? "pending",
+            };
+          }
+
+          // 建任务（pending，M1 makeTask 推进 seq 并入队）+ 写 to 邮箱（§2.8）。
+          const task = makeTask(team, {
+            title: args.title.trim(),
+            prompt: args.prompt,
+            acceptance: args.acceptance?.trim() || undefined,
+            dependsOn: args.dependsOn,
+            createdBy: me.agentKey,
+          }, now);
+          appendTaskHistory(task, "created", me.agentKey, undefined, now);
+
+          // source 字段快照（移植 dsh tools.js:2111-2114：发送者当前开放 attempt）。
+          const extras: MessageExtras = {
+            taskId: task.id,
+            deliveryClaimedAt: now,
+            ...(myOpen?.attemptId != null
+              ? { sourceTaskId: myOpen.id, sourceAttemptId: myOpen.attemptId, sourceTaskStatus: myOpen.status }
+              : {}),
+          };
+          const message = createMessage(me.agentKey, toKey, ticket, extras);
+          await appendMailbox(stateRoot, me.teamId, toKey, message);
+          await writeTeam(stateRoot, team);
+          return {
+            kind: "created" as const,
+            taskId: task.id,
+            status: "pending" as const,
+            messageId: message.id,
+            toSessionId: team.members.find((m) => m.key === toKey)?.sessionId ?? null,
+          };
+        });
+
+        if (prepared.kind === "duplicate") {
+          return okResult(
+            `Task ${prepared.taskId} already dispatched (duplicate); no new task created.`,
+            { taskId: prepared.taskId, status: prepared.status, delivered: "duplicate" },
+          );
+        }
+
+        // 锁外投递（§2.5 三重启用条件由 M2 判定；wake 失败=mailbox，不丢消息）。
+        const sent = await wake(toKey, prepared.toSessionId, "dispatch", [prepared.messageId], ticketText(args));
+        await logEngineEvent(stateRoot, {
+          event: "dispatch",
+          teamId: me.teamId,
+          taskId: prepared.taskId,
+          from: me.agentKey,
+          to: toKey,
+          delivered: sent.delivered,
+          messageId: prepared.messageId,
+        });
+        return okResult(renderDispatch(prepared.taskId, toKey, sent.delivered), {
+          taskId: prepared.taskId,
+          status: prepared.status,
+          delivered: sent.delivered,
+          ...(sent.wakeLog ? { wakeLog: sent.wakeLog } : {}),
+          ...(sent.note ? { note: sent.note } : {}),
+        });
+      });
+    },
+
+    async xc_check_inbox(_args, connectionKey) {
+      return runCore(async () => {
+        const me = identityStore.require(connectionKey);
+        const now = Date.now();
+
+        const teamBefore = await readTeam(stateRoot, me.teamId);
+        if (teamBefore === undefined) {
+          return okResult(renderInbox(0, 0, 0), { messages: [], unreadCount: 0 });
+        }
+
+        // 收件箱消费走 team 锁：锁内用 M1 readCurrentMailboxLocked（陈旧消息就地
+        // discarded 落盘并剔除），正当消息此刻即消费（acknowledgeMailbox，§2.8）。
+        const consumed = await withTeamLock(stateRoot, me.teamId, async () => {
+          const team = (await readTeam(stateRoot, me.teamId)) ?? teamBefore;
+          const current = await readCurrentMailboxLocked(stateRoot, team, me.agentKey);
+          await acknowledgeMailbox(stateRoot, me.teamId, me.agentKey, current.map((m) => m.id), now);
+          return current;
+        });
+
+        // 消费后剩余未读（读路径无锁，§2.7-5 rename 原子写）。
+        const freshTeam = (await readTeam(stateRoot, me.teamId)) ?? teamBefore;
+        const rest = await readUnreadMailbox(stateRoot, me.teamId, me.agentKey);
+        const unreadCount = countUnread(freshTeam, rest);
+        await logEngineEvent(stateRoot, {
+          event: "inbox-check",
+          teamId: me.teamId,
+          agentKey: me.agentKey,
+          consumed: consumed.length,
+          unreadLeft: unreadCount,
+        });
+        return okResult(renderInbox(consumed.length, 0, unreadCount), {
+          messages: consumed,
+          unreadCount,
+        });
+      });
+    },
+
+    async xc_claim(args, connectionKey) {
+      return runCore(async () => {
+        const me = identityStore.require(connectionKey);
+        const out = await withTeamLock(stateRoot, me.teamId, async () => {
+          const team = await readTeam(stateRoot, me.teamId);
+          if (team === undefined) throw new ToolError({ error: "no_team", message: "no team on disk yet; register first" });
+          requireMember(team, me.agentKey); // 会籍有效（§2.6）
+          if (team.phase === "halted") {
+            throw new ToolError({ error: "team_halted", message: `team "${me.teamId}" is halted` });
+          }
+          const task = getTask(team, args.taskId);
+          if (task === undefined) throw invalidParamsError(`unknown task "${args.taskId}"`);
+          if (task.status !== "pending") {
+            throw new ToolError({
+              error: "task_not_pending",
+              taskId: task.id,
+              status: task.status,
+              message: `task ${task.id} is ${task.status}; only pending tasks can be claimed`,
+            });
+          }
+          const unmet = unsatisfiedDependencies(team.tasks, task.dependsOn);
+          if (unmet.length > 0) {
+            throw new ToolError({
+              error: "dependencies_unmet",
+              taskId: task.id,
+              unmet,
+              message: `task ${task.id} depends on [${unmet.join(", ")}] which are not completed`,
+            });
+          }
+          const open = memberOpenTasks(team.tasks, me.agentKey)[0];
+          if (open !== undefined) {
+            // 防一人双线（§2.6，移植 dsh memberOpenTask 约束）。
+            throw new ToolError({
+              error: "already_has_open_task",
+              taskId: open.id,
+              message: `you already have open task ${open.id}; report it (xc_report) before claiming another`,
+            });
+          }
+          const attemptId = beginTaskAttempt(task, me.agentKey, Date.now()); // attempt+1/assignee/pending→claimed
+          await writeTeam(stateRoot, team);
+          return {
+            taskId: task.id,
+            attemptId,
+            attempt: task.attempt,
+            title: task.title,
+            prompt: task.prompt,
+            acceptance: task.acceptance ?? "",
+            dependsOn: task.dependsOn,
+          };
+        });
+        await logEngineEvent(stateRoot, {
+          event: "claim",
+          teamId: me.teamId,
+          taskId: out.taskId,
+          by: me.agentKey,
+          attemptId: out.attemptId,
+        });
+        return okResult(renderClaim(out.taskId, out.attempt, out.attemptId), out);
+      });
+    },
+
+    async xc_report(args, connectionKey) {
+      return runCore(async () => {
+        const me = identityStore.require(connectionKey);
+        // 慢操作在锁外：证据 sha256 现算（§2.8 evidence 格式；note 必填，缺省空串）。
+        const evidence: EvidenceItem[] = [];
+        for (const e of args.evidence ?? []) {
+          evidence.push({
+            path: e.path,
+            sha256: e.sha256 !== undefined ? e.sha256 : await sha256File(e.path),
+            note: e.note ?? "",
+          });
+        }
+
+        const out = await withTeamLock(stateRoot, me.teamId, async () => {
+          const team = await readTeam(stateRoot, me.teamId);
+          if (team === undefined) throw new ToolError({ error: "no_team", message: "no team on disk yet" });
+          requireMember(team, me.agentKey);
+          const task = getTask(team, args.taskId);
+          if (task === undefined) throw invalidParamsError(`unknown task "${args.taskId}"`);
+          // ---- §2.6 硬校验（结构化错误码优先，M1 纯函数兜底复核）----
+          if (task.assignee !== null && task.assignee !== me.agentKey) {
+            throw new ToolError({
+              error: "not_assignee",
+              taskId: task.id,
+              assignee: task.assignee,
+              message: `task ${task.id} is assigned to "${task.assignee}", not you`,
+            });
+          }
+          if (task.attemptId !== null && args.attemptId !== task.attemptId) {
+            throw staleAttemptError(task.id, task.attemptId); // attempt 令牌不匹配 = 硬拒
+          }
+          if (args.status === "completed" && (!(args.result ?? "").trim() || evidence.length < 1)) {
+            throw new ToolError({
+              error: "incomplete_completion",
+              taskId: task.id,
+              message: "status=completed requires non-empty result and at least one evidence entry (§2.6)",
+            });
+          }
+          const m1Reject = reportTransitionError(
+            task,
+            { status: args.status, attemptId: args.attemptId, result: args.result, error: args.error, evidence },
+            me.agentKey,
+          );
+          if (m1Reject !== undefined) {
+            throw new ToolError({
+              error: "illegal_transition",
+              taskId: task.id,
+              from: task.status,
+              to: args.status,
+              message: m1Reject,
+            });
+          }
+
+          applyReport(task, {
+            status: args.status,
+            attemptId: args.attemptId,
+            result: args.result,
+            error: args.error,
+            evidence: evidence.length > 0 ? evidence : undefined,
+          }, me.agentKey, Date.now());
+          await writeTeam(stateRoot, team);
+
+          // 终态 → 给派发方邮箱写回执消息（§2.9-1）。
+          // 注意：回执不带 sourceAttemptId（attempt 关联保留在回执 JSON 内容里，
+          // receiptText）。M1 applyReport 在终态保留 attemptId（dsh parity，
+          // teamstate.ts "attemptId is NOT cleared on terminal"），因此回执即使带
+          // sourceAttemptId 也能通过 isCurrentMail（终态快照与 sourceTaskStatus
+          // 一致即放行）；不带它让回执的新鲜性只由任务终态承担，语义更简单——
+          // attempt 作废语义由任务 history 承担（重派换代后旧回执随旧 attempt 失效）。
+          let receipt: { to: string; messageId: string } | null = null;
+          if (TERMINAL_TASK_STATUSES.includes(args.status)) {
+            const to = task.createdBy;
+            const extras: MessageExtras = {
+              taskId: task.id,
+              sourceTaskId: task.id,
+              sourceTaskStatus: args.status,
+              deliveryClaimedAt: Date.now(),
+            };
+            const msg = createMessage(
+              me.agentKey,
+              to,
+              receiptText(task.id, args.attemptId, args.status, task),
+              extras,
+            );
+            await appendMailbox(stateRoot, me.teamId, to, msg);
+            receipt = { to, messageId: msg.id };
+          }
+          return {
+            taskId: task.id,
+            status: args.status,
+            reportedAt: Date.now(),
+            receipt,
+            toSessionId: receipt
+              ? (team.members.find((m) => m.key === receipt.to)?.sessionId ?? null)
+              : null,
+          };
+        });
+
+        // 锁外唤醒派发方（§2.9-2）。
+        let wakeBack: "wake" | "mailbox" = "mailbox";
+        if (out.receipt !== null) {
+          const sent = await wake(
+            out.receipt.to,
+            out.toSessionId,
+            "report",
+            [out.receipt.messageId],
+            `收到 CrossChat 回执：task ${out.taskId} = ${out.status}`,
+          );
+          wakeBack = sent.delivered;
+        }
+        await logEngineEvent(stateRoot, {
+          event: "report",
+          teamId: me.teamId,
+          taskId: out.taskId,
+          status: out.status,
+          by: me.agentKey,
+          attemptId: args.attemptId,
+          wakeBack,
+        });
+        return okResult(renderReport(out.taskId, out.status, out.receipt?.to ?? null, wakeBack), {
+          taskId: out.taskId,
+          status: out.status,
+          reportedAt: out.reportedAt,
+          wakeBack,
+        });
+      });
+    },
+
+    async xc_message(args, connectionKey) {
+      return runCore(async () => {
+        const me = identityStore.require(connectionKey);
+        const toKey = sanitizeKey(args.to);
+        if (toKey === me.agentKey) throw invalidParamsError("cannot message yourself");
+        if ((args.sourceTaskId === undefined) !== (args.sourceAttemptId === undefined)) {
+          // dsh 同款：source 两字段必须成对。
+          throw invalidParamsError("sourceTaskId and sourceAttemptId must be provided together");
+        }
+        const now = Date.now();
+
+        const out = await withTeamLock(stateRoot, me.teamId, async () => {
+          const team = await readTeam(stateRoot, me.teamId);
+          if (team === undefined) throw new ToolError({ error: "no_team", message: "no team on disk yet" });
+          const recipient = team.members.find((m) => m.key === toKey);
+          if (recipient === undefined) {
+            throw new ToolError({
+              error: "not_a_member",
+              agentKey: toKey,
+              message: `"${toKey}" is not a member of team "${team.teamId}"`,
+            });
+          }
+
+          // source 解析（移植 dsh send_message：显式成对字段，否则取发送者开放 attempt）。
+          const src: MessageExtras = {};
+          if (args.sourceTaskId !== undefined) {
+            const task = getTask(team, args.sourceTaskId);
+            if (task === undefined) throw invalidParamsError(`unknown sourceTaskId "${args.sourceTaskId}"`);
+            if (task.assignee !== me.agentKey || task.attemptId !== args.sourceAttemptId) {
+              throw new ToolError({
+                error: "stale_source_attempt",
+                sourceTaskId: args.sourceTaskId,
+                message: "stale or foreign source attempt; stop sending results from the revoked task",
+              });
+            }
+            src.sourceTaskId = task.id;
+            src.sourceAttemptId = args.sourceAttemptId;
+            src.sourceTaskStatus = task.status;
+          } else {
+            const myOpen = memberOpenTasks(team.tasks, me.agentKey)[0];
+            if (myOpen?.attemptId != null) {
+              src.sourceTaskId = myOpen.id;
+              src.sourceAttemptId = myOpen.attemptId;
+              src.sourceTaskStatus = myOpen.status;
+            }
+          }
+
+          // 收件人开放 attempt 快照（§2.4：attemptId=收件人当前开放 attempt）。
+          const rec: MessageExtras = {};
+          const owned = memberOpenTasks(team.tasks, toKey)[0];
+          if (owned?.attemptId != null) {
+            rec.taskId = owned.id;
+            rec.attemptId = owned.attemptId;
+          }
+
+          // duplicate 去重（M2 findDuplicateMail，逐条件对应 dsh tools.js:2088-2093）。
+          const existing = await readMailbox(stateRoot, me.teamId, toKey);
+          const dup = findDuplicateMail(existing, team, {
+            from: me.agentKey,
+            content: args.content,
+            taskId: rec.taskId,
+            attemptId: rec.attemptId,
+            sourceTaskId: src.sourceTaskId,
+            sourceAttemptId: src.sourceAttemptId,
+            sourceTaskStatus: src.sourceTaskStatus,
+          });
+          if (dup !== undefined) {
+            return { delivered: "duplicate" as const, messageId: dup.id, toSessionId: recipient.sessionId };
+          }
+
+          const msg = createMessage(me.agentKey, toKey, args.content, { ...src, ...rec, deliveryClaimedAt: now });
+          await appendMailbox(stateRoot, me.teamId, toKey, msg);
+          return { delivered: null, messageId: msg.id, toSessionId: recipient.sessionId };
+        });
+
+        let delivered: "wake" | "mailbox" | "duplicate";
+        if (out.delivered === "duplicate") {
+          delivered = "duplicate";
+        } else {
+          const sent = await wake(toKey, out.toSessionId, "message", [out.messageId], args.content);
+          delivered = sent.delivered;
+        }
+        await logEngineEvent(stateRoot, {
+          event: "message",
+          teamId: me.teamId,
+          messageId: out.messageId,
+          from: me.agentKey,
+          to: toKey,
+          delivered,
+        });
+        return okResult(renderMessage(out.messageId, me.agentKey, toKey, delivered), {
+          messageId: out.messageId,
+          delivered,
+        });
+      });
+    },
+
+    async xc_status(args, connectionKey) {
+      return runCore(async () => {
+        const teamId = args.teamId?.trim() || TEAM_ID;
+        const me = identityStore.get(connectionKey); // 豁免注册（§2.8）：未注册省略个人字段
+        const team = await readTeam(stateRoot, teamId);
+        const now = Date.now();
+
+        const snapshot: StatusSnapshot = {
+          teamId,
+          generatedAt: now,
+          phase: team?.phase ?? "none",
+          founderKey: team?.founderKey ?? "(no team yet)",
+          members: (team?.members ?? []).map((m) => ({
+            key: m.key,
+            sessionId: m.sessionId,
+            role: m.role,
+            lastSeen: m.lastSeen,
+          })),
+          tasks: (team?.tasks ?? []).map((t) => ({
+            id: t.id,
+            title: t.title,
+            status: t.status,
+            assignee: t.assignee,
+            attempt: t.attempt,
+            attemptId: t.attemptId,
+            dependsOn: t.dependsOn,
+            createdBy: t.createdBy,
+            result: t.result,
+            error: t.error,
+            evidenceCount: t.evidence.length,
+            updatedAt: t.updatedAt,
+          })),
+          unread: {},
+        };
+
+        if (team !== undefined) {
+          // 读路径无锁（§2.7-5：rename 原子写保证读者看到完整文件）。
+          for (const m of team.members) {
+            const msgs = await readMailbox(stateRoot, teamId, m.key);
+            snapshot.unread[m.key] = countUnread(team, msgs);
+          }
+          if (me !== undefined) {
+            snapshot.me = { agentKey: me.agentKey, unread: snapshot.unread[me.agentKey] ?? 0 };
+          }
+        }
+
+        await writeSnapshot(stateRoot, teamId, snapshot); // §2.8/§4.3：每次调用刷新 snapshot.json
+        await logEngineEvent(stateRoot, {
+          event: "status",
+          teamId,
+          agentKey: me?.agentKey ?? null,
+          tasks: snapshot.tasks.length,
+        });
+        return okResult(renderStatusTable(snapshot), { snapshot });
+      });
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// SDK 接线：把 ToolCore 挂到 stdio MCP server（工具实名 mcp__plugin_zcode-crosschat_crosschat__xc_*）
+// ---------------------------------------------------------------------------
+
+/** 注册全部 7 个工具（DESIGN §2.8）。core 层已做信封映射，handler 只透传。 */
+export function registerTools(server: McpServer, deps: ToolDeps): void {
+  const core = createToolCore(deps);
+
+  server.tool(
+    "xc_register",
+    "Register this connection's session identity into the crosschat team (hook path or wakeToken path).",
+    RegisterShape,
+    async (args, extra) => core.xc_register(args, connectionKeyOf(extra)),
+  );
+  server.tool(
+    "xc_dispatch",
+    "Dispatch a verifiable task to a registered member (creates pending task + mailbox message, then optionally wakes the target).",
+    DispatchShape,
+    async (args, extra) => core.xc_dispatch(args, connectionKeyOf(extra)),
+  );
+  server.tool(
+    "xc_check_inbox",
+    "Read and consume this session's mailbox: current messages are marked read; stale ones discarded.",
+    {},
+    async (_args, extra) => core.xc_check_inbox({}, connectionKeyOf(extra)),
+  );
+  server.tool(
+    "xc_claim",
+    "Atomically claim a pending task; returns the attempt token required by xc_report.",
+    ClaimShape,
+    async (args, extra) => core.xc_claim(args, connectionKeyOf(extra)),
+  );
+  server.tool(
+    "xc_report",
+    "Report task progress/completion/failure with the current attempt token; completion requires result and >=1 evidence.",
+    ReportShape,
+    async (args, extra) => core.xc_report(args, connectionKeyOf(extra)),
+  );
+  server.tool(
+    "xc_message",
+    "Send a free-form message to a member (peer communication; duplicate-deduplicated).",
+    MessageShape,
+    async (args, extra) => core.xc_message(args, connectionKeyOf(extra)),
+  );
+  server.tool(
+    "xc_status",
+    "Team snapshot: members, task board, unread counts. Does not require registration; writes snapshot.json.",
+    StatusShape,
+    async (args, extra) => core.xc_status(args, connectionKeyOf(extra)),
+  );
+}
+
+/** 解析状态根的便捷出口（server.ts / 测试共用；M1 paths.ts 的薄封装）。 */
+export function resolveDeps(cwd: string, env: NodeJS.ProcessEnv = process.env): ToolDeps {
+  const workspace = cwd;
+  return { stateRoot: resolveStateRoot(workspace), workspace, env };
+}
+
+export type { MemberRole };

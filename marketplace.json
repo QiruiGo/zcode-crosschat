@@ -1,0 +1,16 @@
+{
+  "name": "dev-zcode-crosschat",
+  "owner": { "name": "QiruiGo" },
+  "plugins": [
+    {
+      "name": "zcode-crosschat",
+      "source": "./plugin",
+      "version": "0.1.0",
+      "displayName": "ZCode CrossChat",
+      "displayName_i18n": { "zh-CN": "跨会话协作" },
+      "description": "Dispatch verifiable tasks between independent ZCode sessions with a file mailbox and attempt tokens.",
+      "description_i18n": { "zh-CN": "在独立 zcode 会话之间派发可检验任务：文件邮箱、六态状态机、回执唤醒。" },
+      "category": "developer-tools"
+    }
+  ]
+}

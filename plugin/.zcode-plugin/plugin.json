@@ -1,0 +1,50 @@
+{
+  "name": "zcode-crosschat",
+  "version": "0.1.0",
+  "description": "Dispatch verifiable tasks between independent ZCode sessions: file-mailbox source of truth, attempt-token state machine, hook-based identity anchoring, and headless wake-ups.",
+  "description_i18n": {
+    "en": "Dispatch verifiable tasks between independent ZCode sessions. File mailbox as source of truth, six-state task machine with attempt tokens, hook-based session identity, and push/pull wake-ups.",
+    "zh-CN": "在独立 zcode 会话之间派发可检验任务并回传结果：文件邮箱真源、六态任务状态机与 attempt 令牌、钩子身份锚定、推送/拉取双通道唤醒。"
+  },
+  "author": { "name": "QiruiGo" },
+  "license": "MIT",
+  "skills": "skills",
+  "commands": "commands",
+  "hooks": "./hooks/hooks.json",
+  "mcpServers": {
+    "crosschat": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/dist/mcp/server.mjs"],
+      "cwd": "${ZCODE_PROJECT_DIR}",
+      "env": {
+        "ZCODE_PLUGIN_ROOT": "${CLAUDE_PLUGIN_ROOT}",
+        "ZCODE_PLUGIN_DATA": "${ZCODE_PLUGIN_DATA}",
+        "ZCODE_PLUGIN_ID": "zcode-crosschat",
+        "XC_WAKE_ENABLED": "${user_config.wake_enabled}",
+        "XC_ZCODE_EXE": "${user_config.zcode_exe}",
+        "XC_ZCODE_CJS": "${user_config.zcode_cjs}"
+      }
+    }
+  },
+  "userConfig": {
+    "wake_enabled": {
+      "type": "boolean",
+      "default": false,
+      "title": "推送唤醒",
+      "description": "派发/回传后用 zcode --resume 无头唤醒目标会话（fire-and-forget，仅属主缺席会话）。默认关闭：交互会话间的派发不自动 resume 可能正被桌面持有的目标；docs/DESIGN.md §6.4 自动演示的前置步骤会开启。引擎对非 \"true\" 值一律按关闭处理（V7）。"
+    },
+    "zcode_exe": {
+      "type": "file",
+      "default": "",
+      "title": "ZCode 可执行文件",
+      "description": "推送唤醒用的 zcode 可执行文件绝对路径（随机器安装位置不同，需自行填写）。仅在启用推送唤醒（wake_enabled）时使用；留空时推送唤醒不可用，投递自动回落邮箱拉取。"
+    },
+    "zcode_cjs": {
+      "type": "file",
+      "default": "",
+      "title": "zcode CLI 入口脚本",
+      "description": "与 zcode_exe 配套的 CLI 入口脚本绝对路径（随机器安装位置不同，需自行填写）。仅在启用推送唤醒（wake_enabled）时使用；留空时推送唤醒不可用。"
+    }
+  }
+}
