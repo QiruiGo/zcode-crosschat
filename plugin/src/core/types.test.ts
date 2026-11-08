@@ -1,9 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import {
+  MEMBER_IDENTITIES,
+  MEMBER_STATES,
   TASK_STATUSES,
   TASK_TRANSITIONS,
+  coerceNameBindings,
   coerceTeamState,
   isTeamMessage,
+  memberIdentity,
+  memberState,
   transitionError,
   type Task,
 } from './types.js';
@@ -163,5 +168,110 @@ describe('coerceTeamState', () => {
       expect((parsed.state.tasks[0] as Task).history).toEqual([]);
       expect(parsed.state.seq).toBe(1); // seq present in the sample: kept as-is
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.2 member-engine schema (DESIGN-V0.2.md §9.1 W2: state/identity/
+// provisionedAt/stopReason/leadKey/issuedBy — all optional, legacy compatible)
+// ---------------------------------------------------------------------------
+
+describe('v0.2 member schema', () => {
+  it('keeps every v0.1.0 state enum/identity value', () => {
+    expect(MEMBER_STATES).toEqual(['provisioning', 'ready', 'failed', 'removed']);
+    expect(MEMBER_IDENTITIES).toEqual(['self', 'engine']);
+  });
+
+  it('accepts the v0.1.0 member record unchanged (legacy peer, §6.5)', () => {
+    const team = sampleTeam();
+    const parsed = coerceTeamState(team, 'default');
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      const member = parsed.state.members[0]!;
+      expect(member.state).toBeUndefined();
+      expect(member.identity).toBeUndefined();
+      expect(memberState(member)).toBe('ready'); // legacy default
+      expect(memberIdentity(member)).toBe('self'); // legacy default
+      expect(parsed.state.leadKey).toBeUndefined();
+    }
+  });
+
+  it('accepts engine-provisioned records with all v0.2 fields', () => {
+    const team = sampleTeam() as Record<string, unknown>;
+    team['leadKey'] = 'a';
+    (team['members'] as unknown[]).push({
+      key: 'm1', sessionId: 'sess_m1', role: 'worker', joinedAt: 3, lastSeen: 4,
+      state: 'provisioning', identity: 'engine', provisionedAt: 3,
+    });
+    const parsed = coerceTeamState(team, 'default');
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      expect(parsed.state.leadKey).toBe('a');
+      const m1 = parsed.state.members[1]!;
+      expect(m1.state).toBe('provisioning');
+      expect(m1.identity).toBe('engine');
+      expect(m1.provisionedAt).toBe(3);
+    }
+  });
+
+  it('keeps failed/stopReason/error fields through the durable boundary', () => {
+    const team = sampleTeam() as Record<string, unknown>;
+    (team['members'] as unknown[]).push({
+      key: 'm2', sessionId: '', role: 'worker', joinedAt: 5, lastSeen: 6,
+      state: 'failed', identity: 'engine', error: 'create: no sessionId',
+    });
+    const team2 = sampleTeam() as Record<string, unknown>;
+    (team2['members'] as unknown[]).push({
+      key: 'm3', sessionId: 'sess_m3', role: 'worker', joinedAt: 7, lastSeen: 8,
+      state: 'removed', identity: 'engine', stopReason: 'lead requested shutdown',
+    });
+    for (const t of [team, team2]) {
+      const parsed = coerceTeamState(t, 'default');
+      expect(parsed.ok).toBe(true);
+    }
+    const parsed = coerceTeamState(team, 'default');
+    if (parsed.ok) expect(parsed.state.members[1]!.error).toBe('create: no sessionId');
+  });
+
+  it('rejects unknown state/identity values (strict enum at the boundary)', () => {
+    const team = sampleTeam() as Record<string, unknown>;
+    (team['members'] as unknown[]).push({
+      key: 'm9', sessionId: 'x', role: 'worker', joinedAt: 1, lastSeen: 1, state: 'zombie',
+    });
+    const parsed = coerceTeamState(team, 'default');
+    expect(parsed.ok).toBe(false);
+    if (!parsed.ok) expect(parsed.defect).toContain('member');
+  });
+
+  it('tolerates the removed member sessionId="" record (provisioning slot)', () => {
+    const team = sampleTeam() as Record<string, unknown>;
+    (team['members'] as unknown[]).push({
+      key: 'm4', sessionId: '', role: 'worker', joinedAt: 9, lastSeen: 9, state: 'provisioning',
+    });
+    expect(coerceTeamState(team, 'default').ok).toBe(true);
+  });
+});
+
+describe('coerceNameBindings v0.2 issuedBy', () => {
+  it('accepts the v0.1.0 binding shape unchanged', () => {
+    const parsed = coerceNameBindings({ m1: { sessionId: 'sess_1', role: 'worker', registeredAt: 1 } });
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) expect(parsed.bindings['m1']!.issuedBy).toBeUndefined();
+  });
+
+  it('accepts the engine pre-binding with issuedBy (§6.1 step 6)', () => {
+    const parsed = coerceNameBindings({
+      m1: { sessionId: 'sess_1', role: 'worker', registeredAt: 1, issuedBy: 'engine' },
+    });
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) expect(parsed.bindings['m1']!.issuedBy).toBe('engine');
+  });
+
+  it('rejects an unknown issuedBy value', () => {
+    const parsed = coerceNameBindings({
+      m1: { sessionId: 'sess_1', role: 'worker', registeredAt: 1, issuedBy: 'ghost' },
+    });
+    expect(parsed.ok).toBe(false);
+    if (!parsed.ok) expect(parsed.defect).toContain('issuedBy');
   });
 });

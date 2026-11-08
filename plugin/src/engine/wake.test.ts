@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { appendMailbox, createMessage, readMailbox } from "../core/mailbox";
 import { createWakeNonce } from "../core/registry";
+import { newTeamState, writeTeam } from "../core/teamstate";
 import type { TeamMessage, TeamState } from "../core/types";
 import type { SpawnResumeOptions, SpawnResumeResult } from "./resume-cli";
 import {
@@ -18,9 +19,13 @@ import {
   buildWakePrompt,
   decideDelivery,
   findDuplicateMail,
+  includeRulesForScene,
   isWakeEnabled,
+  MEMBER_RULES_V2,
   WAKE_PROMPT_MAX_CHARS,
   WAKE_INFLIGHT_MS,
+  WAKE_RULES_SCENES,
+  WAKE_SCENES,
   type WakeRequest,
 } from "./wake";
 
@@ -236,15 +241,17 @@ describe("buildWakePrompt", () => {
 
 // ─────────────────────────── attemptWake（磁盘端到端） ───────────────────────────
 
+/** 在当前临时 root 的 b 邮箱落一条派单消息（describe 共用）。 */
+async function seedMailbox(): Promise<TeamMessage> {
+  mkdirSync(join(root, "teams", "default", "inbox"), { recursive: true });
+  const message = createMessage("a", "b", "计算 17*23，把结果只写数字到 result-a2b.txt", {
+    deliveryClaimedAt: Date.now(),
+  });
+  await appendMailbox(root, "default", "b", message);
+  return message;
+}
+
 describe("attemptWake", () => {
-  async function seedMailbox(): Promise<TeamMessage> {
-    mkdirSync(join(root, "teams", "default", "inbox"), { recursive: true });
-    const message = createMessage("a", "b", "计算 17*23，把结果只写数字到 result-a2b.txt", {
-      deliveryClaimedAt: Date.now(),
-    });
-    await appendMailbox(root, "default", "b", message);
-    return message;
-  }
 
   it("【成功路径】delivered=wake：spawn 参数正确、nonce 落盘、markDelivered、engine.jsonl 记 {event: wake, pid}", async () => {
     const message = await seedMailbox();
@@ -402,5 +409,164 @@ describe("attemptWake", () => {
     expect(box).toHaveLength(1);
     expect(box[0]!.id).toBe(message.id);
     expect(box[0]!.content).toContain("17*23");
+  });
+});
+
+// ─────────────────────────── v0.2：守则 v2 与场景白名单（§3.4/§9.1） ───────────────────────────
+
+describe("MEMBER_RULES_V2（守则 v2 全文，§3.4）", () => {
+  it("含多任务自驱循环的关键协议元素", () => {
+    expect(MEMBER_RULES_V2).toContain("成员守则 v2");
+    expect(MEMBER_RULES_V2).toContain("一个回合可以做多单");
+    expect(MEMBER_RULES_V2).toContain("xc_report(in_progress)"); // 心跳
+    expect(MEMBER_RULES_V2).toContain("xc_idle"); // 空闲通知
+    expect(MEMBER_RULES_V2).toContain("unblock-notice"); // 依赖解除通知处理
+    expect(MEMBER_RULES_V2).toContain("shutdown-request"); // 停止帧收尾
+    expect(MEMBER_RULES_V2).toContain("task_not_pending");
+    expect(MEMBER_RULES_V2).toContain("dependencies_unmet");
+    expect(MEMBER_RULES_V2).toContain("already_has_open_task");
+    expect(MEMBER_RULES_V2).toContain(".crosschat/"); // 状态目录只读
+  });
+
+  it("在 ≤4000 预算内与任务票共存（buildWakePrompt 不挤掉守则）", () => {
+    const p = buildWakePrompt({
+      teamId: "default",
+      recipientKey: "b",
+      recipientSessionId: "sess_b",
+      wakeToken: "tok",
+      receiptIds: ["m1"],
+      bodyText: "x".repeat(3000), // 超出正文预算 → 截正文保守则
+      includeMemberRules: true,
+    });
+    expect(p).toContain("成员守则 v2");
+    expect(p.length).toBeLessThanOrEqual(WAKE_PROMPT_MAX_CHARS);
+    expect(p).toContain("…[truncated]"); // 挤掉的是正文，不是守则
+  });
+});
+
+describe("场景白名单（§9.1 新增场景 prompt 组装）", () => {
+  it("WAKE_SCENES 覆盖 v0.1.0 三场景 + v0.2 六场景", () => {
+    expect(WAKE_SCENES).toEqual([
+      "dispatch", "report", "message", "unblock", "idle", "cancel",
+      "post-provision", "shutdown", "stale-sweep",
+    ]);
+  });
+
+  it("守则白名单 = dispatch + post-provision；其余场景一律不附加", () => {
+    expect(WAKE_RULES_SCENES).toEqual(["dispatch", "post-provision"]);
+    expect(includeRulesForScene("dispatch")).toBe(true);
+    expect(includeRulesForScene("post-provision")).toBe(true);
+    for (const scene of ["report", "message", "unblock", "idle", "cancel", "shutdown", "stale-sweep"]) {
+      expect(includeRulesForScene(scene)).toBe(false);
+    }
+    expect(includeRulesForScene("unknown-future-scene")).toBe(false); // 未知场景向前兼容
+  });
+
+  it("attemptWake：unblock 场景不带守则", async () => {
+    await seedMailbox();
+    const capturedUnblock: CapturedSpawn[] = [];
+    await attemptWake(baseReq({ reason: "unblock", spawn: fakeSpawn(11, capturedUnblock) }));
+    expect(capturedUnblock).toHaveLength(1);
+    expect(capturedUnblock[0]!.prompt).not.toContain("成员守则");
+  });
+
+  it("attemptWake：post-provision 场景带守则 v2（E-e 投产唤醒）", async () => {
+    await seedMailbox();
+    const capturedPost: CapturedSpawn[] = [];
+    await attemptWake(baseReq({ reason: "post-provision", spawn: fakeSpawn(12, capturedPost) }));
+    expect(capturedPost).toHaveLength(1);
+    expect(capturedPost[0]!.prompt).toContain("成员守则 v2");
+  });
+});
+
+// ─────────────────────────── v0.2：wake-child 审计接线（§4.2） ───────────────────────────
+
+describe("attemptWake: onHelperSpawned → engine.jsonl wake-child（W1 接线）", () => {
+  it("helper 汇报的唤醒子 pid 追记 {event:\"wake-child\", pid}，与 wake 行并排", async () => {
+    await seedMailbox();
+    const captured: CapturedSpawn[] = [];
+    const res = await attemptWake(baseReq({
+      now: 2_000_000,
+      spawn: (opts) => {
+        captured.push(opts);
+        opts.onHelperSpawned?.(7777); // helper stdout {ok:true,pid:7777} 的模拟
+        return { pid: 111, logFile: opts.logFile }; // 111 = helper 自身 pid
+      },
+    }));
+    expect(res.delivered).toBe("wake");
+    const events = readEngineEvents();
+    const wakeRow = events.find((e) => e["event"] === "wake");
+    const childRow = events.find((e) => e["event"] === "wake-child");
+    expect(wakeRow!["pid"]).toBe(111); // wake 行 = helper pid
+    expect(childRow).toBeDefined();
+    expect(childRow!["pid"]).toBe(7777); // wake-child 行 = 唤醒子 pid
+    expect(childRow!["scene"]).toBe("dispatch");
+    expect(childRow!["to"]).toBe("b");
+  });
+});
+
+// ─────────────────────────── v0.2：成员状态门控（§6.3/§7.3.3） ───────────────────────────
+
+describe("attemptWake: 成员状态门控（provisioning/failed/removed 只入箱）", () => {
+  /** 落一个含单成员 b 的 team.json；state 可选。 */
+  async function seedTeamWithMember(state?: string): Promise<void> {
+    const team = newTeamState({ teamId: "default", founderKey: "a", now: 1 });
+    const member = {
+      key: "b", sessionId: "sess_b", role: "worker" as const, joinedAt: 1, lastSeen: 1,
+      ...(state === undefined ? {} : { state }),
+    };
+    team.members.push(member as TeamState["members"][number]);
+    mkdirSync(join(root, "teams", "default", "inbox"), { recursive: true });
+    await writeTeam(root, team);
+  }
+
+  it("provisioning → mailbox + wake-skipped(memberState) + 不写 nonce", async () => {
+    await seedTeamWithMember("provisioning");
+    await seedMailbox();
+    const captured: CapturedSpawn[] = [];
+    const res = await attemptWake(baseReq({ spawn: fakeSpawn(1, captured) }));
+    expect(res.delivered).toBe("mailbox");
+    expect(captured).toHaveLength(0);
+    const skip = readEngineEvents().filter((e) => e["event"] === "wake-skipped").at(-1);
+    expect(String(skip!["reason"])).toContain("member-state:provisioning");
+    expect(existsSync(join(root, "registry", "wake")) ? readdirSync(join(root, "registry", "wake")) : []).toEqual([]);
+  });
+
+  it("removed → 同样只入箱不唤醒（§7.3.3「不再被唤醒」）", async () => {
+    await seedTeamWithMember("removed");
+    await seedMailbox();
+    const captured: CapturedSpawn[] = [];
+    const res = await attemptWake(baseReq({ spawn: fakeSpawn(1, captured) }));
+    expect(res.delivered).toBe("mailbox");
+    expect(captured).toHaveLength(0);
+    const skip = readEngineEvents().filter((e) => e["event"] === "wake-skipped").at(-1);
+    expect(String(skip!["reason"])).toContain("member-state:removed");
+  });
+
+  it("state=ready / 旧数据无 state（§6.5 缺省 ready）→ 照常 wake", async () => {
+    for (const state of ["ready", undefined]) {
+      const freshRoot = mkdtempSync(join(tmpdir(), "xc-wake-gate-"));
+      dirs.push(freshRoot);
+      const prevRoot = root;
+      root = freshRoot;
+      try {
+        await seedTeamWithMember(state);
+        await seedMailbox();
+        const captured: CapturedSpawn[] = [];
+        const res = await attemptWake(baseReq({ spawn: fakeSpawn(3, captured) }));
+        expect(res.delivered).toBe("wake");
+        expect(captured).toHaveLength(1);
+      } finally {
+        root = prevRoot;
+      }
+    }
+  });
+
+  it("团队不存在 → 放行（v0.1.0 行为不变；现有用例同证）", async () => {
+    await seedMailbox();
+    const captured: CapturedSpawn[] = [];
+    const res = await attemptWake(baseReq({ spawn: fakeSpawn(4, captured) }));
+    expect(res.delivered).toBe("wake");
+    expect(captured).toHaveLength(1);
   });
 });

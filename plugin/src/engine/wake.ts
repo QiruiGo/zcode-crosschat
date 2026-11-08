@@ -1,5 +1,5 @@
 /**
- * M2 wake-engine —— 推送唤醒：delivered 三态决策、回执/身份行/wakeToken/任务票 prompt 组装
+ * M2/W3 wake-engine —— 推送唤醒：delivered 三态决策、回执/身份行/wakeToken/任务票 prompt 组装
  * （≤4000 字符）、一次性 wake nonce（兼在途标记，TTL=15min）、fire-and-forget 无头 --resume。
  *
  * 设计依据 docs/DESIGN.md：
@@ -12,6 +12,19 @@
  * - §2.5/§4.2  派发唤醒 prompt 内嵌成员守则摘要（claim→执行→report→结束回合，不 busy-poll）
  * - §2.7-4  慢操作（spawn）一律锁外；本模块对邮箱的补盖章（claim/delivered/release）按 dsh
  *         tools.js:2140-2156 的做法各自短暂重取 team 锁
+ *
+ * v0.2 增量（DESIGN-V0.2.md，文件所有权表 §9.1 wake.ts 归 W3 task-flow）：
+ * - §3.4  MEMBER_RULES 升级为 **守则 v2**（MEMBER_RULES_V2，多任务自驱版：回合内多单循环/
+ *         心跳/idle 通知/unblock-notice 处理/shutdown 帧），替换 v0.1.0 摘要版；
+ * - §9.1  「新增场景 unblock/idle/post-provision/shutdown 的 prompt 组装、buildWakePrompt
+ *         白名单兼容」：守则附加从 `reason === "dispatch"` 单判改为**场景白名单**
+ *         WAKE_RULES_SCENES（dispatch/post-provision 附加守则；unblock/idle/cancel/
+ *         report/message/shutdown/stale-sweep 不附加——成员已带守则开工，lead 不是守则对象）；
+ * - §4.2  W1 接线：spawnResume 的 onHelperSpawned(childPid) → engine.jsonl
+ *         {event:"wake-child", pid}（与 wake 行的 helper pid 并排可查，§4.2 审计）；
+ * - §6.3/§7.3.3  唤醒路径成员状态门控：目标成员 state ∈ {provisioning, failed, removed}
+ *         → 只入箱不唤醒（E-a 派发/E-b unblock/E-c idle 的公共唤醒路径检查点——tools.ts
+ *         主体不改（§10.4 唯一缝隙），门控只能落在这里才同时覆盖三条边）。
  *
  * dsh 原版参照（dsh-agent-teams 0.1.29，lib/ 目录）：
  * - tools.js:2088-2093  duplicate 幂等判定（from+content+taskId/attemptId+source* 全等 ∧
@@ -41,6 +54,7 @@ import {
 import { logEngineEvent } from "../core/log";
 import { withTeamLock } from "../core/lock";
 import { wakeLogFile } from "../core/paths";
+import { readTeam } from "../core/teamstate";
 import {
   consumeWakeNonce,
   createWakeNonce,
@@ -177,14 +191,69 @@ export interface WakePromptInput {
   includeMemberRules?: boolean;
 }
 
-/** 成员守则摘要（DESIGN §4.2：移植 dsh memberPersona capabilities.js:9 思想）。 */
-const MEMBER_RULES = [
-  "成员守则（摘要）：",
-  "1) 先 xc_register（本 prompt 已给出 name/sessionId/wakeToken），再 xc_check_inbox 读取回执消息；",
-  "2) xc_claim 认领任务 → 执行 → xc_report(completed|failed, 必须带 result 与 evidence≥1) → 结束回合；",
-  "3) xc_claim 失败（任务已被他人认领）→ 立即 xc_check_inbox 看是否还有其他未读，没有则直接结束回合——不得重试同一任务、不得 busy-poll；",
-  "4) stale attempt（attemptId 不匹配）立即停手；工具返回 error:\"busy\" 稍后重试一次，仍忙则结束回合。",
+/**
+ * 成员守则 v2（DESIGN-V0.2.md §3.4 全文，「唤醒 prompt 内嵌文本，W3 交付于 wake.ts」，
+ * 替换 v0.1.0 MEMBER_RULES 摘要版；§9.2 W3 对外接口 `export const MEMBER_RULES_V2: string`）。
+ * 这是 G2「成员自动开工」的执行协议本体，逐条对应 CC 队友工作流（11-cc逆向 §4.3-5）。
+ * 与 §3.4 比仅去掉两处纯设计内引用（§6.2 ③ / scheduler.js:178），语义零改动。
+ * W2 的成员欢迎 prompt（xc_member_add 步骤③）经本导出复用同一文本（§9.1 依赖方向）。
+ */
+export const MEMBER_RULES_V2 = [
+  "成员守则 v2（多任务自驱版）：",
+  "1) 身份：先 xc_register（本 prompt 已给出 name/sessionId/wakeToken），再 xc_check_inbox 读消息。",
+  "2) 工作循环（一个回合可以做多单，做完一单领下一单）：",
+  "   a. 取一单：优先看收件箱未读的 task-assignment / unblock-notice；",
+  "   b. xc_claim(taskId) 拿 attemptId → xc_report(in_progress) → 执行；",
+  "   c. 预计超过 10 分钟的任务每 ≤10 分钟 xc_report(in_progress)（心跳，附一句进展）；",
+  "   d. 完成：xc_report(completed, result=结果摘要, evidence=[文件路径+至少一条])；",
+  "      失败：xc_report(failed, error=原因)。回执发出后回到 a 取下一单。",
+  "3) 没有可做的活：向 lead 发 xc_idle（summary 必填；刚完成的单附 completedTaskId/completedStatus），",
+  "   然后立即结束回合。不要空转轮询。（例外：首次供给的欢迎回合无单直接结束回合、不发 xc_idle",
+  "   ——就绪由 roster state 表达。）",
+  "4) xc_claim 被拒：task_not_pending（已被领）→ 不重试，回到 a；",
+  "   dependencies_unmet → 该任务等 unblock-notice 再做，回到 a 看有没有别的活；",
+  "   already_has_open_task → 先把手头的单做完报掉。",
+  "5) stale attempt（attemptId 不匹配）→ 立即停手，该任务已被重置，回 a 取别的；",
+  "   error:\"busy\" → 稍后重试一次，仍忙则 xc_idle 结束回合。",
+  "6) 依赖任务的输出：claim 后如需上游产出，用 xc_status 看依赖任务的 result 字段；",
+  "   unblock-notice 里也会带上游结果摘要（有截断预算）。",
+  "7) 收到 shutdown-request 帧 → 不再领取新任务，把手头单报告（或直接 failed）后结束回合。",
+  "8) 一切与协作有关的状态只经 xc_* 工具读写；.crosschat/ 状态目录是只读诊断面。",
 ].join("\n");
+
+/**
+ * v0.2 唤醒场景标签全集（§9.1 新增场景 unblock/idle/post-provision/shutdown 的 prompt
+ * 组装对齐值；W2/W4/W5 以同一组字符串调 attemptWake，engine.jsonl scene 字段可枚举审计）。
+ * v0.1.0 已有：dispatch（派发任务票）/ report（终态回执）/ message（自由消息）；
+ * v0.2 新增：unblock（W3 依赖解除）/ idle（W4 空闲通知）/ cancel（W4 任务取消）/
+ * post-provision（W2 供给完成投产）/ shutdown（W2 成员停止收尾）/ stale-sweep（W3 清扫回执）。
+ */
+export const WAKE_SCENES = [
+  "dispatch",
+  "report",
+  "message",
+  "unblock",
+  "idle",
+  "cancel",
+  "post-provision",
+  "shutdown",
+  "stale-sweep",
+] as const;
+export type WakeScene = (typeof WAKE_SCENES)[number];
+
+/**
+ * 守则附加白名单（§9.1「buildWakePrompt 白名单兼容」）：这些场景的唤醒 prompt 内嵌
+ * MEMBER_RULES_V2——dispatch 是成员的第一次开工唤醒；post-provision（E-e 投产）虽在
+ * 欢迎回合已见过守则，但它是成员第一条真实投产唤醒，重附一次守则保自驱循环可靠。
+ * 其余场景（report/unblock/idle/cancel/message/shutdown/stale-sweep）不附加：成员
+ * 已在守则下工作，lead 不是守则对象，省下的预算留给任务票正文。
+ */
+export const WAKE_RULES_SCENES: readonly string[] = ["dispatch", "post-provision"];
+
+/** 场景 → 是否附加守则（白名单判定；未知场景一律不附加，向前兼容）。 */
+export function includeRulesForScene(reason: string): boolean {
+  return WAKE_RULES_SCENES.includes(reason);
+}
 
 const TRUNCATE_MARKER = "…[truncated]";
 
@@ -212,7 +281,7 @@ export function buildWakePrompt(input: WakePromptInput, maxChars: number = WAKE_
     `本连接是新的：先调用 xc_register 绑定本连接身份（name 填 "${input.recipientKey}"，` +
     `sessionId 填 "${input.recipientSessionId}"，wakeToken 填 "${input.wakeToken}"），` +
     `注册成功后调用 xc_check_inbox 读取回执对应的消息。`;
-  const rules = input.includeMemberRules === true ? MEMBER_RULES : undefined;
+  const rules = input.includeMemberRules === true ? MEMBER_RULES_V2 : undefined;
 
   // 分隔符开销：parts 以 "\n\n" 连接。
   const sepCount = (rules === undefined ? 2 : 3) * 2;
@@ -245,7 +314,9 @@ export interface WakeRequest {
   toSessionId: string;
   /** 会话工作区（--cwd 传给无头 CLI）。 */
   workspace: string;
-  /** 唤醒场景标签（dispatch/report/message…；进 engine.jsonl）。 */
+  /** 唤醒场景标签（v0.2 取值对齐 WAKE_SCENES：dispatch/report/message/unblock/idle/
+   *  cancel/post-provision/shutdown/stale-sweep；进 engine.jsonl scene 字段；
+   *  守则附加按 WAKE_RULES_SCENES 白名单判定）。 */
   reason: string;
   /** 要投递的消息 id（调用方锁内 append 的那条；回执 ids）。 */
   receiptIds: readonly string[];
@@ -288,15 +359,39 @@ async function withLockBestEffort<T>(stateRoot: string, teamId: string, fn: () =
 }
 
 /**
+ * v0.2 成员状态门控（§6.3/§7.3.3）：目标成员的供给态若应挡住唤醒则返回该状态字符串
+ * （provisioning/failed/removed），否则 undefined（放行）。团队不存在/成员不在册/
+ * 读盘失败 → 放行（与 v0.1.0 行为一致；门控是增量保护，不是新的失败面）。
+ * W2 的 state 可选字段按 §6.5 宽容语义读取（缺省 "ready"=放行，旧花名零行为变化）。
+ */
+async function memberWakeGateState(stateRoot: string, teamId: string, agentKey: string): Promise<string | undefined> {
+  try {
+    const team = await readTeam(stateRoot, teamId);
+    if (team === undefined) return undefined;
+    const member = team.members.find((m) => m.key === agentKey);
+    if (member === undefined) return undefined;
+    const state = (member as { state?: string }).state ?? "ready";
+    if (state === "provisioning" || state === "failed" || state === "removed") return state;
+    return undefined;
+  } catch {
+    return undefined; // team.json 损坏等：门控尽力而为，唤醒路径不受阻
+  }
+}
+
+/**
  * 推送唤醒编排（DESIGN §2.5；**必须在团队锁外调用**——慢操作 spawn 不持锁，§2.7-4；
  * 本函数内部对邮箱的补盖章会各自短暂重取锁，调用方持锁时调用会死锁）：
  *
  * 1. enabled 判定（V7：非 "true" 关，原始值记 engine.jsonl）；
  * 2. 属主缺席约束（§2.5-2，见 DeliveryDecisionInput.ownerAbsent）；
  * 3. 在途 nonce 去重（M1 registry 扫 registry/wake/，TTL=15min，§2.5-3）；
+ * 3.5 v0.2 成员状态门控（§6.3/§7.3.3）：目标 state ∈ {provisioning, failed, removed}
+ *     → 只入箱不唤醒（nonce 落盘之前判定，跳过路径不留 15min 在途标记）；
  * 4. 写一次性 nonce（M1 createWakeNonce，兼在途标记）→ 盖投递租约（M1 claim，60s，尽力而为）；
- * 5. buildWakePrompt → spawnResume（detached+unref，stdout/stderr→logs/wake-<to>-<ts>.json）；
+ * 5. buildWakePrompt（守则附加按 WAKE_RULES_SCENES 白名单）→ spawnResume（helper 孤儿化，
+ *    W1；stdout/stderr→logs/wake-<to>-<ts>.json）；
  * 6. spawn 成功 → markDelivered（dsh tools.js:2150 对应物）+ engine.jsonl {event:"wake", pid}；
+ *    helper 汇报唤醒子 pid → engine.jsonl {event:"wake-child", pid}（§4.2 审计）；
  *    spawn 同步失败 → release 租约（state.js:489-496 对应物）+ engine.jsonl wake-failed，
  *    降级 mailbox——消息留邮箱，pull 兜底，租约到期后可重试（§2.5 mailbox 行）。
  *
@@ -331,6 +426,21 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
     return { delivered: "mailbox", note: d.reason };
   }
 
+  // 3.5 v0.2 成员状态门控（DESIGN-V0.2 §6.3 双向门控 + §7.3.3「E-a/E-b/E-c 唤醒路径
+  // 检查 state」）：provisioning/failed/removed 的成员只入箱、不唤醒——provisioning
+  // 期间 resume 会与 app-server 持有并发（V5 未验证区）；removed 成员不再被唤醒。
+  // 位置在 createWakeNonce **之前**：跳过路径不落 nonce，避免 15min 在途标记挡住
+  // 供给完成后的 E-e 投产唤醒。团队不存在/成员不在册 → 与 v0.1.0 行为一致（放行）；
+  // W2 的 state 可选字段以 §6.5 宽容语义读取（缺省 "ready"=放行，旧数据零行为变化）。
+  const gateState = await memberWakeGateState(stateRoot, req.teamId, toKey);
+  if (gateState !== undefined) {
+    const reason = `member-state:${gateState}: 目标成员供给中/失败/已移除，只入箱不唤醒（DESIGN-V0.2 §6.3/§7.3.3）`;
+    await logEngineEvent(stateRoot, {
+      event: "wake-skipped", reason, scene: req.reason, teamId: req.teamId, to: toKey, memberState: gateState,
+    });
+    return { delivered: "mailbox", note: reason };
+  }
+
   // 4. 写一次性 nonce（兼在途标记）+ 盖投递租约（尽力而为）。
   const { token } = await createWakeNonce(stateRoot, {
     teamId: req.teamId, agentKey: toKey, sid: req.toSessionId, now,
@@ -339,7 +449,7 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
   await withLockBestEffort(stateRoot, req.teamId, () =>
     claimMailboxDelivery(stateRoot, req.teamId, toKey, ids, now));
 
-  // 5. prompt + spawn（fire-and-forget）。
+  // 5. prompt + spawn（fire-and-forget）。守则附加按场景白名单（v0.2 §9.1 白名单兼容）。
   const prompt = buildWakePrompt({
     teamId: req.teamId,
     recipientKey: toKey,
@@ -347,7 +457,7 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
     wakeToken: token,
     receiptIds: ids,
     bodyText: req.ticket,
-    includeMemberRules: req.reason === "dispatch",
+    includeMemberRules: includeRulesForScene(req.reason),
   });
   const logFile = wakeLogFile(stateRoot, toKey, now);
   const releaseOnFailure = async (where: string, err: unknown): Promise<void> => {
@@ -375,6 +485,13 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
       logFile,
       onAsyncError: (err) => {
         void releaseOnFailure("async", err);
+      },
+      // v0.2 W1 接线（DESIGN-V0.2 §4.2 审计）：helper 汇报的唤醒子 pid 追记
+      // engine.jsonl {event:"wake-child", pid}，与 wake 行的 helper pid 并排可查。
+      onHelperSpawned: (childPid) => {
+        void logEngineEvent(stateRoot, {
+          event: "wake-child", pid: childPid, scene: req.reason, teamId: req.teamId, to: toKey, nonce: token,
+        });
       },
     });
     pid = spawned.pid;

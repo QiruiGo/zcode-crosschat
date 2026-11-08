@@ -710,6 +710,17 @@ console.log("build ok -> dist/mcp/server.mjs + dist/hooks/*.mjs");
 | V8 | 插件 MCP server 进程生命周期与 manifest `isolation:"workspace"` 语义（每会话一进程 vs 每工作区共享；PLATFORM.md §2.1 仅记载该字段存在、语义未解释） | 身份模型与锁规模（身份已按**连接绑定**设计，两种结果都成立；锁以 registry→team 固定顺序跨进程生效） | 实测：同工作区两会话，数 MCP 进程/连接（日志或任务管理器）；结论回填本文档 §2.3 |
 | — | 本设计未运行任何插件代码（设计环节无实现物） | — | 全部运行时判据列入 §6 判收条件与 V1-V8，由实现/验证环节执行 |
 
+**v0.2.0 回填（2026-11-09，`docs/FEASIBILITY-V0.2.md` 实测；v0.2 的实现期验证点 V12-V20 见 `docs/DESIGN-V0.2.md` §13，不在此重复编号）：**
+
+| # | 事项 | 回填结论 | 依据 |
+|---|---|---|---|
+| V9 | CLI 单发派发方退出连带清杀唤醒子进程（09 报告 §4.3 现象） | **已修复并实测**：机理修正为「清杀沿活父链传播，孤儿链杀不到」（非作业对象，breakaway 探针无 ACCESS_DENIED）；v0.2 唤醒一律经立即退出的 node 跳板孤儿化（`dist/mcp/wake-helper.mjs`），E3b 端到端通过（派发方 5.7s 退出后孤儿唤醒全自动完成任务） | FEASIBILITY §1.3/§2.1（E1-E3b）、P5 |
+| V10 | WMI 逃逸路径的 SYSTEM 环境坑 | WMI 子进程继承 WmiPrvSE 的 SYSTEM 环境（无用户 env，CLI 起不来）；解法=派发方落盘 `process.env` → wrapper 读回整体替换（E3c2 已验证）。v0.2 不进代码，作为 helper 路径失败时的预设计备选 | FEASIBILITY §2.2、P3 |
+| V11 | 「回合完成等待器」误判 timeline 事件消息 | 完成判定收紧为：assistant ∧ finish∈{completed,stop} ∧ ≥1 个 text part（baseline 与 done 两处都过滤）；产品化于 `plugin/src/engine/provision.ts` | FEASIBILITY §4-P2 |
+| — | V6（模型枚举 providerId） | 更新：枚举主路径改为 `session/create` 结果内联 `settings.model.available[].ref`（`state.updated` 不可依赖）；E4 以回合 modelId=设定值验证 setModel 生效 | FEASIBILITY §4-P1、§3.1-1 |
+| — | 会话持久化时机（原「未知」） | 实测：`session/send` accept 后 ≤3s 落库，硬杀 app-server 不丢——供给完成即 kill keeper 安全 | FEASIBILITY §4-P4 |
+| — | V3/V8/V5 | 维持原口径未确认；V5（resume 活属主）v0.2 全路径不依赖（成员恒 owner-absent，lead keeper 仅引导并在派发回合后退出） | DESIGN-V0.2 §13 末行 |
+
 ## 10. 与验收标准的最终对照
 
 | 验收 | 设计保证 | 证据产出 |

@@ -69,6 +69,27 @@ export type TeamPhase = (typeof TEAM_PHASES)[number];
 export const MEMBER_ROLES = ['peer', 'worker'] as const;
 export type MemberRole = (typeof MEMBER_ROLES)[number];
 
+/**
+ * v0.2 member lifecycle states (DESIGN-V0.2.md §3.3). Optional on the record:
+ * a member without `state` is a v0.1.0 legacy peer and reads as `ready`
+ * (memberState accessor, DESIGN-V0.2.md §6.5).
+ */
+export const MEMBER_STATES = ['provisioning', 'ready', 'failed', 'removed'] as const;
+export type MemberState = (typeof MEMBER_STATES)[number];
+
+/**
+ * v0.2 member identity kinds (DESIGN-V0.2.md §3.1). Optional on the record:
+ * absent = v0.1.0 self-registered peer (`self`).
+ */
+export const MEMBER_IDENTITIES = ['self', 'engine'] as const;
+export type MemberIdentity = (typeof MEMBER_IDENTITIES)[number];
+
+/**
+ * Reserved member keys (DESIGN-V0.2.md §3.1, CC 保留名纪律等效移植): the lead
+ * role name and the default team name. xc_member_add rejects them.
+ */
+export const RESERVED_MEMBER_KEYS: readonly string[] = ['lead', 'default'];
+
 /** v1 keeps exactly one team (DESIGN.md §2.2); the schema stays multi-team-ready. */
 export const DEFAULT_TEAM_ID = 'default';
 
@@ -113,26 +134,59 @@ export interface Task {
   history: TaskHistoryEntry[];
 }
 
-/** One team member (independent peer session; DESIGN.md §2.6/§3). */
+/**
+ * One team member (independent peer session; DESIGN.md §2.6/§3).
+ * v0.2 optional fields (DESIGN-V0.2.md §9.1, W2): `state`/`identity`/
+ * `provisionedAt`/`stopReason` — all absent on v0.1.0 records, which the
+ * accessors below map to the legacy peer semantics (§6.5). `error` carries the
+ * last provisioning failure of a `failed` member (§3.3 「错误进记录」/§6.1 step 5).
+ */
 export interface TeamMember {
   key: string;
   sessionId: string;
   role: MemberRole;
   joinedAt: number;
   lastSeen: number;
+  /** Lifecycle state; absent = legacy peer (= ready). */
+  state?: MemberState;
+  /** Who created this member; absent = self-registered peer. */
+  identity?: MemberIdentity;
+  /** Provisioning bookkeeping timestamp (start of the current supply / last success). */
+  provisionedAt?: number;
+  /** Reason recorded by xc_member_stop (absent otherwise). */
+  stopReason?: string;
+  /** Last provisioning failure detail (state=failed only). */
+  error?: string;
 }
 
-/** The whole team.json record (DESIGN.md §2.6). */
+/**
+ * The whole team.json record (DESIGN.md §2.6). v0.2 adds the optional
+ * `leadKey` (DESIGN-V0.2.md §3.1): the team lead's member key. Absent = no
+ * explicit lead yet; the founder reads as lead (`leadKeyOf` in the member
+ * tools, DESIGN-V0.2.md §6.1 step 1).
+ */
 export interface TeamState {
   teamId: string;
   name: string;
   founderKey: string;
   phase: TeamPhase;
+  /** Team lead's member key (v0.2, optional). */
+  leadKey?: string;
   members: TeamMember[];
   tasks: Task[];
   /** Monotonic counter used to allocate task ids (`t1`, `t2`, ...). */
   seq: number;
   createdAt: number;
+}
+
+/** Lifecycle state of one member with the v0.1.0 compatibility default (§6.5). */
+export function memberState(member: TeamMember): MemberState {
+  return member.state ?? 'ready';
+}
+
+/** Identity of one member with the v0.1.0 compatibility default (§6.5). */
+export function memberIdentity(member: TeamMember): MemberIdentity {
+  return member.identity ?? 'self';
 }
 
 /**
@@ -170,11 +224,19 @@ export interface SessionRecord {
   boundName?: string;
 }
 
-/** One name binding in `registry/names.json` (DESIGN.md §2.2). */
+/**
+ * One name binding in `registry/names.json` (DESIGN.md §2.2). v0.2 adds the
+ * optional `issuedBy` (DESIGN-V0.2.md §6.1 step 6): `engine` on the engine's
+ * pre-binding for provisioned members. Absent = registered by the session
+ * itself. Note: a later re-registration (wake path) overwrites the binding and
+ * drops this marker — the roster's `identity: "engine"` stays authoritative.
+ */
 export interface NameBinding {
   sessionId: string;
   role: MemberRole;
   registeredAt: number;
+  /** `engine` when pre-bound by the member engine (v0.2, optional). */
+  issuedBy?: 'engine' | 'self';
 }
 
 /** name -> binding map, the whole content of `registry/names.json`. */
@@ -398,7 +460,29 @@ function coerceMember(value: unknown): TeamMember | undefined {
   }
   const roleRaw = optionalString(value['role']) ?? 'peer';
   if (!MEMBER_ROLES.includes(roleRaw as MemberRole)) return undefined;
-  return { key, sessionId, role: roleRaw as MemberRole, joinedAt, lastSeen };
+  // v0.2 optional fields (DESIGN-V0.2.md §9.1): unknown/absent values are
+  // dropped, never rejected — old records read unchanged (§6.5/§11.1).
+  const stateRaw = optionalString(value['state']);
+  if (stateRaw !== undefined && !MEMBER_STATES.includes(stateRaw as MemberState)) return undefined;
+  const identityRaw = optionalString(value['identity']);
+  if (identityRaw !== undefined && !MEMBER_IDENTITIES.includes(identityRaw as MemberIdentity)) {
+    return undefined;
+  }
+  const provisionedAt = optionalFinite(value['provisionedAt']);
+  const stopReason = optionalString(value['stopReason']);
+  const error = optionalString(value['error']);
+  return {
+    key,
+    sessionId,
+    role: roleRaw as MemberRole,
+    joinedAt,
+    lastSeen,
+    ...(stateRaw === undefined ? {} : { state: stateRaw as MemberState }),
+    ...(identityRaw === undefined ? {} : { identity: identityRaw as MemberIdentity }),
+    ...(provisionedAt === undefined ? {} : { provisionedAt }),
+    ...(stopReason === undefined ? {} : { stopReason }),
+    ...(error === undefined ? {} : { error }),
+  };
 }
 
 export interface ParsedTeam {
@@ -433,6 +517,8 @@ export function coerceTeamState(value: unknown, expectedTeamId: string): ParsedT
   }
   const createdAt = optionalFinite(value['createdAt']);
   if (createdAt === undefined) return { ok: false, defect: 'field "createdAt" missing or not a number' };
+  // v0.2 optional leadKey (DESIGN-V0.2.md §3.1): absent on legacy teams.
+  const leadKey = optionalString(value['leadKey']);
   if (!Array.isArray(value['members'])) return { ok: false, defect: 'field "members" is not an array' };
   const members: TeamMember[] = [];
   for (const raw of value['members']) {
@@ -462,7 +548,17 @@ export function coerceTeamState(value: unknown, expectedTeamId: string): ParsedT
   }
   return {
     ok: true,
-    state: { teamId, name, founderKey, phase: phaseRaw as TeamPhase, members, tasks, seq, createdAt },
+    state: {
+      teamId,
+      name,
+      founderKey,
+      phase: phaseRaw as TeamPhase,
+      ...(leadKey === undefined ? {} : { leadKey }),
+      members,
+      tasks,
+      seq,
+      createdAt,
+    },
   };
 }
 
@@ -518,7 +614,17 @@ export function coerceNameBindings(value: unknown): ParsedNames | RejectedNames 
     if (!MEMBER_ROLES.includes(roleRaw as MemberRole)) {
       return { ok: false, defect: `binding "${name}" has invalid role "${roleRaw}"` };
     }
-    bindings[name] = { sessionId, role: roleRaw as MemberRole, registeredAt };
+    // v0.2 optional issuedBy (DESIGN-V0.2.md §6.1 step 6): engine pre-binding.
+    const issuedByRaw = optionalString(raw['issuedBy']);
+    if (issuedByRaw !== undefined && issuedByRaw !== 'engine' && issuedByRaw !== 'self') {
+      return { ok: false, defect: `binding "${name}" has invalid issuedBy "${issuedByRaw}"` };
+    }
+    bindings[name] = {
+      sessionId,
+      role: roleRaw as MemberRole,
+      registeredAt,
+      ...(issuedByRaw === undefined ? {} : { issuedBy: issuedByRaw as 'engine' | 'self' }),
+    };
   }
   return { ok: true, bindings };
 }

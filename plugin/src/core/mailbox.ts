@@ -12,6 +12,17 @@
  * - ack/discard/claim/release/append: state.js:371-519, JSONL append instead
  *   of whole-file rewrite (DESIGN.md §2.7-5)
  *
+ * v0.2 (DESIGN-V0.2.md §7.4-I3, hardening G6): frame-type whitelist at READ
+ * time, the 1:1 port of CC's "team_permission_update frames are dropped —
+ * permission rules are never accepted from messages". Content that parses to
+ * a JSON object carrying a `type` field is a NAMED frame; named frames outside
+ * FRAME_TYPES are dropped from every read view and audited
+ * `{event:"frame-rejected", frameType}`. Free text (and JSON without a type
+ * field) stays a chat message — backward compatible with v0.1.0. The
+ * whitelist lives here (the read side needs it); mcp/guards.ts re-exports it
+ * per the §9.2 module contract. Enforced as data-plane structure, not
+ * prompt discipline: no message can ever carry grant/permission semantics.
+ *
  * Lock contract: the `*Locked` functions require the caller to hold the team
  * lock (in-process + cross-process, e.g. via lock.ts withTeamLock); the
  * non-Locked convenience wrappers take the locks themselves.
@@ -21,11 +32,57 @@
 import { randomUUID } from 'node:crypto';
 import { appendJsonl, readJsonl, rewriteJsonl, type MalformedLine } from './jsonl.js';
 import { sanitizeKey } from './sanitize.js';
-import { isTeamMessage, normalizeMessage, type TeamMessage, type TeamState } from './types.js';
+import { isRecord, isTeamMessage, normalizeMessage, type TeamMessage, type TeamState } from './types.js';
 import { logEngineEvent } from './log.js';
 import { withFileLock, withProcessLock } from './lock.js';
 import { inboxFile, teamLockNames } from './paths.js';
 import { readTeam } from './teamstate.js';
+
+// ---------------------------------------------------------------------------
+// Frame-type whitelist (v0.2 §7.4-I3; CC "permission rules are never accepted
+// from messages", 11-cc逆向 §3b-1). Single definition point lives here; the
+// mcp face re-exports FRAME_TYPES from guards.ts (§9.2 contract).
+// ---------------------------------------------------------------------------
+
+/** v0.2 协议帧白名单：未知具名帧一律拒收（W3 unblock-notice / W2 shutdown-request /
+ * W4 idle-notification / W5 delivery-refused 均已列入）。 */
+export const FRAME_TYPES = [
+  'task-assignment',
+  'task-receipt',
+  'idle-notification',
+  'unblock-notice',
+  'shutdown-request',
+  'delivery-refused',
+] as const;
+export type FrameType = (typeof FRAME_TYPES)[number];
+
+const FRAME_TYPE_SET: ReadonlySet<string> = new Set<string>(FRAME_TYPES);
+
+/**
+ * One message content's frame classification (pure, test-facing):
+ * - `{kind:"chat"}` — not a named frame: free text, non-object JSON, or a JSON
+ *   object without a `type` field (v0.1.0 free-text compatibility, §11.1);
+ * - `{kind:"frame"}` — JSON object with a `type` field; `accepted` is the
+ *   whitelist verdict. A non-string `type` is still a named frame (its name
+ *   can never match the whitelist -> rejected).
+ */
+export type FrameClassification =
+  | { kind: 'chat' }
+  | { kind: 'frame'; frameType: string; accepted: boolean };
+
+export function classifyFrame(content: string): FrameClassification {
+  let value: unknown;
+  try {
+    value = JSON.parse(content);
+  } catch {
+    return { kind: 'chat' };
+  }
+  if (!isRecord(value)) return { kind: 'chat' };
+  if (!('type' in value)) return { kind: 'chat' };
+  const raw = value['type'];
+  const frameType = typeof raw === 'string' ? raw : JSON.stringify(raw) ?? '<non-string-type>';
+  return { kind: 'frame', frameType, accepted: FRAME_TYPE_SET.has(frameType) };
+}
 
 /** A crashed delivery attempt becomes retryable after this interval (state.js:26). */
 export const MAILBOX_DELIVERY_LEASE_MS = 60_000;
@@ -80,9 +137,56 @@ function mailboxPath(stateRoot: string, teamId: string, agentKey: string): strin
   return inboxFile(stateRoot, teamId, sanitizeKey(agentKey));
 }
 
+/** One mailbox read split into the deliverable view and the rejected frames. */
+export interface MailboxRead {
+  messages: TeamMessage[];
+  /** Named frames outside the whitelist (§7.4-I3): dropped from every view. */
+  rejected: TeamMessage[];
+}
+
+/**
+ * Detailed read: whole mailbox split into the whitelisted view and rejected
+ * named frames. Rejected frames are audited `{event:"frame-rejected"}`
+ * (best-effort) while not yet disposed on disk; after the team-locked sweep in
+ * readCurrentMailboxLocked stamps them discardedAt, re-reads stay silent.
+ */
+async function readMailboxDetailed(
+  stateRoot: string,
+  teamId: string,
+  agentKey: string,
+  onMalformed?: (malformed: MalformedLine) => void,
+): Promise<MailboxRead> {
+  const file = mailboxPath(stateRoot, teamId, agentKey);
+  const sink = onMalformed ?? defaultOnMalformed(stateRoot, file);
+  const messages = (await readJsonl<TeamMessage>(file, isTeamMessage, sink)).map(normalizeMessage);
+  const kept: TeamMessage[] = [];
+  const rejected: TeamMessage[] = [];
+  for (const message of messages) {
+    const cls = classifyFrame(message.content);
+    if (cls.kind === 'frame' && !cls.accepted) {
+      rejected.push(message);
+      if (message.discardedAt === undefined) {
+        // await：读侧的「丢弃 + 审计」原子化——读返回时审计行已落盘（engine.jsonl
+        // 是 O_APPEND 追加，await 的代价可控；malformed 汇报仍保持 v0.1.0 的尽力而为）。
+        await logEngineEvent(stateRoot, {
+          event: 'frame-rejected',
+          teamId,
+          recipient: agentKey,
+          messageId: message.id,
+          frameType: cls.frameType,
+        });
+      }
+      continue;
+    }
+    kept.push(message);
+  }
+  return { messages: kept, rejected };
+}
+
 /**
  * Read one agent's whole mailbox, oldest first. Malformed lines are skipped
- * and reported (onMalformed; default = engine.jsonl audit entry).
+ * and reported (onMalformed; default = engine.jsonl audit entry). v0.2: named
+ * frames outside the whitelist are dropped from the returned view (§7.4-I3).
  */
 export async function readMailbox(
   stateRoot: string,
@@ -90,10 +194,7 @@ export async function readMailbox(
   agentKey: string,
   onMalformed?: (malformed: MalformedLine) => void,
 ): Promise<TeamMessage[]> {
-  const file = mailboxPath(stateRoot, teamId, agentKey);
-  const sink = onMalformed ?? defaultOnMalformed(stateRoot, file);
-  const messages = await readJsonl<TeamMessage>(file, isTeamMessage, sink);
-  return messages.map(normalizeMessage);
+  return (await readMailboxDetailed(stateRoot, teamId, agentKey, onMalformed)).messages;
 }
 
 /** Read only messages neither read nor discarded (state.js:438-441). */
@@ -207,7 +308,9 @@ export async function discardMailboxMessages(
 /**
  * Read current (non-stale) unread mail while the caller holds the team lock:
  * stale messages are discarded on disk and not returned. 1:1 port of
- * mailbox.js:29-40 readCurrentMailboxLocked.
+ * mailbox.js:29-40 readCurrentMailboxLocked. v0.2: whitelist-rejected frames
+ * are additionally stamped discardedAt on disk under the lock (the only place
+ * a mailbox mutation may run), so later lockless reads stop re-auditing them.
  */
 export async function readCurrentMailboxLocked(
   stateRoot: string,
@@ -215,10 +318,10 @@ export async function readCurrentMailboxLocked(
   recipient: string,
   onMalformed?: (malformed: MalformedLine) => void,
 ): Promise<TeamMessage[]> {
-  const messages = await readUnreadMailbox(stateRoot, team.teamId, recipient, onMalformed);
+  const read = await readMailboxDetailed(stateRoot, team.teamId, recipient, onMalformed);
   const current: TeamMessage[] = [];
-  const staleIds: string[] = [];
-  for (const message of messages) {
+  const staleIds: string[] = read.rejected.map((message) => message.id);
+  for (const message of read.messages) {
     if (isCurrentMail(team, message)) current.push(message);
     else staleIds.push(message.id);
   }

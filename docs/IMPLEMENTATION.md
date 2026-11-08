@@ -2,9 +2,10 @@
 
 - 写作人：集成工程师（动态工作流子代理）
 - 日期：2026-11-09
-- 对照设计：`docs/DESIGN.md`（2026-11-09 版）；平台事实基线：`docs/PLATFORM.md`
+- 对照设计：`docs/DESIGN.md`（2026-11-09 版，v0.1.0 底座）；**v0.2.0 增量对照 `docs/DESIGN-V0.2.md`（§7 新增）**；平台事实基线：`docs/PLATFORM.md`
 - 本文档回答三件事：**每个模块落在哪些文件**、**整体自测跑了什么、结果如何**、**当前已知限制**。
 - 所有结论均来自本会话实际执行的命令与输出；无法验证的条目显式标注「未确认/未执行」。
+- **§1-§6 为 v0.1.0 历史记录（原样保留）；§7 为 v0.2.0 增量的模块对照与本会话自测记录。**
 
 ---
 
@@ -203,3 +204,61 @@ D:\tools\zcode-crosschat\
 **沿袭 DESIGN §9 的开放验证点**（本环节无新证据）：V1（无头/CLI 会话内 MCP 可用性，Phase 2 硬前置）、V2（--resume 是否触发 SessionStart 钩子；wakeToken 路径已内建兜底且冒测通过）、V3（Stop 续跑键名；现按探针实现）、V4（CLI 安装语法；§3.5 实测仍开放）、V5（活属主会话跨进程 resume；默认 wake 关闭+属主缺席约束规避）、V6（无头 setModel 合法 providerId）、V7（userConfig 展开形态；引擎对非 "true" 一律按关）、V8（MCP 进程生命周期；身份已按连接绑定设计，两种结果都成立）。
 
 **残余风险（设计已声明，集成复述）**：身份是协作假设而非密码学校验（模型可谎报 sid）；三重交叉（hook 落盘文件 + wake nonce + 新鲜度告警）是 v1 的全部校验面。锁内纪律/原子写/JSONL 容错已有单测与冒测背书，但「多进程高并发同写一个状态根」只有单测级双进程用例，无长时间并发压测。
+
+---
+
+## 7. v0.2.0 增量实现与全量自测（2026-11-09 集成环节实跑）
+
+对照设计：`docs/DESIGN-V0.2.md`（模块划分 §9.1 文件所有权表 / §9.2 接口签名 / §10 共享文件全文）。本节全部结论来自集成会话实际执行的命令与输出；v0.2 六模块（W1-W6）由并行实现交付，集成环节做结构核对、小修与全量自测。
+
+### 7.1 交付总览与结构核对
+
+相对 v0.1.0（git HEAD `b79869a`），工作区共 45 处变更（`git status --short` 计数）：插件侧 **18 个改动文件 + 19 个新文件**，另含 3 份新文档（DESIGN-V0.2 / FEASIBILITY-V0.2 / GAP-V0.2）、README、本文件。逐条核对 §9.1 文件所有权表：**W1-W6 全部文件在盘、归属与设计一致，无缺件**：
+
+| 模块 | 文件（★新 / ▲改） | 集成核对要点（实测） |
+|---|---|---|
+| **W1 spawn-escape** | `src/engine/wake-helper.ts` ★、`src/engine/resume-cli.ts` ▲、`scripts/build.mjs` ▲ | `spawnResume` 默认 `mode="helper"`（resume-cli.ts:144），经 `resolveWakeHelperPath()` 解析 `dist/mcp/wake-helper.mjs`（:64），新增 `onHelperSpawned?` 回调（:117），导出签名不变；build.mjs 用 `{in,out}` 入口保证产物落在 `dist/mcp/wake-helper.mjs`（见 §7.4 有意偏差）；resume-cli 实测端到端用例（真实 spawn → fixture helper → 孤儿孙进程落 marker）通过 |
+| **W2 member-engine** | `src/engine/appserver.ts` ★（AppServerKeeper 类）、`src/engine/provision.ts` ★（provisionMember + pickModel + buildWelcomePrompt）、`src/mcp/member-tools.ts` ★（registerMemberTools）、`src/core/types.ts` ▲ | `provisionMember(deps, spec): Promise<ProvisionResult>` 与 §9.2 签名一致；member-tools 导入 `revokeAttempt`（graph）、`attemptWake`（wake）、名额/lead 纯函数（maxMembersFromEnv/countActiveMembers/resolveReprovision）均有单测 |
+| **W3 task-flow** | `src/mcp/task-edges.ts` ★（withTaskEdges）、`src/core/snapshot.ts` ★（refreshSnapshot，只 import M1）、`src/core/graph.ts` ★（downstreamReady/collectDependencyOutputs 2000/12000 预算/revokeAttempt/staleTasks/findTaskRecipient）、`src/engine/wake.ts` ▲（MEMBER_RULES_V2 + WAKE_SCENES 含 unblock/idle/post-provision/shutdown） | `refreshSnapshot(stateRoot, teamId=DEFAULT_TEAM_ID)` 签名符合 §9.2；graph.ts:85 `DEPENDENCY_OUTPUTS_TOTAL_MAX_CHARS = 12_000` 与设计预算一致；wake.ts:201 `MEMBER_RULES_V2` 在盘且 `WAKE_RULES_SCENES = ["dispatch","post-provision"]`（:251） |
+| **W4 lead-face** | `src/mcp/lead-tools.ts` ★（registerLeadTools：xc_team_init/xc_idle/xc_cancel）、`src/hooks/stop.ts` ▲（回合收尾 `refreshSnapshot`，best-effort 恒 exit 0，stop.test.ts ★）、`src/mcp/render.ts` ▲（renderPanorama 全景 + PanoramaExtras 门控，旧快照回落 v0.1.0 渲染）、`skills/crosschat/SKILL.md` ▲（v2：lead 协议章/成员守则 v2 章/消息安全章）、`commands/xc-team.md` ★ + `xc-member.md` ★ | stop.ts:49 `await refreshSnapshot(ctx.stateRoot)`；SKILL.md 宣告 13 个 `xc_*` 工具（与 §7.3 冒测实测数一致）；两条新斜杠命令 frontmatter 完整（description/argument-hint/skills） |
+| **W5 security** | `src/core/policy.ts` ★（InboundMode accept/hold/refuse + `.held.jsonl` + accept/discard）、`src/mcp/guards.ts` ★（withGuards + registerSecurityTools + FRAME_TYPES 转出口）、`src/core/mailbox.ts` ▲（FRAME_TYPES 读侧白名单 + frame-rejected 审计，mailbox.ts:49）、`src/mcp/identity.ts` ▲（removed 成员注册硬拒，identity.ts:152-159） | `FRAME_TYPES` 六值在 mailbox.ts:49 定义、guards.ts:45 转出口（§9.2 契约）；`withGuards(core, deps): ToolCore`、`registerSecurityTools(server, deps)` 签名符合 §9.2 |
+| **W6 integration** | `src/mcp/server.ts` ▲（= §10.3 全文：composeCore 组装链 base → withTaskEdges → withGuards，四个 register* 全部挂载，SERVER_VERSION="0.2.0"）、`src/mcp/tools.ts` ▲（仅 §10.4 唯一缝隙：`registerTools(server, deps, coreOverride?)`，tools.ts:764-765）、`plugin/.zcode-plugin/plugin.json` ▲（= §10.1 全文，version 0.2.0 + 10 项 userConfig） | server.ts 与设计逐行一致；tools.ts 其余部分未动（git diff 仅缝隙行）；hooks.json 三个钩子原样（§10.5 不变项核实） |
+
+依赖方向复核（grep 全量 import）：W2/W3/W4/W5 均只按设计方向 import（member-tools→graph/wake、lead-tools→wake、task-edges→snapshot/wake、guards→policy/mailbox、snapshot 只依赖 M1），**无反向、无环**。
+
+### 7.2 全量自测记录（本会话实跑，命令与结果）
+
+| # | 命令 | 结果 |
+|---|---|---|
+| 1 | `npm run typecheck`（tsc --noEmit，strict） | **通过**，零错误 |
+| 2 | `npm run build`（node scripts/build.mjs） | **通过**：5 入口全部产出——`dist/mcp/server.mjs` 1.5mb、`dist/mcp/wake-helper.mjs` 1.3kb（新）、`dist/hooks/{session-start,prompt-submit,stop}.mjs`，exit 0；产物路径与 W1 `resolveWakeHelperPath` 解析路径一致 |
+| 3 | `npm test`（vitest run，全量） | **24 文件 / 294 测试全绿，0 失败**（v0.1.0 基线 167 例全部保留通过 + v0.2 新增用例；含真实跨进程锁竞争、真实 spawn 端到端 helper 链、535ms/1.3s/2.0s 级真实 IO 用例）。分文件计数：wake 36、types 24、mailbox 22、graph 21、resume-cli 18、teamstate 15、render 14、member-tools 14、guards 12、lock 11、jsonl 11、lease 11、identity 11、task-edges 11、registry 10、snapshot 9、protocol 9、policy 6、stop 6、sanitize 7、tools 5、paths 4、atomic 4、log 3 |
+| 4 | `ELECTRON_RUN_AS_NODE=1 /e/ZCode/ZCode.exe /e/ZCode/resources/glm/zcode.cjs plugins validate "D:\tools\zcode-crosschat\plugin"` | **`Plugin manifest is valid`，exit 0**（版本改动后复跑仍通过） |
+| 5 | dist stdio 冒测（临时驱动脚本经 `$TEMP`，测毕即删；临时工作区 cwd） | `initialize` → `serverInfo {"name":"zcode-crosschat","version":"0.2.0"}`；`tools/list` 恰好 **13 个工具**：`xc_cancel, xc_check_inbox, xc_claim, xc_dispatch, xc_idle, xc_inbound_review, xc_member_add, xc_member_stop, xc_message, xc_register, xc_report, xc_status, xc_team_init`——7 个 v0.1.0 工具 + W2 两个 + W4 三个 + W5 一个，与 SKILL.md「13 个 xc_* 工具」宣告一致 |
+
+### 7.3 v0.2.0 版本递增（三处一致）
+
+| 文件 | 版本 | 依据 |
+|---|---|---|
+| `plugin/.zcode-plugin/plugin.json:3` | 0.2.0 | W6 交付已带；grep 实证 |
+| `marketplace.json:8` | 0.2.0 | 集成修复 I1（原 0.1.0） |
+| `plugin/package.json:3` | 0.2.0 | 集成修复 I2（原 0.1.0，与上述两处保持一致） |
+
+### 7.4 集成环节修复记录（小修，均为最小改动）
+
+| # | 文件 | 问题 | 修复 |
+|---|---|---|---|
+| I1 | `marketplace.json` | 任务要求 version → 0.2.0，W6 只改了 plugin.json，市场清单仍 0.1.0 | version 0.1.0 → 0.2.0（仅此一字段） |
+| I2 | `plugin/package.json` | npm 包版本仍 0.1.0，与插件清单两处 0.2.0 不一致（§5-4 要求「递增 version 再走市场更新」，npm 包版本漂移会误导） | version 0.1.0 → 0.2.0 |
+| I3 | `README.md:181` | 验证基线一句残留 v0.2 实现中途口径「19 文件 / 221 例」，与全量实测不符 | 更正为「24 文件 / 294 例」（本节 §7.2-3 实测数） |
+
+**有意偏差（已核对，非缺陷）**：`scripts/build.mjs` 未逐字照抄 §10.2——设计稿的普通 entries 数组会让 esbuild 以公共祖先 `src/` 为 outbase，wake-helper 被输出到 `dist/engine/`，与 §4.2 `resolveWakeHelperPath` 解析的 `dist/mcp/wake-helper.mjs` 不符；实现改为 `{in, out}` 显式入口（build.mjs:13-19 有注释说明），产物布局与 v0.1.0 兼容。build 实测（§7.2-2）产物路径正确。
+
+### 7.5 v0.2.0 未执行项（如实声明）
+
+- **硬验收 1-5 的端到端演示**（DESIGN-V0.2 §8）：未执行——属验证环节职责，且验收 1/2/3 需要真实多会话 + `wake_enabled` + 本机 `zcode_exe`/`zcode_cjs` 配置；本环节自测覆盖构建/单测/清单校验/stdio 工具面冒测（§7.2），不含真实建员（`xc_member_add` 走 app-server 全链路）与真实唤醒回合。
+- **实际安装/启用**：未执行（同 §3.6 口径）。
+- **git 提交**：未执行（不在任务范围）。
+- **V12-V20 实现期验证点**（DESIGN-V0.2 §13）：FEASIBILITY-V0.2 已实测 P1-P5 与 E1-E3c2 并回填 DESIGN.md §9 / PLATFORM.md §9，其余标注「未确认」者（如 V13/V15/V20）维持原状，本环节无新证据。
+
+> **交付环节状态更新（2026-11-09，v0.2.0 交付工程师）**：上列前三项在集成环节之后已完成——① 硬验收 1-5 已由验收环节执行并全部通过（报告：`deepseek-crosschat/reports/10-v020验收.md`，判定 passed=true；验收中修复 provision.ts 供给回调注册缺陷并全量复测，§2.3）；② 插件已实际安装启用（`zcode-crosschat@dev-zcode-crosschat 0.2.0 [enabled]`，报告 §2.1）；③ git 提交由交付环节执行。V13/V20 于验收闭合，V15 及 E-e/E-b 端到端构造仍未做（不作已验证宣称），现状见 README「已知限制」。

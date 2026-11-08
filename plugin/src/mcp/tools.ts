@@ -760,9 +760,9 @@ export function createToolCore(deps: ToolDeps): ToolCore {
 // SDK 接线：把 ToolCore 挂到 stdio MCP server（工具实名 mcp__plugin_zcode-crosschat_crosschat__xc_*）
 // ---------------------------------------------------------------------------
 
-/** 注册全部 7 个工具（DESIGN §2.8）。core 层已做信封映射，handler 只透传。 */
-export function registerTools(server: McpServer, deps: ToolDeps): void {
-  const core = createToolCore(deps);
+/** 注册全部 7 个工具（DESIGN §2.8）。coreOverride 供 v0.2 组装链注入包装后的核心（DESIGN-V0.2 §10.3）。 */
+export function registerTools(server: McpServer, deps: ToolDeps, coreOverride?: ToolCore): void {
+  const core = coreOverride ?? createToolCore(deps);
 
   server.tool(
     "xc_register",

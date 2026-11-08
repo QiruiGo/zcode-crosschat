@@ -259,3 +259,22 @@ ELECTRON_RUN_AS_NODE=1 ZCode.exe zcode.cjs --resume sess_09386566-... \
 6. `--output-format stream-json` 的逐事件格式（只实测了 json）。
 7. 无头新会话模型回落是否可被用户级 `defaultModelSelection` 永久修复（该键在 --prompt 路径实测未生效；可能需要桌面端「设为默认模型」UI 写入，未试）。
 8. 临时文件纪律：所有探针脚本与隔离 provider 配置副本已删除（TEMP 清理实测 `ls | grep zc_` 为空）；.scratch 目录保留为联调工作区，内无文件。
+
+---
+
+## 9. v0.2.0 增补事实（P1–P5，2026-11-09 FEASIBILITY-V0.2 实测回填）
+
+> 来源：`docs/FEASIBILITY-V0.2.md`（E1-E4 实验 + §4 平台事实表），证据根目录 `deepseek-crosschat/evidence/10-v020/feasibility/`。本节为**增补**，不改动上文 §4.3 的原始实测记录；与旧记录冲突处以下列 P1-P5 为准（本机 build 0.17.1，2026-11-09）。
+
+| # | 事实 | 对旧记录的修正/细化 | 证据（FEASIBILITY 内） |
+|---|---|---|---|
+| P1 | `session/create` **结果内联** `settings.model.available[].ref` 全量模型表（本机 52 个）；35s 观察窗内无 `state.updated` 事件 | §4.3-2 / §4.6-1 的「运行时枚举 state.updated 的 model.available」方法**不可依赖**，降级为兜底；产品化实现取 create 结果深扫描 `{providerId, modelId}`（`plugin/src/engine/appserver.ts` absorbModels） | `_logs/raw-probe.log` |
+| P2 | `finish=completed` 的 timeline 事件消息**无文本 parts**；按 finish 计数判定回合完成会把完成判早、真实回合被 app-server 退出腰斩 | §4.6-4 的「过滤 timeline_event」细化为可执行判据：assistant ∧ finish∈{completed,stop} ∧ **≥1 个 text part**（baseline 与 done 两处都要过滤；`plugin/src/engine/provision.ts`） | `_logs/ws-wake-bootstrap.log`、`_logs/b-register-resume.raw.json` |
+| P3 | WMI（`Win32_Process Create`）拉起的进程继承 WmiPrvSE 的 **SYSTEM 环境**；zcode CLI 缺用户 env 时报「未找到 CLI ZCode Built-in Provider Config」无法启动回合 | 新坑位；WMI 逃逸路径（v0.2 预设计备选，未进插件代码）必须显式落盘/回读用户 env | `ws-wake/.crosschat/logs/wake-b-1794168533287.json` 尾行 |
+| P4 | 会话持久化时机：`session/send` accept 后 **≤3s** 即落库（早于首轮回合完成）；app-server 硬杀后仍在 | §4.5 持久化载体的时机细化——引擎可在派发回合同步建员、供给完成即 kill keeper（`plugin/src/engine/provision.ts` finally） | `_logs/e4-dm-create.json` 的 `db.afterSend3s/afterTurn/afterKill` |
+| P5 | CLI 单发回合进程退出时的清杀**沿活父链传播**：helper 孤儿与 WMI 子进程存活、MCP server（活父链上）的 detached 子进程被杀；不存在禁止 breakaway 的作业对象（E1-direct/E1-breakaway/E2-wmi/E3a 四组对照） | V9「作业对象清杀」论被修正；v0.2 的唤醒经立即退出的 node 跳板孤儿化（`dist/mcp/wake-helper.mjs`，W1）即避开活父链 | `_logs/e1-heartbeat-direct.log`、`e3a-turn-output.raw.json` 等 |
+
+增补的坑位清单（接 §4.6 编号）：
+
+8. 动态成员供给（xc_member_add）依赖 XC_ZCODE_EXE/XC_ZCODE_CJS 拉起瞬态 app-server keeper：create 过程必须应答 `session/requestRuntimePreferences`（§4.6-2 同坑）；模型缺失/未登录时 P1 主路径枚举为空，须显式配置 member_model。
+9. `session/resume` 可在**全新 app-server 进程**里恢复 db 中的既有会话并续聊（wake-chain-run.mjs:105 实测，幂等重供给路径依赖此点）；跨进程模型选择随会话持久化（§4.5 `session_entry.runtime/model_selection`）。

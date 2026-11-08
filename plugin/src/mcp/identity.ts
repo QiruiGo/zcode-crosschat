@@ -36,7 +36,7 @@ import {
 } from "../core/registry.js";
 import { newTeamState, readTeam, writeTeam } from "../core/teamstate.js";
 import { logEngineEvent } from "../core/log.js";
-import { DEFAULT_TEAM_ID } from "../core/types.js";
+import { DEFAULT_TEAM_ID, memberState } from "../core/types.js";
 import type { MemberRole, TeamMember, TeamState } from "../core/types.js";
 
 export { DEFAULT_TEAM_ID };
@@ -141,6 +141,26 @@ export async function xcRegister(
     const now = Date.now();
     const warnings: string[] = [];
     let via: "hook" | "wake";
+
+    // ---- v0.2（DESIGN-V0.2 §7.4-I5/§7.3.3）：removed 成员的注册一律拒绝 ----
+    // xc_member_stop 后花名不释放（roster 记录保留）；重新启用必须由 lead 走
+    // xc_member_add 幂等重供给——供给流程会先把 roster state 置回 provisioning
+    // 再发欢迎 prompt（W2 契约 §6.4），故正常的重供给注册不受此门影响。
+    // 先于 wake/hook 分支：不给 removed 会话消费任何一次性 nonce 的机会。
+    const teamNow = await readTeam(stateRoot, teamId);
+    if (teamNow !== undefined) {
+      const stopped = teamNow.members.find((m) => m.key === agentKey && memberState(m) === "removed");
+      if (stopped !== undefined) {
+        throw new ToolError({
+          error: "member_removed",
+          name: agentKey,
+          sessionId,
+          teamId,
+          message: `member "${agentKey}" was removed from team "${teamId}" (xc_member_stop); ` +
+            "re-enable it via the lead's xc_member_add (idempotent reprovision)",
+        });
+      }
+    }
 
     if (args.wakeToken !== undefined && args.wakeToken.trim() !== "") {
       // ---- 路径 2：wakeToken 回退（§2.3-4）----

@@ -25,6 +25,8 @@ import {
   xcRegister,
 } from "./identity.js";
 import { createWakeNonce, readWakeNonce, writeSession } from "../core/registry.js";
+import { readTeam, writeTeam } from "../core/teamstate.js";
+import type { TeamState } from "../core/types.js";
 import type { ToolError } from "./protocol.js";
 
 let workDir: string;
@@ -178,5 +180,68 @@ describe("identity: 连接键与未注册拒绝", () => {
     } catch (err) {
       expect((err as ToolError).payload.error).toBe("not_registered");
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.2（DESIGN-V0.2 §7.4-I5/§9.1-W5）：removed 成员的注册路径拒绝。
+// 重供给流（xc_member_add 同名重调）会先把 roster state 置回 provisioning 再发
+// 欢迎 prompt，故 provisioning 态注册不受此门影响。
+// ---------------------------------------------------------------------------
+
+async function setMemberState(stateRoot: string, key: string, state: "removed" | "provisioning"): Promise<void> {
+  const team = (await readTeam(stateRoot, "default")) as TeamState;
+  const member = team.members.find((m) => m.key === key);
+  if (!member) throw new Error(`member ${key} not in roster`);
+  member.state = state;
+  await writeTeam(stateRoot, team);
+}
+
+describe("identity: removed 成员注册拒绝（v0.2 §7.4-I5）", () => {
+  it("hook 路径：roster 中 removed 成员 → member_removed（先于 session 校验语义照常报锚错误则不受影响）", async () => {
+    await writeSession(stateRoot, { sessionId: "sess-a", cwd: workDir, startedAt: 1, lastSeen: Date.now() });
+    await xcRegister(stateRoot, { name: "a", sessionId: "sess-a" }, nextConn());
+    await setMemberState(stateRoot, "a", "removed");
+
+    const payload = await errorPayload(() =>
+      xcRegister(stateRoot, { name: "a", sessionId: "sess-a" }, nextConn()),
+    );
+    expect(payload.error).toBe("member_removed");
+    expect(payload.name).toBe("a");
+  });
+
+  it("wake 路径：removed 成员 → member_removed 且 nonce 不被消费（不给 stopped 会话烧令牌）", async () => {
+    await writeSession(stateRoot, { sessionId: "sess-a", cwd: workDir, startedAt: 1, lastSeen: Date.now() });
+    await xcRegister(stateRoot, { name: "a", sessionId: "sess-a" }, nextConn());
+    await setMemberState(stateRoot, "a", "removed");
+    const { token } = await createWakeNonce(stateRoot, { teamId: "default", agentKey: "a", sid: "sess-a2" });
+
+    const payload = await errorPayload(() =>
+      xcRegister(stateRoot, { name: "a", sessionId: "sess-a2", wakeToken: token }, nextConn()),
+    );
+    expect(payload.error).toBe("member_removed");
+    const nonce = await readWakeNonce(stateRoot, token);
+    expect(nonce?.used).toBeUndefined(); // 未消费
+  });
+
+  it("provisioning / 无 state（v0.1.0 旧记录）→ 注册照常通过（重供给与 peer 兼容不破门）", async () => {
+    await writeSession(stateRoot, { sessionId: "sess-a", cwd: workDir, startedAt: 1, lastSeen: Date.now() });
+    await xcRegister(stateRoot, { name: "a", sessionId: "sess-a" }, nextConn());
+
+    await setMemberState(stateRoot, "a", "provisioning");
+    const conn = nextConn();
+    const ok1 = await xcRegister(stateRoot, { name: "a", sessionId: "sess-a" }, conn);
+    expect(ok1.via).toBe("hook");
+
+    // 回到 legacy（无 state）：手工写回 team.json，去掉 state 字段。
+    const raw = JSON.parse(await readFile(join(stateRoot, "teams", "default", "team.json"), "utf8")) as {
+      members: Array<{ key: string; state?: string }>;
+    };
+    for (const m of raw.members) delete m.state;
+    await import("node:fs/promises").then((fs) =>
+      fs.writeFile(join(stateRoot, "teams", "default", "team.json"), JSON.stringify(raw, null, 2), "utf8"),
+    );
+    const ok2 = await xcRegister(stateRoot, { name: "a", sessionId: "sess-a" }, nextConn());
+    expect(ok2.via).toBe("hook");
   });
 });

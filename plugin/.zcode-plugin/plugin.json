@@ -1,10 +1,10 @@
 {
   "name": "zcode-crosschat",
-  "version": "0.1.0",
-  "description": "Dispatch verifiable tasks between independent ZCode sessions: file-mailbox source of truth, attempt-token state machine, hook-based identity anchoring, and headless wake-ups.",
+  "version": "0.2.0",
+  "description": "Agent-team collaboration for independent ZCode sessions: a lead coordinates engine-provisioned teammate sessions, members self-start via prompt protocol, and a file mailbox remains the source of truth.",
   "description_i18n": {
-    "en": "Dispatch verifiable tasks between independent ZCode sessions. File mailbox as source of truth, six-state task machine with attempt tokens, hook-based session identity, and push/pull wake-ups.",
-    "zh-CN": "在独立 zcode 会话之间派发可检验任务并回传结果：文件邮箱真源、六态任务状态机与 attempt 令牌、钩子身份锚定、推送/拉取双通道唤醒。"
+    "en": "Lead-teammate collaboration across independent ZCode sessions: engine-provisioned members, protocol-driven auto-start, dependency-aware task graph, structured team panorama, and hard message-safety guarantees on a file-mailbox source of truth.",
+    "zh-CN": "跨独立 zcode 会话的队长-队员协作：引擎程序化建员、协议驱动自动开工、依赖任务图、结构化团队全景，以及基于文件邮箱真源的消息安全硬保证。"
   },
   "author": { "name": "QiruiGo" },
   "license": "MIT",
@@ -23,7 +23,14 @@
         "ZCODE_PLUGIN_ID": "zcode-crosschat",
         "XC_WAKE_ENABLED": "${user_config.wake_enabled}",
         "XC_ZCODE_EXE": "${user_config.zcode_exe}",
-        "XC_ZCODE_CJS": "${user_config.zcode_cjs}"
+        "XC_ZCODE_CJS": "${user_config.zcode_cjs}",
+        "XC_MAX_MEMBERS": "${user_config.max_members}",
+        "XC_MEMBER_MODEL": "${user_config.member_model}",
+        "XC_MEMBER_PROVIDER": "${user_config.member_provider}",
+        "XC_MEMBER_REASONING": "${user_config.member_reasoning}",
+        "XC_MEMBER_BOOTSTRAP_TIMEOUT_MS": "${user_config.member_bootstrap_timeout_ms}",
+        "XC_INBOUND_MODE": "${user_config.inbound_mode}",
+        "XC_STALE_TASK_MINUTES": "${user_config.stale_task_minutes}"
       }
     }
   },
@@ -32,19 +39,61 @@
       "type": "boolean",
       "default": false,
       "title": "推送唤醒",
-      "description": "派发/回传后用 zcode --resume 无头唤醒目标会话（fire-and-forget，仅属主缺席会话）。默认关闭：交互会话间的派发不自动 resume 可能正被桌面持有的目标；docs/DESIGN.md §6.4 自动演示的前置步骤会开启。引擎对非 \"true\" 值一律按关闭处理（V7）。"
+      "description": "派发/回传/解除阻塞后用 zcode --resume 无头唤醒目标会话（经孤儿化跳板，派发方退出不影响唤醒；fire-and-forget，失败自动回落邮箱投递）。团队自动开工演示必须开启；默认关闭以保护正被桌面持有的会话。"
     },
     "zcode_exe": {
       "type": "file",
       "default": "",
       "title": "ZCode 可执行文件",
-      "description": "推送唤醒用的 zcode 可执行文件绝对路径（随机器安装位置不同，需自行填写）。仅在启用推送唤醒（wake_enabled）时使用；留空时推送唤醒不可用，投递自动回落邮箱拉取。"
+      "description": "推送唤醒与成员供给用的 zcode 可执行文件绝对路径（随机器安装位置不同，需自行填写）。"
     },
     "zcode_cjs": {
       "type": "file",
       "default": "",
       "title": "zcode CLI 入口脚本",
-      "description": "与 zcode_exe 配套的 CLI 入口脚本绝对路径（随机器安装位置不同，需自行填写）。仅在启用推送唤醒（wake_enabled）时使用；留空时推送唤醒不可用。"
+      "description": "与 zcode_exe 配套的 CLI 入口脚本绝对路径。"
+    },
+    "max_members": {
+      "type": "number",
+      "default": 8,
+      "title": "成员上限",
+      "description": "团队最大成员数（含 lead 之外的全部成员，removed 不计）。超限的 xc_member_add 被硬拒。对照 dsh-agent-teams maxMembers 默认 8。"
+    },
+    "member_model": {
+      "type": "string",
+      "default": "",
+      "title": "成员模型",
+      "description": "新建成员会话使用的模型 id（如 glm-5.3-flash）。留空时引擎从 app-server 枚举的可用模型表选第一个。新会话默认模型可能是失效 key，建议显式指定（FEASIBILITY P1/E4）。"
+    },
+    "member_provider": {
+      "type": "string",
+      "default": "",
+      "title": "成员模型 provider",
+      "description": "成员模型的 providerId（如 opencode）。留空时按枚举表自动匹配。"
+    },
+    "member_reasoning": {
+      "type": "string",
+      "default": "max",
+      "title": "成员推理档位",
+      "description": "成员会话的 reasoningLevel（默认 max）。"
+    },
+    "member_bootstrap_timeout_ms": {
+      "type": "number",
+      "default": 300000,
+      "title": "成员供给超时",
+      "description": "xc_member_add 等待成员欢迎回合完成的上限（毫秒）。超时成员标记 failed，可同名重试（幂等重供给）。"
+    },
+    "inbound_mode": {
+      "type": "string",
+      "default": "accept",
+      "title": "入站消息策略",
+      "description": "对成员间自由消息（chat 帧）的入站裁决：accept 直接入箱；hold 进 .held.jsonl 待 xc_inbound_review 处置（钩子不注入、唤醒不携带）；refuse 直接拒收并给发送者回执。协议帧（派单/回执/空闲/解除阻塞）不受此开关影响。"
+    },
+    "stale_task_minutes": {
+      "type": "number",
+      "default": 30,
+      "title": "僵尸任务阈值（分钟）",
+      "description": "claimed/in_progress 任务超过该分钟数无任何状态更新且成员无在途唤醒时，被引擎清扫回 pending 并向 lead 发 failed 回执。成员守则要求长任务每 10 分钟心跳一次。"
     }
   }
 }
