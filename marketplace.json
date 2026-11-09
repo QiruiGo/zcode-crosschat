@@ -5,7 +5,7 @@
     {
       "name": "zcode-crosschat",
       "source": "./plugin",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "displayName": "ZCode CrossChat",
       "displayName_i18n": { "zh-CN": "跨会话协作" },
       "description": "Dispatch verifiable tasks between independent ZCode sessions with a file mailbox and attempt tokens.",

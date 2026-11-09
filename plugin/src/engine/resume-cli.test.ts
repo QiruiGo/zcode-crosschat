@@ -36,6 +36,38 @@ function freshDir(): string {
   return d;
 }
 
+/**
+ * 轮询等待一个条件成立（替代固定 sleep）。
+ *
+ * 这些用例要等**真实的 detached 孙进程**落盘，并行满载时固定 sleep 会被饿死：
+ * v0.3 起测试文件从 24 个涨到 36 个，默认并发下 3 连跑有 1~2 次读不到 marker
+ * （证据 deepseek-crosschat/evidence/12-v030/acceptance/phase0/unit-tests-flaky-parallel.md）。
+ */
+async function waitFor(cond: () => boolean, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (cond()) return;
+    if (Date.now() >= deadline) throw new Error(`waitFor timed out after ${timeoutMs}ms`);
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
+
+/** 轮询读一个文件直到内容等于 expected（文件不存在/内容不符都继续等）。 */
+async function waitForFile(file: string, expected: string, timeoutMs: number): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  let last = "";
+  for (;;) {
+    try {
+      last = readFileSync(file, "utf8");
+      if (last === expected) return last;
+    } catch {
+      /* 还没落盘 */
+    }
+    if (Date.now() >= deadline) throw new Error(`waitForFile timed out after ${timeoutMs}ms (last=${JSON.stringify(last)})`);
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
+
 /** 写一个按 helper 协议行动的 fixture .mjs（测试用，非产物）。 */
 function writeHelper(dir: string, name: string, body: string): string {
   const file = join(dir, name);
@@ -289,12 +321,14 @@ describe("spawnResume: helper 形态（v0.2 默认，V9 修复 §4.2）", () => 
       cfg: { zcodeExe: process.execPath, zcodeCjs: script },
       onHelperSpawned: (pid) => childPids.push(pid),
     }));
-    await new Promise((r) => setTimeout(r, 700));
+    // 轮询而不是固定 sleep：marker 由 detached 孙进程写盘，并行满载时
+    // （v0.3 起测试文件从 24 个涨到 36 个）固定 700ms 会被饿死。
+    const markerText = await waitForFile(marker, "alive", 20_000);
     expect(childPids).toHaveLength(1);
     expect(typeof childPids[0]).toBe("number");
     expect(Number.isInteger(childPids[0])).toBe(true);
     // 孤儿孙进程确实执行了（marker 由孙进程写盘）。
-    expect(readFileSync(marker, "utf8")).toBe("alive");
+    expect(markerText).toBe("alive");
   });
 
   it("helper 缺失 → 同步抛错（fail closed，不回退 direct；spawnImpl 不应被触达）", () => {
@@ -334,7 +368,7 @@ describe("spawnResume: helper 形态（v0.2 默认，V9 修复 §4.2）", () => 
     );
     const errors: Error[] = [];
     spawnResume(baseOpts(root, { helperPath, logFile, onAsyncError: (e) => errors.push(e) }));
-    await new Promise((r) => setTimeout(r, 400));
+    await waitFor(() => errors.length === 1, 10_000);
     expect(errors).toHaveLength(1);
     expect(errors[0]!.message).toContain("wake-helper failed");
     expect(errors[0]!.message).toContain("spawn failure");
@@ -351,7 +385,7 @@ describe("spawnResume: helper 形态（v0.2 默认，V9 修复 §4.2）", () => 
     );
     const errors: Error[] = [];
     spawnResume(baseOpts(root, { helperPath, logFile, helperTimeoutMs: 250, onAsyncError: (e) => errors.push(e) }));
-    await new Promise((r) => setTimeout(r, 500));
+    await waitFor(() => errors.length === 1, 10_000);
     expect(errors).toHaveLength(1);
     expect(errors[0]!.message).toContain("wake-helper timeout");
     expect(WAKE_HELPER_TIMEOUT_MS).toBe(5000); // 默认超时契约

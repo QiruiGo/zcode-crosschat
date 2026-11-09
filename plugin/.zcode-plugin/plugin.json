@@ -1,10 +1,10 @@
 {
   "name": "zcode-crosschat",
-  "version": "0.2.0",
-  "description": "Agent-team collaboration for independent ZCode sessions: a lead coordinates engine-provisioned teammate sessions, members self-start via prompt protocol, and a file mailbox remains the source of truth.",
+  "version": "0.3.0",
+  "description": "Agent-team collaboration for independent ZCode sessions: a lead coordinates engine-provisioned teammate sessions, members self-start via prompt protocol, and a file mailbox remains the source of truth. v0.3 adds the cross-session peer axis: a machine-global peer registry, named-pipe transport, name-as-address addressing, and accept/hold/refuse inbound policy.",
   "description_i18n": {
-    "en": "Lead-teammate collaboration across independent ZCode sessions: engine-provisioned members, protocol-driven auto-start, dependency-aware task graph, structured team panorama, and hard message-safety guarantees on a file-mailbox source of truth.",
-    "zh-CN": "跨独立 zcode 会话的队长-队员协作：引擎程序化建员、协议驱动自动开工、依赖任务图、结构化团队全景，以及基于文件邮箱真源的消息安全硬保证。"
+    "en": "Lead-teammate collaboration across independent ZCode sessions plus a cross-session peer axis: machine-global peer registry, named-pipe transport, name-as-address addressing, accept/hold/refuse inbound policy, and structured attribution envelopes on every inbound peer message.",
+    "zh-CN": "跨独立 zcode 会话的队长-队员协作，外加跨会话 peer 轴：机器全局 peer 注册表、命名管道传输、名字即地址寻址、accept/hold/refuse 入站策略，以及每条外来消息都带结构化信封与归因尾注。"
   },
   "author": { "name": "QiruiGo" },
   "license": "MIT",
@@ -30,7 +30,11 @@
         "XC_MEMBER_REASONING": "${user_config.member_reasoning}",
         "XC_MEMBER_BOOTSTRAP_TIMEOUT_MS": "${user_config.member_bootstrap_timeout_ms}",
         "XC_INBOUND_MODE": "${user_config.inbound_mode}",
-        "XC_STALE_TASK_MINUTES": "${user_config.stale_task_minutes}"
+        "XC_STALE_TASK_MINUTES": "${user_config.stale_task_minutes}",
+        "XC_CROSSCHAT_INBOUND": "${user_config.cross_session_inbound}",
+        "XC_PEER_RECEIVE": "${user_config.peer_receive}",
+        "XC_HOLD_TTL_MS": "${user_config.hold_ttl_ms}",
+        "XC_MESSAGING_DIR": "${user_config.messaging_dir}"
       }
     }
   },
@@ -86,7 +90,7 @@
     "inbound_mode": {
       "type": "string",
       "default": "accept",
-      "title": "入站消息策略",
+      "title": "队内入站消息策略",
       "description": "对成员间自由消息（chat 帧）的入站裁决：accept 直接入箱；hold 进 .held.jsonl 待 xc_inbound_review 处置（钩子不注入、唤醒不携带）；refuse 直接拒收并给发送者回执。协议帧（派单/回执/空闲/解除阻塞）不受此开关影响。"
     },
     "stale_task_minutes": {
@@ -94,6 +98,30 @@
       "default": 30,
       "title": "僵尸任务阈值（分钟）",
       "description": "claimed/in_progress 任务超过该分钟数无任何状态更新且成员无在途唤醒时，被引擎清扫回 pending 并向 lead 发 failed 回执。成员守则要求长任务每 10 分钟心跳一次。"
+    },
+    "cross_session_inbound": {
+      "type": "string",
+      "default": "",
+      "title": "跨会话入站策略（用户层）",
+      "description": "本机所有会话的跨会话（peer）入站裁决的用户层取值：accept / hold / refuse。**留空 = 未设**（出厂默认留空，刻意如此：若默认填 accept，则每个会话恒有显式 accept，mode-parity 自动档将永不可达）。与项目层（<工作区>/.crosschat/peer/inbound.json，可按 sessionId 逐会话设置）与会话层（环境变量 XC_CROSSCHAT_INBOUND）共同参与「最严胜」——三者取最严者，不存在某一层放松另一层的情况。三个显式层都未设时走 mode-parity 自动档（按双方权限档类判定）。非法取值按 hold 处理（fail-closed）。"
+    },
+    "peer_receive": {
+      "type": "string",
+      "default": "on",
+      "title": "跨会话接收总开关（kill-switch）",
+      "description": "设为 off 时本机所有会话一律拒收跨会话消息（等价 CC 的 receive kill-switch），压过一切显式设置与自动档，经环境变量 XC_PEER_RECEIVE 注入 MCP server 进程。空串或非 off 视为未命中（默认 on）。"
+    },
+    "hold_ttl_ms": {
+      "type": "number",
+      "default": 43200000,
+      "title": "跨会话暂存期限（毫秒）",
+      "description": "被 hold 的跨会话消息在等待人工放行期间的存活时长，默认 12 小时；到期回执 expired。CC 的对应数值未取证，此为 zcode 自定值。"
+    },
+    "messaging_dir": {
+      "type": "string",
+      "default": "",
+      "title": "peer 注册表目录（留空=插件数据目录）",
+      "description": "机器全局的跨会话 peer 注册表根目录。留空时用插件数据目录（ZCODE_PLUGIN_DATA/peers）；填绝对路径可改到别处（例如做隔离演示）。"
     }
   }
 }

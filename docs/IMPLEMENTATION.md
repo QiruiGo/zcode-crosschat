@@ -2,10 +2,10 @@
 
 - 写作人：集成工程师（动态工作流子代理）
 - 日期：2026-11-09
-- 对照设计：`docs/DESIGN.md`（2026-11-09 版，v0.1.0 底座）；**v0.2.0 增量对照 `docs/DESIGN-V0.2.md`（§7 新增）**；平台事实基线：`docs/PLATFORM.md`
+- 对照设计：`docs/DESIGN.md`（2026-11-09 版，v0.1.0 底座）；**v0.2.0 增量对照 `docs/DESIGN-V0.2.md`（§7 新增）**；**v0.3.0 增量对照 `docs/DESIGN-V0.3.md`（§8-§9 新增）**；平台事实基线：`docs/PLATFORM.md`
 - 本文档回答三件事：**每个模块落在哪些文件**、**整体自测跑了什么、结果如何**、**当前已知限制**。
 - 所有结论均来自本会话实际执行的命令与输出；无法验证的条目显式标注「未确认/未执行」。
-- **§1-§6 为 v0.1.0 历史记录（原样保留）；§7 为 v0.2.0 增量的模块对照与本会话自测记录。**
+- **§1-§6 为 v0.1.0 历史记录（原样保留）；§7 为 v0.2.0 增量的模块对照与本会话自测记录；§8 为 v0.3.0 增量的模块对照（W3 寻址 + W7 组装/面/文档环节）；§9 为 v0.3.0 集成环节的结构核对、修复记录与全量自测。**
 
 ---
 
@@ -262,3 +262,134 @@ D:\tools\zcode-crosschat\
 - **V12-V20 实现期验证点**（DESIGN-V0.2 §13）：FEASIBILITY-V0.2 已实测 P1-P5 与 E1-E3c2 并回填 DESIGN.md §9 / PLATFORM.md §9，其余标注「未确认」者（如 V13/V15/V20）维持原状，本环节无新证据。
 
 > **交付环节状态更新（2026-11-09，v0.2.0 交付工程师）**：上列前三项在集成环节之后已完成——① 硬验收 1-5 已由验收环节执行并全部通过（报告：`deepseek-crosschat/reports/10-v020验收.md`，判定 passed=true；验收中修复 provision.ts 供给回调注册缺陷并全量复测，§2.3）；② 插件已实际安装启用（`zcode-crosschat@dev-zcode-crosschat 0.2.0 [enabled]`，报告 §2.1）；③ git 提交由交付环节执行。V13/V20 于验收闭合，V15 及 E-e/E-b 端到端构造仍未做（不作已验证宣称），现状见 README「已知限制」。
+
+---
+
+## 8. v0.3.0 增量实现：跨会话 peer 轴（2026-11-09，W3 寻址 + W7 组装/面/文档）
+
+设计见 `docs/DESIGN-V0.3.md`（模块划分与所有权表见 §10），规格见 `docs/SPEC-V0.3.md`（R-7..R-12 为寻址面规则）。v0.3 在队内协作之外**新增一条独立通道**：跨会话 peer（名字即地址 + 机器全局注册表 + 命名管道 + 入站三态）。队内 13 工具与其状态根**零改动**。
+
+### 8.1 模块-文件对照（W1..W7，全部文件所有权不重叠）
+
+| 模块 | 文件 | 本环节负责 | 说明 |
+|---|---|---|---|
+| W1 peer-registry | `plugin/src/core/peerdir.ts`、`peerregistry.ts`、`peerregistry.test.ts` | W1 | 机器全局 peer 根解析、记录 schema/扫描/活性/清扫/名字占用/formerNames |
+| W2 transport | `plugin/src/transport/frames.ts`、`pipe.ts`（+ 两个 test） | W2 | 四帧白名单、命名管道 + 文件退化、token 鉴权、七类发送错误 |
+| **W3 addressing** | **`plugin/src/core/peeraddr.ts`**、**`peeraddr.test.ts`** | **W3（本环节）** | 名正则/控制符剥离/保留名、路由 id 编码、行格式、`[ref]` 构造与解析、formerNames 别名回退、歧义分类（唯一命中 / `ambiguous`+候选 / `not-found`） |
+| W4 inbound-gate | `plugin/src/core/peerpolicy.ts`（+ test） | W4 | 显式三层最严胜、mode-parity 自动档、hold 缓冲与释放、终态 |
+| W5 msg-core | `plugin/src/core/peermsg.ts`、`peerenvelope.ts`（+ test） | W5 | inbox/queue/held 三区 IO、排空、入队闸四闸、信封渲染与归因尾注 |
+| W6 peer-face | `plugin/src/mcp/peer-tools.ts`、`peer-drain.ts`（+ test） | W6 | 7 个 peer 工具注册、`withPeerDrain` 末尾追加 `content[2]` |
+| **W7 integration** | **`plugin/src/mcp/server.ts`**、**`plugin/src/hooks/{session-start,prompt-submit,shared}.ts`**、**`plugin/skills/crosschat/SKILL.md`**、**`plugin/commands/xc-agents.md`**、**`plugin/.zcode-plugin/plugin.json`**、**`demo/peer-duo.mjs`**、**`README.md`**、**`docs/IMPLEMENTATION.md`** | **W7（本环节）** | 组装链 + peer 工具注册 + EOF 退出纪律、钩子 peer 基记录与信封注入、`/xc-agents` 面板、清单 v0.3.0、双会话演示驱动器、文档 |
+
+### 8.2 W3 寻址面的自测（本环节实跑）
+
+| # | 命令 | 结果 |
+|---|---|---|
+| 1 | `cd plugin && npx vitest run src/core/peeraddr.test.ts` | **1 文件 / 33 例全绿**（`Test Files 1 passed (1)`、`Tests 33 passed (33)`）。覆盖 DESIGN-V0.3 §9.2 的单测矩阵：唯一命中 / 0 命中 / 2 命中（含别名持有者）/ `[ref]` 精确命中（同名被占用时仍命中）/ ref 非法按 `not-found` / 别名失效 / 保留名拒绝 / 正则拒绝 / 别名不参与「当前名占用」；另含控制符剥离、路由 id 编码、formerNames 32 条 FIFO、行文本 `[ref]` 仅在歧义时追加、保留名 `main` 不可寻址、无 sessionId 的行（工具面行型）仍可解析 |
+| 2 | `node --check demo/peer-duo.mjs` | 无语法错误；缺参数时按约定 exit 2 并打印缺哪个参数 |
+| 3 | `cd plugin && npm run typecheck` | **exit 0，零报错**（W1/W2/W4/W5/W6 全部落盘后复跑）；`npm run build` 五入口产物齐（`dist/mcp/server.mjs` + `dist/mcp/wake-helper.mjs` + `dist/hooks/*.mjs`）；`npm test` 全量 **34 文件 / 496 例全绿**（v0.2 基线 24 文件 / 294 例全绿 + v0.3 新增 10 文件 / 202 例）。中途出现过 2 例失败（W6 的 `src/hooks/prompt-submit.test.ts`），本环节定位为**测试侧模块缓存缺陷**并给出最小复现与修法，W6 随后在自有文件里补上 `vi.resetModules()`，复跑全绿（详见 §8.5） |
+| 4 | `ELECTRON_RUN_AS_NODE=1 /e/ZCode/ZCode.exe /e/ZCode/resources/glm/zcode.cjs plugins validate "D:\tools\zcode-crosschat\plugin"` | **`Plugin manifest is valid`，exit 0**（v0.3.0 清单落盘后复跑） |
+| 5 | `node --check demo/peer-duo.mjs` + 缺参运行 | 无语法错误；缺 `--exe` 等必填参数时 exit 2 并打印缺哪个参数 |
+
+### 8.3 W7 组装面的落点（逐条对应设计 §11）
+
+- `src/mcp/server.ts`：组装链 `base → withTaskEdges → withGuards → withPeerDrain`；注册 peer-tools；**EOF 退出纪律**（`process.stdin` 的 `end`/`close` 都要走 `shutdown()`：摘注册表记录 + 关管道 + `exit(0)`）——依据 FEASIBILITY-V0.3 §3.3 实测：SDK 的 `StdioServerTransport` 不监听 stdin `end`，进程内持有 net server 时会留下永不退出的僵尸端点。
+- `src/hooks/session-start.ts`：写机器全局 peer 基记录 `peers/base/<sessionId>.json`（档类真源）+ 注入 peer 注册指引一行。
+- `src/hooks/prompt-submit.ts`：排空 `peers/queue/<sid>.jsonl` → 渲染信封 → 与队内未读提示**合并成一段文本一次 emit**（stdout 严格单键单行）。
+- `src/hooks/shared.ts`：追加 `peerRootFromEnv` / `readHookPermissionMode` / `writePeerBaseRecord` / `refreshPeerBaseRecord` 四个导出（纯追加，队内逻辑零改动）。
+- `plugin/.zcode-plugin/plugin.json`：版本 0.2.0 → **0.3.0**（版本号必须递增，否则宿主不重新物化），新增 env `XC_CROSSCHAT_INBOUND` / `XC_PEER_RECEIVE` / `XC_HOLD_TTL_MS` / `XC_MESSAGING_DIR` 与对应 userConfig。
+- **版本号三处一致**（沿用 v0.2 §7.3 的先例）：`plugin/.zcode-plugin/plugin.json`、`marketplace.json`、`plugin/package.json` 一并 0.2.0 → **0.3.0**（市场清单与 npm 包版本若不递增，宿主侧安装的仍是 0.2.0 产物，peer 工具面根本不会出现）。
+- `demo/peer-duo.mjs`：两个**不同工作区**的 app-server 会话驱动 D0–D7（前置写项目层 `inbound.json`=accept → 双会话注册 → A 发送带校验串 → B 回合读信封 → B 拉 inbox 取 tool_result 载体 → A 读回执），逐步落证据到 `--evidence-dir`（默认 `.scratch-v03/evidence/phaseA`）；**失败步骤只记录不伪造**。
+
+### 8.4 本环节未执行项（如实声明）
+
+- **硬验收 1-7 的端到端演示未执行**：需真实多会话 + 宿主装插件，属验收环节职责；本环节只交付驱动脚本与单测。
+- **实际安装/启用未执行**：需宿主插件设置面；`plugin.json` 的清单校验随全量 typecheck 一并留给集成环节。
+- **W7 文件与并行同事的接口一致性**：本环节严格按 DESIGN-V0.3 §10.2 的签名对接（W1 `peerdir`/`peerregistry`、W2 `transport`、W5 `peermsg`/`peerenvelope`、W6 `mcp/peer-tools`/`peer-drain`）；若同事最终导出的名字与签名有偏差，需在集成环节对齐（**本环节不代改他人文件**）。
+
+### 8.5 中途发现并已闭环的问题：W6 的钩子 stdout 契约测试（模块缓存）
+
+`plugin/src/hooks/prompt-submit.test.ts`（所有权属 W6）的第 2、3 个用例曾**在任何钩子实现下都取不到 emit**：该文件在 `beforeEach` 里 `vi.clearAllMocks()` 但当时**没有 `vi.resetModules()`**，而 ESM 模块只求值一次——第 2 个用例的 `await import("./prompt-submit.js")` 命中模块缓存，钩子的顶层 `main()` 不会再次执行，于是 `writes` 为空，`JSON.parse(undefined)` 抛 `SyntaxError: "undefined" is not valid JSON`。本环节在仓库外做了等价最小复现（临时目录里的两用例探针）：第一次 import 写 1 次、第二次 import 写 0 次，**与钩子实现无关**。
+
+本环节用一份临时副本（加 `vi.resetModules()`，跑完即删、仓库未留副本）验证：**同样的三个断言在本环节交付的 `prompt-submit.ts` 上全绿**——stdout 恰好一行 JSON、恰好一个 `additionalContext` 键、队内未读提示与 `<crosschat-peer-message>` 信封块合并成**一次** emit、`drainPeerQueue` 被调用。W6 随后在自有文件里补上了 `vi.resetModules()`，全量复跑 **34 文件 / 496 例全绿**。本环节按所有权纪律**全程未改动 W6 的文件**。
+
+另注：W6 的 `peer-tools.ts` 用 `import(/* @ts-ignore */ "../core/peeraddr.js")` 动态引入本模块的寻址面（`sanitizePeerName` / `peerRef` / `resolvePeerTarget`），本模块已按该调用形状对齐（`PeerRow` 的 `sessionId`/`former`/`currentName` 放宽为可选，无 sessionId 的行仍能解析与消歧）。
+
+---
+
+## 9. v0.3.0 集成环节记录（2026-11-09，v0.3 集成工程师）
+
+本节是**集成与全量自测环节**的落点：对照 `docs/DESIGN-V0.3.md` §10.1/§10.2 核对结构完整与模块衔接，小问题就地修并留记录，然后跑全量自测（typecheck + 全部单测 + validate + 按 `reports/10-v020验收.md` §2.2 的物化规则刷新安装）。
+
+### 9.1 结构核对结论（对照 DESIGN §10.1 所有权表）
+
+- **文件齐备**：§10.1 表列的 W1–W7 全部文件在盘（`core/{peerdir,peerregistry,peeraddr,peerpolicy,peermsg,peerenvelope}.ts`、`transport/{frames,pipe}.ts`、`mcp/{peer-tools,peer-drain}.ts`、`mcp/server.ts`、`hooks/{session-start,prompt-submit,shared}.ts`、`commands/xc-agents.md`、`skills/crosschat/SKILL.md` 第 9 章、`demo/peer-duo.mjs`）。
+- **§10.2 对外签名逐条对得上**：`peerRootFromEnv`/`peerSessionsDir`/`peerKeyFile`/`peerInboxFile`/`peerQueueFile`/`peerHeldDir`/`peerBaseFile`、`writePeerRecord`/`readPeerRecord`/`scanPeers`/`isPeerNameFree`/`touchPeerRecord`（W1）；`PEER_FRAME_TYPES`/`encodeFrame`/`decodeFrame`/`startPeerEndpoint`/`stopPeerEndpoint`/`sendPeerFrame`/`PeerErrorClass`（W2）；`PEER_NAME_RE`/`PEER_RESERVED_NAMES`/`sanitizePeerName`/`peerRef`/`formatPeerRow`/`resolvePeerTarget`（W3）；`decideInboundPolicy`/`readPeerInboundPolicy`/`holdPeerMessage`/`releaseHeldMessages`（W4）；`drainPeerQueue`/`appendPeerQueue`/`appendPeerInbox`/`renderPeerEnvelope`/`parsePeerEnvelope`/`renderPeerReceipt`/`admitPeerMessage`（W5）；`registerPeerTools`/`withPeerDrain`（W6）；`composeCore`/`main`（W7）——全部存在且类型检查通过。
+- **队内域零改动**：`git diff --name-only HEAD -- plugin/src/core/{mailbox,policy,identity,types,paths,atomic,jsonl,log,sanitize,lock,registry,teamstate,snapshot,graph}.ts plugin/src/mcp/{tools,guards,member-tools,lead-tools,protocol,render,task-edges}.ts plugin/hooks/hooks.json plugin/scripts/build.mjs plugin/src/hooks/stop.ts` 输出**为空**——DESIGN §9.5「队内域零改动」判据成立。
+- **组装链与面**：`mcp/server.ts:40-45` = `createToolCore → withTaskEdges → withGuards → withPeerDrain`；`mcp/server.ts:78-83` 自建 stdin `end`/`close` 退出纪律（FEASIBILITY-V0.3 §3.3 的硬约束）；钩子面 `hooks/prompt-submit.ts:47-102` 一次 emit 一次输出。
+
+### 9.2 集成环节发现并修复的问题（5 处，全部为小问题，就地修复 + 补测）
+
+| # | 问题 | 依据 | 修法 | 验证 |
+|---|---|---|---|---|
+| F1 | `plugin/src/core/peerdir.ts` 源码里含**一个字面 NUL 字节**（`join('\0')` 写成裸字节）→ 整文件被工具判为二进制（`file` 报 `data`、Read 拒绝、git 视作 binary） | 全仓扫描：仅此 1 个文件含 NUL | 改成转义写法 `'\u0000'`（语义等价） | 该文件回到纯文本；typecheck + 全量单测复跑仍绿 |
+| F2 | `xc_peer_review --action accept` 放行后**没给发方补 `delivered` 回执**（只有 discard 分支发了 `denied`） | DESIGN §9.3「放行 → A 侧收到 delivered」/§6.3「accept → 放行 + 回执 delivered」 | `mcp/peer-tools.ts` 的 `releaseHeldMessages` 补 `onOutcome` 回调 → `sendReceipt(sender, msgId, receipt)` | 新增 `mcp/peer-tools.integration.test.ts`：真命名管道 + 真注册表，放行后发方端点收到 `status:delivered`（实测通过） |
+| F3 | `xc_peers` 的**缺省口径**只返回 `session` 行 → 硬验收 2 要求的「`self(alice)` 与 `session(bob)` 同行」不成立 | DESIGN §8.1（ListAgents 等价物）+§9.2（一次调用同时见 self 与 session、在队成员行同表） | 缺省改为 **self + member + session 三类**；`kind` 显式给出时仍只看那一类 | 集成单测实测：缺省列表含 `alice:self` 与 `bob:session`；`list('session')` 只有 bob |
+| F4 | `xc_peers` 的行文本是自造的 tab 分隔格式，**没用 W3 的规范行渲染器**（`formatPeerRowText`/`formatPeerRows` 实现完备但零调用方） | DESIGN §5.2 行格式 `<名字> [<kind>] [<ref>] cwd=… status=… seen=…`；§5.2「身份串只进结构化字段，不进紧凑行文本」 | `xc_peers` 摘要行改用 `formatPeerRows`；结构化 payload 不变 | 工具层单测：行文本含 `bob [session]` / `cwd=D:\ws-b` / `status=idle`，**不含**身份串，身份串仍在 payload 里 |
+| F5 | `xc_agents` 面板**没给会话级查询面**（CC `H()` 的 `bypass-default`），只给了逐消息裁决口径 | DESIGN §6.2 DV-2（`H()` 与 `k()` 不是同一条件）+§8.3 返回体示例（`inboundPolicy.sessionLevelQuery`）+§14 U16（两者都要展示） | 面板加 `inboundPolicy.sessionLevelQuery`，由 W4 已有的 `decideSessionInboundPolicy` 计算；摘要行同列 | 集成单测实测：显式 accept 时 `{policy:"accept"}`；W4 侧 `decideSessionInboundPolicy` 本就有独立单测矩阵 |
+
+另修一处文档笔误：README 的 peer 轴文件表把 `peers/inbox/<sessionId>.jsonl` 写成「已消费队列」——按 DESIGN §3.1/§7.1 它是**传输级收件箱**（管道不可达、对端缺席时的退化投递落点，由发送方写入），已改为正确描述；`peers/queue/<sessionId>.jsonl` 才是投递级队列（过闸后、模型可见）。
+
+### 9.3 全量自测（本环节亲跑，命令与输出见证据目录）
+
+证据根：`D:\tools\deepseek-crosschat\evidence\13-v030\acceptance\phase0\`
+
+| # | 命令 | 结果 | 证据 |
+|---|---|---|---|
+| 1 | `cd plugin && npx tsc --noEmit` | **exit 0，零报错** | `typecheck.log` |
+| 2 | `cd plugin && npx vitest run` | **35 文件 / 501 例全绿**（v0.2 基线 34 文件 / 496 例全数保留 + 本环节新增 1 文件 / 5 例），2.5s | `unit-tests.log` |
+| 3 | `cd plugin && npm run build` | exit 0；5 入口产物齐：`dist/mcp/server.mjs`（1.6MB）+ `dist/mcp/wake-helper.mjs` + `dist/hooks/{session-start,prompt-submit,stop}.mjs` | 构建输出（终端） |
+| 4 | `zcode.cjs plugins validate "D:\tools\zcode-crosschat\plugin"` | **`Plugin manifest is valid`**，exit 0 | 终端输出 |
+| 5 | `zcode.cjs plugins marketplace update dev-zcode-crosschat` | `Updated marketplace dev-zcode-crosschat (1 plugins)`；快照 `marketplace.json` 与 `plugin/.zcode-plugin/plugin.json` 均已是 **0.3.0**，快照 `dist/mcp/server.mjs` 与本地构建 **md5 一致**（`e6062ad3…`） | `marketplace-update.log` |
+| 6 | `zcode.cjs plugins install zcode-crosschat@dev-zcode-crosschat` | **`Installed plugin zcode-crosschat@dev-zcode-crosschat (0.3.0) [enabled]`** | `install.log` |
+| 7 | `zcode.cjs plugins list` | `zcode-crosschat@dev-zcode-crosschat [enabled]`，安装路径 `…/cache/dev-zcode-crosschat/zcode-crosschat/0.3.0`，skills:1 commands:1 hooks:3 mcp:plugin:zcode-crosschat:crosschat | `plugins-list-after.log` |
+| 8 | 缓存物化新鲜度（md5 比对，v0.2 报告 §2.2 的 CACHE-FRESH 口径） | 缓存 `0.3.0/dist/mcp/server.mjs`、`dist/hooks/prompt-submit.mjs`、`dist/hooks/session-start.mjs` 三项 md5 与本地构建**逐项相同** | 终端输出 |
+| 9 | `zcode.cjs commands list` | 宿主已识别 **`/xc-agents`**（描述取自 0.3.0 缓存路径 `…/0.3.0/commands/xc-agents.md`），7 个 `xc-*` 命令齐 | 终端输出 |
+| 10 | stdio 冒测（`initialize` + `tools/list`，对着**构建产物** `dist/mcp/server.mjs`） | `serverInfo.version = "0.3.0"`；**共 20 个工具 = 13 个队内 + 7 个 peer**（`xc_agents`/`xc_peer_{register,inbox,rename,review,send}`/`xc_peers` 全在） | `stdio-tools-list.json` |
+
+**物化规则沿用 v0.2 报告 §2.2**：市场源是快照副本 → 必须先 `marketplace update` 刷新快照 → 再 `install`（版本变化即触发物化）→ 最后 md5 比对确认缓存与新构建一致。本轮**未执行** `plugins uninstall`（v0.2 报告 §2.4 的事故：`uninstall --force` 会清空 `plugins.options`，导致 `zcode_exe`/`zcode_cjs` 丢失）。
+
+### 9.4 版本号（三处 + 附一处顺手同步）
+
+- `plugin/.zcode-plugin/plugin.json` = **0.3.0**、`marketplace.json` = **0.3.0**、`plugin/package.json` = **0.3.0**（版本必须递增，否则宿主不重新物化——FEASIBILITY-V0.3 §6.1 实测）。
+- 附带：`plugin/package-lock.json` 的根版本字段此前仍停在 **0.1.0**（v0.2 递增时漏更），已同步为 0.3.0（`name: zcode-crosschat-plugin` 的两处 `version`），JSON 复校有效。
+
+### 9.5 本环节未执行项（如实声明）
+
+- **硬验收 1-7 的端到端演示未执行**（两个真实会话互发、三态对照、`/xc-agents` 面板实拍、信封呈现取证）：属验收环节职责；本环节只交付驱动脚本 `demo/peer-duo.mjs`、单测与已安装的 0.3.0 产物。
+- **peer 轴的真实宿主行为仍未实测**：命名管道在真实 zcode 宿主拉起的 MCP server 进程内的绑定与共存（DESIGN §12.3 V-P7）、钩子 `additionalContext` 在 app-server 形态会话是否进入模型上下文（V-P6 / U7）、SessionStart 钩子在 app-server 形态是否触发（V-P1 / U8）——三项均未实测，不得作已验证宣称。
+- **F2 的回执补发只在单测层面闭环**（假发方端点 + 真注册表 + 真管道）：真实双会话下的回执往返属硬验收 1 的取证范围，本环节未跑。
+
+### 9.6 集成环节对并行实现的接口核对备注
+
+W3/W7 环节的记录（§8.4）提到「若同事最终导出的名字与签名有偏差，需在集成环节对齐」。核对结果：**W3 的 `peeraddr.ts` 导出（`sanitizePeerName`/`peerRef`/`resolvePeerTarget`/`formatPeerRow(s)`）与 W6 的 `peer-tools.ts` 静态 import 形状一致，无偏差**；`PeerRow` 的 `sessionId`/`former`/`currentName` 为可选，W3 侧对齐无误。**无跨模块签名冲突需要额外对齐**。
+
+### 9.7 硬验收环节补录（2026-11-09，v0.3 硬验收员）
+
+§9.5 声明的三项「未实测」与端到端演示，已由硬验收环节全部执行完毕，结论如下（报告 `reports/12-v030验收.md`，证据 `evidence/12-v030/acceptance/`）：
+
+| §9.5 的未执行项 | 实测结论 |
+|---|---|
+| 硬验收 1-7 端到端演示 | **七条全部通过**（peer 闭环 11/11 步、发现 6/6、三态 20/20、面板 6/6、信封 8/8、回归全过） |
+| 命名管道在真实宿主拉起的 MCP server 进程内绑定与共存（V-P7） | **成立**：真实双会话下 `via:"pipe"` 投递成功，管道与 stdio 协议流共存（`phaseA/registry/peer-audit.jsonl`） |
+| 钩子 `additionalContext` 在 app-server 形态会话是否进入模型上下文（V-P6 / U7） | **进入**：B 的下一回合 reasoning 里出现信封正文原文（`phaseA/turns/b-turn3.json`）。**仍未实测**它是否以独立上下文块呈现，故不宣称「不占用用户消息通道」 |
+| SessionStart 钩子在 app-server 形态是否触发（V-P1 / U8） | **触发**：`phaseR/autostart/engine.jsonl` 有 4 条 `hook-session-start`（lead + 3 成员），基记录 `peers/base/<sid>.json` 由钩子写出 |
+
+**验收期修复**（均先复现留证再修，均已补回归用例；详见报告 §6）：
+
+1. `src/transport/pipe.ts`：注册表心跳缺失（记录 60 s 后被判 stale 清扫 ⇒ `peer_not_found`）→ 补 15 s 周期心跳 + 退出摘记录；
+2. `src/mcp/peer-tools.ts`：peer 工具不走面 B 排空（工具结果里永远不出现信封块）→ `call()` 统一走 `appendPeerEnvelopes`；另修 `xc_peer_send` 寻址行集漏掉 self 行导致重名歧义检测失效；
+3. `src/transport/pipe.ts`：发送方 data 处理器在「不合法帧行」上死循环（`continue` 在推进游标之前）→ 调整顺序；
+4. 测试基建（非产品缺陷）：`src/engine/resume-cli.test.ts` 固定 sleep 改轮询（并发饿死）、`src/transport/pipe.test.ts` 的 `afterEach` 清理加重试（`ENOTEMPTY`）。
+
+**版本**：v0.3 开发期 manifest 由 0.3.0 递增至 0.3.4（每次改代码都递增，否则宿主不重新物化）；发布定稿 **0.3.0**（git tag `v0.3.0`，`plugin.json` / `marketplace.json` / `SERVER_VERSION` 同步定稿，与 v0.2.0「tag 版本 = manifest 版本」的约定一致）。当前全量 **36 文件 / 509 例**，默认并发下连跑 5 次全绿。

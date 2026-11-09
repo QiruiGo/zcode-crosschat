@@ -1,17 +1,14 @@
 /**
  * M4 hooks-and-face: UserPromptSubmit hook — lastSeen refresh + inbox pull.
  *
- * Behavior (DESIGN.md §2.3-1, §7 M4):
- * 1. Refresh `registry/sessions/<sessionId>.json` lastSeen on EVERY user
- *    prompt — a session open for hours must not be failed by freshness
- *    checks right when the user finally says "继续".
- * 2. When the session has a bound name and unread mail, inject a
- *    "you have N unread" hint via strict-schema `additionalContext`, driving
- *    the model to xc_check_inbox (the pull path of the channel, §2.1).
+ * v0.2 behavior（DESIGN.md §2.3-1、§7 M4）：刷新 registry/sessions/<sid>.json 的
+ * lastSeen；有未读队内邮件时用 additionalContext 提示「有 N 条未读，先 xc_check_inbox」。
  *
- * Read-only over the mailbox: no messages are marked read here — ack stays
- * the instant the tool returns them to the model (§2.8 xc_check_inbox).
- * Silent exit 0 when there is nothing to say; never blocks, never errors.
+ * v0.3 增量（DESIGN-V0.3.md §7.1 面 A、§6.2 档类新鲜度）：
+ * - 跨会话 peer 消息的信封注入：排空机器全局 peers/queue/<sid>.jsonl，把每条渲染成
+ *   <crosschat-peer-message> 信封块（含标签外的归因尾注）。
+ * - 顺带刷新 peers/base/<sid>.json 的 permissionMode（载荷现成）。
+ * - **一次调用一次输出**：队内提示与 peer 信封块合并成一段文本后 emit 一次。
  *
  * Build entry: dist/hooks/prompt-submit.mjs (scripts/build.mjs).
  */
@@ -20,17 +17,23 @@ import {
   boundNamesForSession,
   emitAdditionalContext,
   logHookEvent,
+  peerRootFromEnv,
+  readHookPermissionMode,
   readStdinPayload,
+  refreshPeerBaseRecord,
   refreshSessionRegistration,
   resolveHookContext,
   unreadSummary,
 } from './shared.js';
+import { drainPeerQueue } from '../core/peermsg.js';
+// 信封渲染的属主是 core/peerenvelope.ts（DESIGN-V0.3 §10.2）；W5 的 peermsg.ts
+// 目前只转出了 renderPeerReceipt，故这里直接向属主模块取 renderPeerEnvelope。
+import { renderPeerEnvelope } from '../core/peerenvelope.js';
 
 async function main(): Promise<void> {
   const stdin = readStdinPayload();
   const ctx = resolveHookContext('UserPromptSubmit', stdin);
 
-  // lastSeen refresh is the primary duty; it needs the session id.
   if (ctx.sessionId !== undefined) {
     try {
       await refreshSessionRegistration(ctx.stateRoot, ctx.sessionId, ctx.workspace);
@@ -39,40 +42,68 @@ async function main(): Promise<void> {
     }
   }
 
-  // No session id -> no binding lookup possible; stay silent.
   if (ctx.sessionId === undefined) return;
 
+  const blocks: string[] = [];
+
+  // --- v0.3：跨会话 peer 信封注入（面 A：保证路径）---
+  try {
+    const root = peerRootFromEnv(process.env);
+    // 档类刷新：会话中途改权限模式时，自动档判定不吃陈旧快照。
+    const mode = readHookPermissionMode(stdin);
+    if (mode !== undefined) {
+      await refreshPeerBaseRecord(root, ctx.sessionId, { permissionMode: mode, lastSeen: Date.now() });
+    }
+    const items = await drainPeerQueue(root, ctx.sessionId, 20);
+    if (items.length > 0) {
+      blocks.push(items.map((item) => renderPeerEnvelope(item)).join('\n\n'));
+      await logHookEvent(ctx.stateRoot, {
+        event: 'hook-peer-inbound',
+        sessionId: ctx.sessionId,
+        count: items.length,
+        from: items.map((i) => i.from),
+      });
+    }
+  } catch (error) {
+    await auditHookFailure(ctx.stateRoot, 'prompt-submit-peer-inbound', error);
+  }
+
+  // --- v0.2：队内未读提示（原样保留）---
   let names: string[] = [];
   try {
     names = await boundNamesForSession(ctx.stateRoot, ctx.sessionId);
   } catch (error) {
     await auditHookFailure(ctx.stateRoot, 'prompt-submit-names', error);
-    return;
+    names = [];
   }
-  if (names.length === 0) return; // not registered: SessionStart already onboarded; stay silent
-
-  try {
-    const summary = await unreadSummary(ctx.stateRoot, names[0]!);
-    if (summary.count > 0) {
-      const senders = summary.senders.length > 0 ? `，来自 ${summary.senders.join('、')}` : '';
-      emitAdditionalContext(
-        `[zcode-crosschat] 你（${names[0]}）有 ${summary.count} 条未读协作消息${senders}。`
-        + '先调用 xc_check_inbox 查看并处理，再继续当前工作；任务回执先核对证据再向用户汇报。',
-      );
-      await logHookEvent(ctx.stateRoot, {
-        event: 'hook-prompt-submit-unread',
-        sessionId: ctx.sessionId,
-        name: names[0],
-        unread: summary.count,
-        senders: summary.senders,
-      });
+  if (names.length > 0) {
+    try {
+      const summary = await unreadSummary(ctx.stateRoot, names[0]!);
+      if (summary.count > 0) {
+        const senders = summary.senders.length > 0 ? `，来自 ${summary.senders.join('、')}` : '';
+        blocks.push(
+          `[zcode-crosschat] 你（${names[0]}）有 ${summary.count} 条未读协作消息${senders}。`
+          + '先调用 xc_check_inbox 查看并处理，再继续当前工作；任务回执先核对证据再向用户汇报。',
+        );
+        await logHookEvent(ctx.stateRoot, {
+          event: 'hook-prompt-submit-unread',
+          sessionId: ctx.sessionId,
+          name: names[0],
+          unread: summary.count,
+          senders: summary.senders,
+        });
+      }
+    } catch (error) {
+      await auditHookFailure(ctx.stateRoot, 'prompt-submit-inbox', error);
     }
-  } catch (error) {
-    await auditHookFailure(ctx.stateRoot, 'prompt-submit-inbox', error);
   }
+
+  // 一次 emit、一次输出（stdout 严格单键单行，hooks/shared.ts 契约）。
+  if (blocks.length > 0) emitAdditionalContext(blocks.join('\n\n'));
 }
 
 main().catch(async (error: unknown) => {
+  // Final guard: a hook must never exit non-zero (would mark the run failed).
   const stdin = readStdinPayload();
   const ctx = resolveHookContext('UserPromptSubmit', stdin);
   await auditHookFailure(ctx.stateRoot, 'prompt-submit', error);

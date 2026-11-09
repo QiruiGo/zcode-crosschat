@@ -36,6 +36,11 @@ import { readUnreadMailbox } from '../core/mailbox.js';
 import { withRegistryLock } from '../core/lock.js';
 import { logEngineEvent, type EngineEvent } from '../core/log.js';
 import { DEFAULT_TEAM_ID, type NameBindings, type TeamMessage } from '../core/types.js';
+import {
+  peerRootFromEnv as resolvePeerRoot,
+  refreshPeerBaseRecord as refreshBase,
+  writePeerBaseRecord as writeBase,
+} from '../core/peerdir.js';
 
 /**
  * Registry-lock budget inside a hook. The hook runner kills hooks at 10 s
@@ -195,4 +200,46 @@ export async function unreadSummary(stateRoot: string, name: string): Promise<Un
     if (!senders.includes(message.from)) senders.push(message.from);
   }
   return { count: messages.length, senders, messages };
+}
+
+/**
+ * v0.3：机器全局 peer 根目录（FEASIBILITY-V0.3 §1.2：ZCODE_PLUGIN_DATA 在钩子进程
+ * 与 MCP server 进程都存在，且是用户级绝对路径 ⇒ 跨工作区可见）。
+ */
+export function peerRootFromEnv(env: NodeJS.ProcessEnv = process.env): string {
+  return resolvePeerRoot(env);
+}
+
+/**
+ * v0.3：钩子载荷里的权限档（CC 的 bypass/prompting 类）。
+ * 实测载荷含 permission_mode 与 mode 两个键（"yolo"），这里取其一并映射：
+ * yolo（或等价跳权限配置）→ bypass；其余 → prompting；取不到 → undefined
+ * （收方档类未知时按 mode-unknown 暂存，fail-closed，CC H() 的 R()===null 分支）。
+ */
+export function readHookPermissionMode(stdin: HookStdin | undefined): 'bypass' | 'prompting' | undefined {
+  const raw = stdin?.str('permission_mode', 'mode') ?? stdin?.str('mode', 'mode');
+  if (raw === undefined) return undefined;
+  const v = raw.trim().toLowerCase();
+  if (v === 'yolo' || v === 'bypass' || v === 'acceptEdits') return 'bypass';
+  return 'prompting';
+}
+
+/** v0.3：写机器全局 peer 基记录（薄封装，落盘逻辑在 core/peerdir.ts）。 */
+export async function writePeerBaseRecord(
+  root: string,
+  record: { sessionId: string; cwd: string; permissionMode?: 'bypass' | 'prompting'; source: string | null; startedAt: number; lastSeen: number },
+): Promise<void> {
+  await writeBase(root, record);
+}
+
+/**
+ * v0.3：刷新基记录的档类与 lastSeen（UserPromptSubmit 每次调用）。
+ * 会话中途改权限模式时，自动档判定吃的是本回合的档类而不是 SessionStart 快照。
+ */
+export async function refreshPeerBaseRecord(
+  root: string,
+  sessionId: string,
+  patch: { permissionMode?: 'bypass' | 'prompting'; lastSeen: number },
+): Promise<void> {
+  await refreshBase(root, sessionId, patch);
 }
