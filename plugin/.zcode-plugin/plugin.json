@@ -1,6 +1,6 @@
 {
   "name": "zcode-crosschat",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Agent-team collaboration for independent ZCode sessions: a lead coordinates engine-provisioned teammate sessions, members self-start via prompt protocol, and a file mailbox remains the source of truth. v0.3 adds the cross-session peer axis: a machine-global peer registry, named-pipe transport, name-as-address addressing, and accept/hold/refuse inbound policy.",
   "description_i18n": {
     "en": "Lead-teammate collaboration across independent ZCode sessions plus a cross-session peer axis: machine-global peer registry, named-pipe transport, name-as-address addressing, accept/hold/refuse inbound policy, and structured attribution envelopes on every inbound peer message.",
@@ -49,13 +49,13 @@
       "type": "file",
       "default": "",
       "title": "ZCode 可执行文件",
-      "description": "推送唤醒与成员供给用的 zcode 可执行文件绝对路径（随机器安装位置不同，需自行填写）。"
+      "description": "推送唤醒与成员供给用的 zcode 可执行文件绝对路径。留空时插件自动探测本机 zcode 安装（Windows；探测过程可在 xc_doctor 查看），仅探测失败时才需要手填（zcode 安装目录下的 ZCode.exe）。"
     },
     "zcode_cjs": {
       "type": "file",
       "default": "",
       "title": "zcode CLI 入口脚本",
-      "description": "与 zcode_exe 配套的 CLI 入口脚本绝对路径。"
+      "description": "与 zcode_exe 配套的 CLI 入口脚本绝对路径（通常为 zcode 安装目录下 resources\\<variant>\\zcode.cjs）。留空时随 zcode_exe 一并自动探测。"
     },
     "max_members": {
       "type": "number",
@@ -67,7 +67,7 @@
       "type": "string",
       "default": "",
       "title": "成员模型",
-      "description": "新建成员会话使用的模型 id（如 glm-5.3-flash）。留空时引擎从 app-server 枚举的可用模型表选第一个。新会话默认模型可能是失效 key，建议显式指定（FEASIBILITY P1/E4）。"
+      "description": "新建成员会话使用的模型 id（如 glm-5.3-flash）。留空时引擎从可用模型表自动选第一个——它可能是当前账号不可用的模型；若建员因模型失败，失败回执会给出可选模型与填写指引，届时再填本项即可。"
     },
     "member_provider": {
       "type": "string",

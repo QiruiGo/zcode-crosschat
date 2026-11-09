@@ -1,6 +1,6 @@
 /**
  * M3 server：stdio MCP 入口（DESIGN.md §1.3、§2.8；v0.2 组装链见 DESIGN-V0.2.md §9；
- * v0.3 增量见 DESIGN-V0.3.md §2.3、§11.1）。
+ * v0.3 增量见 DESIGN-V0.3.md §2.3、§11.1；v0.4 增量见 DESIGN-V0.4.md §2.5）。
  *
  * manifest 经 mcpServers.crosschat 拉起本进程（command:"node",
  * args:["${CLAUDE_PLUGIN_ROOT}/dist/mcp/server.mjs"], cwd:"${ZCODE_PROJECT_DIR}"），
@@ -10,9 +10,10 @@
  *
  * v0.3 组装链：
  *   base(createToolCore) → W3 withTaskEdges → W5 withGuards → W6 withPeerDrain
- *   注册：v0.1.0 七工具 + W2 member-tools + W4 lead-tools + W5 security-tools
- *         + W6 peer-tools（xc_peer_register / xc_peers / xc_peer_send /
- *           xc_peer_inbox / xc_peer_review / xc_peer_rename / xc_agents）
+ * 注册：v0.1.0 七工具 + W2 member-tools + W4 lead-tools + W5 security-tools
+ *       + W6 peer-tools（xc_peer_register / xc_peers / xc_peer_send /
+ *         xc_peer_inbox / xc_peer_review / xc_peer_rename / xc_agents）
+ *       + doctor-tool（v0.4：xc_doctor，只读体检，免注册）
  *
  * v0.3 端点纪律（FEASIBILITY-V0.3 §3.3 实测硬约束）：MCP SDK 的 StdioServerTransport
  * 不监听 stdin 'end'，一旦进程内持有 net server（管道监听），stdin EOF 时事件循环被
@@ -29,10 +30,11 @@ import { registerMemberTools } from "./member-tools.js";
 import { registerLeadTools } from "./lead-tools.js";
 import { registerPeerTools } from "./peer-tools.js";
 import { withPeerDrain } from "./peer-drain.js";
+import { registerDoctorTool } from "./doctor-tool.js";
 import { stopPeerEndpoint } from "../transport/pipe.js";
 
 const SERVER_NAME = "zcode-crosschat";
-const SERVER_VERSION = "0.3.0";
+const SERVER_VERSION = "0.4.0";
 
 /** v0.3 工具核心组装链：包装顺序固定——先边沿后守卫，守卫（安全）最贴近工具入口，
  *  peer 投递排空最外层（tool-round 间隙把信封**追加为末尾 text 块 content[2]**，
@@ -67,6 +69,9 @@ export async function main(): Promise<void> {
   registerLeadTools(server, deps);        // W4：xc_team_init / xc_idle / xc_cancel
   registerSecurityTools(server, deps);    // W5：xc_inbound_review
   registerPeerTools(server, deps);         // v0.3 W6：跨会话 peer 工具面
+  registerDoctorTool(server, {            // v0.4：xc_doctor（只读体检，免注册）
+    version: SERVER_VERSION, env: process.env, cwd: process.cwd(),
+  });
 
   const transport = new StdioServerTransport();
   transport.onclose = () => {

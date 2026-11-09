@@ -10,7 +10,7 @@
  *   有在途 nonce 的成员被豁免；
  * - 永不抛出：基座错误信封原样透传、不触发边沿。
  */
-import { afterAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -21,6 +21,20 @@ import { readMailbox } from "../core/mailbox.js";
 import { createWakeNonce, writeSession } from "../core/registry.js";
 import { readTeam, writeTeam } from "../core/teamstate.js";
 import type { TeamState } from "../core/types.js";
+
+// v0.4（DESIGN-V0.4 §2.4）：attemptWake 的 spawn 配置解析改为「env → 自动探测」后，
+// 本文件「XC_WAKE_ENABLED=true 且未配 exe → spawn 同步失败」的原前提会被
+// 探测命中（装有 zcode 的机器）取代——单测将依赖宿主安装且会真拉起 ZCode.exe。
+// 这里把解析钉回「未配置且探测未命中」（本文件用例关心的正是该失败路径的
+// wake-failed 审计面，非探测本身——探测行为由 zcode-locate.test.ts 以注入缝承载）。
+vi.mock("../engine/zcode-locate", async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  resolveZcodeSpawnConfig: () => ({
+    zcodeExe: "",
+    zcodeCjs: "",
+    outcome: { found: false, source: "", pair: null, attempts: [], guidance: "mock: 单测钉死未配置" },
+  }),
+}));
 
 const dirs: string[] = [];
 let workDir: string;

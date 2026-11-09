@@ -30,7 +30,8 @@
 import { DEFAULT_TEAM_ID } from "../core/types.js";
 import { createWakeNonce, readNames } from "../core/registry.js";
 import type { ToolDeps } from "../mcp/tools.js";
-import { AppServerKeeper, appServerConfigFromEnv, type ModelRef } from "./appserver.js";
+import { AppServerKeeper, type ModelRef } from "./appserver.js";
+import { resolveZcodeSpawnConfig } from "./zcode-locate.js";
 // 守则 v2 全文由 W3 交付于 wake.ts（DESIGN-V0.2.md §9.2 钉死导出 MEMBER_RULES_V2）；
 // 这是设计依赖表「provision import wake 场景常量」的落点（§9.1）。
 import { MEMBER_RULES_V2 } from "./wake.js";
@@ -170,6 +171,26 @@ interface AssistantTurn {
   text: string;
 }
 
+/**
+ * v0.4（DESIGN-V0.4 §2.6-1）：建员模型回合失败 → 失败回执附本次尝试的模型与 member_model
+ * 填写指引（硬标准 2：失败给明确指引而非静默）。ProvisionError 保留原 step，
+ * 其他错误按 fallbackStep 包装；只追加信息，不吞错、不改变失败判定。
+ */
+function withModelGuidance(
+  err: unknown,
+  chosen: { providerId: string; modelId: string },
+  fallbackStep: string,
+): ProvisionError {
+  const base = err instanceof ProvisionError
+    ? err
+    : new ProvisionError(fallbackStep, String((err as Error)?.message ?? err));
+  return new ProvisionError(
+    base.step,
+    `${base.message} 本次尝试模型 "${chosen.modelId}"（provider "${chosen.providerId}"）；` +
+      "若该模型不可用，请在插件设置 member_model 显式指定，可用模型见建员结果/xc_doctor 提示。",
+  );
+}
+
 function asRecord(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -225,17 +246,26 @@ export async function provisionMember(deps: ToolDeps, spec: ProvisionSpec): Prom
   const preferReasoning = spec.reasoningLevel ?? optionalEnv(deps.env, "XC_MEMBER_REASONING");
   const mode = spec.mode ?? "auto";
 
-  const keeper = AppServerKeeper.start({
-    cfg: appServerConfigFromEnv(deps.env),
-    env: deps.env,
-    // appserver.ts 协议事实（PLATFORM §4.3-4 / FEASIBILITY E4 实测）：session/create 过程中
-    // 必须应答回调 session/requestRuntimePreferences（15s 超时坑）；
-    // interaction/requestOfficialMcpAuthHeaders 回 {} 被接受（demo/bootstrap-sessions.mjs:106-109）。
-    callbacks: {
-      "session/requestRuntimePreferences": () => ({ nativeSearchEnhancementsEnabled: false }),
-      "interaction/requestOfficialMcpAuthHeaders": () => ({}),
-    },
-  });
+  // v0.4（DESIGN-V0.4 §2.4）：spawn 配置解析改为「env → 自动探测」。
+  const spawnCfg = resolveZcodeSpawnConfig(deps.env);
+  let keeper: AppServerKeeper;
+  try {
+    keeper = AppServerKeeper.start({
+      cfg: spawnCfg,
+      env: deps.env,
+      // appserver.ts 协议事实（PLATFORM §4.3-4 / FEASIBILITY E4 实测）：session/create 过程中
+      // 必须应答回调 session/requestRuntimePreferences（15s 超时坑）；
+      // interaction/requestOfficialMcpAuthHeaders 回 {} 被接受（demo/bootstrap-sessions.mjs:106-109）。
+      callbacks: {
+        "session/requestRuntimePreferences": () => ({ nativeSearchEnhancementsEnabled: false }),
+        "interaction/requestOfficialMcpAuthHeaders": () => ({}),
+      },
+    });
+  } catch (err) {
+    // v0.4（DESIGN-V0.4 §2.4）：失败回执附探测指引（硬标准 2）——member_provision_failed
+    // 不再只有一句「未配置」。
+    throw new ProvisionError("spawn", `${String((err as Error)?.message ?? err)} ${spawnCfg.outcome.guidance}`);
+  }
   try {
     // ---- ① create（或 §6.4 resume 续用）----
     let sessionId = "";
@@ -286,49 +316,59 @@ export async function provisionMember(deps: ToolDeps, spec: ProvisionSpec): Prom
       await sleep(500);
     }
     const chosen = pickModel(keeper.getModels(), { preferModel, preferProvider, preferReasoning });
-    await keeper.request(
-      "session/setModel",
-      {
-        sessionId,
-        model: {
-          providerId: chosen.providerId,
-          modelId: chosen.modelId,
-          options: { reasoningLevel: chosen.reasoningLevel },
+    // v0.4（DESIGN-V0.4 §2.6-1）：模型回合失败（setModel / 欢迎 send / 欢迎等待）的
+    // ProvisionError 一律附本次尝试模型与 member_model 填写指引（硬标准 2）。
+    try {
+      await keeper.request(
+        "session/setModel",
+        {
+          sessionId,
+          model: {
+            providerId: chosen.providerId,
+            modelId: chosen.modelId,
+            options: { reasoningLevel: chosen.reasoningLevel },
+          },
         },
-      },
-      60_000,
-    );
+        60_000,
+      );
+    } catch (err) {
+      throw withModelGuidance(err, chosen, "setModel");
+    }
 
     // ---- ③+④ 欢迎 send + P2 等待器 ----
-    const baseline = (await readAssistantTurns(keeper, sessionId)).filter(isCompleteTurn).length;
-    await keeper.request(
-      "session/send",
-      { sessionId, content: buildWelcomePrompt({ teamId, key: spec.key, sessionId, wakeToken: token }) },
-      30_000,
-    );
-    const deadline = Date.now() + bootTimeoutMs;
-    for (;;) {
-      if (Date.now() > deadline) {
-        throw new ProvisionError(
-          "welcome",
-          `welcome turn timeout after ${bootTimeoutMs} ms for session ${sessionId}`,
-        );
+    try {
+      const baseline = (await readAssistantTurns(keeper, sessionId)).filter(isCompleteTurn).length;
+      await keeper.request(
+        "session/send",
+        { sessionId, content: buildWelcomePrompt({ teamId, key: spec.key, sessionId, wakeToken: token }) },
+        30_000,
+      );
+      const deadline = Date.now() + bootTimeoutMs;
+      for (;;) {
+        if (Date.now() > deadline) {
+          throw new ProvisionError(
+            "welcome",
+            `welcome turn timeout after ${bootTimeoutMs} ms for session ${sessionId}`,
+          );
+        }
+        await sleep(4_000);
+        const done = (await readAssistantTurns(keeper, sessionId)).filter(isCompleteTurn);
+        if (done.length > baseline) {
+          const last = done[done.length - 1]!;
+          return {
+            sessionId,
+            providerId: chosen.providerId,
+            modelId: chosen.modelId,
+            reasoningLevel: chosen.reasoningLevel,
+            welcomeResponse: last.text,
+            reprovisioned,
+            ...(last.modelId === undefined ? {} : { turnModelId: last.modelId }),
+            ...(last.providerId === undefined ? {} : { turnProviderId: last.providerId }),
+          };
+        }
       }
-      await sleep(4_000);
-      const done = (await readAssistantTurns(keeper, sessionId)).filter(isCompleteTurn);
-      if (done.length > baseline) {
-        const last = done[done.length - 1]!;
-        return {
-          sessionId,
-          providerId: chosen.providerId,
-          modelId: chosen.modelId,
-          reasoningLevel: chosen.reasoningLevel,
-          welcomeResponse: last.text,
-          reprovisioned,
-          ...(last.modelId === undefined ? {} : { turnModelId: last.modelId }),
-          ...(last.providerId === undefined ? {} : { turnProviderId: last.providerId }),
-        };
-      }
+    } catch (err) {
+      throw withModelGuidance(err, chosen, "welcome");
     }
   } finally {
     keeper.kill();

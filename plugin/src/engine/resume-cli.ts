@@ -136,9 +136,12 @@ export interface SpawnResumeResult {
 export function spawnResume(opts: SpawnResumeOptions): SpawnResumeResult {
   const { cfg } = opts;
   if (cfg.zcodeExe.trim() === "" || cfg.zcodeCjs.trim() === "") {
-    // 未配置本机 zcode 路径：同步抛错，调用方（wake.ts attemptWake）据此降级 mailbox。
+    // 未配置且自动探测未命中：同步抛错，调用方（wake.ts attemptWake）据此降级 mailbox。
+    // v0.4（DESIGN-V0.4 §2.4）：文案给出明确指引（硬标准 2：不静默）。
     throw new Error(
-      "spawnResume: zcode_exe / zcode_cjs 未配置（请在插件设置中填写本机 zcode 路径）——推送唤醒不可用",
+      "spawnResume: zcode_exe / zcode_cjs 未配置且自动探测未命中——推送唤醒不可用（两会话 pull 协作不受影响）。" +
+      "修复：zcode 桌面端 → 设置 → 插件 → zcode-crosschat → 插件设置，填写 zcode_exe（zcode 安装目录下的 ZCode.exe）" +
+      "与 zcode_cjs（同目录 resources\\<variant>\\zcode.cjs）；或在本会话运行 xc_doctor 查看探测尝试线索。",
     );
   }
   const mode: WakeSpawnMode = opts.mode ?? "helper";

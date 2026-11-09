@@ -140,8 +140,10 @@ export class AppServerKeeper {
   static start(options: AppServerOptions): AppServerKeeper {
     const { cfg } = options;
     if (cfg.zcodeExe.trim() === "" || cfg.zcodeCjs.trim() === "") {
+      // v0.4（DESIGN-V0.4 §2.4）：同 resume-cli 的指引文案（成员供给路径，硬标准 2）。
       throw new Error(
-        "app-server: zcode_exe / zcode_cjs 未配置（请在插件设置中填写本机 zcode 路径）——成员供给不可用",
+        "app-server: zcode_exe / zcode_cjs 未配置且自动探测未命中——成员供给不可用（两会话 pull 协作不受影响）。" +
+        "修复：插件设置填写 zcode_exe / zcode_cjs，或运行 xc_doctor 查看探测尝试线索。",
       );
     }
     const spawnImpl = options.spawnImpl ?? spawn;

@@ -63,7 +63,17 @@ import {
 } from "../core/registry";
 import { sanitizeKey } from "../core/sanitize";
 import type { TeamMessage, TeamState } from "../core/types";
-import { spawnResume, wakeSpawnConfigFromEnv, type WakeSpawnConfig } from "./resume-cli";
+import { spawnResume, type WakeSpawnConfig } from "./resume-cli";
+import { resolveZcodeSpawnConfig, type ResolvedSpawnConfig } from "./zcode-locate";
+
+/** v0.4（DESIGN-V0.4 §2.4）：req.cfg 测试注入（WakeSpawnConfig）与自动探测结果
+ * （ResolvedSpawnConfig）的判别——`in` 收窄会给缺属性分支补 unknown（TS18046），
+ * 显式谓词保证 outcome 只在探测分支被读取。 */
+function isResolvedSpawnConfig(
+  c: WakeSpawnConfig | ResolvedSpawnConfig,
+): c is ResolvedSpawnConfig {
+  return "outcome" in c;
+}
 
 /** 在途唤醒窗口（DESIGN §2.5-3）——唯一定义处是 M1 core/registry，此处转出口。 */
 export { WAKE_INFLIGHT_MS };
@@ -332,7 +342,7 @@ export interface WakeRequest {
   now?: number;
   /** 测试注入：spawn 实现。 */
   spawn?: typeof spawnResume;
-  /** 测试注入：spawn 配置（默认 wakeSpawnConfigFromEnv(req.env)）。 */
+  /** 测试注入：spawn 配置（默认 resolveZcodeSpawnConfig(req.env)，v0.4 起 env 缺失时自动探测）。 */
   cfg?: WakeSpawnConfig;
 }
 
@@ -476,9 +486,20 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
     });
   };
   let pid: number | undefined;
+  // v0.4（DESIGN-V0.4 §2.4）：spawn 配置解析改为「env → 自动探测」，结果落审计。
+  // req.cfg 测试注入优先级不变：注入时零探测（不触发任何子进程），审计行 source 记 test_injected。
+  const resolvedCfg = req.cfg ?? resolveZcodeSpawnConfig(req.env);
+  await logEngineEvent(stateRoot, {
+    event: "zcode-locate",
+    source: isResolvedSpawnConfig(resolvedCfg) ? resolvedCfg.outcome.source : "test_injected",
+    found: isResolvedSpawnConfig(resolvedCfg) ? resolvedCfg.outcome.found : true,
+    exe: resolvedCfg.zcodeExe, cjs: resolvedCfg.zcodeCjs, to: toKey, scene: req.reason,
+  });
   try {
     const spawned = (req.spawn ?? spawnResume)({
-      cfg: req.cfg ?? wakeSpawnConfigFromEnv(req.env),
+      cfg: isResolvedSpawnConfig(resolvedCfg)
+        ? { zcodeExe: resolvedCfg.zcodeExe, zcodeCjs: resolvedCfg.zcodeCjs }
+        : resolvedCfg,
       sessionId: req.toSessionId,
       prompt,
       cwd: req.workspace,

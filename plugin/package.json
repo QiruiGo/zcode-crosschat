@@ -1,8 +1,9 @@
 {
   "name": "zcode-crosschat-plugin",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
+  "engines": { "node": ">=22" },
   "description": "Source package for the zcode-crosschat plugin (plugin root = this directory).",
   "scripts": {
     "build": "node scripts/build.mjs",
