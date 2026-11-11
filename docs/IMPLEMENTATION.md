@@ -5,7 +5,7 @@
 - 对照设计：`docs/DESIGN.md`（2026-11-09 版，v0.1.0 底座）；**v0.2.0 增量对照 `docs/DESIGN-V0.2.md`（§7 新增）**；**v0.3.0 增量对照 `docs/DESIGN-V0.3.md`（§8-§9 新增）**；平台事实基线：`docs/PLATFORM.md`
 - 本文档回答三件事：**每个模块落在哪些文件**、**整体自测跑了什么、结果如何**、**当前已知限制**。
 - 所有结论均来自本会话实际执行的命令与输出；无法验证的条目显式标注「未确认/未执行」。
-- **§1-§6 为 v0.1.0 历史记录（原样保留）；§7 为 v0.2.0 增量的模块对照与本会话自测记录；§8 为 v0.3.0 增量的模块对照（W3 寻址 + W7 组装/面/文档环节）；§9 为 v0.3.0 集成环节的结构核对、修复记录与全量自测。**
+- **§1-§6 为 v0.1.0 历史记录（原样保留）；§7 为 v0.2.0 增量的模块对照与本会话自测记录；§8 为 v0.3.0 增量的模块对照（W3 寻址 + W7 组装/面/文档环节）；§9 为 v0.3.0 集成环节的结构核对、修复记录与全量自测；§10 为 v0.5.0 集成环节记录（lead 元数据化 ｜ 用户亲述溯源 ｜ 防卡死注入预算，对照 `docs/DESIGN-V0.5.md`）。**
 
 ---
 
@@ -14,7 +14,7 @@
 设计要求的 54 个文件（任务下达清单）全部在盘，另有集成环节新增/修改 4 个文件（§4）。目录形态与 DESIGN §1.2 一致：仓根即市场根（`marketplace.json`），插件根 = `plugin/`，构建产物 `dist/` 已生成且与源码同步（§3.3）。
 
 ```
-D:\tools\zcode-crosschat\
+<仓库路径>\
 ├── marketplace.json                 # 市场清单（= DESIGN §8.2-B 原文）
 ├── docs\DESIGN.md / PLATFORM.md / IMPLEMENTATION.md（本文）
 ├── plugin\
@@ -150,7 +150,7 @@ D:\tools\zcode-crosschat\
 
 | 命令 | 结果 |
 |---|---|
-| `ELECTRON_RUN_AS_NODE=1 /e/ZCode/ZCode.exe /e/ZCode/resources/glm/zcode.cjs plugins validate "D:\tools\zcode-crosschat\plugin"` | **`Plugin manifest is valid`，exit 0** |
+| `ELECTRON_RUN_AS_NODE=1 <安装目录>/ZCode.exe <安装目录>/resources/<variant>/zcode.cjs plugins validate "<仓库路径>/plugin"` | **`Plugin manifest is valid`，exit 0** |
 | `… plugins list` | 当前已装 18 个官方插件，zcode-crosschat **尚未安装**（本插件未启用状态，属预期基线） |
 | `… plugins marketplace --help` | 仅打印通用 help（无子命令专属参数），证实 DESIGN §9-V4 仍开放 |
 
@@ -177,9 +177,9 @@ D:\tools\zcode-crosschat\
 
 以下步骤每一步都标注了本会话已验证的证据或剩余风险：
 
-1. **构建**（✅ 已代跑）：`cd D:\tools\zcode-crosschat\plugin && npm install && npm run build`——npm install 含 zod 声明后重跑通过；dist 四产物在盘且与源码字节一致（§3.2）。
-2. **校验**（✅ 已代跑）：`zcode plugins validate "D:\tools\zcode-crosschat\plugin"` → `Plugin manifest is valid`（§3.5）。
-3. **UI 安装**（⏳ 用户执行）：桌面 **插件市场 → 添加 → 添加插件市场**，粘贴目录 `D:\tools\zcode-crosschat`（市场根，`marketplace.json` 已在其下，条目 source="./plugin"）→ **个人 → 安装 zcode-crosschat → 启用**。流程依据 plugin-creator SKILL.md:44（「Plugin Marketplace → Add → Add Plugin Marketplace, paste that directory… Personal → market name → plugin → Install」）。
+1. **构建**（✅ 已代跑）：`cd <仓库路径>/plugin && npm install && npm run build`——npm install 含 zod 声明后重跑通过；dist 四产物在盘且与源码字节一致（§3.2）。
+2. **校验**（✅ 已代跑）：`zcode plugins validate "<仓库路径>/plugin"` → `Plugin manifest is valid`（§3.5）。
+3. **UI 安装**（⏳ 用户执行）：桌面 **插件市场 → 添加 → 添加插件市场**，粘贴目录 `<仓库路径>`（市场根，`marketplace.json` 已在其下，条目 source="./plugin"）→ **个人 → 安装 zcode-crosschat → 启用**。流程依据 plugin-creator SKILL.md:44（「Plugin Marketplace → Add → Add Plugin Marketplace, paste that directory… Personal → market name → plugin → Install」）。
    - 装通判据：`zcode plugins list` 输出含 `zcode-crosschat` 且 `skills: 1, commands: 4, hooks: 3, mcp: plugin:zcode-crosschat:crosschat` 计数非零。
    - 风险点：CLI `plugins install` 语法未文档化（V4，§3.5 实测仍无子命令专属 help）——**UI 是权威路径**。
 4. **安装后注意**：宿主把插件物化进缓存（`cache/<marketplace>/zcode-crosschat/0.1.0/`），**每次改源码必须先 `npm run build` 并递增 `plugin.json`/`marketplace.json` 两处 version，再走市场刷新+更新**，否则装的是旧 dist（DESIGN §1.2/§8.1-4）。
@@ -233,7 +233,7 @@ D:\tools\zcode-crosschat\
 | 1 | `npm run typecheck`（tsc --noEmit，strict） | **通过**，零错误 |
 | 2 | `npm run build`（node scripts/build.mjs） | **通过**：5 入口全部产出——`dist/mcp/server.mjs` 1.5mb、`dist/mcp/wake-helper.mjs` 1.3kb（新）、`dist/hooks/{session-start,prompt-submit,stop}.mjs`，exit 0；产物路径与 W1 `resolveWakeHelperPath` 解析路径一致 |
 | 3 | `npm test`（vitest run，全量） | **24 文件 / 294 测试全绿，0 失败**（v0.1.0 基线 167 例全部保留通过 + v0.2 新增用例；含真实跨进程锁竞争、真实 spawn 端到端 helper 链、535ms/1.3s/2.0s 级真实 IO 用例）。分文件计数：wake 36、types 24、mailbox 22、graph 21、resume-cli 18、teamstate 15、render 14、member-tools 14、guards 12、lock 11、jsonl 11、lease 11、identity 11、task-edges 11、registry 10、snapshot 9、protocol 9、policy 6、stop 6、sanitize 7、tools 5、paths 4、atomic 4、log 3 |
-| 4 | `ELECTRON_RUN_AS_NODE=1 /e/ZCode/ZCode.exe /e/ZCode/resources/glm/zcode.cjs plugins validate "D:\tools\zcode-crosschat\plugin"` | **`Plugin manifest is valid`，exit 0**（版本改动后复跑仍通过） |
+| 4 | `ELECTRON_RUN_AS_NODE=1 <安装目录>/ZCode.exe <安装目录>/resources/<variant>/zcode.cjs plugins validate "<仓库路径>/plugin"` | **`Plugin manifest is valid`，exit 0**（版本改动后复跑仍通过） |
 | 5 | dist stdio 冒测（临时驱动脚本经 `$TEMP`，测毕即删；临时工作区 cwd） | `initialize` → `serverInfo {"name":"zcode-crosschat","version":"0.2.0"}`；`tools/list` 恰好 **13 个工具**：`xc_cancel, xc_check_inbox, xc_claim, xc_dispatch, xc_idle, xc_inbound_review, xc_member_add, xc_member_stop, xc_message, xc_register, xc_report, xc_status, xc_team_init`——7 个 v0.1.0 工具 + W2 两个 + W4 三个 + W5 一个，与 SKILL.md「13 个 xc_* 工具」宣告一致 |
 
 ### 7.3 v0.2.0 版本递增（三处一致）
@@ -288,7 +288,7 @@ D:\tools\zcode-crosschat\
 | 1 | `cd plugin && npx vitest run src/core/peeraddr.test.ts` | **1 文件 / 33 例全绿**（`Test Files 1 passed (1)`、`Tests 33 passed (33)`）。覆盖 DESIGN-V0.3 §9.2 的单测矩阵：唯一命中 / 0 命中 / 2 命中（含别名持有者）/ `[ref]` 精确命中（同名被占用时仍命中）/ ref 非法按 `not-found` / 别名失效 / 保留名拒绝 / 正则拒绝 / 别名不参与「当前名占用」；另含控制符剥离、路由 id 编码、formerNames 32 条 FIFO、行文本 `[ref]` 仅在歧义时追加、保留名 `main` 不可寻址、无 sessionId 的行（工具面行型）仍可解析 |
 | 2 | `node --check demo/peer-duo.mjs` | 无语法错误；缺参数时按约定 exit 2 并打印缺哪个参数 |
 | 3 | `cd plugin && npm run typecheck` | **exit 0，零报错**（W1/W2/W4/W5/W6 全部落盘后复跑）；`npm run build` 五入口产物齐（`dist/mcp/server.mjs` + `dist/mcp/wake-helper.mjs` + `dist/hooks/*.mjs`）；`npm test` 全量 **34 文件 / 496 例全绿**（v0.2 基线 24 文件 / 294 例全绿 + v0.3 新增 10 文件 / 202 例）。中途出现过 2 例失败（W6 的 `src/hooks/prompt-submit.test.ts`），本环节定位为**测试侧模块缓存缺陷**并给出最小复现与修法，W6 随后在自有文件里补上 `vi.resetModules()`，复跑全绿（详见 §8.5） |
-| 4 | `ELECTRON_RUN_AS_NODE=1 /e/ZCode/ZCode.exe /e/ZCode/resources/glm/zcode.cjs plugins validate "D:\tools\zcode-crosschat\plugin"` | **`Plugin manifest is valid`，exit 0**（v0.3.0 清单落盘后复跑） |
+| 4 | `ELECTRON_RUN_AS_NODE=1 <安装目录>/ZCode.exe <安装目录>/resources/<variant>/zcode.cjs plugins validate "<仓库路径>/plugin"` | **`Plugin manifest is valid`，exit 0**（v0.3.0 清单落盘后复跑） |
 | 5 | `node --check demo/peer-duo.mjs` + 缺参运行 | 无语法错误；缺 `--exe` 等必填参数时 exit 2 并打印缺哪个参数 |
 
 ### 8.3 W7 组装面的落点（逐条对应设计 §11）
@@ -342,14 +342,14 @@ D:\tools\zcode-crosschat\
 
 ### 9.3 全量自测（本环节亲跑，命令与输出见证据目录）
 
-证据根：`D:\tools\deepseek-crosschat\evidence\13-v030\acceptance\phase0\`
+证据根：`<证据仓>\evidence\13-v030\acceptance\phase0\`
 
 | # | 命令 | 结果 | 证据 |
 |---|---|---|---|
 | 1 | `cd plugin && npx tsc --noEmit` | **exit 0，零报错** | `typecheck.log` |
 | 2 | `cd plugin && npx vitest run` | **35 文件 / 501 例全绿**（v0.2 基线 34 文件 / 496 例全数保留 + 本环节新增 1 文件 / 5 例），2.5s | `unit-tests.log` |
 | 3 | `cd plugin && npm run build` | exit 0；5 入口产物齐：`dist/mcp/server.mjs`（1.6MB）+ `dist/mcp/wake-helper.mjs` + `dist/hooks/{session-start,prompt-submit,stop}.mjs` | 构建输出（终端） |
-| 4 | `zcode.cjs plugins validate "D:\tools\zcode-crosschat\plugin"` | **`Plugin manifest is valid`**，exit 0 | 终端输出 |
+| 4 | `zcode.cjs plugins validate "<仓库路径>/plugin"` | **`Plugin manifest is valid`**，exit 0 | 终端输出 |
 | 5 | `zcode.cjs plugins marketplace update dev-zcode-crosschat` | `Updated marketplace dev-zcode-crosschat (1 plugins)`；快照 `marketplace.json` 与 `plugin/.zcode-plugin/plugin.json` 均已是 **0.3.0**，快照 `dist/mcp/server.mjs` 与本地构建 **md5 一致**（`e6062ad3…`） | `marketplace-update.log` |
 | 6 | `zcode.cjs plugins install zcode-crosschat@dev-zcode-crosschat` | **`Installed plugin zcode-crosschat@dev-zcode-crosschat (0.3.0) [enabled]`** | `install.log` |
 | 7 | `zcode.cjs plugins list` | `zcode-crosschat@dev-zcode-crosschat [enabled]`，安装路径 `…/cache/dev-zcode-crosschat/zcode-crosschat/0.3.0`，skills:1 commands:1 hooks:3 mcp:plugin:zcode-crosschat:crosschat | `plugins-list-after.log` |
@@ -393,3 +393,85 @@ W3/W7 环节的记录（§8.4）提到「若同事最终导出的名字与签名
 4. 测试基建（非产品缺陷）：`src/engine/resume-cli.test.ts` 固定 sleep 改轮询（并发饿死）、`src/transport/pipe.test.ts` 的 `afterEach` 清理加重试（`ENOTEMPTY`）。
 
 **版本**：v0.3 开发期 manifest 由 0.3.0 递增至 0.3.4（每次改代码都递增，否则宿主不重新物化）；发布定稿 **0.3.0**（git tag `v0.3.0`，`plugin.json` / `marketplace.json` / `SERVER_VERSION` 同步定稿，与 v0.2.0「tag 版本 = manifest 版本」的约定一致）。当前全量 **36 文件 / 509 例**，默认并发下连跑 5 次全绿。
+
+---
+
+## 10. v0.5.0 集成环节记录（2026-11-11，v0.5 集成工程师）
+
+本节是 v0.5.0 **集成与全量自测环节**的落点：三轴（①lead 元数据化可指派可移交 ②用户亲述溯源 ③防卡死注入预算+分页）由并行实现交付 38 个变更路径（27 修改 + 11 新增），本环节对照 `docs/DESIGN-V0.5.md` §6.2 所有权表逐模块核对衔接、留记录，然后跑全量自测（typecheck + 全部单测 + validate）。
+
+### 10.1 结构核对结论（对照 DESIGN-V0.5 §6.2 所有权表，本环节实读全部 diff）
+
+- **文件齐备**：§6.2 表列 7 模块全部在盘。新增 11 文件（`docs/{DESIGN,SPEC,GAP}-V0.5.md` 3 份 + `plugin/commands/xc-say.md` + `plugin/src/core/{budget,msgstore,uservoice}.ts` 3 源 + 3 测试 + `plugin/src/mcp/lead-tools.test.ts`）；修改 27 文件与所有权表一一对应（types/frames/peermsg/peerenvelope/peerdir/mailbox/peerregistry= M1/M3/M4 契约，lead-tools/member-tools= M2，peer-tools/peer-drain= M5，tools/snapshot= M6，plugin.json= M7，命令面 xc-team.md / SKILL.md = M2）。
+- **关键 hunk 逐条核对通过**：frames.ts 四处同步（接口/FRAME_FIELDS 封闭集/validateFrame msg 分支校验与拷贝/发送侧仅 user 写出——P1）；peer-tools.ts origin 传播链四处构造点（receivePeerMessage 形参/队列项构造/fallbackItem/heldItemToQueueItem——P8）+ F-3 两处 store 落点（pipe 接受 :1068 后、held 晋升 :729 后，`storeAfterEnqueue` 共用且失败只审计）；lead-tools.ts F-4 takeover 三 hunk + F-2 to===me invalid_params + P9 reason 清洗（`sanitizeLeadReason` 控制符→空格、截 500）；M1 `budget.ts` = 设计 §6.3-1 全文；M4 `uservoice.ts`/`msgstore.ts` = 设计 §6.3-8/9 全文（环形 8 条、TTL 600s、uses≤3、匹配方向 outgoing ⊂ prompt）。
+- **工具面 21→26 核验**：`grep -c 'server.tool(' ` = 26 处注册，唯一名单 26 个（新增 `xc_lead_transfer`/`xc_lead_release`/`xc_peer_read`/`xc_mail_read`/`xc_task_read`）。`server.ts` 组装链/注册面**零 diff**（唯一改动 = `SERVER_VERSION` 常量，版本冻结五处之一，RELEASING §2.5）。
+- **R-5 负面清单 grep 反证（A1d 同款命令）**：`grep -n "leadKey\|leadKeyOf" plugin/src/mcp/tools.ts plugin/src/mcp/guards.ts` → guards.ts **零命中**；tools.ts 命中 4 行全部在 `xc_status` 域（history schema 描述、isLead 现算、payload leadKey/leadSince）——dispatch/claim/message/guards 路径零 lead 门。
+- **命令面/技能面**：`xc-team.md` 三子形态（transfer/release/takeover）+ lead_exists 三分支文案；`SKILL.md` 三处锚点（角色表 lead 行、工具表 xc_team_init 行、L1）按 §2.3 最小插入；`xc-say.md` 正反例齐。
+
+### 10.2 集成环节记录（对照设计「不改」表的两处偏差与既有用例调整，逐条留痕）
+
+| # | 项 | 性质 | 核实结论 |
+|---|---|---|---|
+| 1 | `src/mcp/guards.ts` 被 MODIFY（DESIGN §6.2 将其列「不改」） | **必要波及的最小适配**（实现方所改，本环节核实放行） | M6 把 `MessageShape.content` 改为可选（forwardOf 转发不带正文，R-13）后，inbound hold 路径 `createMessage(me.agentKey, toKey, a.content, …)` 类型不兼容；现为 `a.content ?? (a.forwardOf !== undefined ? "[forwardOf:<id>]" : "")`——hold 隔离副本带转发指针占位，accept 后收件人经 core 侧解析原文。typecheck/全测通过；除该 hunk 外 guards.ts 其余零改动。**结构性说明**：这是设计未预见 content 可选化的连带面，改动最小且方向正确，如实上报记录在案 |
+| 2 | `budget.ts` 两处偏离 §6.3-1 初稿 | 带注释的等义改进 | ① `degradedCount`：摘要降级（无 item 截断且条数不减）也上报 `budgetTruncated`——对齐 CC gca `budget_truncated` 语义；② TS5.5 `spent.every()` 元素收窄的布尔中转（同语义） |
+| 3 | `peer-tools.test.ts` 既有用例「7 个工具全部注册」→「8 个工具全部注册（v0.5 增 xc_peer_read）」 | 既有用例调整 1 处（A4a 要求逐条列理由） | 断言是**精确工具名单**，注册面 7→8 必然改名单；原 7 项名字与顺序全保留，仅增 `xc_peer_read` 一项。另 `tools.test.ts` 仅 import 行扩展 + 新增 9 例，零删除 |
+
+### 10.3 全量自测（本环节亲跑，版本递增后复跑）
+
+| # | 命令 | 结果 |
+|---|---|---|
+| 1 | `cd plugin && npm run typecheck` | **exit 0 零报错**（banner `zcode-crosschat-plugin@0.5.0`） |
+| 2 | `cd plugin && npx vitest run` | **42 文件 / 681 例全绿**（交付环节 2026-11-11 复跑复核，与验收环节口径一致）。基线核对（GAP-V0.5.md:7 记 v0.4 基线 38 文件/544 例）：对 9 个被改测试文件逐文件 `git show HEAD` 计数 = 125 例 → 现 191 例（**全数保留，仅 §10.2-3 一处更名**），4 个新测试文件 71 例（budget 27 / msgstore 11 / uservoice 18 / lead-tools 15）；544 − 125 + 191 + 71 = 681 ✓ |
+| 3 | `ELECTRON_RUN_AS_NODE=1 <安装目录>/ZCode.exe <安装目录>/resources/<variant>/zcode.cjs plugins validate "<仓库路径>/plugin"` | **`Plugin manifest is valid`**，exit 0 |
+| 4 | `cd plugin && npm run build`（冒测，非验收命名项） | `build ok`，5 产物齐（`dist/mcp/server.mjs` 1.6mb 等）；`xc_lead_transfer`/`xc_peer_read` 与 `inject-budget` 事件名在 server bundle、`uservoiceWrite`/`layoutInjectBlocks` 在 hooks bundle 内 grep 命中（新模块确已进 bundle） |
+
+### 10.4 版本冻结（五处，RELEASING §2）
+
+`plugin/.zcode-plugin/plugin.json` / `marketplace.json` / `plugin/package.json` / `plugin/package-lock.json`（根 + packages[""] 两处）/ `plugin/src/mcp/server.ts SERVER_VERSION` 全部 = **0.5.0**（sed 递增后 grep 复核：五处均 0.5.0、无 0.4.0 残留）。打包发布（RELEASING §3-§6）属发布环节，本环节未执行。
+
+### 10.5 本环节未执行项（如实声明）
+
+- **DESIGN §7 硬验收 A1-A5 的两会话端到端演示未执行**（移交/接管真回合、盖章链真实钩子取证、≥500KB 防卡死实测、三轴冒烟、V-4/V-6 键名实验）：属验收环节职责；本环节交付 = 结构核对 + 全量自测 + 版本冻结 + 单测层断言（盖章/转发/截断/takeover 均已有单测覆盖并全绿）。
+- **`marketplace update` + `install` 物化刷新未执行**（§9.3 步骤 5-8 的 CACHE-FRESH 口径）：版本已递增 0.5.0，物化由验收/发布环节按 §9.3 物化规则执行即可。
+
+---
+
+## 11. v0.5.0 交付与发布环节记录（2026-11-11，v0.5 交付工程师）
+
+本节是 v0.5.0 **交付与发布环节**的落点：交付 = 核查 README/docs 反映 v0.5.0（缺口先补）、核查零本机敏感信息、git commit → push → tag → 打包（预构建包 + SHA256）→ `gh release create` → 发布后自检（RELEASING §1-§6）。
+本环节**未改动产品代码逻辑**：§10 记录的 38 个变更路径原样提交；本环节的改动集中在文档/清单/打包脚本注释，以及一处测试计数勘误。
+
+### 11.1 README/docs 反映 v0.5.0 的缺口修补（逐项）
+
+| # | 缺口（交付环节实测定位） | 修补 | 落点 |
+|---|---|---|---|
+| 1 | README 快速开始仍指向 **0.4.0** 的预构建资产名与安装期望输出（下载/`sha256sum -c`/`tar -xzf`/解包目录名/`marketplace add`/`Installed … (0.4.0)` 共 7 处） | 全部递增到 `0.5.0` | README.md:23-58 |
+| 2 | README 第 3 步判据仍写「7 个斜杠命令文件」（v0.5 新增 `/xc-say` 后实为 8 个） | 改为 8 | README.md:77 |
+| 3 | README 缺 v0.5 的两项能力首达说明：lead 可移交/释放/接管、用户原话可逐字转达 | 各补一段（说明元数据角色语义与盖章链的逐字匹配口径） | README.md:131（peer 段）、README.md:152（团队段） |
+| 4 | README 文档索引缺 v0.5 三件套（`DESIGN-V0.5.md`/`SPEC-V0.5.md`/`GAP-V0.5.md`）与 `RELEASING.md`，且把 DESIGN 序列写成「三代」 | 补齐并改为「五代」 | README.md:264-273 |
+| 5 | `plugin/.zcode-plugin/plugin.json` 与 `marketplace.json` 的描述仍是 v0.3/v0.2 口径（只讲 peer 轴与任务派发），与 v0.5 能力不符 | 两处描述改写为 v0.5 口径（可移交 lead、origin=user、上下文预算截断） | plugin.json:4-8、marketplace.json:11-12 |
+| 6 | `docs/RELEASING.md` 全篇硬编码 `v0.4.0`（照抄即会发布错版本号） | 改为 `<VER>`/`<VERNUM>` 占位符版，并标注「占位未替换即发布是唯一硬性失败模式」 | docs/RELEASING.md |
+| 7 | `scripts/pack-release.mjs` 文件头把用法写死为 `v0.4.0`（脚本本身与版本无关，按 tag 动态断言） | 改为 `v<x.y.z>` 占位 | scripts/pack-release.mjs:3-5 |
+| 8 | `docs/IMPLEMENTATION.md` §10.3 记「42 文件 / 680 例」且基线算式写 `544 + 65 + 71 = 680`（与实测 681 差 1；被改测试文件实为 9 个、HEAD 计数 125 → 现 191） | 按交付环节复跑实测值勘误为 681 并补齐算式 | docs/IMPLEMENTATION.md:424 |
+
+### 11.2 本机敏感信息核查（零本机路径）
+
+- 核查口径：全仓（排除 `.gitignore` 覆盖的 `.scratch-*`/`.crosschat/`/node_modules）扫描 `qdqir`、`E:\ZCode`、`D:\tools`、`C:\Users` 四类本机路径标记。
+- 实测结论：入库前**全仓 14 个文件命中**（含 v0.4.0 时代遗留的 `DESIGN*.md`/`FEASIBILITY*.md`/`PLATFORM.md`/`RELEASE-RECON.md`/`IMPLEMENTATION.md`/源码注释/打包脚本注释）；本环节统一替换为占位符 `<仓库路径>`/`<安装目录>`/`<证据仓>`/`<本机工作区>`/`<用户主目录>`，替换后**仅剩 2 处元描述**（`docs/DESIGN-V0.4.md:804/828` 的「零本机信息」规则条文本身，需保留被禁字符串的字面样例）。
+- `plugin/run-lead.log`（一次失败验收跑留下的本机绝对路径日志，无任何内容被引用）已删除；根 `.gitignore` 增 `*.log`（含本机绝对路径与会话 id 的运行日志一律不入库）。
+- **仍存在且如实声明**：历史文档（`docs/PLATFORM.md:151/182-197/249`、`docs/FEASIBILITY-V0.2.md`、`docs/FEASIBILITY-V0.3.md`）保留 v0.1-v0.3 期实测会话 id（`sess_*`）作为实验证据引文——它们是本机局部标识符，远程读者无法据此访问任何本机状态，且属已随 v0.4.0 发布的既有内容；本环节不做抹除性改写（会破坏历史实验记录的可核查性）。
+
+### 11.3 交付环节亲跑的校验（命令 + 输出）
+
+| # | 命令 | 输出 |
+|---|---|---|
+| 1 | `cd plugin && npm run typecheck` | exit 0，零报错（banner `zcode-crosschat-plugin@0.5.0`） |
+| 2 | `cd plugin && npx vitest run` | **Test Files 42 passed / Tests 681 passed**，Duration 2.06s |
+| 3 | `ELECTRON_RUN_AS_NODE=1 <安装目录>/ZCode.exe <安装目录>/resources/<variant>/zcode.cjs plugins validate "<仓库路径>/plugin"` | `Plugin manifest is valid`，exit 0 |
+| 4 | 版本冻结复核（五处，RELEASING §2） | `plugin.json` 0.5.0、`marketplace.json` 0.5.0、`plugin/package.json` 0.5.0、`package-lock.json` root 0.5.0 与 `packages[""]` 0.5.0、`server.ts:37` `SERVER_VERSION = "0.5.0"` — 全部一致，无 0.4.0 残留 |
+| 5 | 本机路径扫描（全仓 tracked + untracked、排除 .gitignore 覆盖项） | 见 §11.2；替换后仅 2 处规则条文元描述 |
+
+### 11.4 本环节未执行项（如实声明）
+
+- **未做「全新目录隔离安装 + 匿名下载」复核**：该项属验收环节口径（`docs/ACCEPTANCE.md` v0.4.0 第 1 条的实测路径），本环节只做发布动作与发布后 `gh release view` 自检；预构建包的物化行为由 `scripts/pack-release.mjs` 内置的 dist import 冒测（`IMPORT_OK`）把关。
+- **未改产品逻辑**：v0.5.0 的能力判定全部沿用验收环节结论（`docs/ACCEPTANCE.md` v0.5.0 五条硬标准全部通过），本环节不重复宣告、不做二次验收。

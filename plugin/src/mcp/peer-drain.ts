@@ -23,6 +23,8 @@
 import { logEngineEvent } from "../core/log.js";
 import { peerRootFromEnv } from "../core/peerdir.js";
 import { drainPeerQueue, renderPeerEnvelope, type PeerQueueItem } from "../core/peermsg.js";
+import { queueItemToInjectBlock } from "../core/peerenvelope.js";
+import { contextCharsFromEnv, layoutInjectBlocks, receiverInjectBudget } from "../core/budget.js";
 import type { ToolResult } from "./protocol.js";
 import type { ToolCore, ToolDeps } from "./tools.js";
 
@@ -140,7 +142,26 @@ export async function appendPeerEnvelopes(
   let block: string;
   try {
     const backend = deps.peerDrain ?? (await defaultBackend());
-    block = items.map((item) => backend.render(item)).filter((text) => text !== "").join("\n\n");
+    // v0.5（R-23 面 B）：渲染 → 预算排布（花费新→旧、输出保到达序）。
+    // store 已在接收入队时落盘（F-3，§5.1），面内不落——注入面只渲染+排布。
+    const budget = receiverInjectBudget(contextCharsFromEnv(deps.env), deps.env);
+    const injectBlocks = items
+      .map((item) => queueItemToInjectBlock(item as PeerQueueItem, backend.render(item)))
+      // v0.4 行为兼容：空渲染结果（注入后端自定义 render 可能返回 ""）不进排布。
+      .filter((b) => b.rendered !== "");
+    const layout = layoutInjectBlocks(injectBlocks, budget, "peer");
+    block = layout.blocks.join("\n\n");
+    // budgetTruncated 时另记（R-24，对齐 CC budget_truncated @9950531）。
+    if (layout.budgetTruncated) {
+      await logEngineEvent(deps.stateRoot, {
+        event: "inject-budget",
+        face: "B",
+        budget: budget.total,
+        truncatedCount: layout.truncatedCount,
+        totalChars: layout.totalChars,
+        sessionId: context.sessionId,
+      });
+    }
   } catch (error) {
     await logEngineEvent(deps.stateRoot, {
       event: "peer-drain-render-error",
@@ -179,7 +200,12 @@ export function withPeerDrain(core: ToolCore, deps: PeerDrainDeps): ToolCore {
       return await appendPeerEnvelopes(result, deps);
     };
 
+  // v0.5 验收修复（BUG-1）：白名单返回会把 createToolCore 上 v0.5 新增的分页读
+  // 工具（xc_mail_read/xc_task_read）剥掉——composeCore 包装后 core.xc_task_read
+  // is not a function（tools/list 仍列出全部工具，调用即 TypeError）。先 spread
+  // 透传全部方法，再以面 B wrap 覆盖 7 个队内工具；分页读工具不需要面 B 注入。
   return {
+    ...core,
     xc_register: wrap(core.xc_register.bind(core)),
     xc_dispatch: wrap(core.xc_dispatch.bind(core)),
     xc_check_inbox: wrap(core.xc_check_inbox.bind(core)),

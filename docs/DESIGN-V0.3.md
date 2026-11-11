@@ -3,9 +3,9 @@
 - 版本：v0.3.0 设计基线 ｜ 日期：2026-11-09
 - 作者：v0.3 设计师（动态工作流子代理）
 - 配套规格：`docs/SPEC-V0.3.md`（规格精读员产出，R-1…R-34）——本文是**实现级增量设计**，对 SPEC 逐条给出「采纳 / 修正 / 不采纳」的裁定（§13），并在 SPEC 未覆盖处补齐实现细节。
-- 可行性依据：`docs/FEASIBILITY-V0.3.md`（传输侦察员实测，证据根 `D:\tools\deepseek-crosschat\evidence\12-v030\feasibility\`）
-- 机制标尺：`D:\tools\deepseek-crosschat\reports\11-cc逆向.md` §3.b（跨会话通道）、§4.3 增量清单 #1/#2/#9；`D:\tools\deepseek-crosschat\reports\13-cc消息来源区分.md`（信封与归因）
-- 现有实现基线：`D:\tools\zcode-crosschat\plugin\src\**`（v0.2.0）
+- 可行性依据：`docs/FEASIBILITY-V0.3.md`（传输侦察员实测，证据根 `<证据仓>\evidence\12-v030\feasibility\`）
+- 机制标尺：`<证据仓>\reports\11-cc逆向.md` §3.b（跨会话通道）、§4.3 增量清单 #1/#2/#9；`<证据仓>\reports\13-cc消息来源区分.md`（信封与归因）
+- 现有实现基线：`<仓库路径>\plugin\src\**`（v0.2.0）
 - 纪律声明：本文每条结论标注出处（`path:line` / 证据文件名 / 命令输出）。未实测项标「未确认」，不以推测充当事实。
 
 ---
@@ -18,7 +18,7 @@
 |---|---|---|
 | D1 | **两个域并列，不合并**：队内域（`<workspace>/.crosschat/` 文件邮箱 + 六帧白名单）保持 v0.2 原样；跨会话域（机器全局 `peers/` 目录 + 命名管道 + 四帧白名单）是**独立通道**，两域帧集互斥 | SPEC §0.1 / R-15；CC 渲染层把 `teammate-message` 与 `cross-session-message` 列为不同消息种类（11-cc逆向 §3.b 末条，`@394543`） |
 | D2 | **传输层主路径 = Windows 命名管道 `\\.\pipe\LOCAL\xcc-msg-<32hex>`**，对端缺席时退化为**文件收件箱 JSONL** | FEASIBILITY §1.2（T1 绑定/连接/推送/往返 100 次 avg 0.1ms、stdio 共存成立）、§4（T4 并发追加 51/51 零撕裂、rename 换出排空不丢）、§5.2（T5 端到端 9/9，对端关停自动退化 `via:"file"`） |
-| D3 | **注册表机器全局**，落 `ZCODE_PLUGIN_DATA` 指向的插件数据目录下的 `peers/`，记录文件 `<pid>.json`（文件名即 pid） | 实测 `ZCODE_PLUGIN_DATA = C:\Users\qdqir\.zcode\cli\plugins\data\<plugin>@<marketplace>`（`_logs/zcode-probe/mcp-13668.json`），该目录是**用户级**（`ls ~/.zcode/cli/plugins/data/` 见 18 个插件目录），故天然跨工作区可见；SPEC R-1 |
+| D3 | **注册表机器全局**，落 `ZCODE_PLUGIN_DATA` 指向的插件数据目录下的 `peers/`，记录文件 `<pid>.json`（文件名即 pid） | 实测 `ZCODE_PLUGIN_DATA = <用户主目录>\.zcode\cli\plugins\data\<plugin>@<marketplace>`（`_logs/zcode-probe/mcp-13668.json`），该目录是**用户级**（`ls ~/.zcode/cli/plugins/data/` 见 18 个插件目录），故天然跨工作区可见；SPEC R-1 |
 | D4 | **端点宿主 = 插件 MCP server 进程**（每会话一个），注册记录 `pid` = 该进程 pid；MCP server 进程 env **没有** sessionId（实测），会话身份由**钩子写基记录 + 模型显式传参**提供 | FEASIBILITY §6.2（净化父 env 对照：只有钩子有 `CLAUDE_SESSION_ID`/`ZCODE_SESSION_ID`）；§5.1（钩子反向认领 server **5 轮只对 1 轮**，不可用） |
 | D5 | **绑定只走本会话自己的 stdio 连接**（`xc_peer_register(name, sessionId)` 显式注册），不做任何「扫未认领 server 反向 associate」 | FEASIBILITY §5.1（`_logs/hook-crossbind-result.json`：trial2 交叉绑定，alice 的消息会投进 bob 的进程）；§5.2 E2 `pairingCorrect:true` 走的是显式注册路径 |
 | D6 | **档类（bypass/prompting）由钩子载荷的 `permission_mode` 派生**，不采信模型自述 | 实测钩子 stdin 载荷含 `permission_mode:"yolo"` / `mode:"yolo"`（`_logs/zcode-probe/hook-start-11220.json`）；SPEC R-19 的「发方断言档类」落地方 |
@@ -73,7 +73,7 @@
 
 | 事实 | 出处 |
 |---|---|
-| `ZCODE_PLUGIN_DATA` = 用户级绝对路径 `C:\Users\qdqir\.zcode\cli\plugins\data\<plugin>@<marketplace>`（MCP server 进程与钩子进程**都有**） | `_logs/zcode-probe/mcp-13668.json` env 段、`_logs/zcode-probe/hook-start-11220.json` env 段 |
+| `ZCODE_PLUGIN_DATA` = 用户级绝对路径 `<用户主目录>\.zcode\cli\plugins\data\<plugin>@<marketplace>`（MCP server 进程与钩子进程**都有**） | `_logs/zcode-probe/mcp-13668.json` env 段、`_logs/zcode-probe/hook-start-11220.json` env 段 |
 | 插件数据目录是**用户级**（`~/.zcode/cli/plugins/data/` 下按 `<plugin>@<marketplace>` 分目录） | `ls ~/.zcode/cli/plugins/data/`（18 个目录） |
 | MCP server 进程 env **无** `CLAUDE_SESSION_ID`/`ZCODE_SESSION_ID`（净化父 env 对照） | FEASIBILITY §6.2 表 |
 | 钩子进程 env **有** `CLAUDE_SESSION_ID` 与 `ZCODE_SESSION_ID`（同值）；stdin 载荷含 `sessionId`/`session_id`/`permission_mode:"yolo"`/`mode:"yolo"`/`cwd`/`source`/`traceId`/`transcript_path` | `_logs/zcode-probe/hook-start-11220.json` |
@@ -637,8 +637,8 @@ interface PeerQueueItem {
 
 ## 9. 硬验收逐条：演示怎么演、证据怎么落盘
 
-> 证据根目录：`D:\tools\deepseek-crosschat\evidence\13-v030\acceptance\`（下称 `EV/`）。
-> 演示工作区：`D:\tools\zcode-crosschat\.scratch-v03\ws-a\`、`ws-b\`（**两个不同工作区** ⇒ 队内状态根 `.crosschat/` 物理隔离 ⇒「无任何团队关系」可证）。
+> 证据根目录：`<证据仓>\evidence\13-v030\acceptance\`（下称 `EV/`）。
+> 演示工作区：`<仓库路径>\.scratch-v03\ws-a\`、`ws-b\`（**两个不同工作区** ⇒ 队内状态根 `.crosschat/` 物理隔离 ⇒「无任何团队关系」可证）。
 > 驱动器：`demo/bootstrap-sessions.mjs` 同族脚本（app-server 行协议；`session/create` + `session/setModel` + `session/send` + `session/messages`），本轮新增 `demo/peer-duo.mjs`（见 §10 W7 交付物）。
 
 ### 9.1 硬验收 1 · peer 消息闭环（核心）
@@ -1536,5 +1536,5 @@ $ARGUMENTS
 | 测试 | `core/peerregistry.test.ts`、`transport/{frames,pipe}.test.ts`、`core/peeraddr.test.ts`、`core/peerpolicy.test.ts`、`core/{peermsg,peerenvelope}.test.ts`、`mcp/peer-tools.test.ts`、`mcp/peer-drain.test.ts`、`hooks/prompt-submit.test.ts`（后两个承载 F7/F8 的回归断言，归属 W6，§10.1） |
 | 演示 | `demo/peer-duo.mjs`（双会话互发驱动器，app-server 行协议） |
 | 文档 | 本文件；`docs/IMPLEMENTATION.md` 补 v0.3 模块对照；`README.md` 补工具面（13 + 7 = 20 个 `xc_*`）、`/xc-agents` 命令、「已知限制」按 §12.1 回填 |
-| 证据 | `D:\tools\deepseek-crosschat\evidence\13-v030\acceptance\`（§9 全部路径） |
+| 证据 | `<证据仓>\evidence\13-v030\acceptance\`（§9 全部路径） |
 

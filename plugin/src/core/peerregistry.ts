@@ -114,6 +114,8 @@ export interface PeerRecord {
   agent?: string;
   /** Plugin version. */
   version?: string;
+  /** v0.5（R-18）：本会话上下文字符数声明（接收方注入预算刻度；absent = env/200k 缺省）。声明值，非探测值（V-1）。 */
+  contextChars?: number;
 }
 
 /** Why a record was classified dead. */
@@ -187,7 +189,15 @@ export function parsePeerRecord(raw: string): PeerRecord | undefined {
   } catch {
     return undefined;
   }
-  return isPeerRecord(parsed) ? parsed : undefined;
+  if (!isPeerRecord(parsed)) return undefined;
+  // v0.5（R-18）：contextChars 是声明值——字段非法（非正整数）按缺省处理（丢弃该字段），
+  // 不拒整条记录（宽容读取；误声明只影响预算刻度，DESIGN-V0.5 §5.2）。
+  if (parsed.contextChars !== undefined
+    && (typeof parsed.contextChars !== 'number' || !Number.isSafeInteger(parsed.contextChars) || parsed.contextChars <= 0)) {
+    const { contextChars: _dropped, ...rest } = parsed;
+    return rest;
+  }
+  return parsed;
 }
 
 // ---------------------------------------------------------------------------

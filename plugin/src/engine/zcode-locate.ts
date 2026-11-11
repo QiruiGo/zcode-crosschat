@@ -96,7 +96,7 @@ export function pairFromExe(exe: string): ZcodePair | null {
   return cjs ? { exe, cjs } : null;
 }
 
-/** F4：UninstallString（如 `"E:\ZCode\Uninstall ZCode.exe" /currentuser`）→ 安装根。 */
+/** F4：UninstallString（如 `"<安装目录>\Uninstall ZCode.exe" /currentuser`）→ 安装根。 */
 function installRootFromUninstallString(uninstallString: string): string {
   const m = /^\s*"([^"]+)"/.exec(uninstallString) ?? /^\s*(\S+)/.exec(uninstallString);
   return m ? dirname(m[1]!) : "";

@@ -16,12 +16,15 @@ import { z } from "zod";
 import {
   PeerInboxShape,
   PeerListShape,
+  PeerReadShape,
   PeerRegisterShape,
   PeerRenameShape,
   PeerReviewShape,
   PeerSendShape,
   registerPeerTools,
+  validateSendModeArgs,
   type PeerAgentsPanel,
+  type PeerReadResult,
   type PeerRegisterResult,
   type PeerRenameResult,
   type PeerReviewResult,
@@ -110,6 +113,10 @@ function fakeServices(overrides: Partial<PeerServices> = {}): PeerServices & { c
       calls.push(["send", input]);
       return { receipt: "delivered", via: "pipe", msgId: "m-1", to: "bob" };
     },
+    read: async (input): Promise<PeerReadResult> => {
+      calls.push(["read", input]);
+      return { msgId: input.msgId, total: 100, offset: input.offset ?? 0, text: "hi", hasMore: false };
+    },
     inbox: async (limit): Promise<{ items: PeerQueueItem[]; rendered: string[] }> => {
       calls.push(["inbox", limit]);
       return {
@@ -144,7 +151,7 @@ function fakeServices(overrides: Partial<PeerServices> = {}): PeerServices & { c
       return {
         self: row({ name: "alice", kind: "self" }),
         peers: [row()],
-        members: [{ key: "m1", role: "worker", state: "ready", unread: 0 }],
+        members: [{ key: "m1", role: "worker", state: "ready", unread: 0, isLead: false }],
         tasks: { pending: 1, inProgress: 2, done: 3 },
         inboundPolicy: { mode: "hold", decidedBy: "repo-setting", strictest: "hold" },
       };
@@ -161,13 +168,14 @@ function setup(services: PeerServices): FakeServer {
 }
 
 describe("注册面（DESIGN §8.1）", () => {
-  it("7 个工具全部注册", () => {
+  it("8 个工具全部注册（v0.5 增 xc_peer_read，R-22）", () => {
     const server = setup(fakeServices());
     expect(server.tools.map((tool) => tool.name)).toEqual([
       "xc_peer_register",
       "xc_peers",
       "xc_peer_send",
       "xc_peer_inbox",
+      "xc_peer_read",
       "xc_peer_review",
       "xc_peer_rename",
       "xc_agents",
@@ -195,9 +203,18 @@ describe("参数 schema", () => {
 
   it("非法入参被拒", () => {
     expect(z.object(PeerRegisterShape).safeParse({ name: "", sessionId: "s" }).success).toBe(false);
-    expect(z.object(PeerSendShape).safeParse({ to: "bob" }).success).toBe(false);
+    // v0.5（R-13）：message 改 optional（forwardOf 模式不带正文）；「message 与
+    // forwardOf 至少其一」的互斥校验在服务面（services.send）兜底，schema 层只查形状。
+    expect(z.object(PeerSendShape).safeParse({ to: "bob" }).success).toBe(true);
+    expect(z.object(PeerSendShape).safeParse({ to: "bob", message: "" }).success).toBe(false);
+    expect(z.object(PeerSendShape).safeParse({ to: "bob", forwardOf: "" }).success).toBe(false);
+    expect(z.object(PeerRegisterShape).safeParse({ name: "a", sessionId: "s", contextChars: 0 }).success).toBe(false);
+    expect(z.object(PeerRegisterShape).safeParse({ name: "a", sessionId: "s", contextChars: 1.5 }).success).toBe(false);
     expect(z.object(PeerListShape).safeParse({ kind: "nope" }).success).toBe(false);
     expect(z.object(PeerInboxShape).safeParse({ limit: 0 }).success).toBe(false);
+    expect(z.object(PeerReadShape).safeParse({ msgId: "" }).success).toBe(false);
+    expect(z.object(PeerReadShape).safeParse({ msgId: "m", offset: -1 }).success).toBe(false);
+    expect(z.object(PeerReadShape).safeParse({ msgId: "m", limit: 0 }).success).toBe(false);
     expect(z.object(PeerReviewShape).safeParse({ action: "explode" }).success).toBe(false);
   });
 });
@@ -398,5 +415,134 @@ describe("面 B：peer 工具结果里的信封投递（DESIGN §7.1）", () => 
     } finally {
       clearPeerSessionContext();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.5 M5（DESIGN-V0.5.md §6.3-11）：forwardOf 互斥（R-13）、xc_peer_read（R-22）、
+// 面 C 注入预算（R-23）、contextChars 透传（R-18）、isLead（R-7）。
+// ---------------------------------------------------------------------------
+
+describe("v0.5 forwardOf 互斥（R-13）", () => {
+  it("forwardOf 与 message 混用 → invalid_params", () => {
+    expect(() => validateSendModeArgs({ message: "hi", forwardOf: "m-1" })).toThrowError(/R-13/);
+  });
+
+  it("两者都缺 → invalid_params（message 必填或 forwardOf）", () => {
+    expect(() => validateSendModeArgs({})).toThrowError(/message is required/);
+  });
+
+  it("普通发送（只带 message）/ 纯转发（只带 forwardOf）均合法", () => {
+    expect(() => validateSendModeArgs({ message: "hi" })).not.toThrow();
+    expect(() => validateSendModeArgs({ forwardOf: "m-1" })).not.toThrow();
+  });
+
+  it("handler 把 message/forwardOf 原样传给服务面", async () => {
+    const services = fakeServices();
+    const server = setup(services);
+    await server.find("xc_peer_send").handler({ to: "bob", forwardOf: "m-9" }, {});
+    expect(services.calls[0]).toEqual(["send", { to: "bob", forwardOf: "m-9" }]);
+    await server.find("xc_peer_send").handler({ to: "bob", message: "hi", summary: "s" }, {});
+    expect(services.calls[1]).toEqual(["send", { to: "bob", message: "hi", summary: "s" }]);
+  });
+});
+
+describe("v0.5 xc_peer_read（R-22 只读分页器）", () => {
+  it("透传 msgId/offset/limit 给服务面并回显分页信息", async () => {
+    const services = fakeServices();
+    const server = setup(services);
+    const result = await server.find("xc_peer_read").handler({ msgId: "m-1", offset: 40, limit: 20 }, {});
+    expect(services.calls[0]).toEqual(["read", { msgId: "m-1", offset: 40, limit: 20 }]);
+    const payload = payloadOf(result);
+    expect(payload["msgId"]).toBe("m-1");
+    expect(payload["total"]).toBe(100);
+    expect(payload["offset"]).toBe(40);
+    expect(payload["hasMore"]).toBe(false);
+    expect(result.content[0]!.text).toContain("m-1");
+  });
+
+  it("服务面抛 invalid_params（未知 msgId）→ 错误信封", async () => {
+    const services = fakeServices({
+      read: async () => {
+        throw new ToolError(
+          { error: "invalid_params", msgId: "m-x", message: 'unknown msgId "m-x"' },
+          'unknown msgId "m-x"',
+        );
+      },
+    });
+    const server = setup(services);
+    const result = await server.find("xc_peer_read").handler({ msgId: "m-x" }, {});
+    expect(result.isError).toBe(true);
+    expect(payloadOf(result)["error"]).toBe("invalid_params");
+  });
+});
+
+describe("v0.5 面 C 注入预算（R-23）", () => {
+  function setupWithEnv(services: PeerServices, env: Record<string, string>): FakeServer {
+    const server = new FakeServer();
+    registerPeerTools(server as unknown as McpServer, { ...deps, env: { ...deps.env, ...env }, peer: services });
+    return server;
+  }
+
+  it("渲染结果超预算 → envelopes 为排布结果（降级/截断 + budgetTruncated）", async () => {
+    const big = "x".repeat(500);
+    const services = fakeServices({
+      inbox: async () => ({
+        items: [
+          { msgId: "m-big", from: "bob", hopChain: ["bob"], text: big, ts: 2, via: "pipe" as const },
+          { msgId: "m-small", from: "bob", hopChain: ["bob"], text: "hi", ts: 1, via: "pipe" as const },
+        ],
+        rendered: [`<crosschat-peer-message from="bob">\n${big}\n</crosschat-peer-message>`],
+      }),
+    });
+    const server = setupWithEnv(services, { XC_INJECT_ITEM_CHARS: "200", XC_INJECT_TOTAL_CHARS: "300" });
+    const result = await server.find("xc_peer_inbox").handler({}, {});
+    const payload = payloadOf(result);
+    expect(payload["count"]).toBe(2);
+    const envelopes = payload["envelopes"] as string[];
+    // 总预算 300：新块 m-big 截到 item=199+指针行、m-small 20 字符 → 排布结果非原文直通
+    expect(envelopes.length).toBeGreaterThan(0);
+    expect(envelopes.join("\n").length).toBeLessThan(big.length);
+    expect(payload["budgetTruncated"]).toBe(true);
+    expect(envelopes.join("\n")).toContain("xc_peer_read");
+  });
+
+  it("预算充足 → envelopes 即渲染原文（v0.4 行为不变）", async () => {
+    const services = fakeServices();
+    const server = setupWithEnv(services, { XC_INJECT_ITEM_CHARS: "99999999", XC_INJECT_TOTAL_CHARS: "99999999" });
+    const result = await server.find("xc_peer_inbox").handler({}, {});
+    const payload = payloadOf(result);
+    expect(payload["count"]).toBe(1);
+    expect(String(payload["envelopes"])).toContain("<crosschat-peer-message");
+    expect(payload["budgetTruncated"]).toBeUndefined();
+  });
+});
+
+describe("v0.5 xc_peer_register contextChars 透传（R-18）与 xc_agents isLead（R-7）", () => {
+  it("contextChars 透传给注册服务", async () => {
+    const services = fakeServices();
+    const server = setup(services);
+    await server.find("xc_peer_register").handler({ name: "a", sessionId: "s", contextChars: 50000 }, {});
+    expect(services.calls[0]).toEqual(["register", { name: "a", sessionId: "s", contextChars: 50000 }]);
+  });
+
+  it("agents 面板成员行带 isLead（现算字段透传）", async () => {
+    const services = fakeServices({
+      agents: async (): Promise<PeerAgentsPanel> => ({
+        peers: [],
+        members: [
+          { key: "lead1", role: "peer", state: "ready", unread: 0, isLead: true },
+          { key: "m2", role: "worker", state: "ready", unread: 0, isLead: false },
+        ],
+        tasks: { pending: 0, inProgress: 0, done: 0 },
+      }),
+    });
+    const server = setup(services);
+    const result = await server.find("xc_agents").handler({}, {});
+    const members = (payloadOf(result)["members"] as { key: string; isLead: boolean }[]);
+    expect(members.map((member) => ({ key: member.key, isLead: member.isLead }))).toEqual([
+      { key: "lead1", isLead: true },
+      { key: "m2", isLead: false },
+    ]);
   });
 });

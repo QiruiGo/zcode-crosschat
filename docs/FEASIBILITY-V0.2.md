@@ -3,8 +3,8 @@
 - 实验人：可行性侦察员（动态工作流子代理）
 - 日期：2026-11-09
 - 任务：实测 ① V9 修复路径（唤醒/成员回合脱离派发方进程树）、② 动态成员路径（程序化建会话+设模型+首轮 prompt 自动开工），在临时目录做实验，不动正式仓
-- 证据根目录：`D:\tools\deepseek-crosschat\evidence\10-v020\feasibility\`（执行序列与全部原始输出见其 `runbook.md`；下文「证据」列均相对该目录）
-- 实验环境：Windows 11 + Git Bash；zcode CLI 0.17.1（`E:\ZCode\ZCode.exe` + `E:\ZCode\resources\glm\zcode.cjs`）；插件 `zcode-crosschat@dev-zcode-crosschat 0.1.0`（已启用）；模型 glm-5.3-flash（opencode provider，reasoningLevel max）
+- 证据根目录：`<证据仓>\evidence\10-v020\feasibility\`（执行序列与全部原始输出见其 `runbook.md`；下文「证据」列均相对该目录）
+- 实验环境：Windows 11 + Git Bash；zcode CLI 0.17.1（`<安装目录>\ZCode.exe` + `<安装目录>\resources\glm\zcode.cjs`）；插件 `zcode-crosschat@dev-zcode-crosschat 0.1.0`（已启用）；模型 glm-5.3-flash（opencode provider，reasoningLevel max）
 - 纪律声明：全部结论来自本次实验实际执行（命令+输出在证据目录可复核）；查证不了的地方在 §6 明示「未确认」。实验期间 `~/.zcode/cli/config.json` 的改动已逐字节复原（`_logs/config.json.bak-feas-v020` 比对 `config restored exactly: True`）。
 
 ---
@@ -74,7 +74,7 @@ spawnResume 新形态：MCP server spawn node helper（命令行传 sid/prompt/c
 
 实验（E3c 失败→修复→E3c2 通过）：
 
-- E3c（86×47 之外的 72×35→result-e3c.txt）首跑失败：唤醒子进程启动即死，日志尾行 `✗ 未找到 CLI ZCode Built-in Provider Config：E:\ZCode\resources\glm\provider\zcode-builtin.json, E:\config\provider\zcode-builtin.json`（`ws-wake/.crosschat/logs/wake-b-1794168533287.json`）。
+- E3c（86×47 之外的 72×35→result-e3c.txt）首跑失败：唤醒子进程启动即死，日志尾行 `✗ 未找到 CLI ZCode Built-in Provider Config：<安装目录>\resources\glm\provider\zcode-builtin.json, E:\config\provider\zcode-builtin.json`（`ws-wake/.crosschat/logs/wake-b-1794168533287.json`）。
   → **新平台事实 P3：WMI 拉起的进程继承 WmiPrvSE 的 SYSTEM 环境（无用户 env），zcode CLI 因此找不到用户 provider 配置。**
 - 解法（已实现并验证）：派发方回合把完整 `process.env` 落盘（`wake-env-<to>-<ts>.json`）→ WMI 拉起 wrapper（`_scripts/wake-wrap.mjs`）读回并整体替换唤醒子进程 env。
 - E3c2（t4：86×47→result-e3c2.txt，验收 4042）：代理 wmiPid=8916，spawn 后 9.8s CLI 退出；**首个 20s 轮询周期内 t3（E3c 遗留票）与 t4 全部 completed**（2520/4042），sha256 全对；唤醒回合自述「t3/t4 均已完成并回报，回执均已发送给 a」。证据：`_logs/e3c2-turn-output.raw.json`。
@@ -138,7 +138,7 @@ spawnResume 新形态：MCP server spawn node helper（命令行传 sid/prompt/c
 5. 实验会话均为新建独立会话（db 中 sess_91f99771/ab5df0c6/7ba79f85/91eeac57 等），未覆盖桌面端属主在场时的唤醒（V5 边界，v0.1.0 已按约束规避）。
 6. 本次实验产生的测试工作区（ws-wake/ws-member）与 db 会话行留存作证据，未清理；`_scripts/` 脚本属实验件，v0.2 实现时应按 §2.1/§3.2 的设计重写进插件源码，而非直接搬用。
 
-## 7. 证据索引（`D:\tools\deepseek-crosschat\evidence\10-v020\feasibility\`）
+## 7. 证据索引（`<证据仓>\evidence\10-v020\feasibility\`）
 
 - `runbook.md`：全部命令、时间戳、输出的执行序列（本文各结论的「证据」均指向其中）。
 - `_scripts/`：heartbeat.mjs（心跳子进程）、spawn-child.mjs（E1/E2 三形态 spawner+job 探针）、wake-via-escape.mjs（引擎代理 spawner：nonce+prompt 组装+direct/wmi 两模式）、wake-wrap.mjs（WMI 中间跳板，env 文件回读）、dm-create.mjs（E4 动态建员驱动+持久化三点探测）、bootstrap-local.mjs（demo 补丁版）、set-wake-config.py（wake 开关切换/复原）、raw-probe.mjs（app-server 原始事件流探针）。

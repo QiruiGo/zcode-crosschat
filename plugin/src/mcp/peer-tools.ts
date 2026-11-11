@@ -72,7 +72,16 @@ import {
   type PeerQueueItem,
   type RateBuckets,
 } from "../core/peermsg.js";
-import { renderPeerEnvelope } from "../core/peerenvelope.js";
+import { detectForgedEnvelope, queueItemToInjectBlock, renderPeerEnvelope } from "../core/peerenvelope.js";
+import {
+  contextCharsFromEnv,
+  layoutInjectBlocks,
+  paginateText,
+  receiverInjectBudget,
+} from "../core/budget.js";
+import { resolvePeerMessage, storePeerMessageFull } from "../core/msgstore.js";
+import { uservoiceMatchAndConsume } from "../core/uservoice.js";
+import { leadKeyOf } from "./member-tools.js";
 import {
   defaultPeerSocketPath,
   mintPeerTokens,
@@ -107,6 +116,8 @@ export interface PeerRegisterInput {
   kind?: 'interactive' | 'bg';
   /** 档类兜底：仅当钩子基记录里没有档类时才用（DESIGN §8.1）。 */
   modeClass?: 'bypass' | 'prompting';
+  /** v0.5（R-18）：本会话上下文字符数声明（接收方注入预算刻度；声明值，非探测值）。 */
+  contextChars?: number;
 }
 
 export interface PeerRegisterResult {
@@ -121,10 +132,34 @@ export interface PeerRegisterResult {
   modeClassSource: 'base-record' | 'mode-class-fallback' | 'unknown';
 }
 
+/**
+ * 发送入参（v0.5，R-13）：`forwardOf` 与 `message` 互斥——转发原文走 forwardOf
+ * （origin/originSessionId 保留被转消息原值、hopChain 追加本会话），批注另发一条
+ * 普通消息。forwardOf 缺席时 message 必填（handler 侧校验）。
+ */
 export interface PeerSendInput {
   to: string;
-  message: string;
+  /** 消息正文（forwardOf 缺席时必填）。 */
+  message?: string;
+  /** 转发已收到的跨会话消息 id（与 message 互斥）。 */
+  forwardOf?: string;
   summary?: string;
+}
+
+/** v0.5（R-22）：xc_peer_read 入参——只读分页器，不消费。 */
+export interface PeerReadInput {
+  msgId: string;
+  offset?: number;
+  limit?: number;
+}
+
+/** v0.5（R-22）：xc_peer_read 返回。 */
+export interface PeerReadResult {
+  msgId: string;
+  total: number;
+  offset: number;
+  text: string;
+  hasMore: boolean;
 }
 
 export interface PeerSendResult {
@@ -152,7 +187,8 @@ export interface PeerRenameResult {
 export interface PeerAgentsPanel {
   self?: PeerRow;
   peers: PeerRow[];
-  members: { key: string; role: string; state: string; unread: number }[];
+  /** v0.5（R-7）：成员行增 isLead（现算字段 `m.key===leadKeyOf(team)`，不入盘不入快照）。 */
+  members: { key: string; role: string; state: string; unread: number; isLead: boolean }[];
   tasks: { pending: number; inProgress: number; done: number };
   inboundPolicy?: {
     mode: string;
@@ -174,6 +210,8 @@ export interface PeerServices {
   register(input: PeerRegisterInput): Promise<PeerRegisterResult>;
   list(kind?: 'self' | 'member' | 'session'): Promise<PeerRow[]>;
   send(input: PeerSendInput): Promise<PeerSendResult>;
+  /** v0.5（R-22）：全文分页读（只读不消费）。 */
+  read(input: PeerReadInput): Promise<PeerReadResult>;
   inbox(limit: number): Promise<{ items: PeerQueueItem[]; rendered: string[] }>;
   review(input: { action: 'list' | 'accept' | 'discard'; ids?: string[] }): Promise<PeerReviewResult>;
   rename(name: string): Promise<PeerRenameResult>;
@@ -344,6 +382,7 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
         kind: input.kind ?? "interactive",
         name,
         ...(input.displayName !== undefined ? { displayName: input.displayName } : {}),
+        ...(input.contextChars !== undefined ? { contextChars: input.contextChars } : {}),
         formerNames: [],
         workspace: deps.workspace,
         cwd: deps.workspace,
@@ -422,6 +461,9 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
           "not registered: call xc_peer_register first",
         );
       }
+      // v0.5（R-13）：forwardOf 与自定义正文互斥——批注/原文分两条；
+      // forwardOf 缺席时 message 必填（校验逻辑模块级共享，见 validateSendModeArgs）。
+      validateSendModeArgs(input);
       // 寻址用的行集 = 列表口径（self + member + session），**不是**只有 session。
       // DESIGN §5.3「可达的歧义场景」：A 改名后旧名进 formerNames 成为可寻址别名，
       // B 再占用该名 ⇒ 「alice」同时被 A（别名）与 B（当前名）持有 ⇒ 裸名必须
@@ -477,7 +519,47 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
         );
       }
 
+      // v0.5（R-13/R-12）：正文与溯源三元组（text/origin/originSessionId/hopChain）。
+      // 转发模式：text=被转消息原文、origin/originSessionId 保留原值（F-3：store
+      // 携带元数据，排空消费后仍可解析）、hopChain=[...原hopChain, 本会话]
+      // （admit 闸 >2 丢弃照走）；**跳过 uservoice 匹配**（转发者是 agent，origin
+      // 来自被转消息）。普通模式：正文=本条 message，落盘前 uservoice 盖章——
+      // 命中 → origin=user + originSessionId=本会话；未命中不带 origin 字段
+      // （=agent 缺省，wire 不写，R-11「仅 user 时写」）。
       const msgId = randomUUID();
+      let text: string;
+      let origin: "user" | undefined;
+      let originSessionId: string | undefined;
+      let hopChain: string[];
+      if (input.forwardOf !== undefined) {
+        const orig = await resolvePeerMessage(r, self.sessionId, input.forwardOf);
+        if (orig === undefined) {
+          throw new ToolError(
+            {
+              error: "invalid_params",
+              msgId: input.forwardOf,
+              message: `unknown msgId "${input.forwardOf}"; only messages received by this session can be forwarded`,
+            },
+            `unknown msgId "${input.forwardOf}"; only messages received by this session can be forwarded`,
+          );
+        }
+        text = orig.text;
+        if (orig.origin === "user") {
+          origin = "user";
+          originSessionId = orig.originSessionId;
+        }
+        hopChain = [...(orig.hopChain ?? [orig.from ?? input.forwardOf]), self.name ?? "peer"];
+      } else {
+        text = input.message!;
+        hopChain = [self.name ?? "peer"];
+        const stamp = await uservoiceMatchAndConsume(r, self.sessionId, text, Date.now(), deps.env);
+        if (stamp.hit) {
+          origin = "user";
+          originSessionId = self.sessionId;
+          await logPeerEvent(r, { event: "uservoice-hit", msgId, uses: stamp.uses });
+        }
+      }
+
       const base = await readPeerBaseRecord(r, self.sessionId);
       const senderMode: PeerModeClass | undefined =
         base?.permissionMode === 'bypass' || base?.permissionMode === 'prompting'
@@ -488,21 +570,26 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
         msgId,
         from: self.name ?? "peer",
         fromSessionId: self.sessionId,
-        text: input.message,
+        text,
         ...(input.summary !== undefined ? { summary: input.summary } : {}),
         ...(senderMode !== undefined ? { senderMode } : {}),
+        ...(origin === "user" ? { origin: "user" as const } : {}),
+        ...(origin === "user" && originSessionId !== undefined ? { originSessionId } : {}),
       };
 
       // 退化路径（§4.5）：管道不可达 → 落进接收方的收件箱。
-      // 行内容按 W5 的 PeerQueueItem 形状构造（接收方排空时按它解析）。
+      // 行内容按 W5 的 PeerQueueItem 形状构造（接收方排空时按它解析）；
+      // v0.5（P8-4c）：origin/originSessionId 随帧透传（file 通道不丢溯源）。
       const fallbackItem: PeerQueueItem = {
         msgId,
         from: frame.from,
         ...(frame.fromSessionId !== undefined ? { fromSessionId: frame.fromSessionId } : {}),
         ...(senderMode !== undefined ? { fromMode: senderMode } : {}),
-        hopChain: [frame.from],
+        hopChain,
         text: frame.text,
         ...(frame.summary !== undefined ? { summary: frame.summary } : {}),
+        ...(origin === "user" ? { origin: "user" as const } : {}),
+        ...(origin === "user" && originSessionId !== undefined ? { originSessionId } : {}),
         ts: Date.now(),
         via: "file",
       };
@@ -553,6 +640,33 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
       };
     },
 
+    /** v0.5（R-22）：全文分页读（store → held → queue/inbox 兜底解析；只读不消费）。 */
+    async read(input: PeerReadInput): Promise<PeerReadResult> {
+      const r = root();
+      if (self === undefined) {
+        throw new ToolError(
+          { error: "not_registered", message: "not registered: call xc_peer_register first" },
+          "not registered: call xc_peer_register first",
+        );
+      }
+      const resolved = await resolvePeerMessage(r, self.sessionId, input.msgId);
+      if (resolved === undefined) {
+        throw new ToolError(
+          {
+            error: "invalid_params",
+            msgId: input.msgId,
+            message: `unknown msgId "${input.msgId}"; only messages received by this session can be read`,
+          },
+          `unknown msgId "${input.msgId}"; only messages received by this session can be read`,
+        );
+      }
+      // limit 缺省 = 本会话 itemBudget（R-22）；单次 ≤ 64000（paginateText 内钳制）；
+      // 越界 offset → 空文本 + hasMore:false（paginateText 越界安全）。
+      const budget = receiverInjectBudget(contextCharsFromEnv(deps.env), deps.env);
+      const page = paginateText(resolved.text, input.offset, input.limit, budget.item);
+      return { msgId: input.msgId, total: page.total, offset: page.offset, text: page.text, hasMore: page.hasMore };
+    },
+
     async inbox(limit: number): Promise<{ items: PeerQueueItem[]; rendered: string[] }> {
       const r = root();
       if (self === undefined) {
@@ -592,10 +706,17 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
         const results = await releaseHeldMessages(r, self.sessionId, ids, {
           workspace: deps.workspace,
           adjudicate: async (message: PeerHeldMessage): Promise<InboundDecision> => {
+            // v0.5 验收修复（16-v050 验收发现 F6）：放行时按当前策略重新裁决**必须带收方档类**
+            // （recvClass）——与初次接收路径（peer-tools.ts:984-991）同口径。缺它时
+            // decideAutoMode 恒判「收方档类未知 → hold(mode-unknown)」（peerpolicy.ts:455-457），
+            // 于是 cause=mode-unknown 的暂存件**永远无法被 accept 放行**（只到 12h TTL 过期）。
+            // 证据：evidence/16-v050/acceptance/acc2-peer-hold.log（修复前 P2.acceptReleased=FAIL）。
+            const receiver = await readReceiverModeClass(r, self?.sessionId ?? "");
             const { decision } = await resolveInboundDecision({
               workspace: deps.workspace,
               sessionId: self?.sessionId ?? "",
               env: deps.env,
+              ...(receiver.cls !== undefined ? { recvClass: receiver.cls } : {}),
               ...(message.item.fromMode !== undefined ? { senderClass: message.item.fromMode } : {}),
               selfSent: false,
             });
@@ -612,7 +733,10 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
               buckets: rateBucketsFor(r),
             });
             if (!admitted.ok) return { ok: false, reason: admitted.reason };
-            await appendPeerQueue(r, self?.sessionId ?? "", heldItemToQueueItem(message.item));
+            const promoted = heldItemToQueueItem(message.item);
+            await appendPeerQueue(r, self?.sessionId ?? "", promoted);
+            // v0.5（F-3 5b）：晋升入队即落 store（幂等；失败不阻断投递）。
+            await storeAfterEnqueue(r, promoted);
             return true;
           },
           // 放行后的终态回执（DESIGN §9.3「A 侧收到 delivered」/§6.3「accept → 放行
@@ -748,11 +872,14 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
       const selfRows = await rowsOf("self");
       const peers = await rowsOf("session");
       const team = await readTeam(deps.stateRoot, "default");
+      // v0.5（R-7）：成员行增 isLead 现算字段（leadKeyOf 含 founder 兜底语义，
+      // member-tools.ts 同款；不入盘不入快照，修复 v0.4 的无标注缺口）。
       const members = (team?.members ?? []).map((member) => ({
         key: member.key,
         role: member.role,
         state: member.state ?? "ready",
         unread: 0,
+        isLead: team !== undefined && member.key === leadKeyOf(team),
       }));
       const tasks = { pending: 0, inProgress: 0, done: 0 };
       for (const task of team?.tasks ?? []) {
@@ -848,6 +975,9 @@ async function receivePeerMessage(
     text: string;
     summary?: string;
     senderMode?: 'bypass' | 'prompting';
+    /** v0.5（R-11）：作者身份标记（发送侧仅在 user 时写；旧端点帧无此键 = agent）。 */
+    origin?: 'user' | 'agent';
+    originSessionId?: string;
   },
 ): Promise<{ type: 'status'; msgId: string; state: PeerReceipt; detail?: string }> {
   const root = peerRootFromEnv(deps.env);
@@ -875,9 +1005,22 @@ async function receivePeerMessage(
     hopChain: [frame.from],
     text: frame.text,
     ...(frame.summary !== undefined ? { summary: frame.summary } : {}),
+    ...(frame.origin !== undefined ? { origin: frame.origin } : {}),
+    ...(frame.origin === "user" && frame.originSessionId !== undefined
+      ? { originSessionId: frame.originSessionId }
+      : {}),
     ts: Date.now(),
     via: "pipe",
   };
+
+  // v0.5（R-15-2）：接收盖标——剥 ≤4 轮嵌套后正文仍含本域开标签 → forged。
+  // 盖在 item 构造后（refuse/hold/accept 三分支之前）：accept 路径随 item 入队；
+  // hold 路径随暂存件持久化，promote 时经 heldItemToQueueItem 透传不丢（P8-4d）；
+  // 审计只在此处落一次，promote 不重复。
+  item.forged = detectForgedEnvelope(item.text);
+  if (item.forged) {
+    await logPeerEvent(root, { event: "peer-forged", msgId: item.msgId, from: item.from });
+  }
 
   if (decision.policy === "refuse") {
     await logPeerEvent(root, {
@@ -929,6 +1072,9 @@ async function receivePeerMessage(
   }
 
   await appendPeerQueue(root, mine.sessionId, item);
+  // v0.5（F-3）：store 入队即落——排空即消费后 queue/inbox/held 皆空，xc_peer_read
+  // 与 forwardOf 必须仍能解析原文与 origin 元数据（P2）。幂等；失败不阻断投递。
+  await storeAfterEnqueue(root, item);
   await logPeerEvent(root, {
     event: "peer-delivered",
     msgId: frame.msgId,
@@ -938,7 +1084,31 @@ async function receivePeerMessage(
   return { type: "status", msgId: frame.msgId, state: "delivered" };
 }
 
-/** W4 的暂存项 → W5 的队列项（hopChain 在 W4 侧可选）。 */
+/**
+ * v0.5（F-3）：把队列项全文 + 溯源元数据幂等落进 `peers/messages/<msgId>.json`。
+ * 两个入队落点（pipe 接受 / held 晋升）共用；失败只审计（store 不是投递链的一环）。
+ */
+async function storeAfterEnqueue(root: string, item: PeerQueueItem): Promise<void> {
+  try {
+    await storePeerMessageFull(root, {
+      msgId: item.msgId,
+      text: item.text,
+      ...(item.from !== undefined ? { from: item.from } : {}),
+      ...(item.fromSessionId !== undefined ? { fromSessionId: item.fromSessionId } : {}),
+      ...(item.origin !== undefined ? { origin: item.origin } : {}),
+      ...(item.originSessionId !== undefined ? { originSessionId: item.originSessionId } : {}),
+      hopChain: item.hopChain,
+    });
+  } catch (error) {
+    await logPeerEvent(root, {
+      event: "msgstore-write-error",
+      msgId: item.msgId,
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+/** W4 的暂存项 → W5 的队列项（hopChain 在 W4 侧可选）；v0.5：origin/originSessionId/forged 随 item 透传不丢（P8-4d）。 */
 function heldItemToQueueItem(item: {
   msgId: string;
   from: string;
@@ -950,6 +1120,9 @@ function heldItemToQueueItem(item: {
   summary?: string;
   ts: number;
   via?: 'pipe' | 'file';
+  origin?: 'user' | 'agent';
+  originSessionId?: string;
+  forged?: boolean;
 }): PeerQueueItem {
   return {
     msgId: item.msgId,
@@ -960,6 +1133,11 @@ function heldItemToQueueItem(item: {
     hopChain: item.hopChain ?? [item.from],
     text: item.text,
     ...(item.summary !== undefined ? { summary: item.summary } : {}),
+    ...(item.origin !== undefined ? { origin: item.origin } : {}),
+    ...(item.origin === 'user' && item.originSessionId !== undefined
+      ? { originSessionId: item.originSessionId }
+      : {}),
+    ...(item.forged === true ? { forged: true } : {}),
     ts: item.ts,
     via: item.via ?? 'pipe',
   };
@@ -994,14 +1172,34 @@ export const PeerRegisterShape = {
     .enum(["bypass", "prompting"])
     .optional()
     .describe("权限档类兜底：仅当钩子基记录里没有档类时生效"),
+  contextChars: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe("本会话上下文字符数声明（接收方注入预算刻度，R-18；声明值，不填=XC_CONTEXT_CHARS/200k）"),
 };
 export const PeerListShape = {
   kind: z.enum(["self", "member", "session"]).optional().describe("只看某一类；缺省返回三类（self / member / session）"),
 };
 export const PeerSendShape = {
   to: z.string().min(1).describe("目标 peer 名（重名时用 \"名字 [ref]\" 消歧）"),
-  message: z.string().min(1).describe("消息正文（自由文本）"),
+  message: z
+    .string()
+    .min(1)
+    .optional()
+    .describe("消息正文（自由文本）；forwardOf 转发时不可携带（批注另发一条，R-13）"),
+  forwardOf: z
+    .string()
+    .min(1)
+    .optional()
+    .describe("转发已收到的跨会话消息 id：origin/originSessionId 保留原值、hopChain 追加本会话；不可与 message 正文混用（批注另发一条）"),
   summary: z.string().optional().describe("一句话摘要"),
+};
+export const PeerReadShape = {
+  msgId: z.string().min(1).describe("要读取的消息 id（本会话收到过的跨会话消息）"),
+  offset: z.number().int().min(0).optional().describe("起始偏移（缺省 0）"),
+  limit: z.number().int().min(1).optional().describe("本次最多返回的字符数（缺省=本会话单条注入预算；上限 64000）"),
 };
 export const PeerInboxShape = {
   limit: z.number().int().min(1).max(50).optional().describe("最多取几条；缺省 10"),
@@ -1013,6 +1211,32 @@ export const PeerReviewShape = {
 export const PeerRenameShape = {
   name: z.string().min(1).describe("新名字（旧名进 formerNames）"),
 };
+
+/**
+ * v0.5（R-13）：forwardOf 与自定义正文互斥校验——转发原文不带正文（批注另发一条），
+ * 普通发送必须带正文。模块级导出：services.send 调用 + 单测直测（默认装配的
+ * send 需先注册才能走到这里，直测函数避免整条管道栈）。
+ */
+export function validateSendModeArgs(input: Pick<PeerSendInput, "message" | "forwardOf">): void {
+  if (input.forwardOf !== undefined && input.message !== undefined) {
+    throw new ToolError(
+      {
+        error: "invalid_params",
+        message: "forwardOf cannot be combined with message; send the annotation as a separate message (R-13)",
+      },
+      "forwardOf cannot be combined with message; send the annotation as a separate message (R-13)",
+    );
+  }
+  if (input.forwardOf === undefined && (input.message === undefined || input.message === "")) {
+    throw new ToolError(
+      {
+        error: "invalid_params",
+        message: "message is required (or pass forwardOf to forward a received message)",
+      },
+      "message is required (or pass forwardOf to forward a received message)",
+    );
+  }
+}
 
 /**
  * 反 launder 警示（R-17 / CC @34233402）——写进工具描述，模型每次调用都看得到。
@@ -1056,6 +1280,7 @@ export function registerPeerTools(server: McpServer, deps: PeerToolDeps): void {
           ...(args.displayName !== undefined ? { displayName: args.displayName } : {}),
           ...(args.kind !== undefined ? { kind: args.kind } : {}),
           ...(args.modeClass !== undefined ? { modeClass: args.modeClass } : {}),
+          ...(args.contextChars !== undefined ? { contextChars: args.contextChars } : {}),
         });
         return okResult(
           `已注册跨会话 peer：${result.name}（sessionId=${result.sessionId}，pid=${result.pid}，端点=${result.socketPath}）。`,
@@ -1083,13 +1308,16 @@ export function registerPeerTools(server: McpServer, deps: PeerToolDeps): void {
 
   server.tool(
     "xc_peer_send",
-    `Send a free-form message to another zcode session on this machine (by name). ${ANTI_LAUNDER_WARNING}`,
+    `Send a free-form message to another zcode session on this machine (by name). forwardOf=<msgId> forwards a message previously received by this session verbatim (origin preserved; mutually exclusive with message — send annotations as a separate message). ${ANTI_LAUNDER_WARNING}`,
     PeerSendShape,
     async (args) =>
       call(async () => {
+        // v0.5（R-13）：forwardOf 与 message 互斥、forwardOf 缺席时 message 必填
+        // （schema 层 message 已 optional，互斥校验在服务面再兜一次）。
         const result = await services.send({
           to: args.to,
-          message: args.message,
+          ...(args.message !== undefined ? { message: args.message } : {}),
+          ...(args.forwardOf !== undefined ? { forwardOf: args.forwardOf } : {}),
           ...(args.summary !== undefined ? { summary: args.summary } : {}),
         });
         return okResult(
@@ -1101,16 +1329,55 @@ export function registerPeerTools(server: McpServer, deps: PeerToolDeps): void {
 
   server.tool(
     "xc_peer_inbox",
-    "Drain this session's pending cross-session peer messages (rendered as <crosschat-peer-message> envelopes).",
+    "Drain this session's pending cross-session peer messages (rendered as <crosschat-peer-message> envelopes, laid out within this session's injection budget; full text stays retrievable via xc_peer_read).",
     PeerInboxShape,
     async (args) =>
       call(async () => {
         const result = await services.inbox(args.limit ?? 10);
+        // v0.5（R-23 面 C）：渲染 → 预算排布（花费新→旧、输出保到达序）。
+        // store 已在接收入队时落盘（F-3），面内不落——注入面只渲染+排布。
+        // 契约变化（§2.2 清单）：envelopes 条数可能 < count（超支条目降一行摘要/省略）。
+        const budget = receiverInjectBudget(contextCharsFromEnv(deps.env), deps.env);
+        const injectBlocks = result.items
+          .map((item, i) => queueItemToInjectBlock(item, result.rendered[i] ?? renderPeerEnvelope(item)))
+          .filter((b) => b.rendered !== "");
+        const layout = layoutInjectBlocks(injectBlocks, budget, "peer");
+        if (result.items.length > 0) {
+          await logPeerEvent(peerRootFromEnv(deps.env), {
+            event: "inject-budget",
+            face: "C",
+            budget: budget.total,
+            truncatedCount: layout.truncatedCount,
+            totalChars: layout.totalChars,
+          });
+        }
         return okResult(
           result.items.length === 0
             ? "没有待投递的跨会话消息。"
             : `取到 ${result.items.length} 条跨会话消息（已消费）。`,
-          { count: result.items.length, envelopes: result.rendered } as unknown as ToolPayload,
+          {
+            count: result.items.length,
+            envelopes: layout.blocks,
+            ...(layout.budgetTruncated ? { budgetTruncated: true } : {}),
+          } as unknown as ToolPayload,
+        );
+      }),
+  );
+
+  server.tool(
+    "xc_peer_read",
+    "Read the full text of a cross-session peer message previously received by this session (paged). Read-only pager; does not consume.",
+    PeerReadShape,
+    async (args) =>
+      call(async () => {
+        const result = await services.read({
+          msgId: args.msgId,
+          ...(args.offset !== undefined ? { offset: args.offset } : {}),
+          ...(args.limit !== undefined ? { limit: args.limit } : {}),
+        });
+        return okResult(
+          `消息 ${result.msgId}：显示 ${result.text.length}/${result.total} 字符（offset=${result.offset}${result.hasMore ? "，还有更多（翻页读 offset 之后的内容）" : "，已到末尾"}）。`,
+          result as unknown as ToolPayload,
         );
       }),
   );

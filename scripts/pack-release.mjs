@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * v0.4 发布打包（DESIGN-V0.4 §3.3）：从 tag 树产出预构建 slim tgz + SHA256。
+ * 发布打包（DESIGN-V0.4 §3.3 首发版，本脚本与版本无关）：从 tag 树产出预构建 slim tgz + SHA256。
  *
- * 用法（仓库根运行）：node scripts/pack-release.mjs v0.4.0 [--keep-stage]
+ * 用法（仓库根运行）：node scripts/pack-release.mjs v<x.y.z> [--keep-stage]
  *
  * 序列（与 recon/02 §2.3 实测序列一致：build 依赖 devDependencies 的 esbuild，
  * 必须完整 ci → build → prune --omit=dev，不能先 ci --omit=dev）：
@@ -29,7 +29,7 @@ const tag = args.find((a) => !a.startsWith("--"));
 const outDir = join(repoRoot, ".scratch-release");
 
 function run(cmd, cmdArgs, opts = {}) {
-  // shell:true 用于解析 Windows 的 npm.cmd；本仓路径不含空格（D:\tools\zcode-crosschat）。
+  // shell:true 用于解析 Windows 的 npm.cmd；本仓路径不含空格（<仓库路径>）。
   const r = spawnSync(cmd, cmdArgs, { stdio: "inherit", shell: process.platform === "win32", ...opts });
   if (r.status !== 0) {
     console.error(`pack-release: 命令失败（exit=${r.status}）: ${cmd} ${cmdArgs.join(" ")}`);

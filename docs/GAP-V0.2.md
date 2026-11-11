@@ -1,7 +1,7 @@
 # GAP-V0.2：zcode-crosschat v0.1.0 与 Claude Code 协作模式差距分析
 
 > 分析人：差距分析员（dynamic workflow 子代理）｜日期：2026-11-09
-> 基准：Claude Code 官方文档本地快照（`D:\tools\deepseek-crosschat\evidence\doc-agent-teams.html` / `doc-cross-session-messaging.html` / `doc-sub-agents.html`，2026-11-08 抓取）+ 能力锚定报告（`reports/02-能力锚定.md`，8 条能力清单）
+> 基准：Claude Code 官方文档本地快照（`<证据仓>\evidence\doc-agent-teams.html` / `doc-cross-session-messaging.html` / `doc-sub-agents.html`，2026-11-08 抓取）+ 能力锚定报告（`reports/02-能力锚定.md`，8 条能力清单）
 > 对照对象：zcode-crosschat v0.1.0（本仓库 README/docs）+ 09 验证报告实测结论 + dsh-agent-teams 0.1.29 源码参考
 > 纪律：每条结论给证据（引用快照原文 / 源码 `路径:行号` / 实测命令与输出）；查证不到的标「未确认」；差距只允许来自实测证明的平台限制，**不得以形态自选/简化为由降低能力范围（换栈不降效）**。
 > 引用说明：CC 文档引用格式 `doc-*.html（提取文本行 N）`——提取文本为本会话由 HTML 快照解析生成（Temp 目录，解析脚本仅提取 script/style 外文本），引文均经 grep 在 HTML 原文复核存在。
@@ -78,7 +78,7 @@
 
 ## 3. 逐项对照：v0.1.0 现状判定
 
-> v0.1.0 证据约定：README = `D:\tools\zcode-crosschat\README.md`；tools.ts = `plugin/src/mcp/tools.ts`；09 = `D:\tools\deepseek-crosschat\reports\09-zcode验证.md`；DESIGN = `docs/DESIGN.md`。判定分三档：**达标 / 部分 / 缺失**。
+> v0.1.0 证据约定：README = `<仓库路径>\README.md`；tools.ts = `plugin/src/mcp/tools.ts`；09 = `<证据仓>\reports\09-zcode验证.md`；DESIGN = `docs/DESIGN.md`。判定分三档：**达标 / 部分 / 缺失**。
 
 ### C1 任务委托派发 —— **部分**
 
@@ -161,7 +161,7 @@
 
 ## 4. dsh-agent-teams 有而 v0.1.0 无的能力（参考补充，逐项源码行号）
 
-> dsh 源码根：`D:\tools\deepseek-crosschat\src\dsh-agent-teams-0.1.29\`。全部为本会话亲读源码确认。
+> dsh 源码根：`<证据仓>\src\dsh-agent-teams-0.1.29\`。全部为本会话亲读源码确认。
 
 | # | 能力 | dsh 证据 | v0.1.0 现状 |
 |---|---|---|---|

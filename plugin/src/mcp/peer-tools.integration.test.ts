@@ -17,7 +17,7 @@ import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { localPidDomain } from "../core/peerdir.js";
+import { localPidDomain, writePeerBaseRecord } from "../core/peerdir.js";
 import { holdPeerMessage } from "../core/peerpolicy.js";
 import { writePeerKeyFile, writePeerRecord } from "../core/peerregistry.js";
 import { stopPeerEndpoint } from "../transport/pipe.js";
@@ -195,6 +195,68 @@ describe("放行 hold 消息后给发方补回执（DESIGN §9.3 / §6.3）", ()
     expect(statusLine).toBeDefined();
     expect(statusLine!.msgId).toBe("m-held-1");
     expect(statusLine!.state).toBe("delivered");
+  });
+});
+
+describe("放行时重新裁决必须带收方档类（v0.5 验收修复 F6：16-v050 验收发现）", () => {
+  it("收方档类已知时，cause=mode-unknown 的暂存件可被 accept 放行", async () => {
+    // 无显式策略层（不设 XC_CROSSCHAT_INBOUND）→ 走自动档：收方档类必须参与裁决。
+    const services = createDefaultPeerServices({
+      ...deps,
+      env: { XC_MESSAGING_DIR: root } as NodeJS.ProcessEnv,
+    });
+    await services.register({ name: "alice", sessionId: "sess-alice" });
+
+    const socketPath = await startFakePeerEndpoint();
+    const otherPid = await startSleeper();
+    await writePeerRecord(root, {
+      pid: otherPid,
+      sessionId: "sess-bob",
+      messagingSocketPath: socketPath,
+      pidDomain: localPidDomain(),
+      peerProtocol: 1,
+      peerFeatures: [],
+      kind: "interactive",
+      name: "bob",
+      formerNames: [],
+      cwd: "D:\\ws-b",
+      startedAt: Date.now(),
+      lastSeen: Date.now(),
+    });
+    await writePeerKeyFile(root, otherPid, socketPath, {
+      peerToken: TOKEN,
+      pidDomain: localPidDomain(),
+    });
+    // 收方基记录（档类 prompting）——缺失即 mode-unknown。
+    await writePeerBaseRecord(root, {
+      sessionId: "sess-alice",
+      cwd: workspace,
+      permissionMode: "prompting",
+      source: "startup",
+      startedAt: Date.now(),
+      lastSeen: Date.now(),
+    });
+    await holdPeerMessage(
+      root,
+      "sess-alice",
+      {
+        msgId: "m-held-f6",
+        from: "bob",
+        fromSessionId: "sess-bob",
+        fromMode: "prompting",
+        hopChain: ["bob"],
+        text: "hello-f6",
+        ts: Date.now(),
+        via: "pipe",
+      },
+      "mode-unknown",
+      { workspace },
+    );
+
+    const result = await services.review({ action: "accept", ids: ["m-held-f6"] });
+    expect(result.affected).toEqual(["m-held-f6"]);
+    // 修复前此处为 still-held（重新裁决缺 recvClass → 恒判 mode-unknown）。
+    expect(result.receipts[0]?.receipt).toBe("delivered");
   });
 });
 

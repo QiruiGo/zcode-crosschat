@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readdirSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readdirSync, existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -295,5 +295,45 @@ describe('session directory hygiene', () => {
   it('leaves only the pid files behind after a write', async () => {
     await writePeerRecord(dir, liveRecord());
     expect(readdirSync(peerSessionsDir(dir)).sort()).toEqual([`${process.pid}.json`]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.5 M4：PeerRecord.contextChars（R-18 声明值；宽容读取——非法值丢字段不拒记录）
+// ---------------------------------------------------------------------------
+
+describe('contextChars (v0.5 R-18)', () => {
+  it('合法正整数：落盘→读回保留（xc_peer_register contextChars 的存储通道）', async () => {
+    await writePeerRecord(dir, liveRecord({ contextChars: 50_000 }));
+    const record = await readPeerRecord(dir, process.pid);
+    expect(record?.contextChars).toBe(50_000);
+  });
+
+  it('不写该字段：旧版本记录照读（回归——absent = env/200k 缺省）', async () => {
+    await writePeerRecord(dir, liveRecord());
+    const raw = JSON.parse(readFileSync(peerRecordFile(dir, process.pid), 'utf8')) as Record<string, unknown>;
+    expect('contextChars' in raw).toBe(false);
+    const record = await readPeerRecord(dir, process.pid);
+    expect(record?.sessionId).toBe('sess_a');
+    expect(record?.contextChars).toBeUndefined();
+  });
+
+  it('touchPeerRecord 的 patch 带上 contextChars 时能合并落盘', async () => {
+    await writePeerRecord(dir, liveRecord());
+    await touchPeerRecord(dir, process.pid, { contextChars: 1_000_000 });
+    const record = await readPeerRecord(dir, process.pid);
+    expect(record?.contextChars).toBe(1_000_000);
+  });
+
+  it('字段非法（字符串/负数/零）→ 字段被丢弃但整条记录可读（宽容读取，不拒文件）', async () => {
+    mkdirSync(peerSessionsDir(dir), { recursive: true });
+    for (const bad of ['"50000"', '-5', '0', '1.5']) {
+      const raw = JSON.stringify({ ...liveRecord(), contextChars: JSON.parse(bad) });
+      writeFileSync(peerRecordFile(dir, process.pid), raw, 'utf8');
+      const record = await readPeerRecord(dir, process.pid);
+      expect(record, `contextChars=${bad} should not reject the record`).not.toBeUndefined();
+      expect(record?.contextChars, `contextChars=${bad} should be dropped`).toBeUndefined();
+      expect(record?.sessionId).toBe('sess_a');
+    }
   });
 });

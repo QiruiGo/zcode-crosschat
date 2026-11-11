@@ -450,7 +450,7 @@ v0.1.0 的成员记录（无 state/identity 字段）经 coerceMember 读入 →
 
 ## 8. 硬验收 5 条：演示怎么演、证据怎么落盘
 
-> 证据根目录：`D:\tools\deepseek-crosschat\evidence\12-v020-acceptance\`（沿用 08/10 编号惯例，12 未被占用）；验证报告：`reports/12-zcode-v0.2验收.md`。每场景先 `runbook.md` 记命令序列再执行；时间戳全部取自落盘文件。
+> 证据根目录：`<证据仓>\evidence\12-v020-acceptance\`（沿用 08/10 编号惯例，12 未被占用）；验证报告：`reports/12-zcode-v0.2验收.md`。每场景先 `runbook.md` 记命令序列再执行；时间戳全部取自落盘文件。
 
 ### 8.1 场景总表
 

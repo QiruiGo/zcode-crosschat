@@ -9,14 +9,14 @@
 
 | 类别 | 材料 | 使用方式 |
 |---|---|---|
-| 平台能力面 | `D:\tools\zcode-crosschat\docs\PLATFORM.md`（本会话全文通读） | 会话机制（§4）、插件能力（§2）、安装（§2.3）、坑位（§4.6）、推荐栈（§5） |
-| dsh 机制 | `D:\tools\deepseek-crosschat\reports\07-机制分析.md`（全文通读）+ 抽查报告 `08-论断抽查.md`（任务材料给出） | 机制对照（§5） |
-| dsh 源码抽查 | `D:\tools\deepseek-crosschat\src\dsh-agent-teams-0.1.29\lib\{state,mailbox,tools}.js` | **本会话亲读**：state.js:1-30（邮箱布局注释）、state.js:114-123（TASK_TRANSITIONS，含 pending→cancelled 边）、state.js:37-56（withTeamLock）、mailbox.js:1-20（isCurrentMail）、mailbox.js:29-40（readCurrentMailboxLocked 的 **onMalformed 容错回调**——JSONL 读侧容忍损坏行的原版依据）、tools.js:2040-2100（send_message 四态/duplicate 判定）、tools.js:2100-2120（**2107-2109 为 halted 检查；sourceFields 快照在 2111-2114**，修订引用漂移） |
-| 08 报告结构复核 | `D:\tools\deepseek-crosschat\reports\08-论断抽查.md` | 本会话 grep 核实：§4 标题=「对 zcode 复刻最重要的 **3-5 条**机制要点」（仅 ①-⑤）；**质量门/工件论断在 §1.10，原子写论断在 §1.8（:113）与 §4-1（:205）**；全篇不存在 keyTakeaway ⑨，也不存在 verifiedClaims 标签（`grep -c verifiedClaims` 实测 **0**——初版两处引用标签均系虚构，R7 已修正） |
-| zcode hook 契约 | `C:\Users\qdqir\.zcode\cli\plugins\cache\zcode-plugins-official\zcode-guide\0.3.0\skills\diagnosing-hooks\SKILL.md`（本会话全文亲读） | 7 事件、matcher、process 型钩子、输出 JSON 严格 schema、`additionalContext` 注入、Stop 可请求继续（≤3 次）、`${CLAUDE_SESSION_ID}` 作为模板变量+环境变量 |
+| 平台能力面 | `<仓库路径>\docs\PLATFORM.md`（本会话全文通读） | 会话机制（§4）、插件能力（§2）、安装（§2.3）、坑位（§4.6）、推荐栈（§5） |
+| dsh 机制 | `<证据仓>\reports\07-机制分析.md`（全文通读）+ 抽查报告 `08-论断抽查.md`（任务材料给出） | 机制对照（§5） |
+| dsh 源码抽查 | `<证据仓>\src\dsh-agent-teams-0.1.29\lib\{state,mailbox,tools}.js` | **本会话亲读**：state.js:1-30（邮箱布局注释）、state.js:114-123（TASK_TRANSITIONS，含 pending→cancelled 边）、state.js:37-56（withTeamLock）、mailbox.js:1-20（isCurrentMail）、mailbox.js:29-40（readCurrentMailboxLocked 的 **onMalformed 容错回调**——JSONL 读侧容忍损坏行的原版依据）、tools.js:2040-2100（send_message 四态/duplicate 判定）、tools.js:2100-2120（**2107-2109 为 halted 检查；sourceFields 快照在 2111-2114**，修订引用漂移） |
+| 08 报告结构复核 | `<证据仓>\reports\08-论断抽查.md` | 本会话 grep 核实：§4 标题=「对 zcode 复刻最重要的 **3-5 条**机制要点」（仅 ①-⑤）；**质量门/工件论断在 §1.10，原子写论断在 §1.8（:113）与 §4-1（:205）**；全篇不存在 keyTakeaway ⑨，也不存在 verifiedClaims 标签（`grep -c verifiedClaims` 实测 **0**——初版两处引用标签均系虚构，R7 已修正） |
+| zcode hook 契约 | `<用户主目录>\.zcode\cli\plugins\cache\zcode-plugins-official\zcode-guide\0.3.0\skills\diagnosing-hooks\SKILL.md`（本会话全文亲读） | 7 事件、matcher、process 型钩子、输出 JSON 严格 schema、`additionalContext` 注入、Stop 可请求继续（≤3 次）、`${CLAUDE_SESSION_ID}` 作为模板变量+环境变量 |
 | 官方插件实例（本会话亲读） | documents/0.2.1、zcode-site/0.4.2、android-emulator/0.1.0、node-repl-host/0.7.0、browser-use/0.5.1、plugin-creator/0.1.1 的 manifest/SKILL/命令文件 | manifest 字段、commands frontmatter、userConfig+`${user_config.*}` 注入、`${CLAUDE_PLUGIN_ROOT}` 用法、工程化形态 |
-| 本会话亲跑命令 | ① `which node` → `C:\Program Files\nodejs\node`，`node --version` → **v24.22.1**；② `ls /e/ZCode/ZCode.exe /e/ZCode/resources/glm/zcode.cjs` → 均存在；③ `npm view @modelcontextprotocol/sdk version` → **1.32.2**；④ `zcode plugins --help` → 子命令 `list|install|uninstall|enable|disable|update|validate|marketplace` 实测存在（0.17.1）；⑤ `plugins install --help` / `plugins marketplace --help` → **未给出子命令专属参数**（打印的是通用 help），CLI 安装语法列为验证点 V4 | 见 §6.2、§9 |
-| 选型与复核 | `D:\tools\deepseek-crosschat\reports\03-候选与选型.md`（全文通读，含修订记录第 3 版第 5 条 / §6.6 独立性解读差异） | §3 形态选择 |
+| 本会话亲跑命令 | ① `which node` → `C:\Program Files\nodejs\node`，`node --version` → **v24.22.1**；② `ls <安装目录>/ZCode.exe <安装目录>/resources/<variant>/zcode.cjs` → 均存在；③ `npm view @modelcontextprotocol/sdk version` → **1.32.2**；④ `zcode plugins --help` → 子命令 `list|install|uninstall|enable|disable|update|validate|marketplace` 实测存在（0.17.1）；⑤ `plugins install --help` / `plugins marketplace --help` → **未给出子命令专属参数**（打印的是通用 help），CLI 安装语法列为验证点 V4 | 见 §6.2、§9 |
+| 选型与复核 | `<证据仓>\reports\03-候选与选型.md`（全文通读，含修订记录第 3 版第 5 条 / §6.6 独立性解读差异） | §3 形态选择 |
 
 ---
 
@@ -51,7 +51,7 @@ zcode 插件是「声明式资源包」，**没有**「注册全局工具到主�
 ### 1.2 目录结构（仓库 ↔ 插件 ↔ 开发市场三层）
 
 ```
-D:\tools\zcode-crosschat\            # 仓根 = 开发市场根（UI 添加市场时粘贴此目录）
+<仓库路径>\            # 仓根 = 开发市场根（UI 添加市场时粘贴此目录）
 ├── marketplace.json                 # 市场清单（§8.2-B 全文，实现员原样落盘）
 ├── plugin\                          # 插件根（市场条目 source: "./plugin"）
 │   ├── .zcode-plugin\plugin.json    # 插件清单（§8.2-A 全文）
@@ -317,9 +317,9 @@ dsh send_message 的四态（tools.js:2054 output schema，本会话亲读）→
 
 ### 4.1 一次性安装
 
-1. 构建：`cd D:\tools\zcode-crosschat\plugin && npm install && npm run build`（dist/ 生成）。
-2. 校验：`zcode plugins validate "D:\tools\zcode-crosschat\plugin"` → 期望 `Plugin manifest is valid`（该命令 0.17.1 实测存在，本会话亲跑 `plugins --help` 确认子命令）。
-3. 安装（UI，plugin-creator SKILL.md §4-5 权威流程，本会话亲读）：桌面 **插件市场 → 添加 → 添加插件市场 → 粘贴 `D:\tools\zcode-crosschat` → 个人 → 安装 zcode-crosschat → 启用**。CLI `plugins install` 语法未文档化（本会话亲跑 `--help` 无子命令专属参数），列为 V4，装通则可替代 UI。
+1. 构建：`cd <仓库路径>\plugin && npm install && npm run build`（dist/ 生成）。
+2. 校验：`zcode plugins validate "<仓库路径>\plugin"` → 期望 `Plugin manifest is valid`（该命令 0.17.1 实测存在，本会话亲跑 `plugins --help` 确认子命令）。
+3. 安装（UI，plugin-creator SKILL.md §4-5 权威流程，本会话亲读）：桌面 **插件市场 → 添加 → 添加插件市场 → 粘贴 `<仓库路径>` → 个人 → 安装 zcode-crosschat → 启用**。CLI `plugins install` 语法未文档化（本会话亲跑 `--help` 无子命令专属参数），列为 V4，装通则可替代 UI。
 4. 更新：改源码 → 递增 manifest version → 市场源刷新 → 插件详情「更新」（PLATFORM.md §2.3-6）。
 
 ### 4.2 日常操作
@@ -413,7 +413,7 @@ Phase 1 与 Phase 2 各完整跑一遍闭环（互为备份：Phase 1 是 pull-o
 ```bash
 cd /d/tools/zcode-crosschat/plugin
 npm install && npm run build && npm run test        # dist/mcp/server.mjs + dist/hooks/*.mjs + 单测全绿
-ELECTRON_RUN_AS_NODE=1 /e/ZCode/ZCode.exe /e/ZCode/resources/glm/zcode.cjs \
+ELECTRON_RUN_AS_NODE=1 <安装目录>/ZCode.exe <安装目录>/resources/<variant>/zcode.cjs \
   plugins validate "D:\\tools\\zcode-crosschat\\plugin"   # 期望: Plugin manifest is valid
 ```
 然后 UI 安装（§4.1 步骤 3）。**装通判据**：`zcode plugins list` 输出含 zcode-crosschat 且 skills/commands/hooks/mcp 计数非零（命令本会话亲测存在）。并在插件设置里确认 wake_enabled 开关位置（Phase 1 保持默认 false 不动；Phase 2 开跑前开启为 true）。证据存 `evidence/phase0/`。
@@ -424,7 +424,7 @@ ELECTRON_RUN_AS_NODE=1 /e/ZCode/ZCode.exe /e/ZCode/resources/glm/zcode.cjs \
 
 | 步 | 操作 | 即时证据 |
 |---|---|---|
-| 1 | 桌面开**会话 A**（workspace=`D:\tools\zcode-crosschat\.scratch`），输入 `/xc-work a` | `registry/sessions/<A_sid>.json`（SessionStart hook 写入）+ `teams/default/team.json` members+a + A 回复花名册 |
+| 1 | 桌面开**会话 A**（workspace=`<仓库路径>\.scratch`），输入 `/xc-work a` | `registry/sessions/<A_sid>.json`（SessionStart hook 写入）+ `teams/default/team.json` members+a + A 回复花名册 |
 | 2 | 桌面开**会话 B**（同 workspace），输入 `/xc-work b` | 同上 +b |
 | 3 | A 输入 `/xc-dispatch b 计算 17*23，把结果只写数字到 result-a2b.txt` | team.json t1=pending；`inbox/b.jsonl` 1 条；engine.jsonl dispatch 行且 **delivered=mailbox**（wake 关闭的预期值）；A 回复 taskId |
 | 4 | 切到 B 输入「继续」 | UserPromptSubmit hook 注入未读提示 + lastSeen 刷新（hook 执行记录在 zcode 日志可查）；B：xc_check_inbox→xc_claim（t1=claimed+attemptId）→写文件→xc_report（t1=completed+evidence）；`inbox/a.jsonl` 回执；`result-a2b.txt` 内容=391 |
@@ -436,7 +436,7 @@ ELECTRON_RUN_AS_NODE=1 /e/ZCode/ZCode.exe /e/ZCode/resources/glm/zcode.cjs \
 
 **主路径构造性规避 V5**：全程没有进程「常驻持有」目标会话——每个属主都是即起即退的 CLI 单发进程，引擎的 `--resume` 打到的永远是属主缺席的会话（与 PLATFORM.md §4.4 实测形态同构：属主退出后续聊、记忆连续）。
 
-`node demo/bootstrap-and-run.mjs --workspace "D:\tools\zcode-crosschat\.scratch" --evidence "D:\tools\zcode-crosschat\evidence\phase2"`：
+`node demo/bootstrap-and-run.mjs --workspace "<仓库路径>\.scratch" --evidence "<仓库路径>\evidence\phase2"`：
 
 1. **bootstrap（模型选择）**：脚本起 app-server → `session/create` A，参数**显式带 `mode:"yolo"`**（防无头回合撞权限请求卡死；PLATFORM.md §4.3-1 示例同款；workspace 两字段必填）→ 应答 `session/requestRuntimePreferences` 回调 `{"nativeSearchEnhancementsEnabled":false}`（15s 超时坑）→ `session/setModel`（必须带 `options.reasoningLevel`；providerId 以运行时 `state.updated` 的 `model.available[]` 枚举为准，V6）→ 同法建 B → **关闭 app-server 退出**（会话已持久化）。两 sid 落 `evidence/phase2/sessions.json`。注：**V1 有两个子情形**——①app-server 会话内插件 MCP 可用（bootstrap 阶段，主路径不依赖，此时 app-server 已退出）；②**CLI `--resume` 无头回合内插件 MCP 可用（第 2-5 步全部依赖，主路径硬前置）**；②失败 → 半自动回退形态。V2 由 wakeToken 兜底，不构成前置。
 2. **注册（顺带验证 wakeToken 路径）**：脚本为 A/B 各写一个 wake nonce → CLI 单发 `--resume A_sid --output-format json`，prompt 为自包含自然语言指令："你是 zcode 会话 a，sessionId=<A_sid>。本连接是新的，请先调用 xc_register 工具绑定身份：name 填 'a'，sessionId 填 '<A_sid>'，wakeToken 填 '<nA>'；注册成功后复述返回的花名册。"（进程自然退出，属主即逝）→ 同法 B。判据：team.json members 含 a、b；`registry/names.json` 绑定正确。
@@ -455,7 +455,7 @@ ELECTRON_RUN_AS_NODE=1 /e/ZCode/ZCode.exe /e/ZCode/resources/glm/zcode.cjs \
 ### 6.6 证据落盘位置
 
 ```
-D:\tools\zcode-crosschat\evidence\
+<仓库路径>\evidence\
 ├── phase0\build.log / validate.log / plugins-list.log
 ├── phase1\snapshots\step-<n>\…（.crosschat 全量拷贝）+ transcripts\（两会话关键回复文本）
 ├── phase2\sessions.json / wake-b-*.json / wake-a-*.json / a-final.json / checklist.md / snapshots\…

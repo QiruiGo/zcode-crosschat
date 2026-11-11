@@ -122,7 +122,15 @@ export function withGuards(core: ToolCore, deps: ToolDeps): ToolCore {
       if (policy.mode === "accept") return core.xc_message(a, ck);
 
       if (policy.mode === "hold") {
-        const msg = createMessage(me.agentKey, toKey, a.content, chatExtrasOf(a));
+        // v0.5（M6 forwardOf 波及的最小适配）：MessageShape.content 改为可选（forwardOf
+        // 转发不携带正文，R-13），hold 隔离副本对转发消息落 forwardOf 指针占位——原文
+        // 不在隔离副本中（core 侧才解析 forwardOf），accept 后收件人可见转发引用。
+        const msg = createMessage(
+          me.agentKey,
+          toKey,
+          a.content ?? (a.forwardOf !== undefined ? `[forwardOf:${a.forwardOf}]` : ""),
+          chatExtrasOf(a),
+        );
         await appendHeld(stateRoot, me.teamId, toKey, msg);
         return okResult(
           `Message held by inbound policy (mode=hold, source=${policy.source}): quarantined in ` +

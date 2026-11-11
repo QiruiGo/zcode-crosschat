@@ -78,6 +78,12 @@ export interface PeerQueueItem {
   ts: number;
   /** How the message arrived. */
   via: 'pipe' | 'file';
+  /** v0.5（R-11）：作者身份标记（wire 帧 origin；absent = agent）。 */
+  origin?: 'user' | 'agent';
+  /** v0.5（R-11）：最初作者会话。 */
+  originSessionId?: string;
+  /** v0.5（R-15-2）：接收路径盖的可疑信封标记。 */
+  forged?: boolean;
 }
 
 // ---------------------------------------------------------------------------

@@ -114,10 +114,10 @@ npm ci（完整依赖）→ npm run build（产出 dist 5 产物）→ npm prune
 | 步 | 手段 | 实测依据（RELEASE-RECON §3.1 / recon/03） |
 |---|---|---|
 | ① | env `XC_ZCODE_EXE`/`XC_ZCODE_CJS` 非空且文件存在 → 直接用 | 用户显式配置最优先（现行为不变） |
-| ② | `process.execPath` basename==ZCode.exe → 候选 | exe+cjs 运行形态下 execPath 即主程序（zcode doctor 实测 `process: E:\ZCode\ZCode.exe`）；本插件 manifest 为 command:"node"，此步通常不命中，但对齐宿主形态变化零成本 |
+| ② | `process.execPath` basename==ZCode.exe → 候选 | exe+cjs 运行形态下 execPath 即主程序（zcode doctor 实测 `process: <安装目录>\ZCode.exe`）；本插件 manifest 为 command:"node"，此步通常不命中，但对齐宿主形态变化零成本 |
 | ③ | 进程表枚举 `ZCode.exe` 的 ExecutablePath（PowerShell `Get-CimInstance Win32_Process`） | 活进程=必装，覆盖任意盘符；MCP 进程跑在系统 node 下但宿主 ZCode.exe 必在场 |
 | ④ | 父链 1 跳：`process.ppid` → WMI 查 ExecutablePath | MCP/hook 进程 parent=ZCode.exe **恰好 1 跳**（Win32_Process 实拍） |
-| ⑤ | 注册表 HKCU + HKLM + HKLM\WOW6432Node `...\Uninstall\*`，DisplayName~ZCode → UninstallString 反推安装根 | InstallLocation 为空，只能反推（实测 `UninstallString="E:\ZCode\Uninstall ZCode.exe" /currentuser`） |
+| ⑤ | 注册表 HKCU + HKLM + HKLM\WOW6432Node `...\Uninstall\*`，DisplayName~ZCode → UninstallString 反推安装根 | InstallLocation 为空，只能反推（实测 `UninstallString="<安装目录>\Uninstall ZCode.exe" /currentuser`） |
 | ⑥ | 常见路径兜底：`%LOCALAPPDATA%\Programs\ZCode\ZCode.exe`、`%ProgramFiles%\ZCode\ZCode.exe`、`%ProgramFiles(x86)%\ZCode\ZCode.exe` | 样本机装自定义盘证明默认路径不可靠，但标准安装形态仍值得兜底 |
 | ⑦ | cjs 推导（对 ②-⑥ 每个 exe 候选执行）：`<exe_dir>\resources\glm\zcode.cjs` 优先 → glob `<exe_dir>\resources\*\zcode.cjs` | cjs 与 exe 同根推导成立（单机样本）；`glm` 段稳定性未确认 → glob 兜底 |
 | ⑧ | 全败 → 空配置 + 明确指引（错误文案/`xc_doctor`/README），维持手填 | 硬标准 2「探测失败时给出明确指引」 |
@@ -225,7 +225,7 @@ export function pairFromExe(exe: string): ZcodePair | null {
   return cjs ? { exe, cjs } : null;
 }
 
-/** F4：UninstallString（如 `"E:\ZCode\Uninstall ZCode.exe" /currentuser`）→ 安装根。 */
+/** F4：UninstallString（如 `"<安装目录>\Uninstall ZCode.exe" /currentuser`）→ 安装根。 */
 function installRootFromUninstallString(uninstallString: string): string {
   const m = /^\s*"([^"]+)"/.exec(uninstallString) ?? /^\s*(\S+)/.exec(uninstallString);
   return m ? dirname(m[1]!) : "";
@@ -615,7 +615,7 @@ const tag = args.find((a) => !a.startsWith("--"));
 const outDir = join(repoRoot, ".scratch-release");
 
 function run(cmd, cmdArgs, opts = {}) {
-  // shell:true 用于解析 Windows 的 npm.cmd；本仓路径不含空格（D:\tools\zcode-crosschat）。
+  // shell:true 用于解析 Windows 的 npm.cmd；本仓路径不含空格（<仓库路径>）。
   const r = spawnSync(cmd, cmdArgs, { stdio: "inherit", shell: process.platform === "win32", ...opts });
   if (r.status !== 0) {
     console.error(`pack-release: 命令失败（exit=${r.status}）: ${cmd} ${cmdArgs.join(" ")}`);
@@ -819,7 +819,7 @@ console.log("  后续步骤见 docs/RELEASING.md §5-§6");
 
 ### 4.4 docs/ 内部记录处置决策
 
-pain-audit 实测 docs/ 8 文件 49 处本机信息命中（pain-audit.md:180）。决策：**保留原文不清洗**——docs/ 是平台事实基线与设计记录（如 PLATFORM.md:7 的 `~` 定义、实测安装路径），属工程档案性质；README 与 Release notes 不引用其中的本机信息；`docs/RELEASE-RECON.md`（含 E:\ZCode 等环境描述）随本版提交入库，同样按工程档案对待。此决策记录于本节，验收 S5 只对 README/demo 断言零泄漏。
+pain-audit 实测 docs/ 8 文件 49 处本机信息命中（pain-audit.md:180）。决策：**保留原文不清洗**——docs/ 是平台事实基线与设计记录（如 PLATFORM.md:7 的 `~` 定义、实测安装路径），属工程档案性质；README 与 Release notes 不引用其中的本机信息；`docs/RELEASE-RECON.md`（含 <安装目录> 等环境描述）随本版提交入库，同样按工程档案对待。此决策记录于本节，验收 S5 只对 README/demo 断言零泄漏。
 
 ### 4.5 README 走查检查单（R4 自检 + S5 验收共用）
 
@@ -873,7 +873,7 @@ pain-audit 实测 docs/ 8 文件 49 处本机信息命中（pain-audit.md:180）
 ### S4 全新环境全链路（硬标准 4）
 
 - **形态**：单脚本 `evidence/15-v040/s4/run.sh`，一条命令序列从头走到尾：`mkdir 全新目录` → `curl -LO` 下载 Release 资产（保留原名，同 S1/F1）→ `sha256sum -c` → 解包 → 隔离 `ZCODE_STORAGE_DIR` → `marketplace add` → `install` → `plugins list` 断言 enabled → 两会话 pull 冒烟（S2a 同款驱动器）→ 回执 sha256 MATCH → `exit 0`。
-- **断言**：脚本 exit 0；全程日志 tee 落盘；脚本与日志中**不出现**本地仓库路径 `D:\tools\zcode-crosschat`（模拟陌生用户：一切来源于远程下载物）。
+- **断言**：脚本 exit 0；全程日志 tee 落盘；脚本与日志中**不出现**本地仓库路径 `<仓库路径>`（模拟陌生用户：一切来源于远程下载物）。
 
 ### S5 新用户文档（硬标准 5）
 

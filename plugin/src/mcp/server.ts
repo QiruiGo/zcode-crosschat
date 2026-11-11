@@ -34,7 +34,7 @@ import { registerDoctorTool } from "./doctor-tool.js";
 import { stopPeerEndpoint } from "../transport/pipe.js";
 
 const SERVER_NAME = "zcode-crosschat";
-const SERVER_VERSION = "0.4.0";
+const SERVER_VERSION = "0.5.0";
 
 /** v0.3 工具核心组装链：包装顺序固定——先边沿后守卫，守卫（安全）最贴近工具入口，
  *  peer 投递排空最外层（tool-round 间隙把信封**追加为末尾 text 块 content[2]**，

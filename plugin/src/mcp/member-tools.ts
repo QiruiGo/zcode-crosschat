@@ -69,6 +69,7 @@ export const MemberAddShape = {
   model: z.string().optional().describe("成员模型 id；缺省用 member_model 配置，再缺省用枚举首个"),
   reasoningLevel: z.string().optional().describe("成员推理档位；缺省用 member_reasoning 配置（默认 max）"),
   note: z.string().optional().describe("备注（仅入审计日志，不参与逻辑）"),
+  context: z.number().int().positive().optional().describe("该成员的上下文字符数声明（接收方注入预算刻度，R-18；不填=XC_CONTEXT_CHARS/200k）"),
 };
 export const MemberStopShape = {
   name: z.string().min(1).describe("要停止的成员名"),
@@ -223,6 +224,8 @@ async function memberAdd(deps: ToolDeps, args: MemberAddArgs, me: BoundIdentity)
           lastSeen: now,
           error: undefined,
           stopReason: undefined,
+          // v0.5（R-18）：重供给时更新声明；本次未传则保留 existing 的旧声明（...existing 已携带）。
+          ...(args.context !== undefined ? { contextChars: args.context } : {}),
         }
       : {
           key,
@@ -233,6 +236,8 @@ async function memberAdd(deps: ToolDeps, args: MemberAddArgs, me: BoundIdentity)
           provisionedAt: now,
           joinedAt: now,
           lastSeen: now,
+          // v0.5（R-18）：上下文字符数声明（接收方注入预算刻度；absent = env/200k 缺省）。
+          ...(args.context === undefined ? {} : { contextChars: args.context }),
         };
     if (existing === undefined) team.members.push(record);
     else team.members[team.members.indexOf(existing)] = record;

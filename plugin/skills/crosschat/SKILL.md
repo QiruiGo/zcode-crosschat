@@ -11,7 +11,7 @@ description: 跨独立 zcode 会话的团队协作协议：队长（lead）拆�
 
 | 身份 | 来源 | 能做什么 |
 |---|---|---|
-| **lead（队长）** | 调用 `xc_team_init`（或首个建员动作）成为 `team.leadKey`，一个队只有一个 | 拆解目标建任务、`xc_member_add`/`xc_member_stop` 建员停员、派发、核收回执、汇总上报、`xc_cancel` |
+| **lead（队长）** | 调用 `xc_team_init`（或首个建员动作）成为 `team.leadKey`，一个队只有一个；元数据角色，可 `xc_lead_transfer` 移交、`xc_lead_release` 释放 | 拆解目标建任务、`xc_member_add`/`xc_member_stop` 建员停员、派发、核收回执、汇总上报、`xc_cancel` |
 | **engine 成员** | lead 调 `xc_member_add` 由引擎程序化创建的会话 | 收派发→自驱工作→回报；**不可建员** |
 | **peer / 自注册会话** | 用户手动开会话 `/xc-work` → `xc_register` | 可被派发、可自领取、可互发消息；**不可建员** |
 
@@ -28,7 +28,7 @@ description: 跨独立 zcode 会话的团队协作协议：队长（lead）拆�
 | 工具 | 关键参数 | 说明 |
 |---|---|---|
 | `xc_register` | `name*`, `sessionId*`, `role?`(peer/worker), `wakeToken?` | 把当前连接绑定为一个协作身份并加入 default 队 |
-| `xc_team_init` | — | 使本会话成为队长（写 `team.leadKey`）；已有其他队长时返回 `lead_exists`，不得抢位 |
+| `xc_team_init` | `takeover?` | 使本会话成为队长（写 `team.leadKey`）；已有其他队长时返回 `lead_exists`，不得抢位；`{takeover:true}` 仅在用户明确指令时接管现任队长（旧队长被通知、全程审计） |
 | `xc_member_add` | `name*`, `model?`, `reasoningLevel?`, `note?` | （仅队长）由引擎程序化创建一个新成员会话并自动投产；受成员上限约束 |
 | `xc_member_stop` | `name*`, `reason?` | （仅队长）停止成员：不再被唤醒、开放任务收回待重派、花名保留可查 |
 | `xc_dispatch` | `to*`, `title*`, `prompt*`, `acceptance?`, `dependsOn?` | 派发新任务给目标成员（可带依赖） |
@@ -55,7 +55,7 @@ description: 跨独立 zcode 会话的团队协作协议：队长（lead）拆�
 
 ## 3. lead 协议（你是队长）
 
-1. **L1 成为队长**：`/xc-team`（= `xc_team_init`）。已存在其他 lead 时返回 `lead_exists`，不得抢位。
+1. **L1 成为队长**：`/xc-team`（= `xc_team_init`）。已存在其他 lead 时返回 `lead_exists`，不得抢位——如实告知用户现任队长，并按用户意愿：让现任执行 `/xc-team transfer <你>` 移交（`xc_lead_transfer`）、等其 `/xc-team release` 释放（`xc_lead_release`），或**仅用户明确指令**时 `/xc-team takeover`（`xc_team_init({takeover:true})`）接管失效/失联/拒绝配合的现任 lead。lead 是元数据角色：移交/释放/接管不搬任务、邮箱与注册，派发/认领/消息不受影响；无 lead 时 founder 兜底，对等协作照常。
 2. **L2 先盘点**：接到目标后先 `xc_status` 看现有成员/任务，能续用就不新建——不重复别人已在做的花名与工作。
 3. **L3 拆解**：把目标拆成最小可用任务 DAG——每任务 `title` 一句话、`prompt` 写清做什么/写到哪/以什么形式、`acceptance` 必须可检验（如「`result-m1.txt` 存在且内容为 `391`」，没有验收标准不许派发）；有先后关系写 `dependsOn`；可并行的任务不制造假依赖。
 4. **L4 建员**：缺哪个角色补哪个（`xc_member_add`），受成员上限；不加人也能干的就派给现有成员。

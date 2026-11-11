@@ -66,6 +66,7 @@ import {
 import {
   acknowledgeMailbox,
   appendMailbox,
+  classifyFrame,
   createMessage,
   isCurrentMail,
   readCurrentMailboxLocked,
@@ -74,6 +75,13 @@ import {
 } from "../core/mailbox.js";
 import { logEngineEvent } from "../core/log.js";
 import { attemptWake, findDuplicateMail } from "../engine/wake.js";
+// v0.5（M6 轴②③接线）：预算/分页（M1）、队内信封（M3）、盖章链（M4）、全文 sha256（M4）。
+import { contextCharsFromEnv, paginateText, receiverInjectBudget, truncateField, truncateNote } from "../core/budget.js";
+import { isTeamEnvelopeRendered, renderTeamEnvelope } from "../core/peerenvelope.js";
+import { uservoiceMatchAndConsume } from "../core/uservoice.js";
+import { sha256Of } from "../core/msgstore.js";
+import { peerRootFromEnv } from "../core/peerdir.js";
+import { leadKeyOf } from "./member-tools.js";
 
 /** v1 单队固定 default（DESIGN §2.2）。 */
 const TEAM_ID = DEFAULT_TEAM_ID;
@@ -129,11 +137,28 @@ export const ReportShape = {
 };
 export const MessageShape = {
   to: z.string().min(1),
-  content: z.string().min(1),
+  content: z.string().min(1).optional().describe("消息正文；forwardOf 转发时不可携带（批注另发一条，R-13）"),
   sourceTaskId: z.string().optional().describe("与 sourceAttemptId 必须成对出现"),
   sourceAttemptId: z.string().optional(),
+  forwardOf: z.string().min(1).optional().describe("转发已收到的队内消息 id：from=转发者、origin/originSessionId 保留原值；不可与 content 混用（批注另发一条）"),
 };
-export const StatusShape = { teamId: z.string().optional() };
+export const StatusShape = {
+  teamId: z.string().optional(),
+  history: z.boolean().optional().describe("附 lead 角色变更史（leadKey/leadSince/leadHistory，R-7；锁外只读 team.json）"),
+};
+/** v0.5（R-22）：xc_mail_read 入参——读本人邮箱历史件（含已消费），只读不消费。 */
+export const MailReadShape = {
+  messageId: z.string().min(1).describe("要读取的邮箱消息 id（xc_check_inbox payload 的 message.id；含已消费行）"),
+  offset: z.number().int().min(0).optional().describe("起始字符偏移；缺省 0"),
+  limit: z.number().int().min(1).optional().describe("本次返回字符数上限；缺省=本会话 item 预算，硬上限 64000"),
+};
+/** v0.5（R-22）：xc_task_read 入参——分页读 team.json 任务字段（锁外只读）。 */
+export const TaskReadShape = {
+  taskId: z.string().min(1).describe("要读取的任务 id"),
+  field: z.enum(["result", "error", "prompt"]).describe("要分页读取的字段"),
+  offset: z.number().int().min(0).optional().describe("起始字符偏移；缺省 0"),
+  limit: z.number().int().min(1).optional().describe("本次返回字符数上限；缺省=本会话 item 预算，硬上限 64000"),
+};
 
 type RegisterArgs = z.infer<z.ZodObject<typeof RegisterShape>>;
 type DispatchArgs = z.infer<z.ZodObject<typeof DispatchShape>>;
@@ -141,6 +166,8 @@ type ClaimArgs = z.infer<z.ZodObject<typeof ClaimShape>>;
 type ReportArgs = z.infer<z.ZodObject<typeof ReportShape>>;
 type MessageArgs = z.infer<z.ZodObject<typeof MessageShape>>;
 type StatusArgs = z.infer<z.ZodObject<typeof StatusShape>>;
+type MailReadArgs = z.infer<z.ZodObject<typeof MailReadShape>>;
+type TaskReadArgs = z.infer<z.ZodObject<typeof TaskReadShape>>;
 
 // ---------------------------------------------------------------------------
 // 工具核心公共件
@@ -218,6 +245,10 @@ export interface ToolCore {
   xc_report(args: ReportArgs, connectionKey: string): Promise<ToolResult>;
   xc_message(args: MessageArgs, connectionKey: string): Promise<ToolResult>;
   xc_status(args: StatusArgs, connectionKey: string): Promise<ToolResult>;
+  /** v0.5（R-22）：邮箱历史全文分页（只读不消费，含已消费行）。 */
+  xc_mail_read(args: MailReadArgs, connectionKey: string): Promise<ToolResult>;
+  /** v0.5（R-22）：team.json 任务字段全文分页（锁外只读）。 */
+  xc_task_read(args: TaskReadArgs, connectionKey: string): Promise<ToolResult>;
 }
 
 export function createToolCore(deps: ToolDeps): ToolCore {
@@ -404,10 +435,58 @@ export function createToolCore(deps: ToolDeps): ToolCore {
           consumed: consumed.length,
           unreadLeft: unreadCount,
         });
-        return okResult(renderInbox(consumed.length, 0, unreadCount), {
-          messages: consumed,
+
+        // v0.5（R-23 face inbox / R-16 队内信封）：磁盘 JSONL 行全文不动（acknowledgeMailbox
+        // 只置 readAt），截断只发生在返回 payload；content[2] 追加逐条信封块（content[0]
+        // renderInbox 摘要与 content[1] JSON payload 契约不变）。
+        const budget = receiverInjectBudget(contextCharsFromEnv(deps.env), deps.env);
+        let truncatedCount = 0;
+        const messages = consumed.map((m) => {
+          const cut = truncateField(m.content, budget.item, sha256Of);
+          if (cut.truncated !== undefined) truncatedCount += 1;
+          return {
+            ...m,
+            content: cut.text,
+            ...(cut.truncated
+              ? {
+                  contentTruncated: { shown: cut.truncated.shown, total: cut.truncated.total },
+                  contentPointer: "xc_mail_read",
+                }
+              : {}),
+          };
+        });
+        // content[2]：按原文分类帧型；截断文本尾部拼 xc_mail_read 指针后再渲染（P10：
+        // renderTeamEnvelope 保持不感知预算）；队内全文已在邮箱 JSONL，不落 store（F-3 语义）。
+        const envelopeBlocks = consumed.map((m) => {
+          if (isTeamEnvelopeRendered(m.content)) return m.content; // 幂等守卫：已包裹原样返回
+          const cut = truncateField(m.content, budget.item, sha256Of);
+          const body = cut.text + (cut.truncated ? `\n${truncateNote("mail", m.id, cut.truncated.shown, cut.truncated.total)}` : "");
+          const cls = classifyFrame(m.content);
+          return renderTeamEnvelope({
+            frameType: cls.kind === "frame" ? cls.frameType : "chat",
+            from: m.from,
+            content: body,
+            ...(m.origin !== undefined ? { origin: m.origin } : {}),
+          });
+        });
+        const envelopeText = envelopeBlocks.join("\n\n");
+        if (consumed.length > 0) {
+          await logEngineEvent(stateRoot, {
+            event: "inject-budget",
+            face: "inbox",
+            budget: budget.total,
+            truncatedCount,
+            totalChars: envelopeText.length,
+          });
+        }
+        const result = okResult(renderInbox(consumed.length, 0, unreadCount), {
+          messages,
           unreadCount,
         });
+        if (envelopeText !== "") {
+          result.content.push({ type: "text", text: envelopeText });
+        }
+        return result;
       });
     },
 
@@ -609,7 +688,25 @@ export function createToolCore(deps: ToolDeps): ToolCore {
           // dsh 同款：source 两字段必须成对。
           throw invalidParamsError("sourceTaskId and sourceAttemptId must be provided together");
         }
+        // v0.5（R-13）：forwardOf 与自定义正文互斥——批注/原文分两条。
+        if (args.forwardOf !== undefined && args.content !== undefined) {
+          throw invalidParamsError("forwardOf cannot be combined with content; send the annotation as a separate message (R-13)");
+        }
+        // v0.5（R-13 语义分界）：转发不携带任务溯源（source* 不继承）；任务关联的批注另发一条。
+        if (args.forwardOf !== undefined && (args.sourceTaskId !== undefined || args.sourceAttemptId !== undefined)) {
+          throw invalidParamsError("forwardOf carries no task attribution; send the task-related annotation as a separate message (R-13)");
+        }
+        if (args.forwardOf === undefined && args.content === undefined) {
+          throw invalidParamsError("content is required (or pass forwardOf to forward a received message)");
+        }
         const now = Date.now();
+
+        // v0.5（R-12 盖章链）：落盘前把待发正文与本会话用户原话环形记录逐字节匹配——
+        // 命中 → 消息带 origin:"user" + originSessionId（唯一 origin=user 产生路径；
+        // 工具 schema 无 origin 参数，正文自称无效）。转发分支跳过（origin 来自被转消息）。
+        const stamp = args.forwardOf === undefined && args.content !== undefined
+          ? await uservoiceMatchAndConsume(peerRootFromEnv(deps.env), me.sessionId, args.content, now, deps.env)
+          : { hit: false as const, reason: "no-match" as const };
 
         const out = await withTeamLock(stateRoot, me.teamId, async () => {
           const team = await readTeam(stateRoot, me.teamId);
@@ -623,27 +720,45 @@ export function createToolCore(deps: ToolDeps): ToolCore {
             });
           }
 
-          // source 解析（移植 dsh send_message：显式成对字段，否则取发送者开放 attempt）。
+          // v0.5（R-13 转发保真，队内版）：在本人邮箱 JSONL（含已读行）按 id 查找被转消息——
+          // 新 TeamMessage：from=转发者（如实署名）、origin/originSessionId 保留原值、
+          // content=原 content；source* 任务字段不继承（那是任务溯源，不是说话人溯源）。
+          let content: string;
+          let forwardedOrigin: { origin?: "user" | "agent"; originSessionId?: string } = {};
           const src: MessageExtras = {};
-          if (args.sourceTaskId !== undefined) {
-            const task = getTask(team, args.sourceTaskId);
-            if (task === undefined) throw invalidParamsError(`unknown sourceTaskId "${args.sourceTaskId}"`);
-            if (task.assignee !== me.agentKey || task.attemptId !== args.sourceAttemptId) {
-              throw new ToolError({
-                error: "stale_source_attempt",
-                sourceTaskId: args.sourceTaskId,
-                message: "stale or foreign source attempt; stop sending results from the revoked task",
-              });
+          if (args.forwardOf !== undefined) {
+            const orig = (await readMailbox(stateRoot, me.teamId, me.agentKey)).find((m) => m.id === args.forwardOf);
+            if (orig === undefined) {
+              throw invalidParamsError(`unknown messageId "${args.forwardOf}"; only messages in your own mailbox can be forwarded`);
             }
-            src.sourceTaskId = task.id;
-            src.sourceAttemptId = args.sourceAttemptId;
-            src.sourceTaskStatus = task.status;
+            content = orig.content;
+            forwardedOrigin = {
+              ...(orig.origin !== undefined ? { origin: orig.origin } : {}),
+              ...(orig.originSessionId !== undefined ? { originSessionId: orig.originSessionId } : {}),
+            };
           } else {
-            const myOpen = memberOpenTasks(team.tasks, me.agentKey)[0];
-            if (myOpen?.attemptId != null) {
-              src.sourceTaskId = myOpen.id;
-              src.sourceAttemptId = myOpen.attemptId;
-              src.sourceTaskStatus = myOpen.status;
+            content = args.content!;
+            // source 解析（移植 dsh send_message：显式成对字段，否则取发送者开放 attempt）。
+            if (args.sourceTaskId !== undefined) {
+              const task = getTask(team, args.sourceTaskId);
+              if (task === undefined) throw invalidParamsError(`unknown sourceTaskId "${args.sourceTaskId}"`);
+              if (task.assignee !== me.agentKey || task.attemptId !== args.sourceAttemptId) {
+                throw new ToolError({
+                  error: "stale_source_attempt",
+                  sourceTaskId: args.sourceTaskId,
+                  message: "stale or foreign source attempt; stop sending results from the revoked task",
+                });
+              }
+              src.sourceTaskId = task.id;
+              src.sourceAttemptId = args.sourceAttemptId;
+              src.sourceTaskStatus = task.status;
+            } else {
+              const myOpen = memberOpenTasks(team.tasks, me.agentKey)[0];
+              if (myOpen?.attemptId != null) {
+                src.sourceTaskId = myOpen.id;
+                src.sourceAttemptId = myOpen.attemptId;
+                src.sourceTaskStatus = myOpen.status;
+              }
             }
           }
 
@@ -659,7 +774,7 @@ export function createToolCore(deps: ToolDeps): ToolCore {
           const existing = await readMailbox(stateRoot, me.teamId, toKey);
           const dup = findDuplicateMail(existing, team, {
             from: me.agentKey,
-            content: args.content,
+            content,
             taskId: rec.taskId,
             attemptId: rec.attemptId,
             sourceTaskId: src.sourceTaskId,
@@ -670,16 +785,32 @@ export function createToolCore(deps: ToolDeps): ToolCore {
             return { delivered: "duplicate" as const, messageId: dup.id, toSessionId: recipient.sessionId };
           }
 
-          const msg = createMessage(me.agentKey, toKey, args.content, { ...src, ...rec, deliveryClaimedAt: now });
+          const msg = createMessage(me.agentKey, toKey, content, {
+            ...src,
+            ...rec,
+            deliveryClaimedAt: now,
+            // v0.5（R-11）：盖章命中 → origin=user；forwardOf → 被转消息的 origin 原值透传
+            //（两分支互斥——转发跳过盖章）。absent = agent 缺省（wire/渲染层同规）。
+            ...(stamp.hit ? { origin: "user" as const, originSessionId: me.sessionId } : forwardedOrigin),
+          });
           await appendMailbox(stateRoot, me.teamId, toKey, msg);
-          return { delivered: null, messageId: msg.id, toSessionId: recipient.sessionId };
+          return { delivered: null, messageId: msg.id, toSessionId: recipient.sessionId, content };
         });
+
+        if (stamp.hit) {
+          await logEngineEvent(stateRoot, {
+            event: "uservoice-hit",
+            teamId: me.teamId,
+            msgId: out.messageId,
+            uses: stamp.uses,
+          });
+        }
 
         let delivered: "wake" | "mailbox" | "duplicate";
         if (out.delivered === "duplicate") {
           delivered = "duplicate";
         } else {
-          const sent = await wake(toKey, out.toSessionId, "message", [out.messageId], args.content);
+          const sent = await wake(toKey, out.toSessionId, "message", [out.messageId], out.content);
           delivered = sent.delivered;
         }
         await logEngineEvent(stateRoot, {
@@ -703,6 +834,8 @@ export function createToolCore(deps: ToolDeps): ToolCore {
         const me = identityStore.get(connectionKey); // 豁免注册（§2.8）：未注册省略个人字段
         const team = await readTeam(stateRoot, teamId);
         const now = Date.now();
+        // v0.5（R-23）：任务 result/error 观测面截断（磁盘真源 team.json 不动，xc_task_read 拉全文）。
+        const budget = receiverInjectBudget(contextCharsFromEnv(deps.env), deps.env);
 
         const snapshot: StatusSnapshot = {
           teamId,
@@ -715,20 +848,26 @@ export function createToolCore(deps: ToolDeps): ToolCore {
             role: m.role,
             lastSeen: m.lastSeen,
           })),
-          tasks: (team?.tasks ?? []).map((t) => ({
-            id: t.id,
-            title: t.title,
-            status: t.status,
-            assignee: t.assignee,
-            attempt: t.attempt,
-            attemptId: t.attemptId,
-            dependsOn: t.dependsOn,
-            createdBy: t.createdBy,
-            result: t.result,
-            error: t.error,
-            evidenceCount: t.evidence.length,
-            updatedAt: t.updatedAt,
-          })),
+          tasks: (team?.tasks ?? []).map((t) => {
+            const result = t.result === null ? null : truncateField(t.result, budget.item, sha256Of);
+            const error = t.error === null ? null : truncateField(t.error, budget.item, sha256Of);
+            return {
+              id: t.id,
+              title: t.title,
+              status: t.status,
+              assignee: t.assignee,
+              attempt: t.attempt,
+              attemptId: t.attemptId,
+              dependsOn: t.dependsOn,
+              createdBy: t.createdBy,
+              result: result === null ? null : result.text,
+              ...(result !== null && result.truncated ? { resultTruncated: result.truncated } : {}),
+              error: error === null ? null : error.text,
+              ...(error !== null && error.truncated ? { errorTruncated: error.truncated } : {}),
+              evidenceCount: t.evidence.length,
+              updatedAt: t.updatedAt,
+            };
+          }),
           unread: {},
         };
 
@@ -750,7 +889,64 @@ export function createToolCore(deps: ToolDeps): ToolCore {
           agentKey: me?.agentKey ?? null,
           tasks: snapshot.tasks.length,
         });
-        return okResult(renderStatusTable(snapshot), { snapshot });
+        // v0.5（R-7）：落盘 snapshot 与返回 payload 分离——持久化对象不含 isLead/leadHistory，
+        // payload 在其上现算叠加（isLead 不入盘不入快照；history:true 附 lead 变更史）。
+        const payload = {
+          ...snapshot,
+          members: team !== undefined
+            ? snapshot.members.map((m) => ({ ...m, isLead: m.key === leadKeyOf(team) }))
+            : snapshot.members,
+          ...(args.history === true && team !== undefined
+            ? {
+                leadKey: team.leadKey ?? null,
+                leadSince: team.leadSince ?? null,
+                leadHistory: team.leadHistory ?? [],
+              }
+            : {}),
+        };
+        return okResult(renderStatusTable(snapshot), payload);
+      });
+    },
+
+    /**
+     * xc_mail_read（v0.5 R-22，DESIGN-V0.5 §5.5）：读本人邮箱 JSONL 历史件（含已消费行）
+     * 的全文分页——只读不消费；邮箱行全文保留（acknowledgeMailbox 只置 readAt），
+     * xc_check_inbox 截断视图的超读通道。
+     */
+    async xc_mail_read(args, connectionKey) {
+      return runCore(async () => {
+        const me = identityStore.require(connectionKey);
+        const message = (await readMailbox(stateRoot, me.teamId, me.agentKey)).find((m) => m.id === args.messageId);
+        if (message === undefined) {
+          throw invalidParamsError(`unknown messageId "${args.messageId}"; xc_mail_read only reads your own mailbox history`);
+        }
+        const itemBudget = receiverInjectBudget(contextCharsFromEnv(deps.env), deps.env).item;
+        const page = paginateText(message.content, args.offset, args.limit, itemBudget);
+        return okResult(
+          `Mailbox message ${message.id} from ${message.from}: ${page.total} chars (offset ${page.offset}, hasMore=${page.hasMore}).`,
+          { messageId: message.id, total: page.total, offset: page.offset, text: page.text, hasMore: page.hasMore },
+        );
+      });
+    },
+
+    /**
+     * xc_task_read（v0.5 R-22）：分页读 team.json 任务字段（result/error/prompt）——
+     * 读路径无锁（tools.ts:397 读纪律同款）；xc_status 观测面截断的全文拉取通道。
+     */
+    async xc_task_read(args, connectionKey) {
+      return runCore(async () => {
+        const me = identityStore.require(connectionKey);
+        const team = await readTeam(stateRoot, me.teamId);
+        if (team === undefined) throw new ToolError({ error: "no_team", message: "no team on disk yet" });
+        const task = getTask(team, args.taskId);
+        if (task === undefined) throw invalidParamsError(`unknown task "${args.taskId}"`);
+        const text = args.field === "prompt" ? task.prompt : (task[args.field] ?? "");
+        const itemBudget = receiverInjectBudget(contextCharsFromEnv(deps.env), deps.env).item;
+        const page = paginateText(text, args.offset, args.limit, itemBudget);
+        return okResult(
+          `Task ${task.id} field "${args.field}": ${page.total} chars (offset ${page.offset}, hasMore=${page.hasMore}).`,
+          { taskId: task.id, field: args.field, total: page.total, offset: page.offset, text: page.text, hasMore: page.hasMore },
+        );
       });
     },
   };
@@ -796,15 +992,27 @@ export function registerTools(server: McpServer, deps: ToolDeps, coreOverride?: 
   );
   server.tool(
     "xc_message",
-    "Send a free-form message to a member (peer communication; duplicate-deduplicated).",
+    "Send a free-form message to a member (peer communication; duplicate-deduplicated). forwardOf=<messageId> forwards a message from your own mailbox verbatim (origin preserved; mutually exclusive with content — send annotations as a separate message).",
     MessageShape,
     async (args, extra) => core.xc_message(args, connectionKeyOf(extra)),
   );
   server.tool(
     "xc_status",
-    "Team snapshot: members, task board, unread counts. Does not require registration; writes snapshot.json.",
+    "Team snapshot: members (with isLead), task board (oversized result/error truncated with resultTruncated markers), unread counts. history:true appends the lead role change history. Does not require registration; writes snapshot.json.",
     StatusShape,
     async (args, extra) => core.xc_status(args, connectionKeyOf(extra)),
+  );
+  server.tool(
+    "xc_mail_read",
+    "Read-only pager for your own mailbox history (messages already consumed included): returns the full text of one message, paginated. Does not consume.",
+    MailReadShape,
+    async (args, extra) => core.xc_mail_read(args, connectionKeyOf(extra)),
+  );
+  server.tool(
+    "xc_task_read",
+    "Read-only pager for one task's result/error/prompt field from team.json (oversized fields are truncated in xc_status; read them back here in pages). Does not consume.",
+    TaskReadShape,
+    async (args, extra) => core.xc_task_read(args, connectionKeyOf(extra)),
   );
 }
 

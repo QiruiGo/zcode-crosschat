@@ -45,7 +45,9 @@ import { readTeam } from './teamstate.js';
 // ---------------------------------------------------------------------------
 
 /** v0.2 协议帧白名单：未知具名帧一律拒收（W3 unblock-notice / W2 shutdown-request /
- * W4 idle-notification / W5 delivery-refused 均已列入）。 */
+ * W4 idle-notification / W5 delivery-refused 均已列入）。
+ * v0.5（DESIGN-V0.5 §3.1，M3 的白名单扩展 hunk）：第七值 lead-transfer——lead 移交/
+ * 接管/释放的通知与回执帧（字段固定模板，R-15-4 可控字段纪律；只是通知，不带授权语义）。 */
 export const FRAME_TYPES = [
   'task-assignment',
   'task-receipt',
@@ -53,6 +55,7 @@ export const FRAME_TYPES = [
   'unblock-notice',
   'shutdown-request',
   'delivery-refused',
+  'lead-transfer',
 ] as const;
 export type FrameType = (typeof FRAME_TYPES)[number];
 
@@ -91,12 +94,14 @@ export const MAILBOX_DELIVERY_LEASE_MS = 60_000;
 export const RECEIPT_PREFIX = '[CrossChat inbox receipt: ';
 const RECEIPT_SUFFIX = ']';
 
-/** Build a fresh message record (port of state.js:371-373 createMessage + extras). */
+/** Build a fresh message record (port of state.js:371-373 createMessage + extras).
+ *  v0.5（M3 帧域契约）：extra 白名单扩含 origin/originSessionId（队内盖章写入，R-11/R-12；
+ *  只有 'origin' | 'originSessionId' 两个新增键，其余白名单行逐字节不动）。 */
 export function createMessage(
   from: string,
   to: string,
   content: string,
-  extra: Partial<Pick<TeamMessage, 'taskId' | 'attemptId' | 'sourceTaskId' | 'sourceAttemptId' | 'sourceTaskStatus' | 'deliveryClaimedAt'>> = {},
+  extra: Partial<Pick<TeamMessage, 'taskId' | 'attemptId' | 'sourceTaskId' | 'sourceAttemptId' | 'sourceTaskStatus' | 'deliveryClaimedAt' | 'origin' | 'originSessionId'>> = {},
 ): TeamMessage {
   return { id: randomUUID(), from, to, content, ts: Date.now(), ...extra };
 }

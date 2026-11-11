@@ -7,6 +7,7 @@ import {
   coerceNameBindings,
   coerceTeamState,
   isTeamMessage,
+  normalizeMessage,
   memberIdentity,
   memberState,
   transitionError,
@@ -273,5 +274,137 @@ describe('coerceNameBindings v0.2 issuedBy', () => {
     });
     expect(parsed.ok).toBe(false);
     if (!parsed.ok) expect(parsed.defect).toContain('issuedBy');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.5 M1 schema（DESIGN-V0.5.md §6.3-2）：leadSince/leadHistory/contextChars/
+// TeamMessage origin 三字段——宽容解析，旧记录零破坏（验收 A1e/A2f 单测化）。
+// ---------------------------------------------------------------------------
+
+describe('v0.5 TeamState leadSince/leadHistory（R-6）', () => {
+  it('旧文件（无 leadSince/leadHistory）照常解析（宽容读取）', () => {
+    const parsed = coerceTeamState(sampleTeam(), 'default');
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      expect(parsed.state.leadSince).toBeUndefined();
+      expect(parsed.state.leadHistory).toBeUndefined();
+    }
+  });
+
+  it('合法 leadSince/leadHistory 读取进 state', () => {
+    const team = { ...(sampleTeam() as Record<string, unknown>), leadKey: 'm1', leadSince: 42, leadHistory: [
+      { event: 'set', from: null, to: 'm1', ts: 42 },
+    ] };
+    const parsed = coerceTeamState(team, 'default');
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      expect(parsed.state.leadSince).toBe(42);
+      expect(parsed.state.leadHistory).toEqual([{ event: 'set', from: null, to: 'm1', ts: 42 }]);
+    }
+  });
+
+  it('坏条目（event 枚举外/ts 非数字/缺 from 或 to）整条丢弃不拒文件', () => {
+    const team = { ...(sampleTeam() as Record<string, unknown>), leadHistory: [
+      { event: 'set', from: null, to: 'm1', ts: 1 },
+      { event: 'explode', from: null, to: 'm1', ts: 2 },   // 枚举外
+      { event: 'transfer', from: 'm1', to: 'm2' },          // 缺 ts
+      { event: 'release', from: 'm1', to: null, ts: 'x' },  // ts 非数字
+      { event: 'set', to: 'm1', ts: 3 },                     // 缺 from
+      'garbage',                                             // 非对象
+      { event: 'transfer', from: 'm1', to: 'm2', ts: 4, reason: '验收' },
+    ] };
+    const parsed = coerceTeamState(team, 'default');
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      expect(parsed.state.leadHistory).toEqual([
+        { event: 'set', from: null, to: 'm1', ts: 1 },
+        { event: 'transfer', from: 'm1', to: 'm2', ts: 4, reason: '验收' },
+      ]);
+    }
+  });
+
+  it('超 32 条取尾部 32（MAX_LEAD_HISTORY FIFO）', () => {
+    const leadHistory = Array.from({ length: 40 }, (_, i) => ({
+      event: 'transfer' as const, from: `m${i}`, to: `m${i + 1}`, ts: i,
+    }));
+    const parsed = coerceTeamState({ ...(sampleTeam() as Record<string, unknown>), leadHistory }, 'default');
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      expect(parsed.state.leadHistory).toHaveLength(32);
+      expect(parsed.state.leadHistory![0]).toEqual({ event: 'transfer', from: 'm8', to: 'm9', ts: 8 });
+      expect(parsed.state.leadHistory![31]).toEqual({ event: 'transfer', from: 'm39', to: 'm40', ts: 39 });
+    }
+  });
+
+  it('leadHistory 非数组 → undefined（不拒文件）', () => {
+    const parsed = coerceTeamState({ ...(sampleTeam() as Record<string, unknown>), leadHistory: 'nope' }, 'default');
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) expect(parsed.state.leadHistory).toBeUndefined();
+  });
+});
+
+describe('v0.5 TeamMember.contextChars（R-18 声明值）', () => {
+  it('正整数读取；旧记录缺省照读', () => {
+    const team = sampleTeam() as Record<string, unknown>;
+    (team['members'] as unknown[]).push(
+      { key: 'm2', sessionId: 's2', role: 'worker', joinedAt: 1, lastSeen: 1, contextChars: 50000 },
+    );
+    const parsed = coerceTeamState(team, 'default');
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      expect(parsed.state.members[1]!.contextChars).toBe(50000);
+      expect(parsed.state.members[0]!.contextChars).toBeUndefined();
+    }
+  });
+
+  it('非正整数（0/负数/小数/字符串）按 absent 处理（宽容）', () => {
+    for (const bad of [0, -1, 1.5, '50000', Number.NaN]) {
+      const team = sampleTeam() as Record<string, unknown>;
+      (team['members'] as unknown[]).push(
+        { key: 'm2', sessionId: 's2', role: 'worker', joinedAt: 1, lastSeen: 1, contextChars: bad },
+      );
+      const parsed = coerceTeamState(team, 'default');
+      expect(parsed.ok).toBe(true);
+      if (parsed.ok) expect(parsed.state.members[1]!.contextChars).toBeUndefined();
+    }
+  });
+});
+
+describe('v0.5 TeamMessage origin 三字段（R-11）', () => {
+  it('旧记录（无 origin 字段）isTeamMessage 照读', () => {
+    const message = { id: 'x1', from: 'a', to: 'b', content: 'hi', ts: 1 };
+    expect(isTeamMessage(message)).toBe(true);
+    expect(normalizeMessage(message).origin).toBeUndefined();
+  });
+
+  it('origin=user/agent、originSessionId、forged 宽容拷贝', () => {
+    const message = {
+      id: 'x1', from: 'a', to: 'b', content: 'hi', ts: 1,
+      origin: 'user' as const, originSessionId: 'sess-a', forged: true,
+    };
+    expect(isTeamMessage(message)).toBe(true);
+    const normalized = normalizeMessage(message);
+    expect(normalized.origin).toBe('user');
+    expect(normalized.originSessionId).toBe('sess-a');
+    expect(normalized.forged).toBe(true);
+  });
+
+  it('origin 非法取值整行拒绝（sourceTaskStatus 枚举同款纪律）', () => {
+    const message = { id: 'x1', from: 'a', to: 'b', content: 'hi', ts: 1, origin: 'banana' };
+    expect(isTeamMessage(message)).toBe(false);
+  });
+
+  it('originSessionId 非字符串 / forged 非布尔拒绝', () => {
+    expect(isTeamMessage({ id: 'x', from: 'a', to: 'b', content: '', ts: 1, originSessionId: 5 })).toBe(false);
+    expect(isTeamMessage({ id: 'x', from: 'a', to: 'b', content: '', ts: 1, forged: 'yes' })).toBe(false);
+  });
+
+  it('normalizeMessage 把非法 origin 归 absent（宽容归一）', () => {
+    const raw = { id: 'x', from: 'a', to: 'b', content: '', ts: 1, origin: 'user' as const, forged: false };
+    const normalized = normalizeMessage(raw);
+    expect(normalized.origin).toBe('user');
+    expect(normalized.forged).toBe(false);
+    expect(normalized.originSessionId).toBeUndefined();
   });
 });

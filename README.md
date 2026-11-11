@@ -20,15 +20,15 @@
 
 ### 第 1 步：下载并解包
 
-1. 打开 <https://github.com/QiruiGo/zcode-crosschat/releases>，下载资产 **`zcode-crosschat-0.4.0-prebuilt-slim.tar.gz`**（约 4–5MB）。**保留原文件名**——随包发布的 `.sha256` 校验和按原名录，改名后校验会失败。
-2. （可选）校验完整性：在文件所在目录执行 `sha256sum -c zcode-crosschat-0.4.0-prebuilt-slim.tar.gz.sha256`（PowerShell 可用 `Get-FileHash` 对照 `.sha256` 文件里的值），期望输出 `OK`。
+1. 打开 <https://github.com/QiruiGo/zcode-crosschat/releases>，下载资产 **`zcode-crosschat-0.5.0-prebuilt-slim.tar.gz`**（约 4–5MB）。**保留原文件名**——随包发布的 `.sha256` 校验和按原名录，改名后校验会失败。
+2. （可选）校验完整性：在文件所在目录执行 `sha256sum -c zcode-crosschat-0.5.0-prebuilt-slim.tar.gz.sha256`（PowerShell 可用 `Get-FileHash` 对照 `.sha256` 文件里的值），期望输出 `OK`。
 3. 解包（Windows 10+ 自带 tar，PowerShell / Git Bash 均可）：
 
    ```bash
-   tar -xzf zcode-crosschat-0.4.0-prebuilt-slim.tar.gz
+   tar -xzf zcode-crosschat-0.5.0-prebuilt-slim.tar.gz
    ```
 
-   得到目录 `zcode-crosschat-0.4.0/`（下称「解包目录」，其下应有 `marketplace.json`）。
+   得到目录 `zcode-crosschat-0.5.0/`（下称「解包目录」，其下应有 `marketplace.json`）。
 
 ### 第 2 步：安装
 
@@ -43,11 +43,11 @@ zcode 命令行**不在系统 PATH 里**（它是桌面版内置的入口），�
 ```bash
 ZC() { ELECTRON_RUN_AS_NODE=1 "<安装目录>/ZCode.exe" "<安装目录>/resources/<variant>/zcode.cjs" "$@"; }
 
-ZC plugins marketplace add "<解包目录>/zcode-crosschat-0.4.0"
+ZC plugins marketplace add "<解包目录>/zcode-crosschat-0.5.0"
 # 期望：Added marketplace dev-zcode-crosschat (1 plugins)
 
 ZC plugins install zcode-crosschat@dev-zcode-crosschat
-# 期望：Installed plugin zcode-crosschat@dev-zcode-crosschat (0.4.0) [enabled]
+# 期望：Installed plugin zcode-crosschat@dev-zcode-crosschat (0.5.0) [enabled]
 ```
 
 **PowerShell**：
@@ -55,7 +55,7 @@ ZC plugins install zcode-crosschat@dev-zcode-crosschat
 ```powershell
 function ZC { $env:ELECTRON_RUN_AS_NODE = "1"; & "<安装目录>\ZCode.exe" "<安装目录>\resources\<variant>\zcode.cjs" @args }
 
-ZC plugins marketplace add "<解包目录>\zcode-crosschat-0.4.0"
+ZC plugins marketplace add "<解包目录>\zcode-crosschat-0.5.0"
 ZC plugins install zcode-crosschat@dev-zcode-crosschat
 ```
 
@@ -74,7 +74,7 @@ ZC plugins list
   skills: 1, commands: 1, hooks: 3, mcp: plugin:zcode-crosschat:crosschat
 ```
 
-判据：**`[enabled]` 且 skills / commands / hooks / mcp 计数非零**。`commands: 1` 与插件实际自带的 7 个斜杠命令文件不一致——属宿主计数行为，非安装异常。
+判据：**`[enabled]` 且 skills / commands / hooks / mcp 计数非零**。`commands: 1` 与插件实际自带的 8 个斜杠命令文件不一致——属宿主计数行为，非安装异常。
 
 ### 没有合适的 Release 资产？从源码安装（开发者路径）
 
@@ -128,6 +128,8 @@ npm install && npm run build
 
 要点：只能发现**已显式注册**的会话；消息只在**回合边界**注入（不打断对方正在进行的回合）；`/xc-agents` 一张面板看全部（可寻址会话 + 在队成员 + 任务概览 + 当前入站策略）；入站策略出厂走自动档，可设 accept / hold / refuse（hold 进隔离区等 `xc_peer_review` 放行），总开关 `peer_receive=off` 一律拒收。
 
+**v0.5 起可转达用户原话**：想让另一个会话知道「这是**你**说的」，让会话逐字引用你的原话（`/xc-say`）——正文命中用户原始提示时自动带 `origin="user"` 标记，接收方看到的是「发送会话用户的原话」标注；转述/改写不命中，回落为普通会话消息。
+
 ### lead-成员团队自动开工（唯一需要配置的玩法）
 
 一个会话当队长：拆任务、程序化建成员（零人工开窗口）、收回执。先在插件设置（桌面端 → 设置 → 插件 → zcode-crosschat → 插件设置）里：
@@ -147,9 +149,11 @@ npm install && npm run build
 
 配套操作：`/xc-status` 全景（成员状态 / 任务板 / 依赖图）、`/xc-member stop <名字> [原因]` 停止成员、`xc_cancel` 取消任务；派发时用 `dependsOn` 表达依赖，上游完成后下游自动收到解除阻塞通知并开工。
 
+**v0.5 起队长角色可换人**：队长是**元数据角色**不是系统中枢——`/xc-team transfer <成员名>` 把队长身份移交给指定成员、`/xc-team release` 卸任回到无队长的对等态、`/xc-team takeover` 在原队长会话已退出/失联且你明确要求换帅时接管（通知旧队长，全程审计）。移交/释放/接管**不搬**任务、邮箱与注册；即使无队长，派发/认领/互发消息照常（无队长时兜底到创始会话）。
+
 ## 工具与命令
 
-**7 个斜杠命令**：
+**8 个斜杠命令**：
 
 | 命令 | 参数 | 行为 |
 |---|---|---|
@@ -157,31 +161,37 @@ npm install && npm run build
 | `/xc-dispatch` | `<目标名> <任务描述>` | 把描述整理成可检验任务（标题/内容/验收标准）并派发 |
 | `/xc-inbox` | — | 查看本会话协作收件箱并逐条摘要 |
 | `/xc-status` | — | 任务板全景：任务六态、成员状态、依赖图、未读数 |
-| `/xc-team` | `[目标描述]` | 把当前会话立为队长并拆解目标建任务（已有其他队长时拒绝抢位） |
+| `/xc-team` | `[目标描述]` \| `transfer <成员名>` \| `release` \| `takeover` | 立队拆解；v0.5 起 lead 是可指派可移交的元数据角色：`transfer` 移交给指定成员、`release` 卸任回无 lead 对等态、`takeover` 在现任 lead 失联/拒绝配合时按用户指令接管（全程审计） |
 | `/xc-member` | `add <名字>` \| `stop <名字> [原因]` | 队长建员（引擎程序化供给）或停止成员 |
 | `/xc-agents` | — | 跨会话协作全景面板：可寻址会话 + 在队成员 + 任务概览 |
+| `/xc-say` | — | 用户亲述使用指引：让会话「把我的话带给 X」时如何逐字引用原话（盖章链按字节匹配，转述即丢标记） |
 
-**21 个 MCP 工具** = 13 个队内 `xc_*` + 7 个跨会话 peer + 1 个免注册体检：
+**26 个 MCP 工具** = 15 个队内 `xc_*` + 8 个跨会话 peer + 1 个免注册体检 + 2 个只读分页器：
 
 | 工具 | 作用 |
 |---|---|
 | `xc_register` | 把当前连接绑定为协作身份（支持无头唤醒回合的一次性令牌路径） |
 | `xc_dispatch` | 派发新任务（可带依赖 `dependsOn`） |
-| `xc_check_inbox` | 读取并消费自己邮箱的未读消息 |
+| `xc_check_inbox` | 读取并消费自己邮箱的未读消息（超大消息按预算截断并给分页指针） |
 | `xc_claim` | 原子认领 pending 任务，返回一次性 attemptId 凭证 |
 | `xc_report` | 汇报 in_progress / completed（必须带证据）/ failed |
-| `xc_message` | 成员间对等自由消息（可关联任务上下文） |
-| `xc_status` | 任务板快照（免注册；同步落盘 snapshot.json） |
-| `xc_team_init` | （队长）立队；已有其他队长时返回 `lead_exists` |
-| `xc_member_add` | （队长）程序化建成员：建会话→设模型→欢迎回合自注册→投产 |
+| `xc_message` | 成员间对等自由消息（可关联任务上下文；v0.5 支持 `forwardOf` 原文转发并保留作者溯源） |
+| `xc_status` | 任务板快照（免注册；任务 result/error 超预算截断并给 `resultTruncated`；`history:true` 附 lead 变更史） |
+| `xc_mail_read` | 只读分页器：读自己邮箱历史件全文（含已消费），单次 ≤64k 字符 |
+| `xc_task_read` | 只读分页器：读 team.json 任务 result/error/prompt 字段全文 |
+| `xc_team_init` | 立队为 lead；已有其他队长时返回 `lead_exists`（载荷附现任 lead 的 sessionId）；`{takeover:true}` 仅限用户明确指令时接管 |
+| `xc_lead_transfer` | （现任 lead）把 lead 角色移交给另一在册成员——元数据角色，任务/邮箱/注册不动 |
+| `xc_lead_release` | （现任 lead）卸任：团队回到无显式 lead 的对等态，派发/认领/消息照常 |
+| `xc_member_add` | （队长）程序化建成员：建会话→设模型→欢迎回合自注册→投产（可带 `context` 声明该成员上下文字符数） |
 | `xc_member_stop` | （队长）停止成员：开放任务收回池 + 回执 + 停机通知 |
-| `xc_idle` | 成员无活可领时通知队长 |
+| `xc_idle` | 成员无活可领时通知队长（无显式 lead 时回落 founder） |
 | `xc_cancel` | （队长/任务创建者）取消任务并回执 |
 | `xc_inbound_review` | 审查队内 hold 隔离箱：accept / discard |
-| `xc_peer_register` | 把本连接注册为跨会话 peer（名字即地址，重名先到者为准） |
+| `xc_peer_register` | 把本连接注册为跨会话 peer（可带 `contextChars` 声明上下文字符数） |
 | `xc_peers` | 本机可寻址会话清单（免注册） |
-| `xc_peer_send` | 给本机其他会话发信；回执 delivered/held/refused 等 |
-| `xc_peer_inbox` | 拉取本会话待投递的 peer 消息（渲染成信封），拉取即消费 |
+| `xc_peer_send` | 给本机其他会话发信（用户亲述经盖章链可携带 origin=user 权威标记；`forwardOf` 原文转发保留溯源）；回执 delivered/held/refused 等 |
+| `xc_peer_inbox` | 拉取本会话待投递的 peer 消息（信封按接收方注入预算排布），拉取即消费 |
+| `xc_peer_read` | 只读分页器：读某条收到的跨会话消息全文（截断指针的取回通道） |
 | `xc_peer_review` | 跨会话 hold 隔离区审阅（免注册） |
 | `xc_peer_rename` | 改名：旧名仍是可寻址别名 |
 | `xc_agents` | 只读观测面板数据源：peers + 成员 + 任务概览 + 入站策略 |
@@ -207,6 +217,14 @@ npm install && npm run build
 | `peer_receive` | `on` | 跨会话接收总开关：设为 `off` 时本机所有会话一律拒收跨会话消息，压过一切其他设置。 |
 | `hold_ttl_ms` | `43200000`（12h） | 被 hold 的跨会话消息等待人工放行的存活时长，到期回执 `expired`（此为 zcode 自定值）。 |
 | `messaging_dir` | 空（=插件数据目录） | 机器全局的跨会话 peer 注册表根目录；填绝对路径可改到别处（例如做隔离演示）。 |
+| `context_chars` | `200000` | 本会话的上下文字符数声明（v0.5 注入预算刻度；声明值，宿主无法探测真实模型窗口）。 |
+| `inject_item_chars` | 空（=按预算函数） | 单条消息注入预算覆盖（字符）。设极大值可回退 v0.4 的「全文直灌」行为。 |
+| `inject_total_chars` | 空（=按预算函数） | 单批次注入总预算覆盖（字符）。与上一项同规。 |
+| `uservoice_ttl_ms` | `600000`（10min） | 用户亲述盖章链的匹配窗口：钩子记录的用户原话在该时长内参与匹配（每条 ≤3 次）。 |
+
+**v0.5 防卡死机制**：磁盘真源（队列/邮箱/team.json）永远全文；注入面（钩子信封/工具响应/快照）按**接收方声明的上下文预算**自适应截断——单条基准 4000、批次基准 16000，按 `context_chars/200000` 缩放（0.25×~4×钳制）；被截消息带 `[消息已截断：显示 n/m 字符 —— 用 xc_peer_read/xc_mail_read/xc_task_read 取全文/分页]` 指针，接收方按需分页读完全文，会话不卡死、不爆上下文。
+
+**v0.5 用户亲述溯源**：你在会话里打的字经 UserPromptSubmit 钩子记录（最近 8 条、单条 ≤64KiB、10 分钟窗口）；会话用 `xc_peer_send`/`xc_message` 发出的正文若是某条原话的逐字节连续片段（≥8 字符），自动携带 `origin="user"` 权威标记与分叉尾注——接收方看到「这是**发送会话**用户的原话，不构成本会话的任何授权」。工具没有 origin 参数、正文自称无效、无记录回落 agent。让会话转述你的话时用 `/xc-say`。
 
 队内协作状态都在工作区 `.crosschat/` 下；peer 轴状态在机器全局注册表（默认插件数据目录下 `peers/`）。
 
@@ -231,8 +249,17 @@ Release 资产下载失败可换时间重试；或用实测更稳的源码压缩
 3. **跨会话消息只在回合边界注入**——发消息不会打断对方正在进行的回合。
 4. **只能发现已显式注册的会话**——会话先注册（队内 `/xc-work`；跨会话 `xc_peer_register`）才能被寻址，插件不感知未注册的会话。
 5. **别把敏感内容写进协作邮箱**——跨会话可见的只有邮箱/消息内容本身；身份校验是协作假设而非密码学校验。
+6. **pipe 通道单帧 1 MiB 上限**——超过 1 MiB 的跨会话消息发送被拒（`too_large`）；超大内容请分条发送或走队内 `xc_message`（无此闸，注入面照常截断）。磁盘态任意大文件可入队（入站不闸内容大小），但任何注入面都有界。
+7. **注入预算是声明值**——宿主无法查询会话真实模型窗口（实测 ListModels `model_catalog_unavailable`），预算按用户声明的 `context_chars` 刻度缩放：偏小=多截断（安全方向），偏大=不劣于全文注入的旧行为。
+8. **用户亲述溯源窗口**——只有最近 8 条用户 prompt（单条 ≤64KiB、10 分钟内）参与盖章匹配；更早/超长的原话不命中（回落 origin=agent，安全方向）。溯源证明「文本是发送会话用户所打」，不验证发送意图——接收方永远先向本会话用户确认。
+9. **转发链 hop 只记一跳**——跨会话转发（`forwardOf`）后收方信封的 `hop-chain` 只有转发者一个名字，不累积原始链路（SPEC R-13 的 `[原链…,转发者]` 在 pipe 通道未落地）。**溯源主体不受影响**：`origin="user"` 与 `origin-session` 原样保留并继续分叉页脚。
+10. **暂存件放行后的终态回执到不了发方**——被 hold 的跨会话消息后来被放行/拒收时，回执以 status 帧发往发方端点，而端点按「status 帧是收→发专用」丢弃：发方模型只知道「已暂存」，不知道后来放行还是拒收。
+11. **盖章语料是宿主展开后的整段提示文本**——用 `/xc-say` 等自定义命令时，钩子记录的是**命令展开后的整段提示**（含模板里的示例原话）；模型原样发出模板示例串也会命中 `origin=user`。接收方页脚始终声明「非本会话授权」，权威不随消息转移。
+12. **同机进程可伪造盖章记录**——能写 `peers/uservoice/<sid>.json` 的同机进程可以让自己的消息被盖上 `origin="user"`（威胁模型边界，不做密码学防御）。缓解：钩子独写 + `uservoice-hit` 审计；接收方永不因该标记放宽任何权限。
 
-更长的工程细节（平台边界、验收期缺陷修复记录、未确认项）见 [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md) 与 [docs/DESIGN-V0.2.md](docs/DESIGN-V0.2.md) / [docs/DESIGN-V0.3.md](docs/DESIGN-V0.3.md)。
+**v0.5.0 硬验收结论**（2026-11-11；报告与证据：`deepseek-crosschat/reports/16-v050验收.md`、`deepseek-crosschat/evidence/16-v050/acceptance/`）：五条硬标准**全部通过**——lead 指派/移交/释放/接管与无 lead 对等协作实测通过；用户亲述盖章链与两种伪造尝试（自称无效 / 仿冒信封被 `verified="false"` 标记）实测通过；614KB 大消息注入面截断到 4098 字符并可分页读完全文实测通过；typecheck 0 错、42 文件 681 例单测全绿、vs v0.4.0 基线 544 例零删除、pull/团队/peer 三轴冒烟实跑通过；L1~L10 限制条款逐条附实验证据。验收期另修复 1 处既有缺陷（hold 暂存件无法被 accept 放行，已补回归单测）。
+
+更长的工程细节（平台边界、验收期缺陷修复记录、未确认项）见 [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md) 与 [docs/DESIGN-V0.2.md](docs/DESIGN-V0.2.md) / [docs/DESIGN-V0.3.md](docs/DESIGN-V0.3.md) / [docs/DESIGN-V0.5.md](docs/DESIGN-V0.5.md)。
 
 ## 文档 / License
 
@@ -240,7 +267,10 @@ Release 资产下载失败可换时间重试；或用实测更稳的源码压缩
 - [docs/DEMO.md](docs/DEMO.md) — 演示说明（团队协作 / 两会话闭环 / 跨会话消息）；
 - [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md) — 模块-文件对照、自测命令与结果记录；
 - [docs/PLATFORM.md](docs/PLATFORM.md) — zcode 插件平台事实基线（安装物化 / CLI / 配置语义）；
-- [docs/DESIGN.md](docs/DESIGN.md) / [docs/DESIGN-V0.2.md](docs/DESIGN-V0.2.md) / [docs/DESIGN-V0.3.md](docs/DESIGN-V0.3.md) — 三代设计文档（含与 dsh-agent-teams 的机制对照）；
-- 其余工程档案（规格、可行性实测、分发侦察）在 [docs/](docs/) 目录。
+- [docs/DESIGN.md](docs/DESIGN.md) / [docs/DESIGN-V0.2.md](docs/DESIGN-V0.2.md) / [docs/DESIGN-V0.3.md](docs/DESIGN-V0.3.md) / [docs/DESIGN-V0.4.md](docs/DESIGN-V0.4.md) / [docs/DESIGN-V0.5.md](docs/DESIGN-V0.5.md) — 五代设计文档（含与 dsh-agent-teams 的机制对照）；
+- [docs/SPEC-V0.5.md](docs/SPEC-V0.5.md) — v0.5 规格（信封字段表 / 预算刻度 / 盖章链规则）与 CC 逆向坐标对齐；
+- [docs/GAP-V0.5.md](docs/GAP-V0.5.md) — v0.4.0 现状盘点与三项改进的差距分析；
+- [docs/RELEASING.md](docs/RELEASING.md) — 发布 runbook（版本冻结 / 打包 / 发布 / 发布后自检）；
+- 其余工程档案（可行性实测、分发侦察、可行性/平台档案）在 [docs/](docs/) 目录。
 
 License: [MIT](./LICENSE)

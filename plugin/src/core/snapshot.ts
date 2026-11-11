@@ -34,12 +34,22 @@ import { readMailbox, isCurrentMail } from "./mailbox.js";
 import { logEngineEvent } from "./log.js";
 import { memberOpenTasks, readTeam, unsatisfiedDependencies } from "./teamstate.js";
 import { DEFAULT_TEAM_ID, type TeamState } from "./types.js";
+// v0.5（R-23）：观测面截断接线（仍只 import core/*——budget/msgstore 均为 M1 契约基座）。
+import { contextCharsFromEnv, receiverInjectBudget, truncateField } from "./budget.js";
+import { sha256Of } from "./msgstore.js";
 
 // ---------------------------------------------------------------------------
 // 快照类型（v0.1.0 render.ts 的形状 + §7.3.1 的 v2 可选增量）
 // ---------------------------------------------------------------------------
 
-/** 快照里的单任务行（v0.1.0 字段 + v2 派生视图 blockedBy）。 */
+/** 观测面截断标记（v0.5 R-23：{shown,total,sha256}；磁盘真源 team.json 不动）。 */
+export interface SnapshotTruncation {
+  shown: number;
+  total: number;
+  sha256: string;
+}
+
+/** 快照里的单任务行（v0.1.0 字段 + v2 派生视图 blockedBy + v0.5 观测面截断标记）。 */
 export interface StatusSnapshotTask {
   id: string;
   title: string;
@@ -55,6 +65,10 @@ export interface StatusSnapshotTask {
   updatedAt: number;
   /** v2 派生视图：当前未满足（缺失或未 completed）的依赖 id（快照时算，§7.3.1）。 */
   blockedBy?: string[];
+  /** v0.5（R-23）：result 超单条注入预算被截断时的原长与原文指纹（全文走 xc_task_read）。 */
+  resultTruncated?: SnapshotTruncation;
+  /** v0.5（R-23）：error 截断标记（同上）。 */
+  errorTruncated?: SnapshotTruncation;
 }
 
 /** 快照里的单成员行（v0.1.0 字段 + v2 的 state/identity/openTaskId，全可选）。 */
@@ -157,21 +171,33 @@ export async function buildSnapshot(
     };
   });
 
-  const tasks = team.tasks.map((t) => ({
-    id: t.id,
-    title: t.title,
-    status: t.status,
-    assignee: t.assignee,
-    attempt: t.attempt,
-    attemptId: t.attemptId,
-    dependsOn: [...t.dependsOn],
-    createdBy: t.createdBy,
-    result: t.result,
-    error: t.error,
-    evidenceCount: t.evidence.length,
-    updatedAt: t.updatedAt,
-    blockedBy: unsatisfiedDependencies(team.tasks, t.dependsOn),
-  }));
+  // v0.5（R-23）：任务 result/error 过观测面截断（真源 team.json 不动；xc_task_read 拉全文）。
+  const budget = receiverInjectBudget(contextCharsFromEnv(env), env);
+  const tasks = team.tasks.map((t) => {
+    const result = t.result === null ? null : truncateField(t.result, budget.item, sha256Of);
+    const error = t.error === null ? null : truncateField(t.error, budget.item, sha256Of);
+    return {
+      id: t.id,
+      title: t.title,
+      status: t.status,
+      assignee: t.assignee,
+      attempt: t.attempt,
+      attemptId: t.attemptId,
+      dependsOn: [...t.dependsOn],
+      createdBy: t.createdBy,
+      result: result === null ? null : result.text,
+      ...(result !== null && result.truncated
+        ? { resultTruncated: { shown: result.truncated.shown, total: result.truncated.total, sha256: result.truncated.sha256 } }
+        : {}),
+      error: error === null ? null : error.text,
+      ...(error !== null && error.truncated
+        ? { errorTruncated: { shown: error.truncated.shown, total: error.truncated.total, sha256: error.truncated.sha256 } }
+        : {}),
+      evidenceCount: t.evidence.length,
+      updatedAt: t.updatedAt,
+      blockedBy: unsatisfiedDependencies(team.tasks, t.dependsOn),
+    };
+  });
 
   // dag 派生视图：仅含有依赖的任务（§7.3.1 示例 {"t2":["t1"]}——无依赖的 t1 不入图）。
   const dag: Record<string, string[]> = {};

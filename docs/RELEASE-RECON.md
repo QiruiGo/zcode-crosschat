@@ -3,7 +3,7 @@
 - 日期：2026-11-10；执行：分发侦察员（动态工作流子代理）
 - 范围：为「陌生人三步装通」实测分发机制；**临时隔离沙箱实验，未动正式仓代码**（仅新增本文件）
 - 方法与证据根：`deepseek-crosschat/evidence/14-release/recon/`（01-网络获取路径.md、02-市场形态与dist行为.md、03-进程与exe探测事实.md、04-沙箱与复现说明.md + r14/ 沙箱实物）
-- 环境基线：Windows 11 + Git Bash；zcode 0.17.1（`E:\ZCode\ZCode.exe` + `E:\ZCode\resources\glm\zcode.cjs`，ZCode 3.17.2 装于 E 盘非默认路径）；gh 2.103.3 已登录；主网无代理
+- 环境基线：Windows 11 + Git Bash；zcode 0.17.1（`<安装目录>\ZCode.exe` + `<安装目录>\resources\glm\zcode.cjs`，ZCode 3.17.2 装于 E 盘非默认路径）；gh 2.103.3 已登录；主网无代理
 
 ---
 
@@ -81,10 +81,10 @@ validate → Plugin manifest is valid
 
 - 消费点：`plugin/.zcode-plugin/plugin.json:25-26` → env `XC_ZCODE_EXE/XC_ZCODE_CJS` → `plugin/src/engine/resume-cli.ts`（spawn `ELECTRON_RUN_AS_NODE=1 <exe> <cjs> --resume …`）。
 - **MCP/hook 进程（manifest command:"node"）跑在系统 node.exe 下**（execPath≠ZCode.exe），但其 **parent 就是 ZCode.exe（1 跳）**（Win32_Process 实拍，0.3.4 cache 的 server.mjs 进程 ppid=ZCode.exe）。
-- exe+cjs 运行形态下 `process.execPath` 即 ZCode.exe：`zcode doctor` 实测 `process: E:\ZCode\ZCode.exe`、`node: v24.21.0`。
+- exe+cjs 运行形态下 `process.execPath` 即 ZCode.exe：`zcode doctor` 实测 `process: <安装目录>\ZCode.exe`、`node: v24.21.0`。
 - 插件进程 env **没有** exe 路径线索（probe hook 84 键过滤集 + 本会话 bash 全集实测均无 `ELECTRON_RUN_AS_NODE`/`ZCODE_NODE_FALLBACK_EXEC_PATH`/路径类 ZCODE_*；node.cmd fallback shim 存在但默认场景未注入）。
-- 注册表（HKCU per-user NSIS）：`DisplayName=ZCode 3.17.2`，**InstallLocation 为空**，`UninstallString="E:\ZCode\Uninstall ZCode.exe" /currentuser` → 需反推安装根。
-- 本机 `where zcode` 无 PATH shim；`%LOCALAPPDATA%\Programs` 无 ZCode（装在自定义盘 E:\ZCode）——**硬编码默认路径不可靠**。
+- 注册表（HKCU per-user NSIS）：`DisplayName=ZCode 3.17.2`，**InstallLocation 为空**，`UninstallString="<安装目录>\Uninstall ZCode.exe" /currentuser` → 需反推安装根。
+- 本机 `where zcode` 无 PATH shim；`%LOCALAPPDATA%\Programs` 无 ZCode（装在自定义盘 <安装目录>）——**硬编码默认路径不可靠**。
 - cjs 与 exe 同根推导成立：`<安装根>\resources\glm\zcode.cjs`（单机样本；`glm` 段稳定性未确认，需 glob 兜底）。
 
 ### 3.2 探测顺序（建议实现）与降级
@@ -105,7 +105,7 @@ validate → Plugin manifest is valid
 |---|---|
 | published Release 资产的**匿名**下载成功样本 | 未取得（github.com 阻断时段，jq 对照组两次连接超时）；draft 匿名 404 已实测；认证下载已实测 |
 | headless `--prompt` 会话的 SessionStart hook / MCP spawn 生命周期 | 未触发（probe2 两次实测无 dump 落盘）——hook/MCP 进程 env 全集未取得，3.1 结论基于进程枚举+现有 probe 记录 |
-| `resources\glm\zcode.cjs` 在其他机器/版本的路径稳定性 | 单机样本（ZCode 3.17.2 @ E:\ZCode） |
+| `resources\glm\zcode.cjs` 在其他机器/版本的路径稳定性 | 单机样本（ZCode 3.17.2 @ <安装目录>） |
 | `marketplace add` 的 url 形态（tgz URL 直装） | 未测（任务未点名；沙箱并行记录 zst-tgz 可参考） |
 | `marketplace update` 的远程刷新链路（url/github 源） | 本轮仅测 version bump 本地重物化（probe2 0.1.0→0.1.1），远程刷新未测 |
 | `gh release delete` 连带删 tag | 实测发生（push --delete 因网络未执行而 tag 已消失）；是 gh 行为还是 GitHub 端 draft 语义未细分 |

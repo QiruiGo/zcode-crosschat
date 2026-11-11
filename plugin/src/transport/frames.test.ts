@@ -198,3 +198,74 @@ describe("辅助函数", () => {
     expect(frameTypeOf(null)).toBeUndefined();
   });
 });
+
+describe("v0.5 origin 帧四件套（R-11；DESIGN-V0.5 §6.3-6）", () => {
+  it("① FRAME_FIELDS 封闭集已含 origin/originSessionId（白名单外键拒收的反证前提）", () => {
+    // 未知键仍拒收；origin/originSessionId 键不再被拒。
+    expect(validateFrame({ ...msgFrame(), bogus: 1 }).ok).toBe(false);
+    expect(validateFrame({ ...msgFrame(), origin: "user" }).ok).toBe(true);
+    expect(validateFrame({ ...msgFrame(), originSessionId: "sess_x" }).ok).toBe(true);
+  });
+
+  it("② validateFrame 拒非法 origin 值", () => {
+    for (const bad of ["USER", "self", 1, true, null]) {
+      const verdict = validateFrame({ ...msgFrame(), origin: bad });
+      expect(verdict.ok).toBe(false);
+      if (!verdict.ok) expect(verdict.reason).toContain('origin must be "user" or "agent"');
+    }
+  });
+
+  it("② originSessionId 非字符串/空串拒帧", () => {
+    for (const bad of [123, "", "   "]) {
+      const verdict = validateFrame({ ...msgFrame(), originSessionId: bad });
+      expect(verdict.ok).toBe(false);
+      if (!verdict.ok) expect(verdict.reason).toContain("originSessionId");
+    }
+  });
+
+  it("③ origin=user 帧构造：origin+originSessionId 落帧；originSessionId 缺省则不带", () => {
+    const withSession = validateFrame({ ...msgFrame(), origin: "user", originSessionId: "sess_abc" });
+    expect(withSession.ok).toBe(true);
+    if (withSession.ok && withSession.frame.type === "msg") {
+      expect(withSession.frame.origin).toBe("user");
+      expect(withSession.frame.originSessionId).toBe("sess_abc");
+    }
+    const noSession = validateFrame({ ...msgFrame(), origin: "user" });
+    if (noSession.ok && noSession.frame.type === "msg") {
+      expect(noSession.frame.origin).toBe("user");
+      expect(noSession.frame.originSessionId).toBeUndefined();
+    }
+  });
+
+  it("③ origin=agent 或缺失 → 两键不落帧（agent 缺省语义；originSessionId 随之丢弃）", () => {
+    const agent = validateFrame({ ...msgFrame(), origin: "agent", originSessionId: "sess_zzz" });
+    if (agent.ok && agent.frame.type === "msg") {
+      expect(agent.frame.origin).toBeUndefined();
+      expect(agent.frame.originSessionId).toBeUndefined();
+    }
+    const absent = validateFrame(msgFrame());
+    if (absent.ok && absent.frame.type === "msg") {
+      expect(absent.frame.origin).toBeUndefined();
+      expect(absent.frame.originSessionId).toBeUndefined();
+    }
+  });
+
+  it("④ encodeFrame 上线成功（P1 回归）：origin 帧可编码且 decode 保留 user 两键", () => {
+    const frame = msgFrame({ origin: "user", originSessionId: "sess_q1" });
+    const line = encodeFrame(frame);
+    const decoded = decodeFrame(line);
+    expect(decoded.ok).toBe(true);
+    if (decoded.ok && decoded.frame.type === "msg") {
+      expect(decoded.frame.origin).toBe("user");
+      expect(decoded.frame.originSessionId).toBe("sess_q1");
+    }
+  });
+
+  it("旧端点帧（无 origin 两键）照常解析为 agent 缺省（R-11 兼容）", () => {
+    const decoded = decodeFrame(encodeFrame(msgFrame()));
+    expect(decoded.ok).toBe(true);
+    if (decoded.ok && decoded.frame.type === "msg") {
+      expect(decoded.frame.origin).toBeUndefined();
+    }
+  });
+});

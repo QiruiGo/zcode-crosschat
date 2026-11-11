@@ -28,6 +28,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { connectionKeyOf, identityStore } from "./identity.js";
+import { leadKeyOf } from "./member-tools.js";
 import {
   errorResult,
   invalidParamsError,
@@ -40,8 +41,9 @@ import { refreshSnapshot } from "../core/snapshot.js";
 import { LockBusyError, withTeamLock } from "../core/lock.js";
 import { appendMailbox, createMessage } from "../core/mailbox.js";
 import { logEngineEvent } from "../core/log.js";
-import { DEFAULT_TEAM_ID, TERMINAL_TASK_STATUSES, memberState } from "../core/types.js";
-import type { MemberState } from "../core/types.js";
+import { sanitizeKey } from "../core/sanitize.js";
+import { DEFAULT_TEAM_ID, MAX_LEAD_HISTORY, TERMINAL_TASK_STATUSES, memberState } from "../core/types.js";
+import type { LeadHistoryEntry, MemberState } from "../core/types.js";
 import { getTask, newTeamState, readTeam, transitionTask, writeTeam } from "../core/teamstate.js";
 import { attemptWake } from "../engine/wake.js";
 
@@ -64,7 +66,10 @@ function blocksWake(provisionState: MemberState): boolean {
 /** xc_idle 的 idleReason 取值约定（§5.3，对齐 11-cc逆向 §3c-4 idle_notification）。 */
 export const IDLE_REASONS = ["no-claimable-task", "inbox-empty", "blocked-only"] as const;
 
-export const TeamInitShape = {};
+export const TeamInitShape = {
+  // v0.5（R-1 经 F-4）：第三种指派形态——接管现任 lead。默认（不带本参数）行为逐字节不变。
+  takeover: z.boolean().optional().describe("接管现任 lead（仅在用户明确指令时使用）：通知旧 lead、写 leadHistory(reason=takeover)、全程审计"),
+};
 export const IdleShape = {
   summary: z.string().min(1).describe("最终答案/空闲原因摘要（守则 v2 第 3 条：必填）"),
   idleReason: z.enum(IDLE_REASONS).optional().describe("缺省 no-claimable-task"),
@@ -77,8 +82,37 @@ export const CancelShape = {
   taskId: z.string().min(1).describe("要取消的任务 id"),
 };
 
+/** v0.5（R-2）：xc_lead_transfer 入参（lead-tools.ts 新增 core，DESIGN-V0.5 §3.1）。 */
+export const LeadTransferShape = {
+  to: z.string().min(1).describe("移交目标成员名（sanitizeKey 归一；须在册且未 removed）"),
+  reason: z.string().optional().describe("移交原因（入 leadHistory 与审计，不参与逻辑）"),
+};
+/** v0.5（R-3）：xc_lead_release 入参。 */
+export const LeadReleaseShape = {};
+
+type TeamInitArgs = z.infer<z.ZodObject<typeof TeamInitShape>>;
 type IdleArgs = z.infer<z.ZodObject<typeof IdleShape>>;
 type CancelArgs = z.infer<z.ZodObject<typeof CancelShape>>;
+type LeadTransferArgs = z.infer<z.ZodObject<typeof LeadTransferShape>>;
+type LeadReleaseArgs = z.infer<z.ZodObject<typeof LeadReleaseShape>>;
+
+/**
+ * v0.5（R-15-4 系统通知可控字段纪律 / P9）：lead-transfer 的 reason 进帧/史前清洗——
+ * 控制符 → 空格、trim、截 500 字符；空串归一为 undefined（不入史不入帧）。
+ */
+export function sanitizeLeadReason(reason: string | undefined): string | undefined {
+  if (reason === undefined) return undefined;
+  const cleaned = reason.replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, 500);
+  return cleaned === "" ? undefined : cleaned;
+}
+
+/** leadHistory 追加 + ≤32 条 FIFO 截尾（R-6；对齐 formerNames 同款上限口径）。 */
+export function pushLeadHistory(
+  team: { leadHistory?: LeadHistoryEntry[] },
+  entry: LeadHistoryEntry,
+): void {
+  team.leadHistory = [...(team.leadHistory ?? []), entry].slice(-MAX_LEAD_HISTORY);
+}
 
 // ---------------------------------------------------------------------------
 // 渲染（人可读一行摘要；机器负载在 okResult 第二块）
@@ -95,6 +129,18 @@ export function renderIdle(from: string, to: string, delivered: "wake" | "mailbo
 
 export function renderCancel(taskId: string, cancelledBy: string, receiptTo: string, delivered: "wake" | "mailbox"): string {
   return `Task ${taskId} cancelled by ${cancelledBy}; receipt sent to ${receiptTo} (wake via ${delivered}).`;
+}
+
+/** v0.5（R-2）：移交成功的人可读一行。 */
+export function renderLeadTransfer(from: string, to: string, delivered: "wake" | "mailbox"): string {
+  return `Lead role transferred from ${from} to ${to}. This is a metadata role: no tasks, mailboxes or registrations moved (new lead notice via ${delivered}).`;
+}
+
+/** v0.5（R-3）：释放成功/无事可做的人可读一行。 */
+export function renderLeadRelease(released: boolean, teamId: string): string {
+  return released
+    ? `Lead role released. Team "${teamId}" is back to founder-fallback (no explicit lead); collaboration is unaffected.`
+    : `No explicit lead to release (founder-fallback state).`;
 }
 
 // ---------------------------------------------------------------------------
@@ -124,9 +170,13 @@ async function refreshSnapshotBestEffort(stateRoot: string, teamId: string): Pro
 }
 
 export interface LeadToolCore {
-  xc_team_init(args: Record<string, never>, connectionKey: string): Promise<ToolResult>;
+  xc_team_init(args: TeamInitArgs, connectionKey: string): Promise<ToolResult>;
   xc_idle(args: IdleArgs, connectionKey: string): Promise<ToolResult>;
   xc_cancel(args: CancelArgs, connectionKey: string): Promise<ToolResult>;
+  /** v0.5（R-2）：lead 移交（元数据角色；任务/邮箱/注册一概不搬）。 */
+  xc_lead_transfer(args: LeadTransferArgs, connectionKey: string): Promise<ToolResult>;
+  /** v0.5（R-3）：lead 释放（回到 founder 兜底态）。 */
+  xc_lead_release(args: LeadReleaseArgs, connectionKey: string): Promise<ToolResult>;
 }
 
 export function createLeadToolCore(deps: ToolDepsLike): LeadToolCore {
@@ -135,10 +185,12 @@ export function createLeadToolCore(deps: ToolDepsLike): LeadToolCore {
   return {
     /**
      * xc_team_init（§3.2 L1）：把当前连接绑定的身份设为队 lead。
-     * 已存在其他 lead → lead_exists（不得抢位）；已是 lead → 幂等成功。
-     * 落盘：team.json.leadKey + engine.jsonl {event:"lead-set"}（§3.1）。
+     * 已存在其他 lead → lead_exists（不得抢位；v0.5 错误载荷补现任 lead 的 sessionId，
+     * R-1）；已是 lead → 幂等成功。v0.5（F-4）：{takeover:true} 仅在用户明确指令时
+     * 接管现任 lead——通知旧 lead、写 leadHistory(reason=takeover)、全程审计。
+     * 落盘：team.json.leadKey/leadSince/leadHistory + engine.jsonl {event:"lead-set"}。
      */
-    async xc_team_init(_args, connectionKey) {
+    async xc_team_init(args, connectionKey) {
       return runLeadTool(async () => {
         const me = identityStore.require(connectionKey);
         const now = Date.now();
@@ -155,20 +207,59 @@ export function createLeadToolCore(deps: ToolDepsLike): LeadToolCore {
               now,
             });
           }
-          if (team.leadKey !== undefined && team.leadKey !== me.agentKey) {
+          // ★R-1：lead_exists 错误载荷补现任 lead 的 sessionId（用户「指定某人当 lead」→
+          // 让该会话跑 xc_team_init 或让现任移交；F-4 接管须显式传 {takeover:true}）。
+          if (team.leadKey !== undefined && team.leadKey !== me.agentKey && args.takeover !== true) {
             throw new ToolError({
               error: "lead_exists",
               leadKey: team.leadKey,
-              message: `team "${me.teamId}" already has a lead ("${team.leadKey}"); a second lead cannot take over (§3.2 L1)`,
+              sessionId: team.members.find((m) => m.key === team.leadKey)?.sessionId ?? null,
+              message: `team "${me.teamId}" already has a lead ("${team.leadKey}"); a second lead cannot take over (§3.2 L1); ` +
+                "use {takeover:true} only on explicit user instruction (the old lead is notified; the takeover is audited)",
             });
           }
+          const takeoverFrom = args.takeover === true && team.leadKey !== undefined && team.leadKey !== me.agentKey
+            ? team.leadKey
+            : undefined;
           const alreadyLead = team.leadKey === me.agentKey;
           if (!alreadyLead) {
             team.leadKey = me.agentKey;
+            team.leadSince = now;
+            // ★P9：set 枚举写入点——空位认领 from:null；接管 from:旧 lead（reason 固定 "takeover"，无自由文本）。
+            pushLeadHistory(team, {
+              event: "set",
+              from: takeoverFrom ?? null,
+              to: me.agentKey,
+              ts: now,
+              ...(takeoverFrom !== undefined ? { reason: "takeover" } : {}),
+            });
             await writeTeam(stateRoot, team);
           }
-          return { alreadyLead, leadKey: me.agentKey };
+          return { alreadyLead, leadKey: me.agentKey, takeoverFrom };
         });
+
+        // 锁外（F-4 hunk ③）：接管时通知旧 lead（mailbox+唤醒；唤醒失败=mailbox 兜底）。
+        if (out.takeoverFrom !== undefined) {
+          const notice = createMessage(me.agentKey, out.takeoverFrom, JSON.stringify({
+            type: "lead-transfer", teamId: me.teamId, from: me.agentKey, to: me.agentKey, status: "taken-over",
+          }), { deliveryClaimedAt: Date.now() });
+          await appendMailbox(stateRoot, me.teamId, out.takeoverFrom, notice);
+          const oldSessionId = (await readTeam(stateRoot, me.teamId))?.members
+            .find((m) => m.key === out.takeoverFrom)?.sessionId ?? null;
+          if (oldSessionId !== null && oldSessionId !== "") {
+            await attemptWake({
+              stateRoot,
+              teamId: me.teamId,
+              toAgentKey: out.takeoverFrom,
+              toSessionId: oldSessionId,
+              workspace,
+              reason: "lead-transfer",
+              receiptIds: [notice.id],
+              ticket: `CrossChat lead 变更：${me.agentKey} 已接管队长角色（用户指令）`,
+              env: deps.env,
+            });
+          }
+        }
 
         await refreshSnapshotBestEffort(stateRoot, me.teamId); // leadKey 影响全景 lead 行（§7.3.1）
         await logEngineEvent(stateRoot, {
@@ -176,11 +267,13 @@ export function createLeadToolCore(deps: ToolDepsLike): LeadToolCore {
           teamId: me.teamId,
           by: me.agentKey,
           alreadyLead: out.alreadyLead,
+          ...(out.takeoverFrom !== undefined ? { takeover: true, from: out.takeoverFrom } : {}),
         });
         return okResult(renderTeamInit(me.teamId, out.leadKey, out.alreadyLead), {
           teamId: me.teamId,
           leadKey: out.leadKey,
           alreadyLead: out.alreadyLead,
+          ...(out.takeoverFrom !== undefined ? { takeover: true, from: out.takeoverFrom } : {}),
         });
       });
     },
@@ -392,6 +485,165 @@ export function createLeadToolCore(deps: ToolDepsLike): LeadToolCore {
         });
       });
     },
+
+    /**
+     * xc_lead_transfer（v0.5 R-2，DESIGN-V0.5 §3.1）：现任 lead 把 lead 角色移交给
+     * 另一名在册未 removed 成员。lead 是元数据角色：任务、邮箱、注册一概不搬，
+     * 派发/认领/消息完全不受影响。落盘（团队锁内同一事务）：team.leadKey=to、
+     * leadSince=now、leadHistory 追加 transfer（≤32 FIFO）；锁外：lead-transfer 帧
+     * 入新 lead 邮箱 + 回执帧入自己邮箱 + 唤醒新 lead（scene="lead-transfer"，
+     * 不进 WAKE_RULES_SCENES——新 lead 不需守则重附）。
+     */
+    async xc_lead_transfer(args, connectionKey) {
+      return runLeadTool(async () => {
+        const me = identityStore.require(connectionKey);
+        const to = sanitizeKey(args.to);
+        if (to === "") throw invalidParamsError(`name ${JSON.stringify(args.to)} sanitizes to an empty key`);
+        // P9：reason 进帧/史前清洗（控制符→空格、截 500）。
+        const reason = sanitizeLeadReason(args.reason);
+        if (to === me.agentKey) {
+          // F-2（DESIGN D10）：R-2 的「to===me → invalid_params」与「to 已是现任 lead →
+          // 幂等成功」在调用者=现任 lead 时同指；取 invalid_params——转给自己是无操作，
+          // 不造假审计。
+          throw invalidParamsError("transferring the lead role to yourself is a no-op");
+        }
+        const now = Date.now();
+
+        const prepared = await withTeamLock(stateRoot, me.teamId, async () => {
+          const team = await readTeam(stateRoot, me.teamId);
+          if (team === undefined) throw new ToolError({ error: "no_team", message: "no team on disk yet; register first" });
+          if (!team.members.some((m) => m.key === me.agentKey)) {
+            throw new ToolError({
+              error: "not_a_member",
+              agentKey: me.agentKey,
+              message: `"${me.agentKey}" is not a member; register first`,
+            });
+          }
+          // 资格：调用者 = 现任 lead（leadKeyOf 含 founder 兜底，member-tools.ts:101-104 同语义）。
+          if (leadKeyOf(team) !== me.agentKey) {
+            throw new ToolError({
+              error: "not_lead",
+              agentKey: me.agentKey,
+              leadKey: leadKeyOf(team),
+              message: `only the current lead ("${leadKeyOf(team)}") can transfer the role`,
+            });
+          }
+          const target = team.members.find((m) => m.key === to);
+          if (target === undefined || memberState(target) === "removed") {
+            throw invalidParamsError(`transfer target "${to}" is not an active member of team "${team.teamId}"`);
+          }
+          // 落盘（同一事务）：leadKey + leadSince + leadHistory（≤32 FIFO）。
+          team.leadKey = to;
+          team.leadSince = now;
+          pushLeadHistory(team, {
+            event: "transfer",
+            from: me.agentKey,
+            to,
+            ts: now,
+            ...(reason === undefined ? {} : { reason }),
+          });
+          await writeTeam(stateRoot, team);
+          // 通知帧（FRAME_TYPES 第七值 "lead-transfer"；字段固定模板，R-15-4 可控字段纪律）。
+          const notice = createMessage(me.agentKey, to, JSON.stringify({
+            type: "lead-transfer",
+            teamId: me.teamId,
+            from: me.agentKey,
+            to,
+            ...(reason === undefined ? {} : { reason }),
+          }), { deliveryClaimedAt: now });
+          await appendMailbox(stateRoot, me.teamId, to, notice);
+          return { to, noticeId: notice.id, toSessionId: target.sessionId };
+        });
+
+        // 锁外：回执帧给旧 lead（自己查箱可见「已移交」），并唤醒新 lead。
+        const receipt = createMessage(me.agentKey, me.agentKey, JSON.stringify({
+          type: "lead-transfer", teamId: me.teamId, from: me.agentKey, to: prepared.to, status: "completed",
+        }), { deliveryClaimedAt: Date.now() });
+        await appendMailbox(stateRoot, me.teamId, me.agentKey, receipt);
+        let delivered: "wake" | "mailbox" = "mailbox";
+        let note: string | undefined;
+        if (prepared.toSessionId !== null && prepared.toSessionId !== "") {
+          const sent = await attemptWake({
+            stateRoot,
+            teamId: me.teamId,
+            toAgentKey: prepared.to,
+            toSessionId: prepared.toSessionId,
+            workspace,
+            reason: "lead-transfer",
+            receiptIds: [prepared.noticeId],
+            ticket: `收到 CrossChat lead 移交：${me.agentKey} → ${prepared.to}，你现在分别是本队的队长（元数据角色）`,
+            env: deps.env,
+          });
+          delivered = sent.delivered;
+          note = sent.note ?? note;
+        }
+        await refreshSnapshotBestEffort(stateRoot, me.teamId);
+        await logEngineEvent(stateRoot, {
+          event: "lead-transfer",
+          teamId: me.teamId,
+          from: me.agentKey,
+          to: prepared.to,
+          ...(reason === undefined ? {} : { reason }),
+          messageId: prepared.noticeId,
+        });
+        return okResult(renderLeadTransfer(me.agentKey, prepared.to, delivered), {
+          teamId: me.teamId,
+          from: me.agentKey,
+          to: prepared.to,
+          leadSince: now,
+          messageId: prepared.noticeId,
+          delivered,
+          ...(note !== undefined ? { note } : {}),
+        });
+      });
+    },
+
+    /**
+     * xc_lead_release（v0.5 R-3，DESIGN-V0.5 §3.2）：现任 lead 主动卸任——团队锁内删
+     * leadKey/leadSince（回到 founder 兜底态），leadHistory 追加 release；非 lead 调用
+     * → not_lead。本就无显式 leadKey（founder 兜底态）→ released:false 幂等无操作。
+     * 无通知面（SPEC R-3：无人可通知「没有 lead 了」）；后续 xc_idle 收件人自动回落
+     * founder（lead-tools.ts:212 `leadKey ?? founderKey` 现状逻辑不动）。
+     */
+    async xc_lead_release(_args, connectionKey) {
+      return runLeadTool(async () => {
+        const me = identityStore.require(connectionKey);
+        const now = Date.now();
+        const out = await withTeamLock(stateRoot, me.teamId, async () => {
+          const team = await readTeam(stateRoot, me.teamId);
+          if (team === undefined) throw new ToolError({ error: "no_team", message: "no team on disk yet" });
+          if (leadKeyOf(team) !== me.agentKey) {
+            throw new ToolError({
+              error: "not_lead",
+              agentKey: me.agentKey,
+              leadKey: leadKeyOf(team),
+              message: `only the current lead ("${leadKeyOf(team)}") can release the role`,
+            });
+          }
+          if (team.leadKey === undefined) {
+            return { released: false, alreadyDefault: true }; // founder 兜底态本就无显式 leadKey：无事可做
+          }
+          delete team.leadKey;
+          delete team.leadSince; // 回到 founder 兜底态（types.ts 缺省语义）
+          pushLeadHistory(team, { event: "release", from: me.agentKey, to: null, ts: now });
+          await writeTeam(stateRoot, team);
+          return { released: true, alreadyDefault: false };
+        });
+        await refreshSnapshotBestEffort(stateRoot, me.teamId);
+        await logEngineEvent(stateRoot, {
+          event: "lead-release",
+          teamId: me.teamId,
+          from: me.agentKey,
+          released: out.released,
+        });
+        return okResult(renderLeadRelease(out.released, me.teamId), {
+          teamId: me.teamId,
+          from: me.agentKey,
+          released: out.released,
+          ...(out.alreadyDefault ? { alreadyDefault: true } : {}),
+        });
+      });
+    },
   };
 }
 
@@ -406,13 +658,13 @@ export interface ToolDepsLike {
 // SDK 接线
 // ---------------------------------------------------------------------------
 
-/** 注册 W4 三个 lead 面工具（DESIGN-V0.2 §9.2 接口签名）。 */
+/** 注册 lead 面工具（DESIGN-V0.2 §9.2 接口签名；v0.5 增 xc_lead_transfer/xc_lead_release，共 5 个）。 */
 export function registerLeadTools(server: McpServer, deps: ToolDepsLike): void {
   const core = createLeadToolCore(deps);
 
   server.tool(
     "xc_team_init",
-    "Become the team lead (sets team.leadKey to this session's registered identity). Rejected with lead_exists when another lead already holds the role.",
+    "Become the team lead (sets team.leadKey). Rejected with lead_exists when another lead holds the role — use {takeover:true} ONLY on explicit user instruction to take over a dead/unresponsive/refusing lead (the old lead is notified and the takeover is audited). Lead is a metadata role.",
     TeamInitShape,
     async (args, extra) => core.xc_team_init(args, connectionKeyOf(extra)),
   );
@@ -427,5 +679,17 @@ export function registerLeadTools(server: McpServer, deps: ToolDepsLike): void {
     "Cancel a pending/claimed/in_progress task (lead or task creator only): activates the cancelled edge, writes a cancelled receipt to the creator's mailbox and wakes it.",
     CancelShape,
     async (args, extra) => core.xc_cancel(args, connectionKeyOf(extra)),
+  );
+  server.tool(
+    "xc_lead_transfer",
+    "Transfer the team lead role to another member (metadata role only: no tasks, mailboxes or registrations move; dispatch/claim/messaging are unaffected). Current lead only; the target must be an active member.",
+    LeadTransferShape,
+    async (args, extra) => core.xc_lead_transfer(args, connectionKeyOf(extra)),
+  );
+  server.tool(
+    "xc_lead_release",
+    "Release the team lead role (current lead only): team.json drops leadKey and falls back to founder-fallback; collaboration and dispatch/claim/messaging are unaffected. No-op (released:false) when there is no explicit lead.",
+    LeadReleaseShape,
+    async (args, extra) => core.xc_lead_release(args, connectionKeyOf(extra)),
   );
 }

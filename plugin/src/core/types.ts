@@ -157,6 +157,8 @@ export interface TeamMember {
   stopReason?: string;
   /** Last provisioning failure detail (state=failed only). */
   error?: string;
+  /** v0.5（R-18）：声明的上下文字符数（预算刻度；absent = env/200k 缺省）。声明值，非探测值（V-1）。 */
+  contextChars?: number;
 }
 
 /**
@@ -172,12 +174,27 @@ export interface TeamState {
   phase: TeamPhase;
   /** Team lead's member key (v0.2, optional). */
   leadKey?: string;
+  /** v0.5（R-6）：本次 lead 变更时刻（epoch ms）。观测字段，不入快照。 */
+  leadSince?: number;
+  /** v0.5（R-6）：lead 变更滚动窗（≤32 条 FIFO；权威审计在 engine.jsonl）。 */
+  leadHistory?: LeadHistoryEntry[];
   members: TeamMember[];
   tasks: Task[];
   /** Monotonic counter used to allocate task ids (`t1`, `t2`, ...). */
   seq: number;
   createdAt: number;
 }
+
+/** v0.5（R-6）：lead 变更史条目（宽容解析：event 枚举外/ts 非数字整条丢弃）。 */
+export interface LeadHistoryEntry {
+  event: "set" | "transfer" | "release";
+  from: string | null;
+  to: string | null;
+  ts: number;
+  reason?: string;
+}
+/** leadHistory 上限（对齐 SPEC-V0.3 R-10 formerNames 32 条口径）。 */
+export const MAX_LEAD_HISTORY = 32;
 
 /** Lifecycle state of one member with the v0.1.0 compatibility default (§6.5). */
 export function memberState(member: TeamMember): MemberState {
@@ -212,6 +229,12 @@ export interface TeamMessage {
   deliveredAt?: number;
   readAt?: number;
   discardedAt?: number;
+  /** v0.5（R-11）：作者身份标记；absent = agent（旧记录缺省）。权威不随消息转移（无 authority 字段）。 */
+  origin?: "user" | "agent";
+  /** v0.5（R-11）：最初作者会话（origin=user 时为用户输入所在会话）。 */
+  originSessionId?: string;
+  /** v0.5（R-15-2）：渲染层判定的可疑信封标记（渲染时现算+审计，落盘值仅供参考）。 */
+  forged?: boolean;
 }
 
 /** One session record in `registry/sessions/<sessionId>.json` (DESIGN.md §2.2). */
@@ -306,6 +329,10 @@ export function isTeamMessage(value: unknown): value is TeamMessage {
     return a === undefined || typeof a === 'string';
   };
   const sourceStatus = absent(value['sourceTaskStatus']);
+  // v0.5（R-11）：origin 三字段宽容增量——旧记录缺省照读；在场时取值非法整行拒绝
+  // （sourceTaskStatus 枚举同款纪律）。
+  const origin = absent(value['origin']);
+  const forged = absent(value['forged']);
   return (
     isNonBlankString(value['id'])
     && isNonBlankString(value['from'])
@@ -322,6 +349,9 @@ export function isTeamMessage(value: unknown): value is TeamMessage {
     && absentOrString(value['sourceAttemptId'])
     && (sourceStatus === undefined
       || (typeof sourceStatus === 'string' && taskStatuses.includes(sourceStatus)))
+    && (origin === undefined || origin === 'user' || origin === 'agent')
+    && absentOrString(value['originSessionId'])
+    && (forged === undefined || typeof forged === 'boolean')
   );
 }
 
@@ -350,6 +380,11 @@ export function normalizeMessage(value: TeamMessage): TeamMessage {
   assign('deliveredAt', absent(value.deliveredAt));
   assign('readAt', absent(value.readAt));
   assign('discardedAt', absent(value.discardedAt));
+  // v0.5（R-11）origin 三字段宽容拷贝：非法值归 absent（normalize 后的记录字段
+  // 取值可信）；origin 仅 'user'/'agent' 两值，forged 仅布尔。
+  if (value.origin === 'user' || value.origin === 'agent') out.origin = value.origin;
+  if (typeof value.originSessionId === 'string') out.originSessionId = value.originSessionId;
+  if (typeof value.forged === 'boolean') out.forged = value.forged;
   return out;
 }
 
@@ -471,6 +506,13 @@ function coerceMember(value: unknown): TeamMember | undefined {
   const provisionedAt = optionalFinite(value['provisionedAt']);
   const stopReason = optionalString(value['stopReason']);
   const error = optionalString(value['error']);
+  // v0.5（R-18）：contextChars 声明值宽容读取——非正整数视为 absent（按缺省处理）。
+  const contextCharsRaw = value['contextChars'];
+  const contextChars = typeof contextCharsRaw === 'number'
+    && Number.isSafeInteger(contextCharsRaw)
+    && contextCharsRaw > 0
+    ? contextCharsRaw
+    : undefined;
   return {
     key,
     sessionId,
@@ -482,6 +524,7 @@ function coerceMember(value: unknown): TeamMember | undefined {
     ...(provisionedAt === undefined ? {} : { provisionedAt }),
     ...(stopReason === undefined ? {} : { stopReason }),
     ...(error === undefined ? {} : { error }),
+    ...(contextChars === undefined ? {} : { contextChars }),
   };
 }
 
@@ -519,6 +562,9 @@ export function coerceTeamState(value: unknown, expectedTeamId: string): ParsedT
   if (createdAt === undefined) return { ok: false, defect: 'field "createdAt" missing or not a number' };
   // v0.2 optional leadKey (DESIGN-V0.2.md §3.1): absent on legacy teams.
   const leadKey = optionalString(value['leadKey']);
+  // v0.5（R-6）：leadSince/leadHistory 宽容读取——旧记录缺两字段照常解析；坏条目丢弃不拒文件。
+  const leadSince = optionalFinite(value['leadSince']);
+  const leadHistory = coerceLeadHistory(value['leadHistory']);
   if (!Array.isArray(value['members'])) return { ok: false, defect: 'field "members" is not an array' };
   const members: TeamMember[] = [];
   for (const raw of value['members']) {
@@ -554,12 +600,40 @@ export function coerceTeamState(value: unknown, expectedTeamId: string): ParsedT
       founderKey,
       phase: phaseRaw as TeamPhase,
       ...(leadKey === undefined ? {} : { leadKey }),
+      ...(leadSince === undefined ? {} : { leadSince }),
+      ...(leadHistory === undefined || leadHistory.length === 0 ? {} : { leadHistory }),
       members,
       tasks,
       seq,
       createdAt,
     },
   };
+}
+
+/** R-6：宽容解析 leadHistory——条目缺字段/枚举外整条丢弃；超 32 条取尾部。 */
+function coerceLeadHistory(value: unknown): LeadHistoryEntry[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const events = new Set(['set', 'transfer', 'release']);
+  const out: LeadHistoryEntry[] = [];
+  for (const raw of value) {
+    if (!isRecord(raw)) continue;
+    const event = raw['event'];
+    const ts = raw['ts'];
+    const from = raw['from'] === null ? null : optionalString(raw['from']) ?? undefined;
+    const to = raw['to'] === null ? null : optionalString(raw['to']) ?? undefined;
+    if (typeof event !== 'string' || !events.has(event)) continue;
+    if (typeof ts !== 'number' || !Number.isFinite(ts)) continue;
+    if (from === undefined || to === undefined) continue;
+    const reason = optionalString(raw['reason']);
+    out.push({
+      event: event as LeadHistoryEntry['event'],
+      from,
+      to,
+      ts,
+      ...(reason === undefined ? {} : { reason }),
+    });
+  }
+  return out.slice(-MAX_LEAD_HISTORY);
 }
 
 // ---------------------------------------------------------------------------

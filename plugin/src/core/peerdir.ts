@@ -10,6 +10,8 @@
  *   ├── inbox/<sessionId>.jsonl      ← 传输级收件箱（退化投递目标）
  *   ├── queue/<sessionId>.jsonl      ← 投递级队列（过闸后，模型可见）
  *   ├── held/<sessionId>/<msgId>.json← hold 隔离区
+ *   ├── uservoice/<sid>.json        ← 钩子写的用户原话记录（盖章链，DESIGN-V0.5 §4.3）
+ *   ├── messages/<msgId>.json       ← 消息全文 store（接收入队即幂等落盘，R-21 经 F-3）
  *   └── logs/peer.jsonl              ← 跨会话域审计
  *
  * 根目录解析优先级（§3.1）：`XC_MESSAGING_DIR` > `ZCODE_PLUGIN_DATA` + `/peers`
@@ -149,6 +151,21 @@ export function peerHeldFileSegment(msgId: string): string {
   const value = msgId.trim();
   if (/^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/.test(value)) return value;
   return `m-${createHash('sha256').update(msgId, 'utf8').digest('hex').slice(0, 24)}`;
+}
+
+/** `uservoice/<sessionId>.json`：用户原话环形记录（盖章链真源；每会话一文件，追加最近 ≤8 条）。 */
+export function peerUservoiceFile(root: string, sessionId: string): string {
+  return join(root, 'uservoice', `${peerHeldFileSegment(sessionId)}.json`);
+}
+
+/** `messages/`：超大消息全文 store 目录。 */
+export function peerMessagesDir(root: string): string {
+  return join(root, 'messages');
+}
+
+/** `messages/<msgId>.json`：单条全文 store（文件名段消毒复用 peerHeldFileSegment 规则）。 */
+export function peerMessagesFile(root: string, msgId: string): string {
+  return join(peerMessagesDir(root), `${peerHeldFileSegment(msgId)}.json`);
 }
 
 /** `logs/`：跨会话域审计目录。 */

@@ -1,10 +1,10 @@
 {
   "name": "zcode-crosschat",
-  "version": "0.4.0",
-  "description": "Agent-team collaboration for independent ZCode sessions: a lead coordinates engine-provisioned teammate sessions, members self-start via prompt protocol, and a file mailbox remains the source of truth. v0.3 adds the cross-session peer axis: a machine-global peer registry, named-pipe transport, name-as-address addressing, and accept/hold/refuse inbound policy.",
+  "version": "0.5.0",
+  "description": "Agent-team collaboration for independent ZCode sessions: a lead coordinates engine-provisioned teammate sessions, members self-start via prompt protocol, and a file mailbox remains the source of truth. v0.3 adds the cross-session peer axis: a machine-global peer registry, named-pipe transport, name-as-address addressing, and accept/hold/refuse inbound policy. v0.5 makes the lead a transferable metadata role, keeps user-spoken text verifiable end to end (origin=user), and bounds every injection surface by the receiver's declared context budget.",
   "description_i18n": {
-    "en": "Lead-teammate collaboration across independent ZCode sessions plus a cross-session peer axis: machine-global peer registry, named-pipe transport, name-as-address addressing, accept/hold/refuse inbound policy, and structured attribution envelopes on every inbound peer message.",
-    "zh-CN": "跨独立 zcode 会话的队长-队员协作，外加跨会话 peer 轴：机器全局 peer 注册表、命名管道传输、名字即地址寻址、accept/hold/refuse 入站策略，以及每条外来消息都带结构化信封与归因尾注。"
+    "en": "Lead-teammate collaboration across independent ZCode sessions plus a cross-session peer axis: machine-global peer registry, named-pipe transport, name-as-address addressing, accept/hold/refuse inbound policy, and structured attribution envelopes on every inbound peer message. v0.5: the lead is a transferable metadata role, user-spoken text stays verifiable end to end (origin=user), and every injection surface is bounded by the receiver's declared context budget.",
+    "zh-CN": "跨独立 zcode 会话的队长-队员协作，外加跨会话 peer 轴：机器全局 peer 注册表、命名管道传输、名字即地址寻址、accept/hold/refuse 入站策略，以及每条外来消息都带结构化信封与归因尾注。v0.5：队长是可移交的元数据角色，用户亲述端到端可辨（origin=user），所有注入面按接收方声明的上下文预算自适应截断。"
   },
   "author": { "name": "QiruiGo" },
   "license": "MIT",
@@ -34,7 +34,11 @@
         "XC_CROSSCHAT_INBOUND": "${user_config.cross_session_inbound}",
         "XC_PEER_RECEIVE": "${user_config.peer_receive}",
         "XC_HOLD_TTL_MS": "${user_config.hold_ttl_ms}",
-        "XC_MESSAGING_DIR": "${user_config.messaging_dir}"
+        "XC_MESSAGING_DIR": "${user_config.messaging_dir}",
+        "XC_CONTEXT_CHARS": "${user_config.context_chars}",
+        "XC_INJECT_ITEM_CHARS": "${user_config.inject_item_chars}",
+        "XC_INJECT_TOTAL_CHARS": "${user_config.inject_total_chars}",
+        "XC_USERVOICE_TTL_MS": "${user_config.uservoice_ttl_ms}"
       }
     }
   },
@@ -122,6 +126,30 @@
       "default": "",
       "title": "peer 注册表目录（留空=插件数据目录）",
       "description": "机器全局的跨会话 peer 注册表根目录。留空时用插件数据目录（ZCODE_PLUGIN_DATA/peers）；填绝对路径可改到别处（例如做隔离演示）。"
+    },
+    "context_chars": {
+      "type": "number",
+      "default": 0,
+      "title": "默认上下文字符数",
+      "description": "接收方注入预算的上下文声明值（R-18）。0 或留空 = 200000（内置缺省）；成员/peer 可用 context 参数逐会话覆盖。宿主无法查询会话真实模型窗口，本值是声明值：偏小=多截断（安全方向），偏大=接近不截断。"
+    },
+    "inject_item_chars": {
+      "type": "number",
+      "default": 0,
+      "title": "单条注入预算覆盖",
+      "description": "覆盖单条注入预算（基准 4000×缩放，范围 1000–16000）。0 或留空 = 自动。设极大值（如 99999999）可回退到 v0.4 的不截断行为。"
+    },
+    "inject_total_chars": {
+      "type": "number",
+      "default": 0,
+      "title": "批次注入预算覆盖",
+      "description": "覆盖单次注入总预算（基准 16000×缩放，范围 4000–64000）。0 或留空 = 自动。设极大值可回退 v0.4 行为。"
+    },
+    "uservoice_ttl_ms": {
+      "type": "number",
+      "default": 600000,
+      "title": "用户原话记录有效期（毫秒）",
+      "description": "盖章链（用户亲述溯源）中用户原始提示记录的有效期，默认 10 分钟；每条记录最多被匹配 3 次。过期或超次后消息回落 origin=agent（安全方向）。"
     }
   }
 }

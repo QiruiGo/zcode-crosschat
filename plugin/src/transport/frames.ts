@@ -61,6 +61,10 @@ export interface MsgFrame {
   summary?: string;
   /** 发方权限档类断言（zcode 增设字段，R-19）。 */
   senderMode?: 'bypass' | 'prompting';
+  /** v0.5（R-11）：作者身份标记；发送构造仅 "user" 时写出（agent 缺省不写，旧端点兼容）。 */
+  origin?: 'user' | 'agent';
+  /** v0.5（R-11）：最初作者会话（origin=user 时为用户输入所在会话）。 */
+  originSessionId?: string;
 }
 
 /** 控制帧：v0.3 只支持 rename（R-14）。 */
@@ -131,7 +135,7 @@ export const PEER_FORBIDDEN_FIELDS = [
 /** 每种帧的封闭字段集（R-14）。 */
 const FRAME_FIELDS: Record<PeerFrameType, readonly string[]> = {
   auth: ['type', 'token'],
-  msg: ['type', 'msgId', 'from', 'fromSessionId', 'text', 'summary', 'senderMode'],
+  msg: ['type', 'msgId', 'from', 'fromSessionId', 'text', 'summary', 'senderMode', 'origin', 'originSessionId'],
   control: ['type', 'action', 'name', 'sessionId'],
   status: ['type', 'msgId', 'state', 'detail'],
 };
@@ -205,10 +209,25 @@ export function validateFrame(value: unknown): FrameValidation {
       if (senderMode !== undefined && senderMode !== 'bypass' && senderMode !== 'prompting') {
         return { ok: false, reason: 'msg frame senderMode must be bypass or prompting' };
       }
+      // v0.5（R-11）：origin 只允许两值；originSessionId 须为非空字符串。
+      const origin = value['origin'];
+      if (origin !== undefined && origin !== 'user' && origin !== 'agent') {
+        return { ok: false, reason: 'msg frame origin must be "user" or "agent"' };
+      }
+      const originSessionId = value['originSessionId'];
+      if (originSessionId !== undefined && !optionalNonEmptyString(originSessionId)) {
+        return { ok: false, reason: 'msg frame originSessionId must be a non-empty string' };
+      }
       const frame: MsgFrame = { type: 'msg', msgId, from, text };
       if (fromSessionId !== undefined) frame.fromSessionId = fromSessionId;
       if (summary !== undefined) frame.summary = summary;
       if (senderMode !== undefined) frame.senderMode = senderMode;
+      if (origin === 'user') {
+        frame.origin = 'user';
+        if (originSessionId !== undefined) frame.originSessionId = originSessionId;
+      }
+      // origin === 'agent' 或缺失 → 不落字段（缺省语义）；originSessionId 随之丢弃——
+      // 溯源属性只随 user 标记有意义。旧端点帧无两键 → 照常解析为 agent（R-11 兼容）。
       return { ok: true, frame };
     }
     case 'control': {

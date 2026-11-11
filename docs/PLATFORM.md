@@ -2,9 +2,9 @@
 
 - 调研人：平台调研员（动态工作流子代理）
 - 日期：2026-11-09
-- 环境：Windows 11 + Git Bash；ZCode 桌面版 `E:\ZCode\ZCode.exe`（CLI 版本 **0.17.1**，实测输出「zcode 0.17.1」）
+- 环境：Windows 11 + Git Bash；ZCode 桌面版 `<安装目录>\ZCode.exe`（CLI 版本 **0.17.1**，实测输出「zcode 0.17.1」）
 - 方法：全部结论来自本会话内实际读取的文件（路径+行号）与实际执行的命令（命令+输出摘录）。未运行/未确认之处在 §8 明示。
-- 术语：无特别说明时 `~` = `C:\Users\qdqir`。
+- 术语：无特别说明时 `~` = `<用户主目录>`。
 
 ---
 
@@ -134,18 +134,18 @@
 `zcode` 不在 PATH；CLI 实体是 ZCode 桌面版内置的 Node 入口（documents 插件 manifest 同款调法）：
 
 ```bash
-ELECTRON_RUN_AS_NODE=1 /e/ZCode/ZCode.exe /e/ZCode/resources/glm/zcode.cjs <command|options>
+ELECTRON_RUN_AS_NODE=1 <安装目录>/ZCode.exe <安装目录>/resources/<variant>/zcode.cjs <command|options>
 ```
 
 `--help` 实测（0.17.1）关键项：`app-server`（stdio 协议服务器）、`-p/--prompt <text>`（无头单发）、`--resume <sessionId>`（sess_...）、`-c/--continue`、`--output-format`（text|json|stream-json，从 bundle 解析出但未印在 help）、`--mode`（build|edit|plan|yolo|guarded，--prompt 默认 yolo）、`--target`、`--attach`、`--cwd`、`--workflow-mode`。完整参数 schema 从 zcode.cjs 解出（parseArgs 严格模式）：另有 `json/output-format/no-browser/browser-use/browser-executable/memory-bench/attach/cwd/locale/resume/target/target-replace/continue/force/toolsearch-mode/force-mcs/mode/verbose/prepare-storage/stdio/surface/workflow-mode/all/available/keep-data/scope/sparse`。
 
 ### 4.2 无头单发 `--prompt`：机制可用，但默认模型选择有坑
 
-实测命令（scratch = `D:\tools\zcode-crosschat\.scratch`，为测试专建）：
+实测命令（scratch = `<仓库路径>\.scratch`，为测试专建）：
 
 ```bash
-ELECTRON_RUN_AS_NODE=1 /e/ZCode/ZCode.exe /e/ZCode/resources/glm/zcode.cjs \
-  --prompt "只回复四个字符: PONG" --cwd "D:\tools\zcode-crosschat\.scratch"
+ELECTRON_RUN_AS_NODE=1 <安装目录>/ZCode.exe <安装目录>/resources/<variant>/zcode.cjs \
+  --prompt "只回复四个字符: PONG" --cwd "<仓库路径>\.scratch"
 ```
 
 - 会话确实创建并持久化（db.sqlite `session` 表新增 `sess_9162eb78-...`、`sess_bffa1a12-...`，directory=scratch，task_type=interactive——只读 SQL 实查）。
@@ -192,7 +192,7 @@ ELECTRON_RUN_AS_NODE=1 /e/ZCode/ZCode.exe /e/ZCode/resources/glm/zcode.cjs \
 
 ```bash
 ELECTRON_RUN_AS_NODE=1 ZCode.exe zcode.cjs --resume sess_09386566-... \
-  --prompt "把上一次结果再乘以 3，只回复数字" --cwd "D:\tools\zcode-crosschat\.scratch" --output-format json
+  --prompt "把上一次结果再乘以 3，只回复数字" --cwd "<仓库路径>\.scratch" --output-format json
 # 第 1 次（×3）：tail 只截到 usage/projection 段（turn 成功、totalTokenCount 20784），response 字段未入摘录；
 # 第 2 次（×5）完整输出：{"sessionId":"sess_09386566-...","response":"11730","usage":{...,"totalTokens":20829},
 #                        "projection":{"status":"idle","turnCount":1,...}}
@@ -245,7 +245,7 @@ ELECTRON_RUN_AS_NODE=1 ZCode.exe zcode.cjs --resume sess_09386566-... \
 
 ## 7. 给后续环节的直接可用资产
 
-- 测试工作区：`D:\tools\zcode-crosschat\.scratch`（本次全部会话落点；可复用作联调工作区）。
+- 测试工作区：`<仓库路径>\.scratch`（本次全部会话落点；可复用作联调工作区）。
 - 已验证的会话样例（db.sqlite 中可 resume）：`sess_09386566-554e-4b2d-a80b-0784b740d0f8`（多轮记忆：391→782→2346→11730）。
 - 协议客户端最小实现要点：spawn app-server → 逐行 JSON 解析 → 自动应答两类服务器回调 → create/setModel/send/messages 封装（§4.3 的 1-6 步即伪代码）。
 

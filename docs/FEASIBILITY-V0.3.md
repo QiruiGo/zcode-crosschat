@@ -3,10 +3,10 @@
 - 实验人：传输侦察员（动态工作流子代理）
 - 日期：2026-11-09
 - 任务：实测 ① 传输层（插件 MCP server 内起 Windows 命名管道 / localhost TCP server，客户端投递端到端、失败模式与文件退化路径）、② peer 注册表（钩子写 peer 文件 + server 侧扫描发现、活跃判定与过期清理）
-- 证据根目录：`D:\tools\deepseek-crosschat\evidence\12-v030\feasibility\`（脚本 `_scripts/`、结构化结果 `_logs/`、现场 `_run/`；下文「证据」列均相对该目录）
+- 证据根目录：`<证据仓>\evidence\12-v030\feasibility\`（脚本 `_scripts/`、结构化结果 `_logs/`、现场 `_run/`；下文「证据」列均相对该目录）
 - 配套规格：`docs/SPEC-V0.3.md`（规格精读员产出，R-1…R-30）。**本文只给实测事实**，并在 §7 逐条标注对 SPEC 条目的回填/修正/风险提示。
 - 机制标尺：`reports/11-cc逆向.md` §3.b（跨会话 UDS/命名管道、token 鉴权、pid 注册表、名字即地址、`crossSessionInbound` 三态）
-- 实验环境：Windows 11 + Git Bash；node v24.22.1（`C:\Program Files\nodejs\node`）；zcode CLI 0.17.1（`E:\ZCode\ZCode.exe` + `E:\ZCode\resources\glm\zcode.cjs`）；桌面宿主进程 pid 15560
+- 实验环境：Windows 11 + Git Bash；node v24.22.1（`C:\Program Files\nodejs\node`）；zcode CLI 0.17.1（`<安装目录>\ZCode.exe` + `<安装目录>\resources\glm\zcode.cjs`）；桌面宿主进程 pid 15560
 - 纪律声明：全部结论来自本次实验实际执行（命令/脚本与原始输出在证据目录可复核）；未执行/未确认项在 §8 明示。实验期间安装的探针插件 `zcx-probe@zcx-probe-market` 属**实验件**，处置见 §6.4。
 
 ---
@@ -206,7 +206,7 @@ trial 2: hookA_boundServerPid=919905  expectedA=963250
 安装/物化命令与输出：
 
 ```bash
-ELECTRON_RUN_AS_NODE=1 /e/ZCode/ZCode.exe /e/ZCode/resources/glm/zcode.cjs plugins validate "…\probe-market\zcx-probe"
+ELECTRON_RUN_AS_NODE=1 <安装目录>/ZCode.exe <安装目录>/resources/<variant>/zcode.cjs plugins validate "…\probe-market\zcx-probe"
 # → Plugin manifest is valid: …\probe-market\zcx-probe
 
 ELECTRON_RUN_AS_NODE=1 … zcode.cjs plugins marketplace add "…\probe-market"
@@ -224,7 +224,7 @@ ELECTRON_RUN_AS_NODE=1 … zcode.cjs plugins install zcx-probe@zcx-probe-market
 
 | 载体 | `CLAUDE_SESSION_ID` | `ZCODE_SESSION_ID` | `ZCODE_PROJECT_DIR` | cwd | ppid |
 |---|---|---|---|---|---|
-| **钩子进程** | ✅ `sess_6b92eb10-4070-4a01-a4de-6d0405d87b10` | ✅ 同值 | ✅ `D:\tools` | `D:\tools` | 15560（桌面宿主） |
+| **钩子进程** | ✅ `sess_6b92eb10-4070-4a01-a4de-6d0405d87b10` | ✅ 同值 | ✅ `<本机工作区>` | `<本机工作区>` | 15560（桌面宿主） |
 | **MCP server 进程** | ❌ **无** | ❌ **无** | ✅ 有 | = 会话工作区 | 15560 / app-server pid |
 
 净化对照的判据：驱动脚本 spawn app-server 前显式删除父进程的 `CLAUDE_SESSION_ID/ZCODE_SESSION_ID/CLAUDE_PROJECT_DIR/ZCODE_PROJECT_DIR/CLAUDE_PLUGIN_ROOT/…`（`_scripts/zcode-probe-run.mjs` 的 `STRIP` 列表），子进程里仍出现的同类变量必然是 zcode 注入 —— 结果：**只有钩子有，MCP server 没有**。
@@ -238,7 +238,7 @@ ELECTRON_RUN_AS_NODE=1 … zcode.cjs plugins install zcx-probe@zcx-probe-market
 `hooks.json` 必须写成 `{"hooks":{"SessionStart":[{"hooks":[{...}]}]}}`（数组项内再套一层 `hooks` 数组）。**扁平写法**（`SessionStart: [{type,command,args}]`）不生效：探针首版扁平写法下 `plugins list` 显示 `hooks: 0` 且探针钩子从不触发；改成嵌套形状并递增版本重装后，桌面会话真实触发（`_logs/zcode-probe/timeline.log`）：
 
 ```
-2026-11-09T12:38:27.224Z mcp-server pid=13668 ppid=15560 cwd=D:\tools
+2026-11-09T12:38:27.224Z mcp-server pid=13668 ppid=15560 cwd=<本机工作区>
 2026-11-09T12:38:28.479Z hook-SessionStart pid=11220 ppid=15560
 2026-11-09T12:40:15.503Z hook-SessionStart pid=28240 ppid=15560
 2026-11-09T12:40:47.768Z hook-Stop pid=14848 ppid=15560
@@ -283,7 +283,7 @@ v0.2 正式插件用的正是嵌套形状（`plugin/hooks/hooks.json`），可�
 7. **真实 zcode 双会话互发未做**：本轮真实宿主只验证了「探针 MCP server + 钩子被真实拉起并拿到正确的 env/pid/cwd」；跨会话消息本身是在**模拟宿主**（node 驱动 MCP SDK stdio）上端到端跑通的。两个真实 zcode 桌面会话互发未执行（需桌面 UI 双会话，且当前实验插件不实现生产传输层）。
 8. **插件卸载未执行**（§6.4），探针插件仍在用户插件目录。
 9. **`session/…` app-server 侧新建会话与桌面会话的进程模型差异**未深究：app-server 会话的 MCP server 的 ppid = app-server 进程（`mcp-9104.json` ppid 28072），桌面会话的 ppid = 桌面宿主（15560）。「清杀沿活父链传播」在两种形态下行为是否一致，**未确认**（PLATFORM P5 结论来自 CLI 单发形态）。
-10. **`LOCAL\` 命名空间的跨用户可见性未测**：本轮全部同用户（`qdqir`）运行。
+10. **`LOCAL\` 命名空间的跨用户可见性未测**：本轮全部在同一用户下运行。
 
 ---
 

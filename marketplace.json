@@ -5,11 +5,11 @@
     {
       "name": "zcode-crosschat",
       "source": "./plugin",
-      "version": "0.4.0",
+      "version": "0.5.0",
       "displayName": "ZCode CrossChat",
       "displayName_i18n": { "zh-CN": "跨会话协作" },
-      "description": "Dispatch verifiable tasks between independent ZCode sessions with a file mailbox and attempt tokens.",
-      "description_i18n": { "zh-CN": "在独立 zcode 会话之间派发可检验任务：文件邮箱、六态状态机、回执唤醒。" },
+      "description": "Dispatch verifiable tasks between independent ZCode sessions with a file mailbox and attempt tokens; a transferable lead role, cross-session peer messaging, end-to-end user-authority markers, and context-budget-bounded injection.",
+      "description_i18n": { "zh-CN": "在独立 zcode 会话之间派发可检验任务：文件邮箱、六态状态机、回执唤醒；可移交的队长角色、跨会话 peer 消息、端到端用户亲述标记、按上下文预算自适应截断的注入面。" },
       "category": "developer-tools"
     }
   ]
