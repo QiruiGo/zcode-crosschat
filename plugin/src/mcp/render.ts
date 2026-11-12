@@ -40,8 +40,14 @@ export function renderDispatch(taskId: string, to: string, delivered: string): s
   return `Task ${taskId} dispatched to ${to} via ${delivered}.`;
 }
 
-export function renderInbox(consumed: number, discarded: number, unread: number): string {
-  return `Inbox: ${consumed} message(s) consumed, ${discarded} stale discarded, ${unread} unread remain.`;
+export function renderInbox(consumed: number, discarded: number, unread: number, malformed = 0, batchPointer = ""): string {
+  const base = `Inbox: ${consumed} message(s) consumed, ${discarded} stale discarded, ${unread} unread remain`;
+  // v0.5.1（故障注-3 修复）：不可解析坏行计数披露——此前坏行被静默跳过（仅审计
+  // 留痕），整箱乱码时静默当空箱，调用方无从得知有消息协议层不可恢复。
+  const bad = malformed > 0 ? `; ${malformed} unreadable line(s) skipped` : "";
+  // v0.5.1（SCALE-1 修复）：批次窗口截断的续读指针（窗口外消息保持未读，下一批继续消费）。
+  const batch = batchPointer === "" ? "" : `; ${batchPointer}`;
+  return `${base}${bad}${batch}.`;
 }
 
 export function renderClaim(taskId: string, attempt: number, attemptId: string): string {
@@ -191,6 +197,13 @@ export function renderStatusTable(snapshot: StatusSnapshot & PanoramaExtras): st
   lines.push(`Team "${snapshot.teamId}" phase=${snapshot.phase} founder=${snapshot.founderKey} tasks=${snapshot.tasks.length}`);
   const memberCols = snapshot.members.map((m) => unreadText(snapshot, m.key)).join(" ");
   lines.push(`Members: ${memberCols || "(none)"}`);
+  // v0.5.1（故障注-2 修复）：孤儿任务引用告警行——邮箱信封指向不存在的任务，
+  // 说明真源任务段丢失（被清空/截断/整队重置）。仅在非空时出现（回归锁定不变）。
+  const orphanTasks = snapshot.orphanTasks;
+  if (orphanTasks !== undefined && Object.keys(orphanTasks).length > 0) {
+    const parts = Object.entries(orphanTasks).map(([key, ids]) => `${key}: ${ids.join(", ")}`);
+    lines.push(`WARNING orphan task references (envelopes point to tasks missing from team.json): ${parts.join("; ")}`);
+  }
   lines.push(renderTaskTable(snapshot));
   return lines.join("\n");
 }

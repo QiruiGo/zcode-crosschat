@@ -14,9 +14,9 @@
  * @module core/teamstate
  */
 import { randomUUID } from 'node:crypto';
-import { mkdir, readFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { writeFileAtomic } from './atomic.js';
-import { inboxDir, teamFile } from './paths.js';
+import { inboxDir, snapshotFile, teamBackupFile, teamCorruptFile, teamDir, teamFile } from './paths.js';
 import {
   OPEN_TASK_STATUSES,
   TASK_TRANSITIONS,
@@ -31,37 +31,116 @@ import {
   type TeamMember,
   type TeamState,
 } from './types.js';
+import { logEngineEvent } from './log.js';
 
 export { DEFAULT_TEAM_ID } from './types.js';
 
 /**
+ * v0.5.1（故障注-1 修复）：解析并校验一段 team.json 文本（主文件或备份共用）。
+ * @returns 解析缺陷描述；undefined 表示成功且 `state` 可用。
+ */
+function parseTeamText(raw: string, teamId: string): { state?: TeamState; defect?: string } {
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch (error) {
+    return { defect: `not valid JSON (${error instanceof Error ? error.message : String(error)})` };
+  }
+  const parsed = coerceTeamState(value, teamId);
+  if (!parsed.ok) return { defect: parsed.defect };
+  return { state: parsed.state };
+}
+
+/**
+ * v0.5.1（故障注-1 修复）：把损坏真源原地保全为 `team.json.corrupt`
+ * （ forensic：后续 writeTeam 会整文件替换，残损字节不留底即永久丢失）。
+ * 尽力而为：保全失败不影响主流程（审计里已有 defect）。
+ */
+async function preserveCorruptTeamFile(stateRoot: string, teamId: string, raw: string): Promise<void> {
+  try {
+    await writeFile(teamCorruptFile(stateRoot, teamId), raw, 'utf8');
+  } catch {
+    // best-effort
+  }
+}
+
+/**
  * Read one team record; `undefined` when the team does not exist yet.
- * Corrupt data throws a diagnostic (strict whole-file validation, §2.7-5).
+ *
+ * v0.5.1（故障注-1 修复）：真源不可解析时不再裸抛 JSON 错误使全队工具持续
+ * internal——先尝试从 last-known-good 镜像 `team.json.bak` 自愈（内存恢复 +
+ * 审计 + 残损字节保全），无可用备份则抛带文件路径与修复指引的显式诊断
+ * （fail-closed 语义不变，恢复手段从「人工读 JSON 报错猜」变成「照指引修文件」）。
+ * 本函数从不写主文件：持锁的变更路径随后 writeTeam 自然把磁盘治好。
  */
 export async function readTeam(stateRoot: string, teamId: string): Promise<TeamState | undefined> {
+  const file = teamFile(stateRoot, teamId);
   let raw: string;
   try {
-    raw = await readFile(teamFile(stateRoot, teamId), 'utf8');
+    raw = await readFile(file, 'utf8');
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
     throw error;
   }
-  const parsed = coerceTeamState(JSON.parse(raw), teamId);
-  if (!parsed.ok) {
-    throw new Error(`invalid team state in team "${teamId}": ${parsed.defect}`);
+  const primary = parseTeamText(raw, teamId);
+  if (primary.state !== undefined) return primary.state;
+
+  // 真源损坏：尝试 last-known-good 镜像自愈。
+  const backupPath = teamBackupFile(stateRoot, teamId);
+  let backupRaw: string | undefined;
+  try {
+    backupRaw = await readFile(backupPath, 'utf8');
+  } catch {
+    backupRaw = undefined; // 无备份（旧版本从未写过 / 备份同样丢失）
   }
-  return parsed.state;
+  if (backupRaw !== undefined) {
+    const backup = parseTeamText(backupRaw, teamId);
+    if (backup.state !== undefined) {
+      await preserveCorruptTeamFile(stateRoot, teamId, raw);
+      await logEngineEvent(stateRoot, {
+        event: 'team-state-recovered',
+        teamId,
+        defect: primary.defect,
+        backup: backupPath,
+      });
+      return backup.state;
+    }
+  }
+  await logEngineEvent(stateRoot, {
+    event: 'team-state-corrupt',
+    teamId,
+    defect: primary.defect,
+    backupUsable: false,
+  });
+  throw new Error(
+    `team state file "${file}" is corrupt (${primary.defect}); ` +
+    `no usable backup at "${backupPath}" — restore it manually or delete the team directory to reset`,
+  );
 }
 
 /**
  * Persist one team record (whole-file atomic write; caller holds the lock).
+ * v0.5.1（故障注-1 修复）：成功落盘后把同一内容原子镜像到 `team.json.bak`
+ * （last-known-good，真源下次损坏时的自愈源）。镜像失败不影响主写入，
+ * 仅尽力记审计。
  */
 export async function writeTeam(stateRoot: string, team: TeamState): Promise<void> {
   await mkdir(inboxDir(stateRoot, team.teamId), { recursive: true });
-  await writeFileAtomic(teamFile(stateRoot, team.teamId), JSON.stringify(team, null, 2));
+  const content = JSON.stringify(team, null, 2);
+  await writeFileAtomic(teamFile(stateRoot, team.teamId), content);
+  try {
+    await writeFileAtomic(teamBackupFile(stateRoot, team.teamId), content);
+  } catch (error) {
+    await logEngineEvent(stateRoot, {
+      event: 'team-state-backup-failed',
+      teamId: team.teamId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
 }
 
-/** Build a fresh initial team record (founder becomes the first member if given). */
+/** Build a fresh initial team record (founder becomes the first member if given).
+ *  v0.5.1（故障注-5 修复）：每个新时代生成独立纪元令牌，任务 id 带纪元前缀。 */
 export function newTeamState(options: {
   teamId: string;
   name?: string;
@@ -75,6 +154,9 @@ export function newTeamState(options: {
     name: options.name ?? options.teamId,
     founderKey: options.founderKey,
     phase: 'open',
+    // 纪元令牌：8 hex（randomUUID 去连字符取前 8）。新时代的任务 id `<era>-t<n>`
+    // 与旧时代残存邮箱信封里的任务 id 结构性不同名，重建后不再撞号。
+    era: randomUUID().replaceAll('-', '').slice(0, 8),
     members: options.founder === undefined ? [] : [options.founder],
     tasks: [],
     seq: 0,
@@ -90,9 +172,13 @@ export interface NewTaskInput {
   createdBy: string;
 }
 
-/** Allocate the next task id from the team's seq counter (`t<seq+1>`). */
+/**
+ * Allocate the next task id from the team's seq counter.
+ * v0.5.1（故障注-5 修复）：带纪元的新时代为 `<era>-t<seq+1>`；旧记录（无 era）
+ * 保持 legacy `t<seq+1>` 形态不变。
+ */
 export function nextTaskId(team: TeamState): string {
-  return `t${team.seq + 1}`;
+  return team.era === undefined ? `t${team.seq + 1}` : `${team.era}-t${team.seq + 1}`;
 }
 
 /**
@@ -296,6 +382,43 @@ export function transitionTask(
   task.status = to;
   appendTaskHistory(task, to, by, options.attemptId, options.now);
   return task;
+}
+
+/**
+ * v0.5.1（故障注-5 修复）：建队前的残迹检测——team.json 缺失但团队目录仍有
+ * 上一时代的邮箱/快照残留时，「静默整队重置」不再无声：返回给注册/建队路径
+ * 的告警文案（undefined = 无残迹，正常首建），并落审计 `team-reset-detected`。
+ * 探测尽力而为：残迹探测自身失败按无残迹处理（不阻塞建队）。
+ */
+export async function noteTeamReset(stateRoot: string, teamId: string): Promise<string | undefined> {
+  let inboxEntries: string[] = [];
+  let hasSnapshot = false;
+  try {
+    inboxEntries = (await readdir(inboxDir(stateRoot, teamId))).filter((name) => name.endsWith('.jsonl'));
+  } catch {
+    // 邮箱目录不存在 = 无邮箱残迹
+  }
+  try {
+    hasSnapshot = await stat(snapshotFile(stateRoot, teamId)).then(
+      () => true,
+      () => false,
+    );
+  } catch {
+    // 探测失败按无残迹处理
+  }
+  if (inboxEntries.length === 0 && !hasSnapshot) return undefined;
+  await logEngineEvent(stateRoot, {
+    event: 'team-reset-detected',
+    teamId,
+    inboxFiles: inboxEntries.length,
+    snapshot: hasSnapshot,
+  });
+  return (
+    `team.json was missing while previous-era state still exists in teams/${teamId}/ `
+    + `(${inboxEntries.length} inbox file(s)${hasSnapshot ? ' + snapshot.json' : ''}); `
+    + 'a new team era was created — old envelopes may reference tasks that no longer exist '
+    + '(orphan warnings appear in xc_status)'
+  );
 }
 
 export type { MemberRole };

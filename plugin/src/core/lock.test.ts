@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, mkdirSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -10,6 +10,7 @@ import {
   withProcessLock,
   withRegistryThenTeamLocks,
   withTeamLock,
+  UNPARSEABLE_LOCK_GRACE_MS,
 } from './lock.js';
 import { lockFile, teamLockNames } from './paths.js';
 
@@ -165,6 +166,61 @@ describe('acquireFileLock (cross-process lockfile, DESIGN §2.7-2)', () => {
     expect(existsSync(lockFile(dir, 'owned'))).toBe(true);
     expect(JSON.parse(readFileSync(lockFile(dir, 'owned'), 'utf8')).token).toBe('someone-else');
   });
+
+  // ---- v0.5.1（故障注-6 修复）：不可解析残留锁的安全清除 ----
+
+  it('safely clears an UNPARSEABLE residual lock (old mtime) and acquires (故障注-6)', async () => {
+    mkdirSync(join(dir, 'locks'), { recursive: true });
+    const path = lockFile(dir, 'garbage');
+    writeFileSync(path, '\u0000\u0001binary-garbage', 'utf8'); // 乱码：无法提取 pid/token
+    // mtime 拨老（超过宽限期）→ 首轮即判定为无主残留并清除
+    const old = new Date(Date.now() - UNPARSEABLE_LOCK_GRACE_MS * 2);
+    utimesSync(path, old, old);
+    const started = Date.now();
+    const lock = await acquireFileLock(dir, 'garbage', { waitMs: 5000 });
+    expect(Date.now() - started).toBeLessThan(2000); // 不再 15s busy
+    // 锁文件已被本进程的合法内容替换
+    const raw = JSON.parse(readFileSync(path, 'utf8'));
+    expect(raw.pid).toBe(process.pid);
+    await lock.release();
+    expect(existsSync(path)).toBe(false);
+  }, 15000);
+
+  it('clears a 0-byte residual lock (crash between openSync and writeSync)', async () => {
+    mkdirSync(join(dir, 'locks'), { recursive: true });
+    const path = lockFile(dir, 'zero-byte');
+    writeFileSync(path, '', 'utf8');
+    const old = new Date(Date.now() - UNPARSEABLE_LOCK_GRACE_MS * 2);
+    utimesSync(path, old, old);
+    const lock = await acquireFileLock(dir, 'zero-byte', { waitMs: 5000 });
+    expect(JSON.parse(readFileSync(path, 'utf8')).pid).toBe(process.pid);
+    await lock.release();
+  }, 15000);
+
+  it('a FRESH unparseable lock is respected within the grace window, cleared after it', async () => {
+    mkdirSync(join(dir, 'locks'), { recursive: true });
+    const path = lockFile(dir, 'fresh-garbage');
+    writeFileSync(path, '{}', 'utf8'); // 合法 JSON 但缺字段 → 不可解析
+    const started = Date.now();
+    const lock = await acquireFileLock(dir, 'fresh-garbage', { waitMs: 10_000 });
+    // 宽限期内只重试不清除（不误删刚被合法持有的锁），约一个宽限期后自愈
+    expect(Date.now() - started).toBeGreaterThanOrEqual(UNPARSEABLE_LOCK_GRACE_MS - 50);
+    expect(JSON.parse(readFileSync(path, 'utf8')).pid).toBe(process.pid);
+    await lock.release();
+  }, 15000);
+
+  it('a VALID fresh lock with a live pid is never cleared (宽限不破坏正常竞争)', async () => {
+    mkdirSync(join(dir, 'locks'), { recursive: true });
+    const path = lockFile(dir, 'valid-live');
+    writeFileSync(path, JSON.stringify({ pid: process.pid, ts: Date.now(), token: 'live-holder' }), 'utf8');
+    const error = await acquireFileLock(dir, 'valid-live', { waitMs: 300 }).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(error).toBeInstanceOf(LockBusyError);
+    // 锁未被清除：内容原样
+    expect(JSON.parse(readFileSync(path, 'utf8')).token).toBe('live-holder');
+  }, 15000);
 });
 
 describe('withTeamLock / withRegistryThenTeamLocks (fixed registry -> team order)', () => {

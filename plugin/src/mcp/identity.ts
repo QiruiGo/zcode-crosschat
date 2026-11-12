@@ -34,9 +34,9 @@ import {
   unbindName,
   writeSession,
 } from "../core/registry.js";
-import { newTeamState, readTeam, writeTeam } from "../core/teamstate.js";
+import { newTeamState, noteTeamReset, readTeam, writeTeam } from "../core/teamstate.js";
 import { logEngineEvent } from "../core/log.js";
-import { DEFAULT_TEAM_ID, memberState } from "../core/types.js";
+import { DEFAULT_TEAM_ID, memberState, RESERVED_MEMBER_KEYS } from "../core/types.js";
 import type { MemberRole, TeamMember, TeamState } from "../core/types.js";
 
 export { DEFAULT_TEAM_ID };
@@ -130,6 +130,17 @@ export async function xcRegister(
   const agentKey = sanitizeKey(name);
   if (!agentKey) {
     throw invalidParamsError(`name ${JSON.stringify(name)} sanitizes to an empty key`);
+  }
+  // v0.5.1（BND-5 修复）：保留名规则与 xc_member_add 统一（member-tools.ts 同码）。
+  // 此前 xc_register 放行 lead/default：字面成员名与 lead 角色语义 / 缺省 teamId
+  // 撞名（xc_lead_transfer{to:"lead"} 会把角色授予字面成员 "lead"），两入口
+  // 不一致构成注册旁路。锁外快拒，任何路径（hook/wake）都到不了绑定。
+  if ((RESERVED_MEMBER_KEYS as readonly string[]).includes(agentKey)) {
+    throw new ToolError({
+      error: "name_reserved",
+      name: agentKey,
+      message: `member name "${agentKey}" is reserved (${RESERVED_MEMBER_KEYS.join("/")})`,
+    });
   }
   const sessionId = args.sessionId.trim();
   if (!sessionId) throw invalidParamsError("sessionId is required");
@@ -228,7 +239,7 @@ export async function xcRegister(
     await bindName(stateRoot, agentKey, { sessionId, role, registeredAt: now });
     let team: TeamState;
     try {
-      team = await joinTeam(stateRoot, teamId, agentKey, sessionId, role, now);
+      team = await joinTeam(stateRoot, teamId, agentKey, sessionId, role, now, warnings);
     } catch (err) {
       await unbindName(stateRoot, agentKey, sessionId); // 条件回滚：仍指向本 sid 才删
       throw err;
@@ -265,7 +276,9 @@ export async function xcRegister(
   });
 }
 
-/** team 入队：不存在则建队（首个注册者=founderKey，§2.2）；存在则 upsert 成员。 */
+/** team 入队：不存在则建队（首个注册者=founderKey，§2.2）；存在则 upsert 成员。
+ *  v0.5.1（故障注-5 修复）：team.json 缺失但有残迹（邮箱/快照）时建队不再静默
+ *  ——noteTeamReset 产出告警进注册响应的 warnings 并落 `team-reset-detected` 审计。 */
 async function joinTeam(
   stateRoot: string,
   teamId: string,
@@ -273,9 +286,12 @@ async function joinTeam(
   sessionId: string,
   role: MemberRole,
   now: number,
+  warnings: string[],
 ): Promise<TeamState> {
   const found = await readTeam(stateRoot, teamId);
   if (found === undefined) {
+    const resetWarning = await noteTeamReset(stateRoot, teamId);
+    if (resetWarning !== undefined) warnings.push(resetWarning);
     const member: TeamMember = { key: agentKey, sessionId, role, joinedAt: now, lastSeen: now };
     const created = newTeamState({ teamId, name: teamId, founderKey: agentKey, founder: member, now });
     await writeTeam(stateRoot, created);

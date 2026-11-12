@@ -349,3 +349,104 @@ describe("重名消歧（DESIGN §5.3「可达的歧义场景」）", () => {
         expect(received.filter((line) => line.includes("to-current-holder")).length).toBe(1);
   }, 30_000);
 });
+
+// ─────────────────────────── v0.5.1 BND-2：显式 hold 策略下 accept 必须真放行 ───────────────────────────
+
+describe("BND-2 修复：显式 hold 策略下 xc_peer_review accept 必须真投递（红队假成功黑洞回归）", () => {
+  it("repo 层 {mode:hold} 暂存的件，accept 后入队 + 暂存区清空 + 审计带终态计数（策略文件未动）", async () => {
+    // 收方策略 = 项目层文件 hold（不设 XC_CROSSCHAT_INBOUND，让 repo 层成为唯一显式层）。
+    const policyDir = join(stateRoot, "peer");
+    const { mkdirSync, writeFileSync, readFileSync, existsSync } = await import("node:fs");
+    mkdirSync(policyDir, { recursive: true });
+    writeFileSync(join(policyDir, "inbound.json"), JSON.stringify({ mode: "hold" }), "utf8");
+
+    const services = createDefaultPeerServices({
+      ...deps,
+      env: { XC_MESSAGING_DIR: root } as NodeJS.ProcessEnv,
+    });
+    await services.register({ name: "alice", sessionId: "sess-alice" });
+
+    // 直落一件暂存（等价于 pa→pb 被三态闸 hold 的产物，cause=repo-setting）。
+    await holdPeerMessage(
+      root,
+      "sess-alice",
+      {
+        msgId: "m-held-bnd2",
+        from: "bob",
+        fromSessionId: "sess-bob",
+        hopChain: ["bob"],
+        text: "bnd2-black-hole-probe",
+        ts: Date.now(),
+        via: "pipe",
+      },
+      "repo-setting",
+      { workspace },
+    );
+
+    // 修复前：accept 重裁回 still-held，「影响 1 条」假成功、消息滞留到 12h TTL。
+    const result = await services.review({ action: "accept", ids: ["m-held-bnd2"] });
+    expect(result.affected).toEqual(["m-held-bnd2"]);
+    expect(result.receipts[0]?.outcome).toBe("delivered");
+    expect(result.receipts[0]?.receipt).toBe("delivered");
+
+    // 真投递：消息已进投递级队列（xc_peer_inbox 的下一轮就能取走），暂存区清空。
+    const { readPeerQueue } = await import("../core/peermsg.js");
+    const queued = await readPeerQueue(root, "sess-alice");
+    expect(queued.map((item) => item.msgId)).toEqual(["m-held-bnd2"]);
+    const { listHeldPeerMessages } = await import("../core/peerpolicy.js");
+    expect(await listHeldPeerMessages(root, "sess-alice")).toHaveLength(0);
+
+    // 策略文件未被改写（放行不依赖改策略）。
+    expect(readFileSync(join(policyDir, "inbound.json"), "utf8")).toContain('"hold"');
+
+    // 审计如实：peer-hold-released 事件带终态计数（旧版只记 ids，still-held 也算 released）。
+    const auditFile = join(root, "logs", "peer.jsonl");
+    expect(existsSync(auditFile)).toBe(true);
+    const events = readFileSync(auditFile, "utf8")
+      .split("\n")
+      .filter((line) => line.trim() !== "")
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    const released = events.filter((e) => (e["event"] as Record<string, unknown> | undefined)?.["event"] === "peer-hold-released");
+    const last = released.at(-1);
+    expect(last).toBeDefined();
+    // peerregistry 的 logPeerEvent 形态：{event:{...业务字段}, ts} —— 计数在 event 内层。
+    expect((last!["event"] as Record<string, unknown>)["outcomes"]).toMatchObject({ delivered: 1, "still-held": 0 });
+  });
+
+  it("策略转为 refuse 时 accept 仍拒放（fail-closed：显式批准不越过 opt-out）", async () => {
+    const policyDir = join(stateRoot, "peer");
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    mkdirSync(policyDir, { recursive: true });
+    writeFileSync(join(policyDir, "inbound.json"), JSON.stringify({ mode: "refuse" }), "utf8");
+
+    const services = createDefaultPeerServices({
+      ...deps,
+      env: { XC_MESSAGING_DIR: root } as NodeJS.ProcessEnv,
+    });
+    await services.register({ name: "alice", sessionId: "sess-alice" });
+    await holdPeerMessage(
+      root,
+      "sess-alice",
+      {
+        msgId: "m-held-refuse",
+        from: "bob",
+        fromSessionId: "sess-bob",
+        hopChain: ["bob"],
+        text: "should-stay-refused",
+        ts: Date.now(),
+        via: "pipe",
+      },
+      "repo-setting",
+      { workspace },
+    );
+
+    const result = await services.review({ action: "accept", ids: ["m-held-refuse"] });
+    expect(result.receipts[0]?.outcome).toBe("refused");
+    expect(result.receipts[0]?.receipt).toBe("refused");
+    // refuse 终态=删除暂存件（DESIGN §6.3），消息不进队列。
+    const { readPeerQueue } = await import("../core/peermsg.js");
+    expect(await readPeerQueue(root, "sess-alice")).toHaveLength(0);
+    const { listHeldPeerMessages } = await import("../core/peerpolicy.js");
+    expect(await listHeldPeerMessages(root, "sess-alice")).toHaveLength(0);
+  });
+});

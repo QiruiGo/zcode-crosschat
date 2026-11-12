@@ -44,7 +44,7 @@ async function seedTeam(options: { withV2Fields?: boolean } = {}): Promise<TeamS
   t1.status = "completed";
   t1.assignee = "m1";
   t1.result = "1 4 9";
-  const t2 = makeTask(team, { title: "用表求和", prompt: "P2", dependsOn: ["t1"], createdBy: "a" }, 100);
+  const t2 = makeTask(team, { title: "用表求和", prompt: "P2", dependsOn: [t1.id], createdBy: "a" }, 100);
   beginTaskAttempt(t2, "m2", 100);
   if (options.withV2Fields === true) {
     // W2 落盘后的形态：leadKey + 成员 state/identity（写入前先宽展为可写记录）。
@@ -100,14 +100,14 @@ describe("buildSnapshot（§7.3.1 v2 形状）", () => {
     const m1 = snap.members.find((m) => m.key === "m1")!;
     expect(m1).toMatchObject({ state: "ready", identity: "engine", openTaskId: null, sessionId: "sess_m1" });
     const m2 = snap.members.find((m) => m.key === "m2")!;
-    expect(m2.openTaskId).toBe("t2"); // in_progress（claimed 也算开放）
+    expect(m2.openTaskId).toBe(team.tasks[1]!.id); // in_progress（claimed 也算开放）
 
-    const t2 = snap.tasks.find((t) => t.id === "t2")!;
+    const t2 = snap.tasks.find((t) => t.id === team.tasks[1]!.id)!;
     expect(t2.blockedBy).toEqual([]); // t1 已 completed
-    const t1 = snap.tasks.find((t) => t.id === "t1")!;
+    const t1 = snap.tasks.find((t) => t.id === team.tasks[0]!.id)!;
     expect(t1.evidenceCount).toBe(0);
 
-    expect(snap.dag).toEqual({ t2: ["t1"] }); // 无依赖的 t1 不入图
+    expect(snap.dag).toEqual({ [team.tasks[1]!.id]: [team.tasks[0]!.id] }); // 无依赖的 t1 不入图
     expect(snap.unread).toEqual({ m1: 0, m2: 1 });
   });
 
@@ -115,11 +115,10 @@ describe("buildSnapshot（§7.3.1 v2 形状）", () => {
     const team = newTeamState({ teamId: "default", founderKey: "a", now: 100 });
     team.members.push(member("m1", "sess_m1"));
     const t1 = makeTask(team, { title: "A", prompt: "P", createdBy: "a" }, 100); // pending
-    const t2 = makeTask(team, { title: "B", prompt: "P", dependsOn: ["t1"], createdBy: "a" }, 100);
-    void t1;
+    const t2 = makeTask(team, { title: "B", prompt: "P", dependsOn: [t1.id], createdBy: "a" }, 100);
     void t2;
     const snap = await buildSnapshot(root, team, { env: {} });
-    expect(snap.tasks.find((t) => t.id === "t2")!.blockedBy).toEqual(["t1"]);
+    expect(snap.tasks.find((t) => t.id === t2.id)!.blockedBy).toEqual([t1.id]);
   });
 
   it("W2 字段缺省（v0.1.0 旧数据）→ state/identity 省略、leadKey 省略（§6.5 兼容）", async () => {
@@ -131,7 +130,7 @@ describe("buildSnapshot（§7.3.1 v2 形状）", () => {
       expect(m.identity).toBeUndefined();
     }
     // openTaskId 是 W3 自产字段，旧数据也有。
-    expect(snap.members.find((m) => m.key === "m2")!.openTaskId).toBe("t2");
+    expect(snap.members.find((m) => m.key === "m2")!.openTaskId).toBe(team.tasks[1]!.id);
     // 交叉类型兼容：v0.1.0 形状快照（tools.ts xc_status 字面量）可赋值给本类型。
     const legacy: import("./snapshot.js").StatusSnapshot = {
       teamId: "default",

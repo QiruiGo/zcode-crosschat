@@ -245,3 +245,63 @@ describe("identity: removed 成员注册拒绝（v0.2 §7.4-I5）", () => {
     expect(ok2.via).toBe("hook");
   });
 });
+
+// v0.5.1（BND-5 回归）：xc_register 接受保留名 lead/default 的双路径不一致。
+// 红队原始复现（adjudication.md #5 / cases.md C-4）：xc_register{name:"default"}
+// 与 {name:"lead"} 均成功入册，而 xc_member_add 同名硬拒 name_reserved；
+// xc_lead_transfer{to:"lead"} 把 lead 角色授予字面成员。修复后与 member_add
+// 同一规则（RESERVED_MEMBER_KEYS 唯一定义处 core/types.ts:91），锁外快拒、
+// 零副作用（names.json / team.json 不落）。
+describe("identity: 保留名注册拒绝（BND-5，与 xc_member_add 规则统一）", () => {
+  it("hook 路径：name=default / lead → name_reserved（错误信封与 member_add 同码）", async () => {
+    for (const name of ["default", "lead"]) {
+      const payload = await errorPayload(() =>
+        xcRegister(stateRoot, { name, sessionId: "sess-a" }, nextConn()),
+      );
+      expect(payload.error).toBe("name_reserved");
+      expect(payload.name).toBe(name);
+      expect(payload.message).toContain(`member name "${name}" is reserved (lead/default)`);
+    }
+  });
+
+  it("先于锚定/绑定校验：无 session 记录也报 name_reserved（锁外快拒，与 member_add 同位）", async () => {
+    // 不写 sessions/<sid>.json：若保留名闸缺席，此调用会以 session_not_anchored 失败。
+    const payload = await errorPayload(() =>
+      xcRegister(stateRoot, { name: "default", sessionId: "sess-no-anchor" }, nextConn()),
+    );
+    expect(payload.error).toBe("name_reserved");
+  });
+
+  it("wake 路径同样拒绝且 nonce 不被消费（不给旁路烧令牌）", async () => {
+    // 手工放一枚合法 nonce：agentKey=lead、sid 匹配——闸缺席时它会走通绑定。
+    const { token } = await createWakeNonce(stateRoot, { teamId: "default", agentKey: "lead", sid: "sess-w" });
+    const payload = await errorPayload(() =>
+      xcRegister(stateRoot, { name: "lead", sessionId: "sess-w", wakeToken: token }, nextConn()),
+    );
+    expect(payload.error).toBe("name_reserved");
+    const nonce = await readWakeNonce(stateRoot, token);
+    expect(nonce?.used).toBeUndefined(); // 未消费
+  });
+
+  it("零副作用：names.json / team.json 不落盘、花名册不增（对照：非保留名照常入册）", async () => {
+    for (const name of ["default", "lead"]) {
+      const payload = await errorPayload(() =>
+        xcRegister(stateRoot, { name, sessionId: `sess-${name}` }, nextConn()),
+      );
+      expect(payload.error).toBe("name_reserved");
+    }
+    expect(existsSync(join(stateRoot, "registry", "names.json"))).toBe(false);
+    expect(existsSync(join(stateRoot, "teams", "default", "team.json"))).toBe(false);
+
+    // 大小写归一后命中保留名同样拒（sanitizeKey → 小写）。
+    const upper = await errorPayload(() =>
+      xcRegister(stateRoot, { name: "LEAD", sessionId: "sess-upper" }, nextConn()),
+    );
+    expect(upper.error).toBe("name_reserved");
+
+    // 对照：普通名字仍可注册（修复不误伤正常路径）。
+    await writeSession(stateRoot, { sessionId: "sess-ok", cwd: workDir, startedAt: 1, lastSeen: Date.now() });
+    const ok = await xcRegister(stateRoot, { name: "a", sessionId: "sess-ok" }, nextConn());
+    expect(ok.roster.map((m) => m.key)).toEqual(["a"]);
+  });
+});

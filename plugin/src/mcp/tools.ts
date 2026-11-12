@@ -45,7 +45,7 @@ import {
   writeSnapshot,
   type StatusSnapshot,
 } from "./render.js";
-import { resolveStateRoot } from "../core/paths.js";
+import { isValidTeamId, resolveStateRoot } from "../core/paths.js";
 import { LockBusyError, withTeamLock } from "../core/lock.js";
 import { sanitizeKey } from "../core/sanitize.js";
 import { DEFAULT_TEAM_ID, TERMINAL_TASK_STATUSES } from "../core/types.js";
@@ -58,6 +58,7 @@ import {
   makeTask,
   memberOpenTasks,
   newTeamState,
+  noteTeamReset,
   readTeam,
   reportTransitionError,
   unsatisfiedDependencies,
@@ -69,14 +70,16 @@ import {
   classifyFrame,
   createMessage,
   isCurrentMail,
+  orphanTaskIds,
   readCurrentMailboxLocked,
   readMailbox,
   readUnreadMailbox,
 } from "../core/mailbox.js";
+import type { MailboxReadDiagnostics } from "../core/mailbox.js";
 import { logEngineEvent } from "../core/log.js";
 import { attemptWake, findDuplicateMail } from "../engine/wake.js";
 // v0.5（M6 轴②③接线）：预算/分页（M1）、队内信封（M3）、盖章链（M4）、全文 sha256（M4）。
-import { contextCharsFromEnv, paginateText, receiverInjectBudget, truncateField, truncateNote } from "../core/budget.js";
+import { batchWindowCount, contextCharsFromEnv, paginateText, receiverInjectBudget, truncateField, truncateNote } from "../core/budget.js";
 import { isTeamEnvelopeRendered, renderTeamEnvelope } from "../core/peerenvelope.js";
 import { uservoiceMatchAndConsume } from "../core/uservoice.js";
 import { sha256Of } from "../core/msgstore.js";
@@ -128,12 +131,12 @@ export const ReportShape = {
     .array(
       z.object({
         path: z.string().min(1).describe("证据文件绝对路径"),
-        sha256: z.string().nullable().optional().describe("缺省时由工具对文件现算"),
+        sha256: z.string().nullable().optional().describe("缺省或 null 时由工具对文件现算；提供时与现算值复核，不符即整单拒绝"),
         note: z.string().optional(),
       }),
     )
     .optional()
-    .describe("completed 必须至少 1 条"),
+    .describe("completed 必须至少 1 条；每条文件必须真实存在且 sha256 与工具现算值一致，否则拒绝（evidence_file_missing / evidence_checksum_mismatch）"),
 };
 export const MessageShape = {
   to: z.string().min(1),
@@ -155,7 +158,8 @@ export const MailReadShape = {
 /** v0.5（R-22）：xc_task_read 入参——分页读 team.json 任务字段（锁外只读）。 */
 export const TaskReadShape = {
   taskId: z.string().min(1).describe("要读取的任务 id"),
-  field: z.enum(["result", "error", "prompt"]).describe("要分页读取的字段"),
+  // v0.5.1（SCALE-2 修复）：增 "acceptance"——claim 回显截断后验收标准的全文分页取回通道。
+  field: z.enum(["result", "error", "prompt", "acceptance"]).describe("要分页读取的字段"),
   offset: z.number().int().min(0).optional().describe("起始字符偏移；缺省 0"),
   limit: z.number().int().min(1).optional().describe("本次返回字符数上限；缺省=本会话 item 预算，硬上限 64000"),
 };
@@ -231,6 +235,44 @@ async function sha256File(path: string): Promise<string | null> {
 /** 当前未读（未读 ∧ 未丢弃 ∧ isCurrentMail）计数，xc_status 与 inbox 共用。 */
 function countUnread(team: TeamState, messages: TeamMessage[]): number {
   return messages.filter((m) => !m.readAt && !m.discardedAt && isCurrentMail(team, m)).length;
+}
+
+/**
+ * v0.5.1（SCALE-1 修复）：xc_check_inbox 单条消息在本响应两个面的形态与成本——
+ * `entry` = content[1] JSON payload 的逐条对象（content 超 item 预算截断 +
+ * contentTruncated/contentPointer，R-23 同款）；`block` = content[2] 的信封块
+ * （超预算尾部拼 xc_mail_read 指针）；`cost` = 两个面的字符成本之和（批次窗口
+ * 记账用）。磁盘 JSONL 全文不动（acknowledgeMailbox 只置 readAt，R-21）。
+ */
+function inboxEntry(
+  m: TeamMessage,
+  budgetItem: number,
+): { entry: Record<string, unknown>; block: string; cost: number; truncated: boolean } {
+  const cut = truncateField(m.content, budgetItem, sha256Of);
+  const entry: Record<string, unknown> = {
+    ...m,
+    content: cut.text,
+    ...(cut.truncated
+      ? {
+          contentTruncated: { shown: cut.truncated.shown, total: cut.truncated.total },
+          contentPointer: "xc_mail_read",
+        }
+      : {}),
+  };
+  let block: string;
+  if (isTeamEnvelopeRendered(m.content)) {
+    block = m.content; // 幂等守卫：已包裹原样返回
+  } else {
+    const body = cut.text + (cut.truncated ? `\n${truncateNote("mail", m.id, cut.truncated.shown, cut.truncated.total)}` : "");
+    const cls = classifyFrame(m.content);
+    block = renderTeamEnvelope({
+      frameType: cls.kind === "frame" ? cls.frameType : "chat",
+      from: m.from,
+      content: body,
+      ...(m.origin !== undefined ? { origin: m.origin } : {}),
+    });
+  }
+  return { entry, block, cost: JSON.stringify(entry).length + block.length, truncated: cut.truncated !== undefined };
 }
 
 // ---------------------------------------------------------------------------
@@ -310,8 +352,12 @@ export function createToolCore(deps: ToolDeps): ToolCore {
         const prepared = await withTeamLock(stateRoot, me.teamId, async () => {
           // 锁内重读重验（§2.7-4）。
           let team = await readTeam(stateRoot, me.teamId);
+          let teamResetWarning: string | undefined;
           if (team === undefined) {
             // 防御分支：注册路径已建队；首个派发者自动建队并成为 founder（§2.2）。
+            // v0.5.1（故障注-5 修复）：真源丢失后的自动建队不再静默——有残迹
+            // （邮箱/快照）即审计 `team-reset-detected` 并在响应负载里带告警。
+            teamResetWarning = await noteTeamReset(stateRoot, me.teamId);
             team = newTeamState({ teamId: me.teamId, name: me.teamId, founderKey: me.agentKey, now });
           }
           requireMember(team, toKey); // §2.6：to 必须是已注册成员
@@ -374,6 +420,7 @@ export function createToolCore(deps: ToolDeps): ToolCore {
             status: "pending" as const,
             messageId: message.id,
             toSessionId: team.members.find((m) => m.key === toKey)?.sessionId ?? null,
+            teamResetWarning,
           };
         });
 
@@ -399,6 +446,7 @@ export function createToolCore(deps: ToolDeps): ToolCore {
           taskId: prepared.taskId,
           status: prepared.status,
           delivered: sent.delivered,
+          ...(prepared.teamResetWarning !== undefined ? { teamResetWarning: prepared.teamResetWarning } : {}),
           ...(sent.wakeLog ? { wakeLog: sent.wakeLog } : {}),
           ...(sent.note ? { note: sent.note } : {}),
         });
@@ -417,72 +465,88 @@ export function createToolCore(deps: ToolDeps): ToolCore {
 
         // 收件箱消费走 team 锁：锁内用 M1 readCurrentMailboxLocked（陈旧消息就地
         // discarded 落盘并剔除），正当消息此刻即消费（acknowledgeMailbox，§2.8）。
+        // v0.5.1（故障注-4 修复）：只消费未读——README 承诺「读取并消费自己邮箱的
+        // 未读消息」，此前 current 含已读件（readAt 已盖章）被无条件重注入，重注入
+        // 量随邮箱历史无界增长。陈旧清扫仍作用于全部现行消息（含已读），但注入面
+        // 只承载 readAt 缺省的未读件：第二次起 `0 message(s) consumed`。
+        // v0.5.1（故障注-3 修复）：不可解析坏行经诊断收集器透出，摘要行披露
+        // `N unreadable line(s) skipped`（此前静默当空箱/吞行，只有审计留痕）；
+        // 就地丢弃的陈旧件数一并接入摘要行（此前 renderInbox 的 discarded 恒为
+        // 硬编码 0，陈旧清扫不可见）。
+        const diagnostics: MailboxReadDiagnostics = { malformed: [], discarded: 0 };
+        // v0.5.1（SCALE-1 修复）：批次注入预算接入消费路径——单次只消费「JSON 面 +
+        // 信封面」联合成本 ≤ 批次预算（budget.total）的**到达序前缀**（保底一条）；
+        // 其余正当消息**保持未读**（留在邮箱，下一次 xc_check_inbox 继续消费）。
+        // 此前 300 条积压单次直灌 201,193 字符（裁决 #18，>批次上限 3.1 倍）且无指针；
+        // 修复后单次响应有界（≈16k 基准），分页指针 = 批次截断提示 + unreadCount。
+        const budget = receiverInjectBudget(contextCharsFromEnv(deps.env), deps.env);
         const consumed = await withTeamLock(stateRoot, me.teamId, async () => {
           const team = (await readTeam(stateRoot, me.teamId)) ?? teamBefore;
-          const current = await readCurrentMailboxLocked(stateRoot, team, me.agentKey);
-          await acknowledgeMailbox(stateRoot, me.teamId, me.agentKey, current.map((m) => m.id), now);
-          return current;
+          const current = await readCurrentMailboxLocked(stateRoot, team, me.agentKey, undefined, diagnostics);
+          const unread = current.filter((m) => m.readAt === undefined);
+          const entries = unread.map((m) => inboxEntry(m, budget.item));
+          const windowCount = batchWindowCount(entries.map((e) => e.cost), budget.total);
+          await acknowledgeMailbox(stateRoot, me.teamId, me.agentKey, unread.slice(0, windowCount).map((m) => m.id), now);
+          return { messages: unread.slice(0, windowCount), entries: entries.slice(0, windowCount), totalUnread: unread.length };
         });
 
-        // 消费后剩余未读（读路径无锁，§2.7-5 rename 原子写）。
+        // 消费后剩余未读（读路径无锁，§2.7-5 rename 原子写）——含本批窗口留在箱外的部分。
         const freshTeam = (await readTeam(stateRoot, me.teamId)) ?? teamBefore;
         const rest = await readUnreadMailbox(stateRoot, me.teamId, me.agentKey);
         const unreadCount = countUnread(freshTeam, rest);
+        const batchTruncated = consumed.messages.length < consumed.totalUnread;
         await logEngineEvent(stateRoot, {
           event: "inbox-check",
           teamId: me.teamId,
           agentKey: me.agentKey,
-          consumed: consumed.length,
+          consumed: consumed.messages.length,
           unreadLeft: unreadCount,
+          ...(diagnostics.malformed.length > 0 ? { malformedLines: diagnostics.malformed.length } : {}),
+          ...(diagnostics.discarded > 0 ? { staleDiscarded: diagnostics.discarded } : {}),
+          ...(batchTruncated ? { batchTotalUnread: consumed.totalUnread } : {}),
         });
 
         // v0.5（R-23 face inbox / R-16 队内信封）：磁盘 JSONL 行全文不动（acknowledgeMailbox
         // 只置 readAt），截断只发生在返回 payload；content[2] 追加逐条信封块（content[0]
         // renderInbox 摘要与 content[1] JSON payload 契约不变）。
-        const budget = receiverInjectBudget(contextCharsFromEnv(deps.env), deps.env);
-        let truncatedCount = 0;
-        const messages = consumed.map((m) => {
-          const cut = truncateField(m.content, budget.item, sha256Of);
-          if (cut.truncated !== undefined) truncatedCount += 1;
-          return {
-            ...m,
-            content: cut.text,
-            ...(cut.truncated
-              ? {
-                  contentTruncated: { shown: cut.truncated.shown, total: cut.truncated.total },
-                  contentPointer: "xc_mail_read",
-                }
-              : {}),
-          };
-        });
-        // content[2]：按原文分类帧型；截断文本尾部拼 xc_mail_read 指针后再渲染（P10：
-        // renderTeamEnvelope 保持不感知预算）；队内全文已在邮箱 JSONL，不落 store（F-3 语义）。
-        const envelopeBlocks = consumed.map((m) => {
-          if (isTeamEnvelopeRendered(m.content)) return m.content; // 幂等守卫：已包裹原样返回
-          const cut = truncateField(m.content, budget.item, sha256Of);
-          const body = cut.text + (cut.truncated ? `\n${truncateNote("mail", m.id, cut.truncated.shown, cut.truncated.total)}` : "");
-          const cls = classifyFrame(m.content);
-          return renderTeamEnvelope({
-            frameType: cls.kind === "frame" ? cls.frameType : "chat",
-            from: m.from,
-            content: body,
-            ...(m.origin !== undefined ? { origin: m.origin } : {}),
-          });
-        });
+        const truncatedCount = consumed.entries.filter((e) => e.truncated).length;
+        const messages = consumed.entries.map((e) => e.entry);
+        const envelopeBlocks = consumed.entries.map((e) => e.block);
+        if (batchTruncated) {
+          envelopeBlocks.push(
+            `[批次已按注入预算截断：本批消费 ${consumed.messages.length}/${consumed.totalUnread} 条；`
+            + "其余保持未读——再调一次 xc_check_inbox 继续消费]",
+          );
+        }
         const envelopeText = envelopeBlocks.join("\n\n");
-        if (consumed.length > 0) {
+        if (consumed.messages.length > 0) {
           await logEngineEvent(stateRoot, {
             event: "inject-budget",
             face: "inbox",
             budget: budget.total,
             truncatedCount,
             totalChars: envelopeText.length,
+            ...(batchTruncated ? { batchTotalUnread: consumed.totalUnread, batchReturned: consumed.messages.length } : {}),
           });
         }
-        const result = okResult(renderInbox(consumed.length, 0, unreadCount), {
-          messages,
-          unreadCount,
-        });
+        const result = okResult(
+          renderInbox(
+            consumed.messages.length,
+            diagnostics.discarded,
+            unreadCount,
+            diagnostics.malformed.length,
+            batchTruncated
+              ? ` 本批按注入预算（${budget.total} 字符）截断：只消费 ${consumed.messages.length}/${consumed.totalUnread} 条，其余保持未读——再调一次 xc_check_inbox 继续`
+              : "",
+          ),
+          {
+            messages,
+            unreadCount,
+            ...(diagnostics.malformed.length > 0 ? { malformedLines: diagnostics.malformed.length } : {}),
+            ...(diagnostics.discarded > 0 ? { staleDiscarded: diagnostics.discarded } : {}),
+            ...(batchTruncated ? { batchTruncated: true, batchTotalUnread: consumed.totalUnread, batchBudgetChars: budget.total } : {}),
+          },
+        );
         if (envelopeText !== "") {
           result.content.push({ type: "text", text: envelopeText });
         }
@@ -501,7 +565,23 @@ export function createToolCore(deps: ToolDeps): ToolCore {
             throw new ToolError({ error: "team_halted", message: `team "${me.teamId}" is halted` });
           }
           const task = getTask(team, args.taskId);
-          if (task === undefined) throw invalidParamsError(`unknown task "${args.taskId}"`);
+          if (task === undefined) {
+            // v0.5.1（故障注-2 修复）：unknown task 不再裸报。若本人邮箱仍有指向
+            // 该任务的分派/回执信封（孤儿引用），说明真源任务段丢失（被清空/
+            // 截断/整队重置）而在途凭证无声蒸发——给出可行动诊断与恢复指引。
+            const orphans = orphanTaskIds(team, await readMailbox(stateRoot, team.teamId, me.agentKey));
+            if (orphans.includes(args.taskId)) {
+              throw new ToolError({
+                error: "orphan_task_reference",
+                taskId: args.taskId,
+                message:
+                  `unknown task "${args.taskId}"; your mailbox still holds envelope(s) referencing it — ` +
+                  `the team state lost its task list (truncated or reset). ` +
+                  `Check the xc_status orphan warnings and ask the dispatcher to re-dispatch`,
+              });
+            }
+            throw invalidParamsError(`unknown task "${args.taskId}"`);
+          }
           if (task.status !== "pending") {
             throw new ToolError({
               error: "task_not_pending",
@@ -547,21 +627,60 @@ export function createToolCore(deps: ToolDeps): ToolCore {
           by: me.agentKey,
           attemptId: out.attemptId,
         });
-        return okResult(renderClaim(out.taskId, out.attempt, out.attemptId), out);
+        // v0.5.1（SCALE-2 修复）：认领回显接入注入预算——600KB prompt 此前全文回显
+        // （600,234 字符响应，裁决 #19）。截断只作用于响应 payload（team.json 真源
+        // 全文不动，R-21）；分页指针 = xc_task_read（prompt/acceptance 字段，R-22）。
+        // promptTruncated 携带全文 sha256（与 xc_status resultTruncated 同款，分页
+        // 拼回可终验）；未截断时 payload 形状与 v0.5.0 逐字段一致。
+        const claimBudget = receiverInjectBudget(contextCharsFromEnv(deps.env), deps.env);
+        const promptCut = truncateField(out.prompt, claimBudget.item, sha256Of);
+        const acceptanceCut = truncateField(out.acceptance, claimBudget.item, sha256Of);
+        return okResult(renderClaim(out.taskId, out.attempt, out.attemptId), {
+          taskId: out.taskId,
+          attemptId: out.attemptId,
+          attempt: out.attempt,
+          title: out.title,
+          dependsOn: out.dependsOn,
+          prompt: promptCut.text,
+          acceptance: acceptanceCut.text,
+          ...(promptCut.truncated
+            ? { promptTruncated: promptCut.truncated, promptPointer: "xc_task_read" }
+            : {}),
+          ...(acceptanceCut.truncated
+            ? { acceptanceTruncated: acceptanceCut.truncated, acceptancePointer: "xc_task_read" }
+            : {}),
+        });
       });
     },
 
     async xc_report(args, connectionKey) {
       return runCore(async () => {
         const me = identityStore.require(connectionKey);
-        // 慢操作在锁外：证据 sha256 现算（§2.8 evidence 格式；note 必填，缺省空串）。
+        // 慢操作在锁外：证据门（§2.8 evidence 格式；note 必填，缺省空串）。
+        // 每条证据文件必须真实存在，sha256 一律由工具现算复核（边界与-3/边界与-4 修复）：
+        // 文件缺失/不可读 → evidence_file_missing；调用方声明值（非 null）与现算值
+        // 不符 → evidence_checksum_mismatch。声明值缺省或显式 null 均视为未声明，
+        // 落库存现算值（工具描述承诺「缺省时由工具对文件现算」，不再落 sha256:null）。
         const evidence: EvidenceItem[] = [];
         for (const e of args.evidence ?? []) {
-          evidence.push({
-            path: e.path,
-            sha256: e.sha256 !== undefined ? e.sha256 : await sha256File(e.path),
-            note: e.note ?? "",
-          });
+          const computed = await sha256File(e.path);
+          if (computed === null) {
+            throw new ToolError({
+              error: "evidence_file_missing",
+              path: e.path,
+              message: `evidence file "${e.path}" does not exist or is unreadable; the evidence gate requires a real file (§2.6)`,
+            });
+          }
+          if (e.sha256 != null && e.sha256 !== computed) {
+            throw new ToolError({
+              error: "evidence_checksum_mismatch",
+              path: e.path,
+              claimed: e.sha256,
+              computed,
+              message: `evidence sha256 mismatch for "${e.path}": claimed ${e.sha256}, computed ${computed}`,
+            });
+          }
+          evidence.push({ path: e.path, sha256: computed, note: e.note ?? "" });
         }
 
         const out = await withTeamLock(stateRoot, me.teamId, async () => {
@@ -831,6 +950,17 @@ export function createToolCore(deps: ToolDeps): ToolCore {
     async xc_status(args, connectionKey) {
       return runCore(async () => {
         const teamId = args.teamId?.trim() || TEAM_ID;
+        // v0.5.1（BND-1 修复）：调用方可控 teamId 在触碰任何路径构建器前先过
+        // 段合法性闸——`../../evil` 之类穿越串此前会经 join 逃出状态根建目录并
+        // 写 snapshot.json（且可控字符串进 engine.jsonl 审计）。缺省 teamId
+        // （default）与产品自建队恒为安全段，不受影响。
+        if (!isValidTeamId(teamId)) {
+          throw invalidParamsError(
+            `teamId ${JSON.stringify(teamId)} is not a valid team name ` +
+              "(single path segment: starts with a letter/digit, then letters/digits/._-, max 128 chars); " +
+              "path separators, traversal segments and drive syntax are rejected",
+          );
+        }
         const me = identityStore.get(connectionKey); // 豁免注册（§2.8）：未注册省略个人字段
         const team = await readTeam(stateRoot, teamId);
         const now = Date.now();
@@ -873,9 +1003,19 @@ export function createToolCore(deps: ToolDeps): ToolCore {
 
         if (team !== undefined) {
           // 读路径无锁（§2.7-5：rename 原子写保证读者看到完整文件）。
+          // v0.5.1（故障注-2 修复）：同一批邮箱读取顺带计算孤儿任务引用——
+          // 邮箱信封指向 team.tasks 中不存在的任务 = 真源任务段丢失（被清空/
+          // 截断/整队重置）而在途工作无声蒸发。非空时披露进快照与渲染行，
+          // 静默丢任务变为可观测。
+          const orphanTasks: Record<string, string[]> = {};
           for (const m of team.members) {
             const msgs = await readMailbox(stateRoot, teamId, m.key);
             snapshot.unread[m.key] = countUnread(team, msgs);
+            const orphans = orphanTaskIds(team, msgs);
+            if (orphans.length > 0) orphanTasks[m.key] = orphans;
+          }
+          if (Object.keys(orphanTasks).length > 0) {
+            snapshot.orphanTasks = orphanTasks;
           }
           if (me !== undefined) {
             snapshot.me = { agentKey: me.agentKey, unread: snapshot.unread[me.agentKey] ?? 0 };
@@ -883,11 +1023,13 @@ export function createToolCore(deps: ToolDeps): ToolCore {
         }
 
         await writeSnapshot(stateRoot, teamId, snapshot); // §2.8/§4.3：每次调用刷新 snapshot.json
+        const orphanTasks = snapshot.orphanTasks;
         await logEngineEvent(stateRoot, {
           event: "status",
           teamId,
           agentKey: me?.agentKey ?? null,
           tasks: snapshot.tasks.length,
+          ...(orphanTasks !== undefined ? { orphanAgents: Object.keys(orphanTasks).length } : {}),
         });
         // v0.5（R-7）：落盘 snapshot 与返回 payload 分离——持久化对象不含 isLead/leadHistory，
         // payload 在其上现算叠加（isLead 不入盘不入快照；history:true 附 lead 变更史）。

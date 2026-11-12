@@ -223,6 +223,29 @@ describe("限额与忙分类（R-30 / R-32）", () => {
     if (!result.ok) expect(result.errorClass).toBe("socket_busy");
   });
 
+  it("红队 CONC-3 回归：45 并发发送（9 发送者×5，裁决 #8 档位）→ 默认上限下 0 busy 全投递", async () => {
+    // handler 延迟回执：把 45 条连接同时钉在端点上，复现红队「同 tick 全并发」窗口
+    // （修复前 maxConnections=32 → 恰 45−32=13 条 socket_busy）。
+    const handlers: PeerEndpointHandlers = {
+      onMessage: async (frame) => {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        return { type: "status", msgId: frame.msgId, state: "delivered", detail: "enqueued" };
+      },
+    };
+    const info = await startPeerEndpoint({ root, record: record(), token: TOKEN, handlers });
+    const sends = Array.from({ length: 45 }, (_, i) =>
+      sendPeerFrame({
+        socketPath: info.socketPath,
+        token: TOKEN,
+        frame: { type: "msg", msgId: `m-${i}`, from: `p${i % 9}`, text: "fan-in" },
+      }),
+    );
+    const results = await Promise.all(sends);
+    const busy = results.filter((r) => !r.ok && r.errorClass === "socket_busy");
+    expect(busy).toEqual([]);
+    expect(results.filter((r) => r.ok)).toHaveLength(45);
+  });
+
   it("超预算的 msg 帧 → too_large（发送前判定，不上线）", async () => {
     const info = await startPeerEndpoint({ root, record: record(), token: TOKEN });
     const result = await sendPeerFrame({

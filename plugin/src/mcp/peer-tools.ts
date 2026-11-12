@@ -212,7 +212,8 @@ export interface PeerServices {
   send(input: PeerSendInput): Promise<PeerSendResult>;
   /** v0.5（R-22）：全文分页读（只读不消费）。 */
   read(input: PeerReadInput): Promise<PeerReadResult>;
-  inbox(limit: number): Promise<{ items: PeerQueueItem[]; rendered: string[] }>;
+  /** v0.5.1（P3 count 口径修复）：返回体增 `remaining` = 排空后队列里剩余的待投递条数。 */
+  inbox(limit: number): Promise<{ items: PeerQueueItem[]; rendered: string[]; remaining: number }>;
   review(input: { action: 'list' | 'accept' | 'discard'; ids?: string[] }): Promise<PeerReviewResult>;
   rename(name: string): Promise<PeerRenameResult>;
   agents(): Promise<PeerAgentsPanel>;
@@ -667,7 +668,7 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
       return { msgId: input.msgId, total: page.total, offset: page.offset, text: page.text, hasMore: page.hasMore };
     },
 
-    async inbox(limit: number): Promise<{ items: PeerQueueItem[]; rendered: string[] }> {
+    async inbox(limit: number): Promise<{ items: PeerQueueItem[]; rendered: string[]; remaining: number }> {
       const r = root();
       if (self === undefined) {
         throw new ToolError(
@@ -677,7 +678,10 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
       }
       const items = await drainPeerQueue(r, self.sessionId, limit);
       const rendered = items.map((item) => renderPeerEnvelope(item));
-      return { items, rendered };
+      // v0.5.1（P3 count 口径修复）：排空后的剩余深度随结果返回，调用面据此给
+      // 「再拉一次」指针（拉取即消费，剩余件留在 queue 不丢）。
+      const remaining = await peerQueueDepth(r, self.sessionId);
+      return { items, rendered, remaining };
     },
 
     async review(input: { action: 'list' | 'accept' | 'discard'; ids?: string[] }): Promise<PeerReviewResult> {
@@ -702,15 +706,20 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
       const ids = input.ids ?? held.map((message) => message.item.msgId);
 
       if (input.action === "accept") {
-        // 释放时用**当前策略重新裁决**（CC `A()`），放行后再过入队闸。
+        // v0.5.1（BND-2/边界与-2 修复）：xc_peer_review 的 accept 是**收方的显式放行批准**
+        // （README L129「hold 进隔离区等 xc_peer_review 放行」）。释放时的重新裁决
+        // （DESIGN §6.3「释放路径按当前策略重裁」）只保留 refuse 一道闸：当前策略已转为
+        // refuse（含 kill-switch / opt-out）→ 仍拒放（fail-closed，收方已整体退出跨会话接收，
+        // 智能体的 accept 不得越过）；**hold 不再回吞暂存件**——旧逻辑在显式 hold 策略下
+        // accept 永远重裁回 still-held（releaseHeldMessages 的 hold→still-held 分支，
+        // core/peerpolicy.ts），暂存件直到 12h TTL 过期都出不了隔离区，而回执仍报
+        // 「影响 1 条」、审计记 peer-hold-released——红队 BND-2 的「假成功黑洞」。
+        // 证据：evidence/adversarial/adjudication/logs/bnd2*.jsonl（accept 3 次均 0 投递）。
         const results = await releaseHeldMessages(r, self.sessionId, ids, {
           workspace: deps.workspace,
           adjudicate: async (message: PeerHeldMessage): Promise<InboundDecision> => {
-            // v0.5 验收修复（16-v050 验收发现 F6）：放行时按当前策略重新裁决**必须带收方档类**
-            // （recvClass）——与初次接收路径（peer-tools.ts:984-991）同口径。缺它时
-            // decideAutoMode 恒判「收方档类未知 → hold(mode-unknown)」（peerpolicy.ts:455-457），
-            // 于是 cause=mode-unknown 的暂存件**永远无法被 accept 放行**（只到 12h TTL 过期）。
-            // 证据：evidence/16-v050/acceptance/acc2-peer-hold.log（修复前 P2.acceptReleased=FAIL）。
+            // 重新裁决保留 F6 修复口径（带收方档类，peer-tools 历史注释见下），用于识别
+            // refuse；显式 hold / 自动档 hold 在收方显式 accept 下一律放行（见上）。
             const receiver = await readReceiverModeClass(r, self?.sessionId ?? "");
             const { decision } = await resolveInboundDecision({
               workspace: deps.workspace,
@@ -720,7 +729,7 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
               ...(message.item.fromMode !== undefined ? { senderClass: message.item.fromMode } : {}),
               selfSent: false,
             });
-            return decision;
+            return decision.policy === "refuse" ? decision : { policy: "accept" };
           },
           deliver: async (message: PeerHeldMessage) => {
             const admitted = admitPeerMessage({
@@ -749,10 +758,13 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
             await sendReceipt(sender, result.msgId, result.receipt, result.detail);
           },
         });
+        // v0.5.1（BND-2 修复）：审计如实——事件附各终态计数。旧版只记 ids，
+        // 「仍滞留/被闸弃」的也记成 released，假成功在审计面同样成立。
         await logPeerEvent(r, {
           event: "peer-hold-released",
           sessionId: self.sessionId,
           ids: results.map((result) => result.msgId),
+          outcomes: countReleaseOutcomes(results),
         });
         return {
           action: "accept",
@@ -1108,6 +1120,46 @@ async function storeAfterEnqueue(root: string, item: PeerQueueItem): Promise<voi
   }
 }
 
+/**
+ * v0.5.1（BND-2 修复）：把 releaseHeldMessages 的逐条终态收敛成计数表。
+ * 未知终态（前向兼容）计进 other，不静默丢弃。
+ */
+export function countReleaseOutcomes(
+  results: readonly { outcome?: string }[],
+): { delivered: number; dropped: number; refused: number; "still-held": number; other: number } {
+  const counts = { delivered: 0, dropped: 0, refused: 0, "still-held": 0, other: 0 };
+  for (const result of results) {
+    if (result.outcome === "delivered" || result.outcome === "dropped"
+      || result.outcome === "refused" || result.outcome === "still-held") {
+      counts[result.outcome] += 1;
+    } else {
+      counts.other += 1;
+    }
+  }
+  return counts;
+}
+
+/**
+ * v0.5.1（BND-2 修复）：xc_peer_review 的摘要行必须反映**真实终态**。
+ * 旧版 accept/discard 一律报「影响 N 条」——still-held（未放行）也计入，
+ * 红队 BND-2 据此把假成功定性为 P1（accept 3 次均「影响 1 条」而投递 0 条）。
+ * accept 现按终态分组如实播报；list/discard 的旧文案不变（discard 的全部
+ * 结果就是 discarded，「影响 N 条」属实）。
+ */
+export function renderReviewSummary(result: PeerReviewResult): string {
+  if (result.action !== "accept") {
+    return `暂存区 ${result.held.length} 条；本次动作 ${result.action}，影响 ${result.affected.length} 条。`;
+  }
+  const counts = countReleaseOutcomes(result.receipts);
+  const parts: string[] = [];
+  if (counts.delivered > 0) parts.push(`放行投递 ${counts.delivered} 条`);
+  if (counts.dropped > 0) parts.push(`入队闸弃 ${counts.dropped} 条`);
+  if (counts.refused > 0) parts.push(`策略拒绝 ${counts.refused} 条（消息已删除）`);
+  if (counts["still-held"] > 0) parts.push(`仍滞留 ${counts["still-held"]} 条（未放行）`);
+  if (counts.other > 0) parts.push(`其他终态 ${counts.other} 条`);
+  return `暂存区 ${result.held.length} 条；accept 结果：${parts.length > 0 ? parts.join("、") : "无可处理的暂存件"}。`;
+}
+
 /** W4 的暂存项 → W5 的队列项（hopChain 在 W4 侧可选）；v0.5：origin/originSessionId/forged 随 item 透传不丢（P8-4d）。 */
 function heldItemToQueueItem(item: {
   msgId: string;
@@ -1249,7 +1301,7 @@ const ANTI_LAUNDER_WARNING =
 export function registerPeerTools(server: McpServer, deps: PeerToolDeps): void {
   const services = deps.peer ?? createDefaultPeerServices(deps);
 
-  const call = async (fn: () => Promise<ToolResult>): Promise<ToolResult> => {
+  const call = async (fn: () => Promise<ToolResult>, opts: { skipFaceB?: boolean } = {}): Promise<ToolResult> => {
     let result: ToolResult;
     try {
       result = await fn();
@@ -1261,6 +1313,7 @@ export function registerPeerTools(server: McpServer, deps: PeerToolDeps): void {
         result = errorResult({ error: "internal", message });
       }
     }
+    if (opts.skipFaceB === true) return result;
     // 面 B（DESIGN §7.1）：peer 工具调用结束后，也在 tool-round 间隙把待投递的
     // peer 消息排空、**追加为末尾 text 块**（content[0]/content[1] 不变）。
     // 与队内工具（mcp/peer-drain.ts 的 withPeerDrain）同款语义——外来消息
@@ -1329,9 +1382,15 @@ export function registerPeerTools(server: McpServer, deps: PeerToolDeps): void {
 
   server.tool(
     "xc_peer_inbox",
-    "Drain this session's pending cross-session peer messages (rendered as <crosschat-peer-message> envelopes, laid out within this session's injection budget; full text stays retrievable via xc_peer_read).",
+    "Drain this session's pending cross-session peer messages (rendered as <crosschat-peer-message> envelopes, laid out within this session's injection budget; full text stays retrievable via xc_peer_read). count = envelopes presented in this response; leftover messages stay queued — poll again (see remaining).",
     PeerInboxShape,
     async (args) =>
+      // v0.5.1（P3 count 口径修复）：skipFaceB——xc_peer_inbox 是自主排空面（面 C），
+      // 结果里的 count/envelopes 必须与**本响应实际呈现的条数**一致。此前 call 包装
+      // 会再叠一次面 B 排空（PEER_DRAIN_LIMIT=5 条塞进末尾 text 块），结构化 count
+      // 只数面 C 自己的排空（如 10），响应实际承载 15 条——只读结构化块的消费方
+      // 误判「丢了 5 条」（红队 conc1 误判消息丢失的直接原因）。抑制后：count =
+      // envelopes = 本次真实呈现数；剩余件留在 queue，由 remaining 字段给「再拉一次」指针。
       call(async () => {
         const result = await services.inbox(args.limit ?? 10);
         // v0.5（R-23 面 C）：渲染 → 预算排布（花费新→旧、输出保到达序）。
@@ -1349,19 +1408,21 @@ export function registerPeerTools(server: McpServer, deps: PeerToolDeps): void {
             budget: budget.total,
             truncatedCount: layout.truncatedCount,
             totalChars: layout.totalChars,
+            ...(result.remaining > 0 ? { remaining: result.remaining } : {}),
           });
         }
         return okResult(
           result.items.length === 0
             ? "没有待投递的跨会话消息。"
-            : `取到 ${result.items.length} 条跨会话消息（已消费）。`,
+            : `取到 ${result.items.length} 条跨会话消息（已消费）${result.remaining > 0 ? `；另有 ${result.remaining} 条待投递——再调一次 xc_peer_inbox 继续拉取` : ""}。`,
           {
             count: result.items.length,
             envelopes: layout.blocks,
+            remaining: result.remaining,
             ...(layout.budgetTruncated ? { budgetTruncated: true } : {}),
           } as unknown as ToolPayload,
         );
-      }),
+      }, { skipFaceB: true }),
   );
 
   server.tool(
@@ -1392,10 +1453,7 @@ export function registerPeerTools(server: McpServer, deps: PeerToolDeps): void {
           action: args.action ?? "list",
           ...(args.ids !== undefined ? { ids: args.ids } : {}),
         });
-        return okResult(
-          `暂存区 ${result.held.length} 条；本次动作 ${result.action}，影响 ${result.affected.length} 条。`,
-          result as unknown as ToolPayload,
-        );
+        return okResult(renderReviewSummary(result), result as unknown as ToolPayload);
       }),
   );
 

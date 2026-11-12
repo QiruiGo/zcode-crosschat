@@ -6,9 +6,9 @@
  * 磁盘类测试用系统 TEMP 下的临时 stateRoot + M1 真实读写函数（end-to-end 到 M1 契约）。
  */
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { appendMailbox, createMessage, readMailbox } from "../core/mailbox";
 import { createWakeNonce } from "../core/registry";
 import { newTeamState, writeTeam } from "../core/teamstate";
@@ -568,5 +568,144 @@ describe("attemptWake: 成员状态门控（provisioning/failed/removed 只入�
     const res = await attemptWake(baseReq({ spawn: fakeSpawn(4, captured) }));
     expect(res.delivered).toBe("wake");
     expect(captured).toHaveLength(1);
+  });
+});
+
+// ─────────────────────────── v0.5.1 FI-7：唤醒失败侦听与回执语义真实化 ───────────────────────────
+
+import {
+  findWakeFailureEvidence,
+  wakeFallbackNote,
+  WAKE_WATCH_POLL_MS,
+  WAKE_WATCH_WINDOW_MS,
+} from "./wake";
+
+function waitUntil(check: () => boolean, timeoutMs = 3000, stepMs = 20): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  return new Promise((resolve) => {
+    const tick = (): void => {
+      if (check()) resolve(true);
+      else if (Date.now() > deadline) resolve(false);
+      else setTimeout(tick, stepMs);
+    };
+    tick();
+  });
+}
+
+describe("findWakeFailureEvidence（FI-7：只认正向失败证据，绝不虚报）", () => {
+  it("命中：行首 Error（红队实测形态 Session not found）", () => {
+    expect(findWakeFailureEvidence("Error: Session not found: sess_x\n")).toBe(
+      "Error: Session not found: sess_x",
+    );
+  });
+  it("命中：JSON 错误形状 isError:true / success:false / 顶层 error 字符串", () => {
+    expect(findWakeFailureEvidence('{"isError":true,"message":"boom"}')).toContain("boom");
+    expect(findWakeFailureEvidence('{"success":false}')).toBe('{"success":false}');
+    expect(findWakeFailureEvidence('{"error":"resume rejected"}')).toContain("resume rejected");
+  });
+  it("不虚报：成功 JSON（单行对象）、内部含 Error 字样的响应文本、普通告警、空文本", () => {
+    expect(findWakeFailureEvidence('{"sessionId":"s","response":"... Error: not at line start"}')).toBeUndefined();
+    expect(findWakeFailureEvidence('{"sessionId":"s","response":"hi"}')).toBeUndefined();
+    expect(findWakeFailureEvidence("[WARN] slow startup\n")).toBeUndefined();
+    expect(findWakeFailureEvidence("")).toBeUndefined();
+  });
+});
+
+describe("wakeFallbackNote（FI-7：env 配置失效回落自动探测的回执标注）", () => {
+  const resolvedFallback = {
+    zcodeExe: "E:\ZCode\ZCode.exe",
+    zcodeCjs: "E:\ZCode\resources\glm\zcode.cjs",
+    outcome: { found: true, source: "process_table" as const, pair: null, attempts: [], guidance: "" },
+  } satisfies import("./zcode-locate").ResolvedSpawnConfig;
+  it("env 已配置但文件不存在 + 探测命中 → 标注回落目标", () => {
+    const note = wakeFallbackNote({ XC_ZCODE_EXE: "D:\nope\ZCode.exe", XC_ZCODE_CJS: "D:\nope\z.cjs" }, resolvedFallback);
+    expect(note).toContain("自动探测回落");
+    expect(note).toContain("E:\ZCode\ZCode.exe");
+  });
+  it("env 未配置（零必填常规路径）/ env 命中（无回落）/ 探测未命中 → 不标注", () => {
+    expect(wakeFallbackNote({}, resolvedFallback)).toBe("");
+    expect(
+      wakeFallbackNote(
+        { XC_ZCODE_EXE: "D:\ok\ZCode.exe", XC_ZCODE_CJS: "D:\ok\z.cjs" },
+        { ...resolvedFallback, outcome: { ...resolvedFallback.outcome, source: "user_config" } },
+      ),
+    ).toBe("");
+    expect(
+      wakeFallbackNote(
+        { XC_ZCODE_EXE: "D:\nope\ZCode.exe", XC_ZCODE_CJS: "D:\nope\z.cjs" },
+        { ...resolvedFallback, outcome: { ...resolvedFallback.outcome, found: false } },
+      ),
+    ).toBe("");
+    // 测试注入 cfg（非 ResolvedSpawnConfig）→ 不标注
+    expect(wakeFallbackNote({ XC_ZCODE_EXE: "D:\nope\ZCode.exe", XC_ZCODE_CJS: "D:\nope\z.cjs" }, { zcodeExe: "Z.exe", zcodeCjs: "z.cjs" })).toBe("");
+  });
+});
+
+describe("attemptWake 失败侦听（FI-7：spawn 成功 ≠ 送达；回执须反映真实结果）", () => {
+  it("【回执语义】wake 态 note 明示「非送达确认」+ 失败自动检测去向；不再只说「已发起」", async () => {
+    await seedMailbox();
+    const res = await attemptWake(baseReq({ spawn: fakeSpawn(11, []) }));
+    expect(res.delivered).toBe("wake");
+    expect(res.note).toContain("非送达确认");
+    expect(res.note).toContain("wake-failed");
+    expect(WAKE_WATCH_WINDOW_MS).toBeGreaterThan(0);
+    expect(WAKE_WATCH_POLL_MS).toBeGreaterThan(0);
+  });
+
+  it("【失败检测】唤醒子进程异步失败（wake 日志出现 Error:）→ engine.jsonl wake-failed{where:wake-child} + 释放租约 + 消费 nonce + 可重试", async () => {
+    const message = await seedMailbox();
+    const res = await attemptWake(baseReq({
+      receiptIds: [message.id],
+      now: 1_000_000,
+      watchWindowMs: 1500,
+      watchPollMs: 20,
+      spawn: (opts) => {
+        // 模拟孤儿唤醒子进程：spawn 返回后才把失败写进 wake 日志（父进程无退出码可观察）
+        setTimeout(() => {
+          mkdirSync(dirname(opts.logFile), { recursive: true });
+          appendFileSync(opts.logFile, "Error: Session not found: sess_b\n");
+        }, 40);
+        return { pid: 4242, logFile: opts.logFile };
+      },
+    }));
+    expect(res.delivered).toBe("wake");
+    expect(res.wakeLog).toContain("wake-b-1000000.json");
+
+    // 等待失败侦听结算（轮询到 wake-failed 出现，上限 3s）
+    const sawFailure = await waitUntil(() => readEngineEvents().some((e) => e["event"] === "wake-failed"));
+    expect(sawFailure).toBe(true);
+    const failed = readEngineEvents().find((e) => e["event"] === "wake-failed");
+    expect(failed!["where"]).toBe("wake-child");
+    expect(String(failed!["error"])).toContain("Session not found");
+
+    // 投递租约已释放：pull 立即可见（deliveryClaimedAt 移除，消息未丢）
+    const after = (await readMailbox(root, "default", "b")).find((m) => m.id === message.id);
+    expect(after).toBeDefined();
+    expect(after?.deliveryClaimedAt).toBeUndefined();
+
+    // nonce 已消费：15min 在途标记不再挡重试 → 立即重试成功
+    const retry: CapturedSpawn[] = [];
+    const res2 = await attemptWake(baseReq({ receiptIds: [message.id], spawn: fakeSpawn(9, retry) }));
+    expect(res2.delivered).toBe("wake");
+    expect(retry).toHaveLength(1);
+  });
+
+  it("【不虚报】窗口内日志静默/无失败证据 → 不记 wake-failed，wake 态不回滚", async () => {
+    await seedMailbox();
+    const res = await attemptWake(baseReq({
+      watchWindowMs: 120,
+      watchPollMs: 20,
+      spawn: (opts) => {
+        // 子进程只写普通输出（无失败证据形态）
+        setTimeout(() => {
+          mkdirSync(dirname(opts.logFile), { recursive: true });
+          appendFileSync(opts.logFile, '{"sessionId":"sess_b","response":"ok"}\n');
+        }, 30);
+        return { pid: 77, logFile: opts.logFile };
+      },
+    }));
+    expect(res.delivered).toBe("wake");
+    await new Promise((r) => setTimeout(r, 220)); // 越过侦听窗口
+    expect(readEngineEvents().some((e) => e["event"] === "wake-failed")).toBe(false);
   });
 });

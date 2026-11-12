@@ -23,9 +23,10 @@
  * @module core/lock
  */
 import { closeSync, openSync, unlinkSync, writeSync } from 'node:fs';
-import { mkdir, readFile, unlink } from 'node:fs/promises';
+import { mkdir, readFile, stat, unlink } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { lockFile, locksDir, registryLockNames, teamLockNames } from './paths.js';
+import { logEngineEvent } from './log.js';
 
 // ---------------------------------------------------------------------------
 // 1. In-process promise chains (port of state.js:29-63)
@@ -73,6 +74,14 @@ export const LOCK_STALE_MS = 120_000;
 export const LOCK_BACKOFF_START_MS = 25;
 /** Backoff cap. */
 export const LOCK_BACKOFF_MAX_MS = 500;
+/**
+ * v0.5.1（故障注-6 修复）：不可解析残留锁的安全清除宽限期。
+ * tryCreateLockFile 在 openSync('wx') 与 writeSync 之间若被调度打断会留下短暂的
+ * 0 字节锁；宽限期内只重试不清除，超过即判定为崩溃/外部损坏残留并安全删除
+ * （内容不可解析 = 无法证明存在活持有者）。宽限远小于 LOCK_WAIT_MS，残留锁
+ * 从「每次 15s busy 永久饥饿」变为约 1 个宽限期后自愈。
+ */
+export const UNPARSEABLE_LOCK_GRACE_MS = 1_000;
 
 /** Structured busy error: `toStructured()` is what the tool layer returns. */
 export class LockBusyError extends Error {
@@ -191,10 +200,13 @@ export async function acquireFileLock(stateRoot: string, name: string, options: 
     }
     // Held by someone: judge staleness from the current content.
     let holder: LockContent | undefined;
+    let unparseable = false;
     try {
-      holder = parseLockContent(await readFile(path, 'utf8'));
+      const raw = await readFile(path, 'utf8');
+      holder = parseLockContent(raw);
+      unparseable = holder === undefined; // 文件在但内容不可解析（0 字节/乱码/缺字段）
     } catch {
-      holder = undefined; // vanished or unreadable -> retry immediately
+      holder = undefined; // vanished -> retry immediately
     }
     if (holder !== undefined) {
       const stale = !pidAlive(holder.pid) || Date.now() - holder.ts > staleMs;
@@ -212,6 +224,26 @@ export async function acquireFileLock(stateRoot: string, name: string, options: 
           } catch {
             // Lost the unlink race -> loop and retry normally.
           }
+        }
+      }
+    } else if (unparseable) {
+      // v0.5.1（故障注-6 修复）：不可解析残留锁的安全清除。此前此分支只会
+      // 空转到 15s 超时且锁文件永不清除——崩溃写锁中断（半写/0 字节）或外部
+      // 损坏导致变更类操作永久饥饿。现在：超过宽限期仍不可解析即判定为无主
+      // 残留（无法提取 pid 证明活持有者），删除后下一轮 tryCreateLockFile 正常
+      // 夺取；审计 `lock-repaired`。宽限期挡住「创建者 openSync 与 writeSync
+      // 之间被打断」的瞬时 0 字节窗口，不误删刚被合法持有的锁。
+      const mtimeMs = await stat(path).then((s) => s.mtimeMs, () => Date.now());
+      if (Date.now() - mtimeMs > UNPARSEABLE_LOCK_GRACE_MS) {
+        try {
+          unlinkSync(path);
+          void logEngineEvent(stateRoot, {
+            event: 'lock-repaired',
+            lock: name,
+            reason: 'unparseable-content',
+          });
+        } catch {
+          // Lost the unlink race -> loop and retry normally.
         }
       }
     }

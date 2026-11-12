@@ -79,6 +79,13 @@ function snapshotFile(): string {
   return join(stateRoot, "teams", "default", "snapshot.json");
 }
 
+/** 证据门（v0.5.1 边界与-3 修复）要求证据文件真实存在：落一个真文件并返回其路径。 */
+function evidenceFile(name: string, content = "evidence"): string {
+  const p = join(workDir, name);
+  writeFileSync(p, content, "utf8");
+  return p;
+}
+
 function refreshCount(): number {
   return readEngineEvents().filter((e) => e["event"] === "snapshot-refresh").length;
 }
@@ -133,7 +140,8 @@ describe("withTaskEdges: xc_dispatch（E-a）", () => {
     await hookRegister(core, "conn-b", "b", "sess_b");
 
     const res = unwrap(await core.xc_dispatch({ to: "b", title: "平方表", prompt: "算 1..10 平方" }, "conn-a"));
-    expect(res["taskId"]).toBe("t1");
+    // v0.5.1（故障注-5 修复）：任务 id 为 <era>-t<n> 形态，断言只锁后缀序号形态。
+    expect(res["taskId"]).toMatch(/-t1$/);
 
     expect(existsSync(snapshotFile())).toBe(true);
     const snap = JSON.parse(readFileSync(snapshotFile(), "utf8")) as Record<string, unknown>;
@@ -157,40 +165,41 @@ describe("withTaskEdges: xc_dispatch（E-a）", () => {
 
 // ─────────────────────────── E-b 终态报告边沿 ───────────────────────────
 
-/** 标准三成员剧本：a 派 t1→m1、t2(依赖 t1)→m2。 */
-async function seedChain(core: ToolCore): Promise<void> {
+/** 标准三成员剧本：a 派 t1→m1、t2(依赖 t1)→m2；返回动态任务 id（<era>-t<n> 形态）。 */
+async function seedChain(core: ToolCore): Promise<{ t1: string; t2: string }> {
   await hookRegister(core, "conn-a", "a", "sess_a");
   await hookRegister(core, "conn-m1", "m1", "sess_m1");
   await hookRegister(core, "conn-m2", "m2", "sess_m2");
-  unwrap(await core.xc_dispatch({ to: "m1", title: "平方表", prompt: "算 1..10 平方" }, "conn-a"));
-  unwrap(
-    await core.xc_dispatch({ to: "m2", title: "求和", prompt: "把平方表求和", dependsOn: ["t1"] }, "conn-a"),
-  );
+  const t1 = (unwrap(await core.xc_dispatch({ to: "m1", title: "平方表", prompt: "算 1..10 平方" }, "conn-a"))["taskId"]) as string;
+  const t2 = (unwrap(
+    await core.xc_dispatch({ to: "m2", title: "求和", prompt: "把平方表求和", dependsOn: [t1] }, "conn-a"),
+  )["taskId"]) as string;
+  return { t1, t2 };
 }
 
 describe("withTaskEdges: xc_report completed → 依赖解除（E-b ②）", () => {
   it("下游就绪 → unblock-notice 入 m2 邮箱（带上游结果摘要）+ 无开放任务即尝试唤醒", async () => {
     const core = makeCore({ XC_WAKE_ENABLED: "true" }); // 未配 exe → spawn 同步失败 → wake-failed 证明走到唤醒
-    await seedChain(core);
+    const { t1, t2 } = await seedChain(core);
 
-    const attemptId = await claimAndStart(core, "conn-m1", "t1");
+    const attemptId = await claimAndStart(core, "conn-m1", t1);
     const res = unwrap(
       await core.xc_report(
-        { taskId: "t1", attemptId, status: "completed", result: "1 4 9 … 100", evidence: [{ path: "D:\\e\\sq.txt" }] },
+        { taskId: t1, attemptId, status: "completed", result: "1 4 9 … 100", evidence: [{ path: evidenceFile("sq.txt") }] },
         "conn-m1",
       ),
     );
     const unblocked = (res["edges"] as Record<string, unknown>)["unblocked"] as Array<Record<string, unknown>>;
     expect(unblocked).toHaveLength(1);
-    expect(unblocked[0]).toMatchObject({ taskId: "t2", recipient: "m2", woken: true });
+    expect(unblocked[0]).toMatchObject({ taskId: t2, recipient: "m2", woken: true });
 
     // m2 邮箱：unblock-notice 帧 + 上游结果摘要（collectDependencyOutputs）
     const box = await readMailbox(stateRoot, "default", "m2");
     const notices = box.filter((m) => m.content.includes('"unblock-notice"'));
     expect(notices).toHaveLength(1);
     const frame = JSON.parse(notices[0]!.content) as Record<string, unknown>;
-    expect(frame["taskId"]).toBe("t2");
-    expect(frame["unblockedBy"]).toBe("t1");
+    expect(frame["taskId"]).toBe(t2);
+    expect(frame["unblockedBy"]).toBe(t1);
     expect(String(frame["dependencyOutputs"])).toContain("1 4 9");
 
     // 唤醒路径被走到（spawn 因未配 exe 失败 → wake-failed，scene=unblock，to=m2）。
@@ -203,15 +212,15 @@ describe("withTaskEdges: xc_report completed → 依赖解除（E-b ②）", () 
 
   it("收件人有开放任务 → 只入箱不唤醒（woken:false，无 unblock 唤醒事件）", async () => {
     const core = makeCore({ XC_WAKE_ENABLED: "true" });
-    await seedChain(core);
-    // m2 先领一张独立单 t3 → 拥有开放任务。
-    unwrap(await core.xc_dispatch({ to: "m2", title: "独立单", prompt: "P" }, "conn-a"));
-    await claimAndStart(core, "conn-m2", "t3");
+    const { t1 } = await seedChain(core);
+    // m2 先领一张独立单（t3）→ 拥有开放任务。
+    const t3 = (unwrap(await core.xc_dispatch({ to: "m2", title: "独立单", prompt: "P" }, "conn-a"))["taskId"]) as string;
+    await claimAndStart(core, "conn-m2", t3);
 
-    const attemptId = await claimAndStart(core, "conn-m1", "t1");
+    const attemptId = await claimAndStart(core, "conn-m1", t1);
     const res = unwrap(
       await core.xc_report(
-        { taskId: "t1", attemptId, status: "completed", result: "r", evidence: [{ path: "D:\\e.txt" }] },
+        { taskId: t1, attemptId, status: "completed", result: "r", evidence: [{ path: evidenceFile("e.txt") }] },
         "conn-m1",
       ),
     );
@@ -226,13 +235,13 @@ describe("withTaskEdges: xc_report completed → 依赖解除（E-b ②）", () 
 
   it("removed 成员不唤醒（§6.3/§7.3.3），通知照常入箱", async () => {
     const core = makeCore({ XC_WAKE_ENABLED: "true" });
-    await seedChain(core);
+    const { t1 } = await seedChain(core);
     await setMemberState("m2", "removed");
 
-    const attemptId = await claimAndStart(core, "conn-m1", "t1");
+    const attemptId = await claimAndStart(core, "conn-m1", t1);
     const res = unwrap(
       await core.xc_report(
-        { taskId: "t1", attemptId, status: "completed", result: "r", evidence: [{ path: "D:\\e.txt" }] },
+        { taskId: t1, attemptId, status: "completed", result: "r", evidence: [{ path: evidenceFile("e.txt") }] },
         "conn-m1",
       ),
     );
@@ -248,11 +257,11 @@ describe("withTaskEdges: xc_report completed → 依赖解除（E-b ②）", () 
 
   it("failed 报告 → 下游保持阻塞（无 unblock-notice、无 edges 字段），快照仍刷新", async () => {
     const core = makeCore();
-    await seedChain(core);
-    const attemptId = await claimAndStart(core, "conn-m1", "t1");
+    const { t1 } = await seedChain(core);
+    const attemptId = await claimAndStart(core, "conn-m1", t1);
     const res = unwrap(
       await core.xc_report(
-        { taskId: "t1", attemptId, status: "failed", error: "算不动了" },
+        { taskId: t1, attemptId, status: "failed", error: "算不动了" },
         "conn-m1",
       ),
     );
@@ -264,9 +273,9 @@ describe("withTaskEdges: xc_report completed → 依赖解除（E-b ②）", () 
 
   it("in_progress 心跳 → 无边沿动作但快照刷新（§7.3.1 机制 3「每单 report 至少一次」）", async () => {
     const core = makeCore();
-    await seedChain(core);
+    const { t1 } = await seedChain(core);
     const before = refreshCount();
-    const attemptId = await claimAndStart(core, "conn-m1", "t1"); // 含一次 in_progress 心跳
+    const attemptId = await claimAndStart(core, "conn-m1", t1); // 含一次 in_progress 心跳
     void attemptId;
     expect(refreshCount()).toBeGreaterThan(before);
   });
@@ -277,32 +286,32 @@ describe("withTaskEdges: xc_report completed → 依赖解除（E-b ②）", () 
 describe("withTaskEdges: 僵尸清扫（E-b ①）", () => {
   it("超时 40min 且无在途 nonce → 引擎重置回 pending + 派发方收 stale-swept 回执 + 审计", async () => {
     const core = makeCore();
-    await seedChain(core);
-    // m1 认领 t1 后失联（无心跳）；m2 在独立单 t3 上认领并完成 → E-b 边沿清扫 t1。
+    const { t1 } = await seedChain(core);
+    // m1 认领 t1 后失联（无心跳）；m2 在独立单（t3）上认领并完成 → E-b 边沿清扫 t1。
     // （t2 依赖 t1、m2 领不了——清扫边沿需要一条无关的终态报告来触发。）
-    const attemptId1 = await claimAndStart(core, "conn-m1", "t1");
-    unwrap(await core.xc_dispatch({ to: "m2", title: "独立单", prompt: "P" }, "conn-a"));
-    const attemptId3 = await claimAndStart(core, "conn-m2", "t3");
+    const attemptId1 = await claimAndStart(core, "conn-m1", t1);
+    const t3 = (unwrap(await core.xc_dispatch({ to: "m2", title: "独立单", prompt: "P" }, "conn-a"))["taskId"]) as string;
+    const attemptId3 = await claimAndStart(core, "conn-m2", t3);
     await backdateOpenTask("m1", 40 * 60_000);
 
     const res = unwrap(
       await core.xc_report(
-        { taskId: "t3", attemptId: attemptId3, status: "completed", result: "385", evidence: [{ path: "D:\\e\\sum.txt" }] },
+        { taskId: t3, attemptId: attemptId3, status: "completed", result: "385", evidence: [{ path: evidenceFile("sum.txt") }] },
         "conn-m2",
       ),
     );
     const swept = (res["edges"] as Record<string, unknown>)["swept"] as Array<Record<string, unknown>>;
     expect(swept).toHaveLength(1);
-    expect(swept[0]).toMatchObject({ taskId: "t1", assignee: "m1" });
+    expect(swept[0]).toMatchObject({ taskId: t1, assignee: "m1" });
     expect(swept[0]!["revokedAttemptId"]).toBe(attemptId1);
 
     // t1 已回 pending 池（引擎特权重置）。
     const team = (await readTeam(stateRoot, "default"))!;
-    const t1 = team.tasks.find((t) => t.id === "t1")!;
-    expect(t1.status).toBe("pending");
-    expect(t1.assignee).toBeNull();
-    expect(t1.attemptId).toBeNull();
-    expect(t1.history[t1.history.length - 1]!.event).toBe("revoked-stale");
+    const t1rec = team.tasks.find((t) => t.id === t1)!;
+    expect(t1rec.status).toBe("pending");
+    expect(t1rec.assignee).toBeNull();
+    expect(t1rec.attemptId).toBeNull();
+    expect(t1rec.history[t1rec.history.length - 1]!.event).toBe("revoked-stale");
 
     // 派发方 a 的邮箱收到 stale-swept 回执。
     const boxA = await readMailbox(stateRoot, "default", "a");
@@ -314,12 +323,12 @@ describe("withTaskEdges: 僵尸清扫（E-b ①）", () => {
     expect(String(frame["error"])).toContain("stale-swept");
 
     // engine.jsonl 审计行。
-    expect(readEngineEvents().some((e) => e["event"] === "task-swept" && e["taskId"] === "t1")).toBe(true);
+    expect(readEngineEvents().some((e) => e["event"] === "task-swept" && e["taskId"] === t1)).toBe(true);
 
     // 复活的 m1 用旧令牌报告 → 硬拒（重置后任务 pending 且无当前 attempt，
     // pending→completed 转移本身也非法——双保险拒绝）。
     const late = await core.xc_report(
-      { taskId: "t1", attemptId: attemptId1, status: "completed", result: "x", evidence: [{ path: "D:\\e.txt" }] },
+      { taskId: t1, attemptId: attemptId1, status: "completed", result: "x", evidence: [{ path: evidenceFile("e.txt") }] },
       "conn-m1",
     );
     expect(late.isError).toBe(true);
@@ -328,22 +337,22 @@ describe("withTaskEdges: 僵尸清扫（E-b ①）", () => {
 
   it("成员有在途 wake nonce → 豁免清扫（回合可能仍在跑）", async () => {
     const core = makeCore();
-    await seedChain(core);
-    const attemptId1 = await claimAndStart(core, "conn-m1", "t1");
-    unwrap(await core.xc_dispatch({ to: "m2", title: "独立单", prompt: "P" }, "conn-a"));
-    const attemptId3 = await claimAndStart(core, "conn-m2", "t3");
+    const { t1 } = await seedChain(core);
+    const attemptId1 = await claimAndStart(core, "conn-m1", t1);
+    const t3 = (unwrap(await core.xc_dispatch({ to: "m2", title: "独立单", prompt: "P" }, "conn-a"))["taskId"]) as string;
+    const attemptId3 = await claimAndStart(core, "conn-m2", t3);
     await backdateOpenTask("m1", 40 * 60_000);
     await createWakeNonce(stateRoot, { teamId: "default", agentKey: "m1", sid: "sess_m1", now: Date.now() });
 
     const res = unwrap(
       await core.xc_report(
-        { taskId: "t3", attemptId: attemptId3, status: "completed", result: "385", evidence: [{ path: "D:\\e\\sum.txt" }] },
+        { taskId: t3, attemptId: attemptId3, status: "completed", result: "385", evidence: [{ path: evidenceFile("sum.txt") }] },
         "conn-m2",
       ),
     );
-    expect(res["edges"]).toBeUndefined(); // 无清扫（豁免）、无解除（t3 无下游）
-    const t1 = (await readTeam(stateRoot, "default"))!.tasks.find((t) => t.id === "t1")!;
-    expect(t1.status).toBe("in_progress"); // 原样保留（claimAndStart 已推进到 in_progress）
+    expect(res["edges"]).toBeUndefined(); // 无清扫（豁免）、无解除（独立单无下游）
+    const t1rec = (await readTeam(stateRoot, "default"))!.tasks.find((t) => t.id === t1)!;
+    expect(t1rec.status).toBe("in_progress"); // 原样保留（claimAndStart 已推进到 in_progress）
     void attemptId1;
   });
 });
@@ -355,11 +364,11 @@ describe("withTaskEdges: 透传与错误隔离（§11.1 基座不动）", () => 
     const core = makeCore();
     await hookRegister(core, "conn-a", "a", "sess_a");
     await hookRegister(core, "conn-m1", "m1", "sess_m1");
-    unwrap(await core.xc_dispatch({ to: "m1", title: "T", prompt: "P" }, "conn-a"));
+    const t1 = (unwrap(await core.xc_dispatch({ to: "m1", title: "T", prompt: "P" }, "conn-a"))["taskId"]) as string;
     expect(refreshCount()).toBe(1);
 
     // 未认领的 pending 任务直接报 completed：状态机拒绝（pending 无 completed 边）。
-    const bad = await core.xc_report({ taskId: "t1", attemptId: "wrong", status: "completed", result: "r", evidence: [{ path: "D:\\e.txt" }] }, "conn-m1");
+    const bad = await core.xc_report({ taskId: t1, attemptId: "wrong", status: "completed", result: "r", evidence: [{ path: evidenceFile("e.txt") }] }, "conn-m1");
     expect(bad.isError).toBe(true);
     expect((payloadOf(bad))["error"]).toBe("illegal_transition");
     expect(refreshCount()).toBe(1); // 无快照刷新
@@ -369,25 +378,29 @@ describe("withTaskEdges: 透传与错误隔离（§11.1 基座不动）", () => 
     const core = makeCore();
     await hookRegister(core, "conn-a", "a", "sess_a");
     await hookRegister(core, "conn-m1", "m1", "sess_m1");
-    unwrap(await core.xc_dispatch({ to: "m1", title: "T", prompt: "P" }, "conn-a"));
-    // 损坏 team.json：基座对损坏文件一律干净错误信封（不向上抛）。
+    const t1 = (unwrap(await core.xc_dispatch({ to: "m1", title: "T", prompt: "P" }, "conn-a"))["taskId"]) as string;
+    // 损坏 team.json（含 .bak 镜像，避免 v0.5.1 故障注-1 的 last-known-good 自愈
+    // 介入）：基座对不可解析真源一律干净错误信封（不向上抛）。
     const teamFile = join(stateRoot, "teams", "default", "team.json");
+    const bakFile = join(stateRoot, "teams", "default", "team.json.bak");
     const good = readFileSync(teamFile, "utf8");
     try {
       writeFileSync(teamFile, "{ corrupt");
+      if (existsSync(bakFile)) writeFileSync(bakFile, "!!!");
       const bad = await core.xc_report(
-        { taskId: "t1", attemptId: "x", status: "completed", result: "r", evidence: [{ path: "D:\\e.txt" }] },
+        { taskId: t1, attemptId: "x", status: "completed", result: "r", evidence: [{ path: evidenceFile("e.txt") }] },
         "conn-m1",
       );
       expect(bad.isError).toBe(true);
       expect((payloadOf(bad))["error"]).toBe("internal");
     } finally {
       writeFileSync(teamFile, good);
+      if (existsSync(bakFile)) writeFileSync(bakFile, good);
     }
     // 恢复后正常终态报告：边沿正常工作（健全性）。
-    const attemptId = await claimAndStart(core, "conn-m1", "t1");
+    const attemptId = await claimAndStart(core, "conn-m1", t1);
     const res = unwrap(
-      await core.xc_report({ taskId: "t1", attemptId, status: "completed", result: "done", evidence: [{ path: "D:\\e.txt" }] }, "conn-m1"),
+      await core.xc_report({ taskId: t1, attemptId, status: "completed", result: "done", evidence: [{ path: evidenceFile("e.txt") }] }, "conn-m1"),
     );
     expect(res["status"]).toBe("completed");
     expect(existsSync(snapshotFile())).toBe(true);

@@ -112,6 +112,19 @@ export const PEER_TOKEN_RE = /^[0-9a-f]{32}$/;
 export const PEER_SEND_TIMEOUT_MS = 10_000;
 
 /**
+ * peer 端点并发连接上限（v0.5.1，CONC-3/并发与-3 修复）。
+ *
+ * 根因（裁决 #8 confirmed，P2）：旧缺省 32 低于产品主路径的现实 fan-in 突发——
+ * `xc_peer_send` 每次调用开一条新连接（sendPeerFrame→connect），红队实测 9 发送者
+ * ×5 条同 tick 并发 = 45 条在途连接，超 32 的 13 条被端点以 `endpoint-busy` 拒收
+ * （45−32=13、40−32=8、35−32=3，三档与实测逐位吻合：adjudication.md #8）。
+ * 一对多 fan-in（lead 派发/成员回执）是产品主路径，max_members 上限 8，128 覆盖
+ * 8 成员 ×在途突发 ×余量；端点仍有界（auth 期限 30s 掐死无主连接），超过 128
+ * 的突发依旧显式 busy（fail-closed），README 已知限制 6 同步声明该上限。
+ */
+export const PEER_MAX_CONNECTIONS = 128;
+
+/**
  * 权限类黑名单字段名（R-14 安全规则①的显式落点）。
  *
  * 封闭字段集本身已经挡住这些键；这里再列一份是为了：(1) 审计信息更明确；

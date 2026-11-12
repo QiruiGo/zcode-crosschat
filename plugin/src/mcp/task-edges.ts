@@ -298,6 +298,119 @@ async function unblockDependentsLocked(
   return { unblocked, wakePlan };
 }
 
+// ─────────────────────────── 模块级边沿助手（E-b 边沿与周期清扫共用） ───────────────────────────
+
+/** 边沿/清扫后的快照刷新：best-effort，失败审计（观测面失败永不影响工具结果，§7.3.1）。 */
+async function refreshSnapshotBestEffort(deps: ToolDeps): Promise<void> {
+  try {
+    await refreshSnapshot(deps.stateRoot, DEFAULT_TEAM_ID);
+  } catch (err) {
+    await logEngineEvent(deps.stateRoot, {
+      event: "snapshot-refresh-failed",
+      teamId: DEFAULT_TEAM_ID,
+      where: "task-edges",
+      error: String(err instanceof Error ? err.message : err),
+    });
+  }
+}
+
+/** 锁内计划的锁外唤醒执行（attemptWake 必须在团队锁外，§2.7-4）。 */
+async function runWakePlan(deps: ToolDeps, plan: readonly WakePlanItem[]): Promise<void> {
+  for (const item of plan) {
+    if (item.sessionId === null) continue; // 无 sessionId：mailbox 兜底（不 spawn）
+    try {
+      await attemptWake({
+        stateRoot: deps.stateRoot,
+        teamId: DEFAULT_TEAM_ID,
+        toAgentKey: item.to,
+        toSessionId: item.sessionId,
+        workspace: deps.workspace,
+        reason: item.reason,
+        receiptIds: item.receiptIds,
+        ticket: item.ticket,
+        env: deps.env,
+      });
+    } catch (err) {
+      // attemptWake 自身永不抛（信封内降级）；防御一层，保持边沿永不抛的约定。
+      await logEngineEvent(deps.stateRoot, {
+        event: "task-edges-failed",
+        where: "wake-plan",
+        to: item.to,
+        error: String(err instanceof Error ? err.message : err),
+      });
+    }
+  }
+}
+
+// ─────────────────────────── 周期清扫（故障注-8 修复：README L215 承诺兑现） ───────────────────────────
+
+/**
+ * 清扫节拍（毫秒）＝ 由阈值推导：threshold/6，钳制在 [10s, 60s]。
+ * 阈值可配（XC_STALE_TASK_MINUTES）：阈值 1min → 10s 节拍（阈值到期后 ≤10s 内被清扫）；
+ * 缺省 30min → 60s 节拍。下限保证极小阈值下不空转，上限保证大文件 team.json 不被高频重读。
+ */
+export function sweepTickMsFromThreshold(thresholdMs: number): number {
+  return Math.max(10_000, Math.min(thresholdMs / 6, 60_000));
+}
+
+export interface StaleSweepSummary {
+  swept: number;
+  skipped: boolean;
+}
+
+/**
+ * 一轮独立清扫（与 E-b 边沿内的清扫同一条实现路径，只是触发源不同）：
+ * 读盘预检（无锁、零候选即返回）→ 锁内重读 → 清扫 + 回执 + 审计 → 锁外唤醒 → 刷快照。
+ *
+ * 存在理由（故障注-8）：E-b 边沿清扫只在「有成员成功报告终态」时运行——成员死后
+ * 再无报告，僵尸任务永不清扫。本函数由 MCP server 进程的周期定时器驱动
+ * （startStaleSweeper），使「在途任务超阈值无更新」无论是否有其他成员活动都会被
+ * 引擎兑现为「清扫回待领并回执派发方（lead 主导派发流中即队长）」。
+ *
+ * 永不抛出：team.json 缺失/损坏、锁忙（15s 等待超时）、IO 失败一律吞掉返回
+ * skipped（损坏状态由故障注-1 的错误信封面负责，清扫面静默让路、下轮重试）。
+ */
+export async function sweepStaleTasksOnce(deps: ToolDeps, now: number = Date.now()): Promise<StaleSweepSummary> {
+  const { stateRoot, env } = deps;
+  const teamId = DEFAULT_TEAM_ID;
+  try {
+    const thresholdMs = staleThresholdMsFromEnv(env);
+    // 无锁预检：没有僵尸候选就不碰锁（常态节拍的零成本路径）。
+    const probe = await readTeam(stateRoot, teamId);
+    if (probe === undefined || staleTasks(probe.tasks, now, thresholdMs).length === 0) {
+      return { swept: 0, skipped: true };
+    }
+    const outcome = await withTeamLock(stateRoot, teamId, async () => {
+      const team = await readTeam(stateRoot, teamId);
+      if (team === undefined) return { swept: [] as SweptTaskInfo[], wakePlan: [] as WakePlanItem[] };
+      const sweep = await sweepStaleTasksLocked(stateRoot, team, thresholdMs, now);
+      if (sweep.swept.length > 0) await writeTeam(stateRoot, team);
+      return sweep;
+    });
+    await runWakePlan(deps, outcome.wakePlan);
+    if (outcome.swept.length > 0) await refreshSnapshotBestEffort(deps);
+    return { swept: outcome.swept.length, skipped: false };
+  } catch {
+    // 永不抛出（withTaskEdges 同款纪律）：清扫面失败不影响任何工具结果，
+    // 邮箱/团队真源兜底，下一轮节拍重算。
+    return { swept: 0, skipped: true };
+  }
+}
+
+/**
+ * 启动周期清扫定时器（server.ts 在 main() 里调用；单测可直接驱动 sweepStaleTasksOnce）。
+ * 节拍由 XC_STALE_TASK_MINUTES 推导（sweepTickMsFromThreshold）；定时器 unref——
+ * 不改变进程退出语义（EOF 纪律的 shutdown 仍以 process.exit 收口）。
+ */
+export function startStaleSweeper(deps: ToolDeps, intervalMs?: number): NodeJS.Timeout {
+  const tick = intervalMs ?? sweepTickMsFromThreshold(staleThresholdMsFromEnv(deps.env));
+  const timer = setInterval(() => {
+    void sweepStaleTasksOnce(deps);
+  }, tick);
+  timer.unref();
+  return timer;
+}
+
 // ─────────────────────────── 包装器 ───────────────────────────
 
 /**
@@ -306,48 +419,6 @@ async function unblockDependentsLocked(
  */
 export function withTaskEdges(core: ToolCore, deps: ToolDeps): ToolCore {
   const { stateRoot, env } = deps;
-
-  /** 边沿后的快照刷新：best-effort，失败审计（观测面失败永不影响工具结果，§7.3.1）。 */
-  async function refreshSnapshotBestEffort(teamId: string): Promise<void> {
-    try {
-      await refreshSnapshot(stateRoot, teamId);
-    } catch (err) {
-      await logEngineEvent(stateRoot, {
-        event: "snapshot-refresh-failed",
-        teamId,
-        where: "task-edges",
-        error: String(err instanceof Error ? err.message : err),
-      });
-    }
-  }
-
-  /** 锁内计划的锁外唤醒执行（attemptWake 必须在团队锁外，§2.7-4）。 */
-  async function runWakePlan(plan: readonly WakePlanItem[]): Promise<void> {
-    for (const item of plan) {
-      if (item.sessionId === null) continue; // 无 sessionId：mailbox 兜底（不 spawn）
-      try {
-        await attemptWake({
-          stateRoot,
-          teamId: DEFAULT_TEAM_ID,
-          toAgentKey: item.to,
-          toSessionId: item.sessionId,
-          workspace: deps.workspace,
-          reason: item.reason,
-          receiptIds: item.receiptIds,
-          ticket: item.ticket,
-          env,
-        });
-      } catch (err) {
-        // attemptWake 自身永不抛（信封内降级）；防御一层，保持边沿永不抛的约定。
-        await logEngineEvent(stateRoot, {
-          event: "task-edges-failed",
-          where: "wake-plan",
-          to: item.to,
-          error: String(err instanceof Error ? err.message : err),
-        });
-      }
-    }
-  }
 
   return {
     ...core,
@@ -358,7 +429,7 @@ export function withTaskEdges(core: ToolCore, deps: ToolDeps): ToolCore {
       const payload = payloadOf(result);
       if (typeof payload["taskId"] !== "string") return result;
       if (payload["delivered"] === "duplicate") return result; // 无状态变化，不刷快照
-      await refreshSnapshotBestEffort(DEFAULT_TEAM_ID);
+      await refreshSnapshotBestEffort(deps);
       return result;
     },
 
@@ -387,9 +458,9 @@ export function withTaskEdges(core: ToolCore, deps: ToolDeps): ToolCore {
             outcome.unblocked = unblock.unblocked;
             return [...sweep.wakePlan, ...unblock.wakePlan];
           });
-          await runWakePlan(plan);
+          await runWakePlan(deps, plan);
         }
-        await refreshSnapshotBestEffort(teamId);
+        await refreshSnapshotBestEffort(deps);
       } catch (err) {
         // 永不抛出：边沿失败审计后吞掉，工具结果保持基座原样（邮箱真源兜底）。
         await logEngineEvent(stateRoot, {

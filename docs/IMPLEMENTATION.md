@@ -475,3 +475,123 @@ W3/W7 环节的记录（§8.4）提到「若同事最终导出的名字与签名
 
 - **未做「全新目录隔离安装 + 匿名下载」复核**：该项属验收环节口径（`docs/ACCEPTANCE.md` v0.4.0 第 1 条的实测路径），本环节只做发布动作与发布后 `gh release view` 自检；预构建包的物化行为由 `scripts/pack-release.mjs` 内置的 dist import 冒测（`IMPORT_OK`）把关。
 - **未改产品逻辑**：v0.5.0 的能力判定全部沿用验收环节结论（`docs/ACCEPTANCE.md` v0.5.0 五条硬标准全部通过），本环节不重复宣告、不做二次验收。
+
+---
+
+## 12. v0.5.1 集成环节记录（2026-11-13，v0.5.1 集成工程师）
+
+本节是 v0.5.1 **修复集成收口环节**的落点。红队对抗测试（`deepseek-crosschat/evidence/adversarial/`，裁决见同目录 `adjudication.md`：19 项中 18 项 confirmed、1 项 unconfirmed；#17 与 #3/#4 同根因合并）确认的缺陷由五组修复员白盒修复（对照各组 cases.md 的精确复现步骤与根因）。本环节职责：跨组冲突检查、全量自测、版本递增、README 一致性核查、按物化规则刷新安装；集成中发现的缺口按「小错直接修（留记录）」纪律处理（见 §12.6）。
+
+### 12.1 逐 bug 修复对照表（裁决编号 ↔ 修复 ↔ 防回归单测）
+
+严重级口径：**裁决定级**（adjudication.md 逐项记录）；修复运行汇总口径（P1×4、P2×13、P3×1）中 边界与-4、故障注-7 按 P2 计，边界与-5 为唯一 P3——两口径下修复内容完全一致，本表以裁决原文为准。
+
+| 裁决# | 红队 id | 裁决级 | 根因（裁决原文要点） | 修复（文件:要点） | 防回归单测 |
+|---|---|---|---|---|---|
+| #1 | 边界与-1 | P0→P1 | `xc_status.teamId` 穿越串经 join 逃出状态根建目录写 snapshot.json | `core/paths.ts` 新增 `isValidTeamId`（单安全路径段闸）+ `mcp/tools.ts` xc_status 触碰任何路径构建器前先过闸（invalid_params，附合法口径说明） | `core/paths.test.ts`「isValidTeamId (BND-1)」3 例：合法段接受/红队穿越载荷全拒（正反斜杠、深穿越、盘符）/`..`、`.`、分隔符、控制字符、超长、空串结构性排除 |
+| #2 | 边界与-2 | P1 | peer 轴 hold→accept 假成功：释放时按当前策略重裁回 hold→held 件滞留/被删、消息永不投递、回执虚报「影响 1 条」 | `mcp/peer-tools.ts` accept 重裁只保留 refuse 一道闸（收方显式批准不回吞 hold）；`renderReviewSummary` 按真实终态分组播报；审计 `peer-hold-released` 附 `outcomes` 终态计数 | `mcp/peer-tools.test.ts`「renderReviewSummary（BND-2）」5 例（全放行/混合终态/无可处理项/list-discard 旧口径/未知终态计 other）+ `mcp/peer-tools.integration.test.ts` 2 例（repo 层 hold 件 accept 后入队+审计计数/策略转 refuse 仍拒放） |
+| #3 | 边界与-3 | P2 | completed 证据门只查「有条目」：不存在文件被接受、sha256=null 落库 | `mcp/tools.ts` xc_report 证据门：`sha256File` 现算，文件缺失/不可读 → `evidence_file_missing`；缺省/显式 null 落**现算值**（不再落 null） | `mcp/evidence-gate.test.ts`（新文件）「红队 #3 回归」：不存在文件被拒、真源不动、回执不发 |
+| #4 | 边界与-4 | P3（汇总口径 P2） | 调用方伪造 sha256 原样入库并随回执分发 | 同上门：声称值非 null 且与现算不符 → `evidence_checksum_mismatch`（整单拒绝，附 claimed/computed） | `mcp/evidence-gate.test.ts`「红队 #4 回归」伪造 sha256 被拒 +「正确声明的 sha256 通过；缺省/显式 null 均落现算值」 |
+| #17 | 安全对-1 | P2（并入 #3/#4） | 与 #3/#4 同根因（证据门不查内容） | 同上门（一条实现覆盖三个可观察面） | `mcp/evidence-gate.test.ts` 另 2 例：in_progress 带缺失文件同样被拒 / failed 报告携带真实文件证据正常通过 |
+| #5 | 边界与-5 | P3（汇总口径唯一 P3） | `xc_register` 放行保留名 lead/default（与 `xc_member_add` 双路径不一致） | `mcp/identity.ts` xc_register 锁外快拒 `name_reserved`（RESERVED_MEMBER_KEYS 同码，hook/wake 双路径均拦） | `mcp/identity.test.ts`「保留名注册拒绝（BND-5）」4 例：hook 路径/先于锚定校验/wake 路径 nonce 不被消费/零副作用 |
+| #6 残留 | 并发与-1 残留观察 | P3（裁决 unconfirmed，残留观察 3） | `xc_peer_inbox` 的 count/汇总行只计 JSON 块信封（≤10），响应实际承载约 15 条 → 只读结构化块误判丢消息 | `mcp/peer-tools.ts`：xc_peer_inbox 抑制面 B 双排空（skipFaceB），count = 本次真实呈现数；`remaining` 字段 + 摘要行「另有 N 条待投递——再调一次」指针 | `mcp/peer-inbox-count.test.ts`（新文件）5 例：count=envelopes 一致/content.length===2/remaining 指针双向/面 B 不扩伤（xc_peers 仍追加）/schema 描述声明口径 |
+| #7 | 并发与-2 | P1 | ≥10MiB 工具帧使 SDK ReadBuffer 溢出 → close → exit 0 静默自退出 | 新增 `transport/mcpstdio.ts` `GuardedStdioTransport`：上限提至 32MiB（覆盖红队 9~24MiB 全档位），溢出改显式 JSON-RPC 拒收（code -32700）+ 丢帧不关传输；`mcp/server.ts` 换用该传输 | `transport/mcpstdio.test.ts`（新文件）7 例：12/24MiB 正常解析、超限恰一条拒收不关传输、拒收后同连接继续服务、跨块/连续超限 + `mcp/injection-budget.test.ts` CONC-2 工具层腿（12MiB 消息磁盘保真入队） |
+| #8 | 并发与-3 | P2 | ≥7 并发发送者打同一 peer → endpoint-busy（45−32=13/40−32=8/35−32=3，与实测逐位吻合：端点 maxConnections 缺省 32 低于现实 fan-in 突发） | **集成环节直接修（§12.6）**：`transport/frames.ts` 新增 `PEER_MAX_CONNECTIONS = 128`（缺省，附根因注记），`transport/pipe.ts` 缺省改引该常量；README 已知限制 6 声明上限与 busy 语义 | `transport/pipe.test.ts`「红队 CONC-3 回归」：45 并发（9×5 裁决档位、handler 延迟回执钉住全并发窗口）→ 0 busy 全投递；判别力实证：同测试配 maxConnections:32 恰失败于 13 条 busy |
+| #9 | 故障注-1 | P2 | team.json 损坏 → 全队工具持续 internal、无自愈 | `core/teamstate.ts` readTeam：真源不可解析先从 last-known-good 镜像 `team.json.bak` 自愈（残损字节保全为 `team.json.corrupt` + 审计 `team-state-recovered`）；无备份抛带文件路径与修复指引的显式诊断（不再裸抛 JSON 错误）；writeTeam 每次成功落盘原子镜像 .bak | `mcp/fault-injection.test.ts`「FI-1」2 例（半行截断自愈+残损保全/无备份显式降级诊断）+ `core/teamstate.test.ts` 3 例（无备份诊断/从备份恢复/.bak 镜像） |
+| #10 | 故障注-2 | P2 | team.json 合法但 tasks:[] → 在途凭证无声蒸发 | `core/mailbox.ts` 新增 `orphanTaskIds`（纯函数）+ `mcp/tools.ts` xc_claim unknown-task 诊断富化（`orphan_task_reference` + 恢复指引）、xc_status 计算孤儿引用 + `core/snapshot.ts` 快照增 `orphanTasks` + `mcp/render.ts` 状态表 WARNING 行 | `mcp/fault-injection.test.ts`「FI-2」1 例（status 披露 + claim 诊断）+ `core/mailbox.test.ts`「orphanTaskIds + 孤儿信封陈旧判定」2 例 |
+| #11 | 故障注-3 | P2 | inbox JSONL 坏行静默吞（整箱乱码静默当空箱） | `core/mailbox.ts`：读取诊断收集器（`MailboxReadDiagnostics.malformed/discarded`）+ `mcp/tools.ts` 摘要行披露 `N unreadable line(s) skipped` + payload `malformedLines` | `mcp/fault-injection.test.ts`「FI-3」1 例（坏行跳过好行照常投递 + 摘要披露）+ `core/mailbox.test.ts` 1 例（collector 透出） |
+| #12 | 故障注-4 | P2 | `xc_check_inbox` 无条件重投已读消息（重注入随历史无界增长） | `mcp/tools.ts` xc_check_inbox 只消费 `readAt === undefined` 的未读件（陈旧清扫仍作用于全部现行消息）；第二次起 `0 message(s) consumed` | `mcp/fault-injection.test.ts`「FI-4」1 例（已读不再重注入、走完生命周期也只返回未读） |
+| #13 | 故障注-5 | P2 | 删 team.json → 静默整队重置、taskId 撞号、旧分派复活 | `core/types.ts` TeamState 增 `era` 纪元令牌 + `core/teamstate.ts` `nextTaskId` 带 `<era>-t` 前缀（旧记录宽容保持 `t<n>`）、`noteTeamReset` 残迹检测（审计 `team-reset-detected` + 注册/派发响应带告警）+ `mcp/identity.ts` joinTeam 接告警 + `core/mailbox.ts` 无 attemptId 但带 taskId 的信封在任务不存在时判陈旧（旧分派不复活） | `mcp/fault-injection.test.ts`「FI-5」2 例（重置告警+审计/纪元前缀不撞号+旧信封判陈旧）+ `core/teamstate.test.ts` 2 例（era 前缀分配/legacy 无 era 保持旧形态） |
+| #14 | 故障注-6 | P2 | 不可解析残留锁 → 每次 15s 等待→busy 永久饥饿 | `core/lock.ts`：不可解析锁（0 字节/乱码/缺字段）超过 1s 宽限期即判定无主残留、安全清除 + 审计 `lock-repaired`（宽限挡住 openSync↔writeSync 之间被打断的瞬时 0 字节窗口） | `core/lock.test.ts` 4 例：旧 mtime 不可解析锁清除后夺取/0 字节锁清除/宽限期内 fresh 锁被尊重/合法活锁永不清除 |
+| #15 | 故障注-7 | P3（汇总口径 P2） | wake 供应商失败回执仍宣称 delivered=wake（子进程失败只落 wake 日志，无失败标记） | `engine/wake.ts`：spawn 后 20s 有界失败侦听（轮询 wake 日志，`findWakeFailureEvidence` 只认正向失败证据——行首 `Error` / isError:true / success:false / 顶层 error 字符串），命中 → `wake-failed` 审计 + 释放投递租约 + 消费 nonce；回执 note 写明「非送达确认」+ 探测回落标注（`wakeFallbackNote`）；窗口静默不表态（不虚报成败） | `engine/wake.test.ts` 6 例新增（findWakeFailureEvidence 正反例/失败侦听释放租约/窗口静默不表态/回落标注） |
+| #16 | 故障注-8 | P2 | 僵尸任务清扫从未发生（README L215 承诺落空；边沿清扫只在有成员成功报告时运行） | **承诺实现**：`mcp/task-edges.ts` 新增 `sweepStaleTasksOnce`（读盘预检→锁内清扫回待领+回执派发方+审计→锁外唤醒→刷快照，永不抛）+ `startStaleSweeper` 周期定时器（节拍=阈值/6 钳 [10s,60s]，unref）+ `mcp/server.ts` main() 启动 | `mcp/stale-sweep.test.ts`（新文件）9 例：claimed/in_progress 僵尸清扫+回执+审计+快照/清扫后他人可认领/未超阈值不动/在途 wake 豁免/并发一轮只清一次/损坏 team.json 静默跳过/定时器独立兑现/节拍与阈值解析 |
+| #18 | 规模压-1 | P1 | `xc_check_inbox` 批量消费无批次预算截断（300 条直灌 201,193 字符，超批次上限 3.1 倍，无指针） | **承诺实现**：`core/budget.ts` 新增 `batchWindowCount`（到达序前缀窗口，保底一条）+ `mcp/tools.ts` xc_check_inbox 只消费「JSON 面+信封面」联合成本 ≤ 批次预算的前缀（其余保持未读）+ 摘要行/payload/信封尾行三处「再调一次」指针 | `mcp/injection-budget.test.ts`（新文件）SCALE-1 3 例：40 条+小预算只消费窗口前缀且三处指针/默认预算小批量行为不变（无 batchTruncated 字段）/单条超预算保底一条 |
+| #19 | 规模压-2 | P2 | `xc_claim` 全文回显 600KB prompt（claim 路径未接入预算截断） | `mcp/tools.ts` xc_claim 回显接入预算：prompt/acceptance 超单条预算截断（`promptTruncated`/`acceptanceTruncated` 携全文 sha256，与 xc_status 同款）+ `xc_task_read` 指针 + TaskReadShape 增 `acceptance` 枚举（全文分页取回通道）；真源全文不动 | `mcp/injection-budget.test.ts` SCALE-2 3 例：600KB 认领响应有界+分页拼回 sha256 一致/acceptance 同样截断且未超时 payload 与 v0.5.0 逐字段一致/acceptance 枚举锁定 |
+
+修复面合计：**37 个文件** = 修复员交付 34（27 修改 + 7 新增，其中 README 1）+ 集成环节 CONC-3 补修 3（transport/frames.ts、transport/pipe.ts、transport/pipe.test.ts，均为修复员未触碰的文件，见 §12.6）。README 承诺落空两项（#16 僵尸清扫、#18 批量截断）均**选择实现承诺**而非改 README 缩水（修复纪律优先项），README 相应更新为已兑现口径并注明 v0.5.1 起。
+### 12.2 跨组冲突检查（公共文件语义一致性，本环节逐 hunk 实读全量 diff）
+
+- **`mcp/tools.ts`（7 项修复叠放，最高风险公共文件）**：改动落在**互不重叠的工具处理器**——xc_status（BND-1 闸 + FI-2 孤儿计算）、xc_report（BND-3/4 证据门）、xc_claim（FI-2 诊断 + SCALE-2 截断，同一处理器内先抛诊断后塑形成功负载，两修复顺序兼容）、xc_check_inbox（FI-3 诊断 + FI-4 未读过滤 + SCALE-1 批次窗口，三者叠加在同一消费路径：`readCurrentMailboxLocked`（含陈旧清扫）→ `unread` 过滤 → `inboxEntry` 成本化 → `batchWindowCount` 窗口 → 只 ack 窗口内未读件，语义链条自洽且各自有独立单测锁定）、xc_dispatch（FI-5 重置告警透传）。无同 handler 内的语义对撞。
+- **纪元前缀（FI-5 `<era>-t1`）的波及面**：产品代码无任务 id 形态解析（grep `t${`/`/^t`/parseInt 反证零命中）；既有用例硬编码 `t1` 的 1 处断言已由修复员改为 `toMatch(/-t1$/)`（guards.test.ts）；legacy 无 era 记录宽容读取保持 `t<n>` 旧形态（teamstate.test.ts 锁定）。
+- **`mcp/peer-tools.ts`（BND-2 + P3 口径）**：二者分属 review 与 inbox 两条链路 + `call` 包装器加 `skipFaceB` 选项（缺省 false，其余 peer 工具行为不变，peer-inbox-count.test.ts 有「面 B 不扩伤」反例锁定）；`PeerServices.inbox` 接口增 `remaining` 字段——typecheck 强制全部实现点同步，集成 typecheck 通过即证无遗漏。
+- **`mcp/task-edges.ts`（FI-8）**：`refreshSnapshotBestEffort`/`runWakePlan` 从包装器闭包提升为模块级（签名加 deps），E-b 边沿路径与新增周期清扫共用同一 `sweepStaleTasksLocked` 实现（单一事实源，无双实现漂移）；`sweepStaleTasksOnce` 永不抛（损坏状态让路给 FI-1 的错误信封面，下一轮重试）。
+- **`engine/wake.ts`（FI-7）**：纯增量（失败侦听 + note 文案），未触碰 delivered 三态契约与投递租约主流程；侦听定时器全部 unref，不改进程退出语义。
+- **`mcp/server.ts`（CONC-2 + FI-8）**：传输层替换与清扫定时器启动互相独立；本环节仅改 `SERVER_VERSION`（版本冻结项）。
+- **`mcp/identity.ts`（BND-5 + FI-5）**：保留名快拒在锚定/绑定之前（零副作用，identity.test.ts 锁定），与 joinTeam 残迹告警无交叠。
+- **结论**：五组修复无语义冲突；未发现「同文件同路径多组各改一处」的对撞。发现并处置 1 处**范围缺口**（CONC-3，§12.6）。
+
+### 12.3 全量自测（本环节亲跑，版本递增前后各跑一轮，结果一致）
+
+| # | 命令 | 结果 |
+|---|---|---|
+| 1 | `cd plugin && npm run typecheck` | **exit 0 零报错**（修复交付态、版本递增后、CONC-3 补修后共三轮全绿） |
+| 2 | `cd plugin && npm test` | **48 文件 / 757 例全绿**（版本递增后复跑同结果）。基线核对：v0.5.0 = 42 文件 / 681 例 → 新增 6 测试文件（evidence-gate 5、fault-injection 8、injection-budget 7、peer-inbox-count 5、stale-sweep 9、mcpstdio 7 = 41 例）+ 既有测试文件新增 35 例 = **+76 例**；681+76=757 ✓（CONC-3 补修后再 +1 = 758，见 §12.6） |
+| 3 | `ELECTRON_RUN_AS_NODE=1 <安装目录>/ZCode.exe <安装目录>/resources/<variant>/zcode.cjs plugins validate "D:/tools/zcode-crosschat/plugin"` | **`Plugin manifest is valid`**，exit 0 |
+| 4 | `cd plugin && npm run build` | `build ok`，5 产物齐；`SERVER_VERSION = "0.5.1"` 在 dist bundle 内 grep 命中，`"0.5.0"` 零命中 |
+| 5 | 红队原始复现黑盒回归（evidence/adversarial/fix-verify/，本环节对**最终 dist** 实跑） | `repro-group.mjs`：CONC-2（10~24MiB 正常入队、40MiB 显式拒收且 server 存活）/ SCALE-1（poll1 17,494 字符、25/300 窗口消费、12 轮排空 300/300）/ SCALE-2（claim 4,420 字符、promptTruncated.sha256 分页拼回一致）/ P3（count=envelopes=真实呈现数、15/15 对账 lost=0）；`fix-v051-case-evi.mjs` 11/11（不存在文件拒收/伪造 sha256 拒收/缺省落现算值）；`fix-v051-case-fi8.mjs` 7/7（75s 实测窗内清扫回 pending + 派发方回执 + task-swept 审计 + 第三人可认领）。三脚本全绿 |
+
+### 12.4 版本冻结（五处，RELEASING §2）
+
+`plugin/.zcode-plugin/plugin.json` / `marketplace.json` / `plugin/package.json` / `plugin/package-lock.json`（根 + packages[""] 两处）/ `plugin/src/mcp/server.ts SERVER_VERSION` 全部 **0.5.0 → 0.5.1**（grep 复核五处均 0.5.1、无 0.5.0 残留；RELEASING.md「当前实例」同步 v0.5.1，基线行更新为 48 文件/757 例）。README 安装指引的 Release 资产名/解包目录/marketplace add 路径同步 0.5.1（8 处）。打包发布（RELEASING §3-§6）属发布环节，本环节未执行。
+
+### 12.5 README 与行为一致性核查（承诺落空两项的处理结果如实反映）
+
+- **僵尸清扫（裁决 #16）**：README L215 的承诺「在途任务超过 stale_task_minutes 无任何更新且成员无在途唤醒时，被引擎清扫回待领并回执队长」由 `startStaleSweeper` 周期定时器兑现——README 无需改口，行为与承诺一致（stale-sweep.test.ts 红队 75s 场景的加速等价单测锁定）。
+- **批量截断（裁决 #18）**：README L225「批次基准 16000」的承诺由批次窗口兑现；README 工具表 xc_check_inbox 行与防卡死段已由修复员更新为如实描述（单次只消费窗口内消息、其余保持未读、三处指针），核查与实现一致（injection-budget.test.ts 锁定）。
+- **新增承诺的落地声明**：README 已知限制 6 追加「MCP stdio 传输层 32 MiB 单帧上限 + 超限显式拒收」（CONC-2）与「pipe 端点并发连接上限 128 + busy 语义」（CONC-3，§12.6）；硬校验清单与 xc_report 工具行追加「证据文件存在性与 sha256 现算复核」（BND-3/4）；xc_claim/xc_peer_inbox 工具行与实现逐字对照一致。
+- **核查方法**：本环节对 README 全部 26 工具行、已知限制 1-12、硬校验清单逐条与实现/单测对照；未发现承诺落空或描述失真残留。
+
+### 12.6 集成环节直接修（留记录）
+
+| # | 项 | 依据 | 处置 |
+|---|---|---|---|
+| 1 | **CONC-3（裁决 #8，P2）五组修复未覆盖**：全量 diff 中 `transport/pipe.ts`/`frames.ts` 零改动、无发送侧重试、README 无并发上限声明；红队三档失败数（3/8/13）与端点 `maxConnections ?? 32` 逐位吻合（45−32=13、40−32=8、35−32=3） | 集成纪律「小错直接修（留记录）」；根因明确、改动面最小（常量缺省值 + 1 处引用） | `transport/frames.ts` 新增 `PEER_MAX_CONNECTIONS = 128`（附根因注记：fan-in 是主路径、max_members=8、128 覆盖 8 成员×在途突发×余量、超限仍显式 fail-closed）；`transport/pipe.ts` 缺省改引该常量；README 已知限制 6 声明；回归单测 1 例（45 并发全投递）并实证判别力（配 32 恰失败 13 条）。补修后 typecheck + 全量 758 例复跑全绿 |
+
+### 12.7 物化刷新（按 IMPLEMENTATION §9.3 物化规则，本环节实跑）
+
+`marketplace update dev-zcode-crosschat`（快照刷新）→ `plugins install zcode-crosschat@dev-zcode-crosschat` → **`Installed plugin zcode-crosschat@dev-zcode-crosschat (0.5.1) [enabled]`**（版本变化触发重新物化）→ `plugins list` 缓存路径 `…/cache/dev-zcode-crosschat/zcode-crosschat/0.5.1`（skills:1 commands:1 hooks:3 mcp:1）→ md5 比对：仓库 dist 5 产物（server.mjs `fabf06af…` / wake-helper.mjs / hooks 3 件）与安装态**逐一相同**；缓存 `.zcode-plugin/plugin.json` version = 0.5.1。**未执行** `plugins uninstall`（v0.2 §2.4 事故先例：`--force` 清空 plugins.options 丢失 zcode_exe/zcode_cjs）。旧 0.5.0 缓存目录保留未动（多版本共存，宿主按安装版本取用）。
+
+### 12.8 本环节未执行项（如实声明）
+
+- **红队 19 项的端到端黑盒复验未执行**（属复验环节职责，evidence/17-v051/reverify/ 监视区；本环节交付 = 跨组冲突检查 + 全量单测层自测 + CONC-3 补修 + 版本冻结 + README 核查 + 物化刷新）。工具层可自动化部分的防回归由 §12.1 表右列单测承载（全部绿）。
+- **发布环节未执行**（RELEASING §3-§6：pack-release、gh release create/upload、发布后自检）。
+- **打包自断言（pack-release.mjs 五处版本一致）未跑**：属发布环节第一步，版本五处已按其断言口径对齐（§12.4）。
+
+## 13. v0.5.1 交付与发布环节记录（2026-11-13，v0.5.1 交付工程师）
+
+本节是 v0.5.1 **交付发布环节**的落点：README/docs 一致性核查、敏感信息扫描、逐 bug 发布说明、commit/tag/push、预构建包 + gh release。
+
+### 13.1 交付态亲跑校验（命令 + 输出）
+
+| # | 命令 | 结果 |
+|---|---|---|
+| 1 | `cd plugin && npm run typecheck` | exit 0 零报错 |
+| 2 | `cd plugin && npm test` | **48 文件 / 758 例全绿**（与 §12.3、复验报告 §2.1 三方一致） |
+| 3 | 版本冻结五处 grep 复核 | `plugin.json` / `marketplace.json` / `package.json` / `package-lock.json`（根+packages[""]）/ `server.ts SERVER_VERSION` 全部 `0.5.1`，无 0.5.0 残留 |
+
+### 13.2 README/docs 一致性核查
+
+- **发现并修正 1 处文档过期**：`docs/RELEASING.md` §1 前置项基线行写「48 文件 / **757** 例」，为 §12.6 CONC-3 补修（+1 例）前的旧值；实测与 README「基线 48 文件 / 758 例全绿」均为 **758**——已改为 758（其余 README/docs 口径逐条核对一致：26 工具行、已知限制 1-12、硬校验清单、安装资产名 0.5.1、RELEASE-RECON.md 已在库）。
+- **承诺落空两项**（僵尸清扫 #16、批量截断 #18）均为实现承诺而非改 README 缩水，README 已按兑现口径更新（§12.5 核查记录），本环节复核无异。
+
+### 13.3 本机敏感信息核查
+
+对全部 130 个 tracked 文件扫描 `C:\Users` / `D:\tools` / `E:\` / `sess-` / `qdqir` / `/d/tools` 等模式（`git ls-files -z | xargs -0 grep -nEI …`，含 package-lock.json 单独复核）：**零命中**。`.gitignore` 已排除 `.crosschat/`、`.scratch-*/`、`evidence/`、`*.log` 等含本机路径与会话 id 的运行数据。
+
+### 13.4 发布说明
+
+逐 bug 发布说明（18 项：症状/修复/验证参照）写入 `.scratch-release/notes-v0.5.1.md`（gitignore 覆盖、不入库），gh release create 直接采用；每项验证参照指向复验证据 `evidence/17-v051/reverify/01~20-*.md` 与对应防回归单测文件，并整体引用复验报告 `deepseek-crosschat/reports/17-v051复验.md`。未确认项（并发与-1）与附带观察如实单列，不混入 18 项。
+
+### 13.5 发布执行（RELEASING §2-§6）
+
+- commit：`fix: red-team findings batch (v0.5.1)`（**43 files changed, +3263/−284**；其中修复面 37 个文件见 §12.1，余为版本冻结五处与文档记录：README、docs/IMPLEMENTATION.md、docs/RELEASING.md、marketplace.json、plugin/.zcode-plugin/plugin.json、plugin/package.json、plugin/package-lock.json）；
+- tag：`v0.5.1`（annotated），指向上述 commit；
+- push：`git push origin main v0.5.1`；
+- 打包：`node scripts/pack-release.mjs v0.5.1`（worktree 导出 tag 树 → npm ci → build → prune → dist 冒测 IMPORT_OK → tar + SHA256；五处版本断言过）；
+- 发布：`gh release create v0.5.1 --target <SHA> --notes-file .scratch-release/notes-v0.5.1.md` + `gh release upload` 两资产（tgz + .sha256）；
+- 发布后自检：`gh release view`（isDraft=false、资产在、body 引用复验报告）。
+
+### 13.6 本环节未执行项（如实声明）
+
+- **发布后匿名下载 `sha256sum -c` 复验与隔离安装冒测**（RELEASING §6 后半）：本机直连 github.com 下载通道按用户全局规则不保障，未执行匿名拉取；资产完整性由打包环节的 node crypto SHA256 + `.sha256` 随包发布保障，安装侧校验留给用户执行（README 第 1 步有指引）。
+- **真实宿主会话级验证**：同复验报告 §5.4，未执行（非本环节职责）。

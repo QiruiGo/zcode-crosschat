@@ -135,7 +135,8 @@ describe("withGuards: removed 成员硬拒（§7.3.3，错误码 member_removed�
     // a 未被移除：派发仍可走通（建任务 + 入箱；wake 关闭 → mailbox）。
     const res = await guarded.xc_dispatch({ to: "b", title: "t", prompt: "p" }, connA);
     expect(res.isError).toBeFalsy();
-    expect(payloadOf(res)["taskId"]).toBe("t1");
+    // v0.5.1（故障注-5 修复）：新时代任务 id 带纪元前缀（`<era>-t1`）。
+    expect(payloadOf(res)["taskId"]).toMatch(/-t1$/);
   });
 });
 

@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -17,6 +17,7 @@ import {
   unsatisfiedDependencies,
   writeTeam,
 } from './teamstate.js';
+import { teamBackupFile, teamCorruptFile, teamFile } from './paths.js';
 
 let dir: string;
 
@@ -33,17 +34,28 @@ function setup() {
 }
 
 describe('task allocation', () => {
-  it('allocates t1, t2, ... from the seq counter', () => {
+  // v0.5.1（故障注-5 修复）：新时代任务 id 带纪元前缀，重建后不与旧时代撞号。
+  it('allocates era-prefixed t1, t2, ... from the seq counter', () => {
     const team = setup();
+    expect(team.era).toMatch(/^[0-9a-f]{8}$/);
     const t1 = makeTask(team, { title: 'one', prompt: 'p', createdBy: 'a' });
     const t2 = makeTask(team, { title: 'two', prompt: 'p', createdBy: 'a' });
-    expect(t1.id).toBe('t1');
-    expect(t2.id).toBe('t2');
-    expect(nextTaskId(team)).toBe('t3');
+    expect(t1.id).toBe(`${team.era}-t1`);
+    expect(t2.id).toBe(`${team.era}-t2`);
+    expect(nextTaskId(team)).toBe(`${team.era}-t3`);
     expect(team.seq).toBe(2);
     expect(t1.status).toBe('pending');
     expect(t1.assignee).toBeNull();
     expect(t1.attemptId).toBeNull();
+  });
+
+  // 旧记录（无 era 字段）宽容兼容：任务 id 保持 legacy `t<n>` 形态。
+  it('legacy teams without an era keep the bare t<n> id shape', () => {
+    const legacy = newTeamState({ teamId: 'default', founderKey: 'a' });
+    delete (legacy as { era?: string }).era;
+    const task = makeTask(legacy, { title: 'one', prompt: 'p', createdBy: 'a' });
+    expect(task.id).toBe('t1');
+    expect(nextTaskId(legacy)).toBe('t2');
   });
 });
 
@@ -51,9 +63,9 @@ describe('unsatisfiedDependencies / memberOpenTasks', () => {
   it('reports dependencies that are missing or not completed', () => {
     const team = setup();
     const t1 = makeTask(team, { title: 'one', prompt: 'p', createdBy: 'a' });
-    const t2 = makeTask(team, { title: 'two', prompt: 'p', createdBy: 'a', dependsOn: ['t1', 'ghost'] });
+    const t2 = makeTask(team, { title: 'two', prompt: 'p', createdBy: 'a', dependsOn: [t1.id, 'ghost'] });
     // t1 pending (and ghost nonexistent) -> both unsatisfied:
-    expect(unsatisfiedDependencies(team.tasks, t2.dependsOn)).toEqual(['t1', 'ghost']);
+    expect(unsatisfiedDependencies(team.tasks, t2.dependsOn)).toEqual([t1.id, 'ghost']);
     t1.status = 'completed'; // direct test-only mutation of the dependency gate
     expect(unsatisfiedDependencies(team.tasks, t2.dependsOn)).toEqual(['ghost']);
   });
@@ -63,7 +75,7 @@ describe('unsatisfiedDependencies / memberOpenTasks', () => {
     const t1 = makeTask(team, { title: 'one', prompt: 'p', createdBy: 'a' });
     expect(memberOpenTasks(team.tasks, 'b')).toEqual([]);
     const attempt = beginTaskAttempt(t1, 'b'); // pending -> claimed
-    expect(memberOpenTasks(team.tasks, 'b').map((t) => t.id)).toEqual(['t1']);
+    expect(memberOpenTasks(team.tasks, 'b').map((t) => t.id)).toEqual([t1.id]);
     applyReport(t1, { status: 'in_progress', attemptId: attempt }, 'b');
     expect(memberOpenTasks(team.tasks, 'b')).toHaveLength(1);
     applyReport(t1, {
@@ -192,21 +204,50 @@ describe('readTeam/writeTeam roundtrip + corrupt diagnostics', () => {
     expect(await readTeam(dir, 'default')).toBeUndefined();
   });
 
-  it('throws a diagnostic (not a silent coerce) for corrupt team.json', async () => {
+  it('throws a diagnostic (not a silent coerce) for corrupt team.json without a usable backup', async () => {
     await writeTeam(dir, setup());
     const file = join(dir, 'teams', 'default', 'team.json');
+    // 无备份（v0.5.1 之前从未写过 .bak / 备份同样丢失）：fail-closed，但错误信息
+    // 从裸 JSON/裸 defect 升级为「路径 + 缺陷 + 修复指引」的显式降级诊断。
+    unlinkSync(teamBackupFile(dir, 'default'));
     writeFileSync(file, JSON.stringify({ teamId: 'default', tasks: 'not-an-array' }), 'utf8');
-    await expect(readTeam(dir, 'default')).rejects.toThrow(/invalid team state/);
+    await expect(readTeam(dir, 'default')).rejects.toThrow(/is corrupt \(field "founderKey" missing or blank\)/);
+    await expect(readTeam(dir, 'default')).rejects.toThrow(/restore it manually or delete the team directory/);
     writeFileSync(file, '{broken json', 'utf8');
-    await expect(readTeam(dir, 'default')).rejects.toThrow();
+    await expect(readTeam(dir, 'default')).rejects.toThrow(/not valid JSON/);
+  });
+
+  // v0.5.1（故障注-1 修复）：真源损坏时从 last-known-good 镜像自愈，
+  // 残损字节保全为 team.json.corrupt，审计落 team-state-recovered。
+  it('recovers from the last-known-good backup when team.json is corrupt', async () => {
+    const team = setup();
+    makeTask(team, { title: 'before corruption', prompt: 'p', createdBy: 'a' });
+    await writeTeam(dir, team); // team.json + team.json.bak 同内容
+    const file = join(dir, 'teams', 'default', 'team.json');
+    writeFileSync(file, '{half-written truncation', 'utf8');
+    const recovered = await readTeam(dir, 'default');
+    expect(recovered).toBeDefined();
+    expect(recovered!.tasks[0]!.title).toBe('before corruption');
+    expect(existsSync(teamCorruptFile(dir, 'default'))).toBe(true);
+    expect(readFileSync(teamCorruptFile(dir, 'default'), 'utf8')).toBe('{half-written truncation');
+  });
+
+  it('writeTeam mirrors the same content to team.json.bak', async () => {
+    const team = setup();
+    makeTask(team, { title: 'mirrored', prompt: 'p', createdBy: 'a' });
+    await writeTeam(dir, team);
+    const backup = JSON.parse(readFileSync(teamBackupFile(dir, 'default'), 'utf8'));
+    expect(backup.tasks).toHaveLength(1);
+    expect(backup.tasks[0].title).toBe('mirrored');
+    expect(backup.era).toBe(team.era);
   });
 });
 
 describe('getTask', () => {
   it('finds tasks by id', () => {
     const team = setup();
-    makeTask(team, { title: 't', prompt: 'p', createdBy: 'a' });
-    expect(getTask(team, 't1')?.id).toBe('t1');
-    expect(getTask(team, 't9')).toBeUndefined();
+    const task = makeTask(team, { title: 't', prompt: 'p', createdBy: 'a' });
+    expect(getTask(team, task.id)?.id).toBe(task.id);
+    expect(getTask(team, `${team.era}-t9`)).toBeUndefined();
   });
 });

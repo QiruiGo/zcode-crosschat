@@ -117,7 +117,7 @@ function fakeServices(overrides: Partial<PeerServices> = {}): PeerServices & { c
       calls.push(["read", input]);
       return { msgId: input.msgId, total: 100, offset: input.offset ?? 0, text: "hi", hasMore: false };
     },
-    inbox: async (limit): Promise<{ items: PeerQueueItem[]; rendered: string[] }> => {
+    inbox: async (limit): Promise<{ items: PeerQueueItem[]; rendered: string[]; remaining: number }> => {
       calls.push(["inbox", limit]);
       return {
         items: [
@@ -131,6 +131,7 @@ function fakeServices(overrides: Partial<PeerServices> = {}): PeerServices & { c
           },
         ],
         rendered: ['<crosschat-peer-message from="bob">\nhi\n</crosschat-peer-message>'],
+        remaining: 0,
       };
     },
     review: async (input): Promise<PeerReviewResult> => {
@@ -493,6 +494,7 @@ describe("v0.5 面 C 注入预算（R-23）", () => {
           { msgId: "m-small", from: "bob", hopChain: ["bob"], text: "hi", ts: 1, via: "pipe" as const },
         ],
         rendered: [`<crosschat-peer-message from="bob">\n${big}\n</crosschat-peer-message>`],
+        remaining: 0,
       }),
     });
     const server = setupWithEnv(services, { XC_INJECT_ITEM_CHARS: "200", XC_INJECT_TOTAL_CHARS: "300" });
@@ -544,5 +546,89 @@ describe("v0.5 xc_peer_register contextChars 透传（R-18）与 xc_agents isLea
       { key: "lead1", isLead: true },
       { key: "m2", isLead: false },
     ]);
+  });
+});
+
+// ─────────────────────────── v0.5.1 BND-2：accept 放行的回执必须反映真实终态 ───────────────────────────
+
+describe("renderReviewSummary（BND-2 修复：摘要行不再虚报「影响 N 条」）", () => {
+  it("accept 全部放行 → 摘要行报「放行投递 N 条」，不再出现「影响 N 条」", async () => {
+    const services = fakeServices({
+      review: async (input): Promise<PeerReviewResult> => ({
+        action: input.action,
+        held: [{ msgId: "m-9", from: "bob", ts: 1, cause: "repo-setting" }],
+        affected: ["m-9"],
+        receipts: [{ msgId: "m-9", receipt: "delivered", outcome: "delivered" }],
+      }),
+    });
+    const server = setup(services);
+    const result = await server.find("xc_peer_review").handler({ action: "accept" }, {});
+    expect(String(result.content[0]?.text)).toContain("accept 结果：放行投递 1 条");
+    expect(String(result.content[0]?.text)).not.toContain("影响");
+  });
+
+  it("accept 混合终态（delivered + still-held）→ 分组如实播报，滞留不再被算成成功", async () => {
+    const services = fakeServices({
+      review: async (input): Promise<PeerReviewResult> => ({
+        action: input.action,
+        held: [
+          { msgId: "m-1", from: "bob", ts: 1, cause: "repo-setting" },
+          { msgId: "m-2", from: "bob", ts: 2, cause: "repo-setting" },
+        ],
+        affected: ["m-1", "m-2"],
+        receipts: [
+          { msgId: "m-1", receipt: "delivered", outcome: "delivered" },
+          { msgId: "m-2", outcome: "still-held" },
+        ],
+      }),
+    });
+    const server = setup(services);
+    const result = await server.find("xc_peer_review").handler({ action: "accept" }, {});
+    const text = String(result.content[0]?.text);
+    expect(text).toContain("放行投递 1 条");
+    expect(text).toContain("仍滞留 1 条（未放行）");
+  });
+
+  it("accept 无可处理项 → 明说「无可处理的暂存件」而非「影响 0 条」的含糊口径", async () => {
+    const services = fakeServices({
+      review: async (input): Promise<PeerReviewResult> => ({
+        action: input.action,
+        held: [],
+        affected: [],
+        receipts: [],
+      }),
+    });
+    const server = setup(services);
+    const result = await server.find("xc_peer_review").handler({ action: "accept" }, {});
+    expect(String(result.content[0]?.text)).toContain("无可处理的暂存件");
+  });
+
+  it("list/discard 摘要行保持旧口径（discard 的结果全是 discarded，「影响 N 条」属实）", async () => {
+    const services = fakeServices({
+      review: async (input): Promise<PeerReviewResult> => ({
+        action: input.action,
+        held: [{ msgId: "m-9", from: "bob", ts: 1, cause: "repo-setting" }],
+        affected: input.action === "list" ? [] : ["m-9"],
+        receipts: input.action === "list" ? [] : [{ msgId: "m-9", receipt: "denied", outcome: "discarded" }],
+      }),
+    });
+    const server = setup(services);
+    const listed = await server.find("xc_peer_review").handler({ action: "list" }, {});
+    expect(String(listed.content[0]?.text)).toContain("本次动作 list，影响 0 条");
+    const discarded = await server.find("xc_peer_review").handler({ action: "discard" }, {});
+    expect(String(discarded.content[0]?.text)).toContain("本次动作 discard，影响 1 条");
+  });
+
+  it("countReleaseOutcomes：未知终态计进 other（前向兼容，不静默丢）", async () => {
+    const { countReleaseOutcomes } = await import("./peer-tools.js");
+    const counts = countReleaseOutcomes([
+      { outcome: "delivered" },
+      { outcome: "still-held" },
+      { outcome: "refused" },
+      { outcome: "dropped" },
+      { outcome: "future-state" },
+      {},
+    ]);
+    expect(counts).toEqual({ delivered: 1, dropped: 1, refused: 1, "still-held": 1, other: 2 });
   });
 });

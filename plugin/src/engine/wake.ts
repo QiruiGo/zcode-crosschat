@@ -51,6 +51,7 @@ import {
   markMailboxDelivered,
   releaseMailboxDelivery,
 } from "../core/mailbox";
+import { readFileSync } from "node:fs";
 import { logEngineEvent } from "../core/log";
 import { withTeamLock } from "../core/lock";
 import { wakeLogFile } from "../core/paths";
@@ -82,6 +83,52 @@ export const WAKE_PROMPT_MAX_CHARS = 4000;
 
 /** delivered 三态（DESIGN §2.5 表；dsh 的 live 态在 zcode 无对等 steer，弃用）。 */
 export type DeliveredMode = "wake" | "mailbox" | "duplicate";
+
+// ─────────────────────────── 唤醒子进程失败侦听（v0.5.1 FI-7） ───────────────────────────
+
+/**
+ * v0.5.1（FI-7/故障注-7）：唤醒子进程的**失败证据**判定（纯函数，单测直测）。
+ *
+ * 背景：helper 孤儿化后本进程拿不到子进程退出码（wake-helper.ts 立即退出，
+ * 子进程 detached），唯一可观察面是 wake 日志文件（子进程 stdout/stderr 直落，
+ * --output-format json 成功时末尾是单对象 JSON）。红队实测的失败形态是日志首行
+ * `Error: Session not found: sess-…`（adjudication.md #15）。
+ *
+ * 只认**正向失败证据**，绝不虚报：
+ * - 行首 `Error…`（CLI 崩溃输出的标准前缀；成功 JSON 是单行对象、以 `{` 开头，
+ *   其内部文本即便含 "Error:" 也不会顶行）；
+ * - 单行 JSON 对象携带错误形状：`isError:true` / `success:false` / 顶层非空 `error` 字符串。
+ * 其余情况（窗口内无输出、普通告警）一律不表态——成功回合可能远超侦听窗口，
+ * pull 邮箱与 wake 日志始终是真源。
+ *
+ * @returns 首个命中证据（截到 200 字符），无证据返回 undefined。
+ */
+export function findWakeFailureEvidence(logText: string): string | undefined {
+  for (const rawLine of logText.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (line === "") continue;
+    if (/^Error\b/i.test(line)) return line.slice(0, 200);
+    if (line.startsWith("{")) {
+      try {
+        const parsed: unknown = JSON.parse(line);
+        if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+          const record = parsed as Record<string, unknown>;
+          if (record["isError"] === true || record["success"] === false) return line.slice(0, 200);
+          const error = record["error"];
+          if (typeof error === "string" && error.trim() !== "") return line.slice(0, 200);
+        }
+      } catch {
+        /* 非 JSON 行（半行/进度文本）继续扫 */
+      }
+    }
+  }
+  return undefined;
+}
+
+/** 失败侦听窗口默认值（从 spawn 成功起算；窗口静默=不表态，不虚报成败）。 */
+export const WAKE_WATCH_WINDOW_MS = 20_000;
+/** 失败侦听轮询间隔默认值。 */
+export const WAKE_WATCH_POLL_MS = 500;
 
 // ─────────────────────────── 开关判定（V7） ───────────────────────────
 
@@ -344,6 +391,14 @@ export interface WakeRequest {
   spawn?: typeof spawnResume;
   /** 测试注入：spawn 配置（默认 resolveZcodeSpawnConfig(req.env)，v0.4 起 env 缺失时自动探测）。 */
   cfg?: WakeSpawnConfig;
+  /**
+   * v0.5.1（FI-7）：失败侦听窗口（ms）；缺省 WAKE_WATCH_WINDOW_MS（20s）。
+   * 窗口内轮询 wake 日志，命中失败证据 → wake-failed{where:"wake-child"} +
+   * 释放投递租约 + 消费 nonce；窗口静默 → 不表态。
+   */
+  watchWindowMs?: number;
+  /** v0.5.1（FI-7）：失败侦听轮询间隔（ms）；缺省 WAKE_WATCH_POLL_MS（500ms）。 */
+  watchPollMs?: number;
 }
 
 export interface WakeResult {
@@ -533,12 +588,64 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
     event: "wake", scene: req.reason, teamId: req.teamId, to: toKey, pid, nonce: token,
     wakeLog: logFile, receiptIds: ids,
   });
+
+  // v0.5.1（FI-7/故障注-7）：spawn 成功只代表「唤醒已发起」，不代表送达——helper 孤儿化后
+  // 本进程拿不到子进程退出码，子进程 --resume 失败（如 Session not found）只会落进 wake
+  // 日志。红队实测：回执宣称 delivered=wake「已发起」而唤醒链实际失败，engine.jsonl 无任何
+  // 失败标记（adjudication.md #15）。这里对 wake 日志做**有界失败侦听**：窗口内轮询日志，
+  // 只认正向失败证据（findWakeFailureEvidence），命中 → wake-failed{where:"wake-child"} +
+  // 释放投递租约 + 消费 nonce（pull 立即可见消息、重试不被 15min 在途标记挡住）；窗口静默
+  // → 不表态（成功回合可能远超窗口，日志与 pull 仍是真源）。定时器全部 unref，不拖进程。
+  const watchWindowMs = req.watchWindowMs ?? WAKE_WATCH_WINDOW_MS;
+  const watchPollMs = req.watchPollMs ?? WAKE_WATCH_POLL_MS;
+  if (watchWindowMs > 0 && watchPollMs > 0) {
+    const pollTimer = setInterval(() => {
+      let text = "";
+      try {
+        text = readFileSync(logFile, "utf8");
+      } catch {
+        return; // 日志尚未出现（子进程还没写）→ 继续等
+      }
+      const evidence = findWakeFailureEvidence(text);
+      if (evidence === undefined) return;
+      clearInterval(pollTimer);
+      void releaseOnFailure("wake-child", evidence).catch(() => undefined);
+    }, watchPollMs);
+    pollTimer.unref?.();
+    const stopTimer = setTimeout(() => clearInterval(pollTimer), watchWindowMs);
+    stopTimer.unref?.();
+  }
+
+  // v0.5.1（FI-7）：回执语义真实化——delivered:"wake" 是契约态（push 已发起），note 必须
+  // 写明「非送达确认」，并标注 zcode 路径的自动探测回落（红队形态：env 配置的 exe/cjs
+  // 文件不存在，探测静默改用本机安装——回执只字不提，lead 无从得知唤醒通道已回落）。
   return {
     delivered: "wake",
-    note: "spawned: 无头 --resume 已发起（fire-and-forget）",
+    note:
+      "spawned: 无头 --resume 已发起（fire-and-forget，非送达确认；" +
+      "失败由引擎侦听 wake 日志自动检测并记 engine.jsonl wake-failed、释放投递租约，消息以邮箱 pull 兜底）"
+      + wakeFallbackNote(req.env, resolvedCfg),
     wakeLog: logFile,
     pid,
     receiptIds: ids,
     nonce: token,
   };
+}
+
+/**
+ * v0.5.1（FI-7）：env 配置了 zcode_exe/zcode_cjs 但文件不存在、自动探测回落命中时的
+ * 回落标注（纯函数，单测直测）。env 未配置 → 空串（v0.4 零必填配置的常规路径，无需标注）；
+ * env 命中（source=user_config）→ 空串（没有回落这回事）；探测未命中 → 空串
+ * （spawn 会同步抛错走 mailbox 降级，回落无从谈起）。
+ */
+export function wakeFallbackNote(
+  env: NodeJS.ProcessEnv,
+  resolved: WakeSpawnConfig | ResolvedSpawnConfig,
+): string {
+  if (!isResolvedSpawnConfig(resolved)) return "";
+  const exeEnv = (env["XC_ZCODE_EXE"] ?? "").trim();
+  const cjsEnv = (env["XC_ZCODE_CJS"] ?? "").trim();
+  if (exeEnv === "" || cjsEnv === "") return "";
+  if (!resolved.outcome.found || resolved.outcome.source === "user_config") return "";
+  return `；注意：XC_ZCODE_EXE/XC_ZCODE_CJS 配置的文件不存在，唤醒通道已自动探测回落到 ${resolved.zcodeExe}`;
 }

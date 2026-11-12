@@ -143,6 +143,27 @@ export function truncateField(text: string, itemBudget: number, sha256Of: (s: st
   return { text: text.slice(0, shown), truncated: { shown, total: text.length, sha256: sha256Of(text) } };
 }
 
+/**
+ * 批次窗口计数（v0.5.1，SCALE-1 修复）：
+ * 给定每条消息在本响应两个面（机器 JSON 面 + 注入信封面）的联合成本，按**到达序
+ * 前缀**累加，返回能放进 `budgetTotal` 的条数。保底第一条（单条超预算也返回 1，
+ * 由调用方的 item 截断兜住单条上限）；`costs` 为空返回 0。
+ *
+ * 与 layoutInjectBlocks（peer 面 A/B/C 的注意力排布：新→旧花费、旧条降摘要）的
+ * 差异是**有意的**：xc_check_inbox 是消费面（FIFO 服务队列），被窗口留在箱外的
+ * 消息保持未读、下一批继续消费，不需要降级摘要行；预算口径同源（budget.total）。
+ */
+export function batchWindowCount(costs: readonly number[], budgetTotal: number): number {
+  let sum = 0;
+  let count = 0;
+  for (const cost of costs) {
+    if (count > 0 && sum + cost > budgetTotal) break;
+    sum += cost;
+    count += 1;
+  }
+  return count;
+}
+
 /** 分页原语（R-22 通用约束）：非法入参由调用面映射 invalid_params；越界安全。 */
 export function paginateText(
   text: string, offset: number | undefined, limit: number | undefined, defaultLimit: number,

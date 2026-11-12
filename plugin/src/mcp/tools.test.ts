@@ -8,9 +8,10 @@
  * import 失败前先由构建/集成方确认依赖在场；用 tryImport 不可行于静态 TS，
  * 故以 VITEST 环境变量 XC_SKIP_TOOLS_TESTS=1 支持显式跳过）。
  */
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 import { payloadOf } from "./protocol.js";
@@ -108,50 +109,54 @@ describe("tools: 闭环主流程（register→dispatch→claim→report→inbox�
       "conn-a",
     );
     const dispatch = payloadOf(rd) as { taskId: string; delivered: string; status: string };
-    expect(dispatch).toMatchObject({ taskId: "t1", status: "pending", delivered: "mailbox" }); // wake 关闭的预期值
+    // v0.5.1（故障注-5 修复）：任务 id 为 <era>-t<n> 形态；后续步骤统一用动态 id。
+    const taskId = dispatch.taskId;
+    expect(taskId).toMatch(/-t1$/);
+    expect(dispatch).toMatchObject({ status: "pending", delivered: "mailbox" }); // wake 关闭的预期值
 
     const dup = payloadOf(await core.xc_dispatch(
       { to: "b", title: "计算 17*23", prompt: "把结果只写数字到 result-a2b.txt", acceptance: "文件内容为 391" },
       "conn-a",
     )) as { delivered: string; taskId: string };
     expect(dup.delivered).toBe("duplicate");
-    expect(dup.taskId).toBe("t1");
+    expect(dup.taskId).toBe(taskId);
 
     const inbox = payloadOf(await core.xc_check_inbox({}, "conn-b")) as { messages: Array<{ taskId?: string }>; unreadCount: number };
     expect(inbox.messages).toHaveLength(1);
-    expect(inbox.messages[0]?.taskId).toBe("t1");
+    expect(inbox.messages[0]?.taskId).toBe(taskId);
     expect(inbox.unreadCount).toBe(0);
 
-    const claim = payloadOf(await core.xc_claim({ taskId: "t1" }, "conn-b")) as { attemptId: string };
+    const claim = payloadOf(await core.xc_claim({ taskId }, "conn-b")) as { attemptId: string };
     expect(claim.attemptId).toMatch(/\S/);
 
     // 派发方重复认领同一 pending 任务 → task_not_pending
-    const second = await core.xc_claim({ taskId: "t1" }, "conn-b");
+    const second = await core.xc_claim({ taskId }, "conn-b");
     expect(payloadOf(second).error).toBe("task_not_pending");
 
-    // stale attempt 硬拒
+    // stale attempt 硬拒（证据文件先落盘：v0.5.1 证据门要求证据文件真实存在）
+    await writeFile(join(workDir, "result-a2b.txt"), "391", "utf8");
     const stale = await core.xc_report(
-      { taskId: "t1", attemptId: "wrong", status: "completed", result: "391", evidence: [{ path: join(workDir, "result-a2b.txt") }] },
+      { taskId, attemptId: "wrong", status: "completed", result: "391", evidence: [{ path: join(workDir, "result-a2b.txt") }] },
       "conn-b",
     );
     expect(payloadOf(stale).error).toBe("stale_attempt");
 
     // completed 缺证据硬拒
     const noEv = await core.xc_report(
-      { taskId: "t1", attemptId: claim.attemptId, status: "completed", result: "391" },
+      { taskId, attemptId: claim.attemptId, status: "completed", result: "391" },
       "conn-b",
     );
     expect(payloadOf(noEv).error).toBe("incomplete_completion");
 
     // 进度更新：claimed→in_progress 合法
-    const prog = await core.xc_report({ taskId: "t1", attemptId: claim.attemptId, status: "in_progress" }, "conn-b");
+    const prog = await core.xc_report({ taskId, attemptId: claim.attemptId, status: "in_progress" }, "conn-b");
     expect(prog.isError).toBeUndefined();
 
     // 完成 + 证据（工具现算 sha256）
     await writeFile(join(workDir, "result-a2b.txt"), "391", "utf8");
     const rep = payloadOf(await core.xc_report(
       {
-        taskId: "t1",
+        taskId,
         attemptId: claim.attemptId,
         status: "completed",
         result: "391",
@@ -167,7 +172,7 @@ describe("tools: 闭环主流程（register→dispatch→claim→report→inbox�
       messages: Array<{ sourceTaskId?: string; content: string }>;
     };
     expect(aInbox.messages).toHaveLength(1);
-    expect(aInbox.messages[0]?.sourceTaskId).toBe("t1");
+    expect(aInbox.messages[0]?.sourceTaskId).toBe(taskId);
     const receipt = JSON.parse(aInbox.messages[0]?.content ?? "{}") as { evidence: Array<{ sha256: string | null }> };
     expect(receipt.evidence[0]?.sha256).toMatch(/^[0-9a-f]{64}$/);
 
@@ -177,7 +182,7 @@ describe("tools: 闭环主流程（register→dispatch→claim→report→inbox�
     const snap = JSON.parse(await readFile(join(stateRoot, "teams", "default", "snapshot.json"), "utf8")) as {
       tasks: Array<{ id: string; status: string; evidenceCount: number }>;
     };
-    expect(snap.tasks[0]).toMatchObject({ id: "t1", status: "completed", evidenceCount: 1 });
+    expect(snap.tasks[0]).toMatchObject({ id: taskId, status: "completed", evidenceCount: 1 });
   });
 
   it("依赖未满足/自派发/非成员/双线认领均被硬拒", async () => {
@@ -190,25 +195,25 @@ describe("tools: 闭环主流程（register→dispatch→claim→report→inbox�
     const unknownTo = await core.xc_dispatch({ to: "nobody", title: "T", prompt: "P" }, "conn-a");
     expect(payloadOf(unknownTo).error).toBe("not_a_member");
 
-    // 未知依赖在派发时即拒绝（不建任务）
-    const badDep = await core.xc_dispatch({ to: "b", title: "T3", prompt: "P3", dependsOn: ["t9"] }, "conn-a");
+    // 未知依赖在派发时即拒绝（不建任务；v0.5.1 era id 下 "<era>-t1-ghost" 必然不存在）
+    const first = (payloadOf(await core.xc_dispatch({ to: "b", title: "T1", prompt: "P1" }, "conn-a"))["taskId"]) as string;
+    const badDep = await core.xc_dispatch({ to: "b", title: "T3", prompt: "P3", dependsOn: [first + "-ghost"] }, "conn-a");
     expect(payloadOf(badDep).error).toBe("invalid_params");
 
-    // 两个无依赖任务
-    await core.xc_dispatch({ to: "b", title: "T1", prompt: "P1" }, "conn-a");
-    await core.xc_dispatch({ to: "b", title: "T2", prompt: "P2" }, "conn-a");
+    // 两个无依赖任务（T1 已建，再建一个）
+    const secondId = (payloadOf(await core.xc_dispatch({ to: "b", title: "T2", prompt: "P2" }, "conn-a"))["taskId"]) as string;
     await core.xc_check_inbox({}, "conn-b");
 
-    const c1 = await core.xc_claim({ taskId: "t1" }, "conn-b");
+    const c1 = await core.xc_claim({ taskId: first }, "conn-b");
     expect(c1.isError).toBeUndefined();
 
     // 一人双线（memberOpenTask 约束）
-    const double = await core.xc_claim({ taskId: "t2" }, "conn-b");
+    const double = await core.xc_claim({ taskId: secondId }, "conn-b");
     expect(payloadOf(double).error).toBe("already_has_open_task");
 
-    // 依赖未满足（t1 已认领未完成）
-    await core.xc_dispatch({ to: "b", title: "T3", prompt: "P3", dependsOn: ["t1"] }, "conn-a");
-    const claimDep = await core.xc_claim({ taskId: "t3" }, "conn-b");
+    // 依赖未满足（T1 已认领未完成）
+    const t3 = (payloadOf(await core.xc_dispatch({ to: "b", title: "T3", prompt: "P3", dependsOn: [first] }, "conn-a"))["taskId"]) as string;
+    const claimDep = await core.xc_claim({ taskId: t3 }, "conn-b");
     expect(payloadOf(claimDep).error).toBe("dependencies_unmet");
   });
 });
@@ -360,10 +365,12 @@ describe("tools v0.5: xc_check_inbox 预算截断 + content[2] 信封块（R-16/
 
     // 读即消费语义不变（v0.4 基线实证：readCurrentMailboxLocked 返回全部 current 邮件，
     // 重查重给文但 readAt 幂等置位）：再次查箱仍可见该消息，信封块经幂等守卫逐字节一致。
+    // v0.5.1（故障注-4 修复）读即消费：已读件（readAt 已盖章）不再重注入——README
+    // 承诺「读取并消费自己邮箱的未读消息」；第二次查箱 0 条、无信封块。
     const again = await small.xc_check_inbox({}, "conn-b");
     const againPayload = payloadOf(again) as { messages: Array<{ id: string }> };
-    expect(againPayload.messages.map((m) => m.id)).toEqual([payload.messages[0]?.id]);
-    expect(again.content[2]?.text).toBe(envelopeBlock); // isTeamEnvelopeRendered 幂等不重包
+    expect(againPayload.messages).toEqual([]);
+    expect(again.content[2]?.text).toBeUndefined();
 
     // 审计 face=inbox
     const events = await engineEvents();
@@ -473,19 +480,21 @@ describe("tools v0.5: xc_status isLead/history + 任务字段观测面截断（R
 
     const dispatched = await small.xc_dispatch({ to: "b", title: "大结果", prompt: "P".repeat(1500) }, "conn-a");
     expect(dispatched.isError).toBeUndefined();
+    const taskId = (payloadOf(dispatched)["taskId"]) as string; // v0.5.1 era id，动态取
     const inboxRes = await small.xc_check_inbox({}, "conn-b");
     expect(inboxRes.isError).toBeUndefined();
-    const claimRes = await small.xc_claim({ taskId: "t1" }, "conn-b");
+    const claimRes = await small.xc_claim({ taskId }, "conn-b");
     expect(claimRes.isError).toBeUndefined();
     const claim = payloadOf(claimRes) as { attemptId: string };
     // 协议状态机：claimed → in_progress → completed（TASK_TRANSITIONS）
     const progRes = await small.xc_report(
-      { taskId: "t1", attemptId: claim.attemptId, status: "in_progress" },
+      { taskId, attemptId: claim.attemptId, status: "in_progress" },
       "conn-b",
     );
     expect(progRes.isError).toBeUndefined();
+    await writeFile(join(workDir, "e.txt"), "evidence", "utf8"); // v0.5.1 证据门：证据文件须真实存在
     const reportRes = await small.xc_report(
-      { taskId: "t1", attemptId: claim.attemptId, status: "completed", result: "R".repeat(3000), evidence: [{ path: join(workDir, "e.txt") }] },
+      { taskId, attemptId: claim.attemptId, status: "completed", result: "R".repeat(3000), evidence: [{ path: join(workDir, "e.txt") }] },
       "conn-b",
     );
     expect(reportRes.isError).toBeUndefined();
@@ -508,7 +517,7 @@ describe("tools v0.5: xc_status isLead/history + 任务字段观测面截断（R
     let offset = 0;
     let joined = "";
     for (let guard = 0; guard < 100; guard += 1) {
-      const page = payloadOf(await small.xc_task_read({ taskId: "t1", field: "result", offset }, "conn-a")) as {
+      const page = payloadOf(await small.xc_task_read({ taskId, field: "result", offset }, "conn-a")) as {
         text: string; offset: number; hasMore: boolean;
       };
       joined += page.text;
@@ -518,9 +527,67 @@ describe("tools v0.5: xc_status isLead/history + 任务字段观测面截断（R
     expect(joined).toBe("R".repeat(3000));
 
     // prompt 字段同样可拉；未知任务在 core 层拒绝
-    const promptPage = payloadOf(await small.xc_task_read({ taskId: "t1", field: "prompt" }, "conn-a")) as { total: number };
+    const promptPage = payloadOf(await small.xc_task_read({ taskId, field: "prompt" }, "conn-a")) as { total: number };
     expect(promptPage.total).toBe(1500);
     const unknownTask = await small.xc_task_read({ taskId: "t9", field: "result" }, "conn-a");
     expect(payloadOf(unknownTask)).toMatchObject({ error: "invalid_params" });
+  });
+});
+
+// v0.5.1（BND-1 回归）：xc_status.teamId 路径穿越。红队原始复现
+// （adjudication.md #1 / cases.md C-61）：未注册连接直接
+// xc_status{teamId:"../../evil-adj"} → 无错误返回，且在状态根外建目录写
+// snapshot.json；深穿越可逃出工作区。修复后：入参先过段合法性闸，
+// 结构化 invalid_params，磁盘零副作用；合法 teamId 不受影响。
+describe("tools: xc_status.teamId 路径穿越闸（BND-1）", () => {
+  /** 红队逐条载荷（含 workDir 相对可达的各级穿越）。 */
+  const payloads = [
+    "../../evil-adj",
+    "..\\..\\evil2-adj",
+    "../../xc-adj-escape-proof",
+    "../../../../xc-adj-deep-escape",
+    "../../../xc-adj-3up",
+    ".",
+    "..",
+    "default extra space",
+  ];
+
+  it("未注册连接的穿越 teamId → invalid_params 且状态根外零落盘", async () => {
+    for (const teamId of payloads) {
+      const res = await core.xc_status({ teamId }, "ghost");
+      expect(res.isError).toBe(true);
+      const payload = payloadOf(res) as { error: string; message: string };
+      expect(payload.error).toBe("invalid_params");
+      expect(payload.message).toContain("not a valid team name");
+    }
+    // 磁盘断言：按红队观测点逐点核验零落盘（工作区根 / 上级 / tmpdir 级），
+    // 目标名带 mkdtemp 随机前缀，历史残留不可能撞名。
+    expect(existsSync(join(workDir, "evil-adj", "snapshot.json"))).toBe(false);
+    expect(existsSync(join(workDir, "evil2-adj", "snapshot.json"))).toBe(false);
+    expect(existsSync(join(workDir, "xc-adj-escape-proof", "snapshot.json"))).toBe(false);
+    expect(existsSync(resolve(dirname(workDir), "xc-adj-deep-escape", "snapshot.json"))).toBe(false);
+    expect(existsSync(resolve(dirname(workDir), "xc-adj-3up", "snapshot.json"))).toBe(false);
+    expect(existsSync(join(stateRoot, "teams"))).toBe(false); // 未建任何队目录
+    // 审计不留痕：穿越串不进 engine.jsonl（闸在 logEngineEvent 之前抛出）。
+    expect(existsSync(engineLogFile(stateRoot))).toBe(false);
+  });
+
+  it("注册后同样拒绝；合法 teamId（缺省与 default）不受影响", async () => {
+    await hookRegister("conn-a", "a", "sess-a");
+    const res = await core.xc_status({ teamId: "../../evil-adj" }, "conn-a");
+    expect(res.isError).toBe(true);
+    expect(payloadOf(res)).toMatchObject({ error: "invalid_params" });
+
+    for (const args of [{}, { teamId: "default" }]) {
+      const ok = await core.xc_status(args, "conn-a");
+      expect(ok.isError).toBeUndefined();
+      const st = payloadOf(ok) as { teamId: string; phase: string };
+      expect(st.teamId).toBe("default");
+      expect(st.phase).toBe("open");
+      expect(existsSync(join(stateRoot, "teams", "default", "snapshot.json"))).toBe(true);
+    }
+    // teams/ 下没有穿越产物
+    const teamDirs = await readdir(join(stateRoot, "teams"));
+    expect(teamDirs).toEqual(["default"]);
   });
 });

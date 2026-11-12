@@ -17,6 +17,7 @@ import {
   mailboxBody,
   mailboxPrompt,
   markMailboxDelivered,
+  orphanTaskIds,
   parseReceipt,
   readCurrentMailbox,
   readCurrentMailboxLocked,
@@ -189,6 +190,66 @@ describe('readCurrentMailboxLocked (port of dsh mailbox.js:29-40)', () => {
     const reloaded = await readTeam(dir, 'default');
     expect(reloaded).toBeDefined();
   });
+
+  // v0.5.1（故障注-3 修复）：不可解析坏行不再无声吞掉——收集器逐行透出（行号+原因），
+  // 坏行原样保留在盘上；整箱乱码时返回 0 条但收集器非空（不是「静默当空箱」）。
+  it('surfaces unparseable lines through the malformed collector (fault 注-3)', async () => {
+    const team = teamWithTask();
+    await writeTeam(dir, team);
+    await appendMailbox(dir, 'default', 'b', createMessage('a', 'b', 'first'));
+    await appendMailbox(dir, 'default', 'b', createMessage('a', 'b', 'good'));
+    const file = join(dir, 'teams', 'default', 'inbox', 'b.jsonl');
+    // 首行截断（红队 FJ-3b 形态）+ 好行照常投递
+    const raw = readFileSync(file, 'utf8');
+    const lines = raw.split('\n');
+    const truncated = lines.map((line, i) => (i === 0 && line !== '' ? line.slice(0, Math.max(1, Math.floor(line.length / 2))) : line)).join('\n');
+    writeFileSync(file, truncated, 'utf8');
+    const diagnostics: import('./mailbox.js').MailboxReadDiagnostics = { malformed: [], discarded: 0 };
+    const current = await readCurrentMailboxLocked(dir, team, 'b', undefined, diagnostics);
+    expect(current.map((m) => m.content)).toEqual(['good']);
+    expect(diagnostics.malformed).toHaveLength(1);
+    expect(diagnostics.malformed[0]?.lineNo).toBe(1);
+    expect(diagnostics.malformed[0]?.error).toContain('invalid JSON');
+    // 坏行原样保留（不破坏现场）
+    expect(readFileSync(file, 'utf8')).toBe(truncated);
+
+    // 整箱乱码：0 条 + 逐行收集（不再是静默空箱）
+    writeFileSync(file, '\u0000garbage\n\u0000more-garbage\n', 'utf8');
+    const wholeBad: import('./mailbox.js').MailboxReadDiagnostics = { malformed: [], discarded: 0 };
+    const empty = await readCurrentMailboxLocked(dir, team, 'b', undefined, wholeBad);
+    expect(empty).toEqual([]);
+    expect(wholeBad.malformed).toHaveLength(2);
+  });
+});
+
+// v0.5.1（故障注-2 / 故障注-5 修复）：孤儿任务引用——邮箱信封指向 team.tasks
+// 中不存在的任务 = 真源任务段丢失（被清空/截断/整队重置）。
+describe('orphanTaskIds + orphaned envelope freshness (故障注-2/5)', () => {
+  it('lists task ids referenced by envelopes but missing from team.tasks', () => {
+    const team = teamWithTask();
+    const known = team.tasks[0]!.id;
+    const messages = [
+      createMessage('a', 'b', 'assignment', { taskId: known }),
+      createMessage('a', 'b', 'orphan assignment', { taskId: 'ghost-era-t1' }),
+      createMessage('a', 'b', 'plain chat'),
+      createMessage('a', 'b', 'dup orphan', { taskId: 'ghost-era-t1' }),
+      createMessage('a', 'b', 'orphan receipt', { taskId: 'old-era-t7', sourceTaskId: 'old-era-t7' }),
+    ];
+    expect(orphanTaskIds(team, messages)).toEqual(['ghost-era-t1', 'old-era-t7']);
+    expect(orphanTaskIds(team, [createMessage('a', 'b', 'no refs')])).toEqual([]);
+  });
+
+  it('an envelope whose taskId no longer exists is stale (旧分派不复活，故障注-5)', () => {
+    const team = teamWithTask(); // 只有一个任务
+    // 旧时代分派信封（无 attemptId、taskId 不在 tasks 中）：
+    const ghostAssignment = createMessage('a', 'b', 'compute 17*23', { taskId: 'deadbeef-t1' });
+    expect(isCurrentMail(team, ghostAssignment)).toBe(false);
+    // 现行任务的分派信封不受影响：
+    const liveAssignment = createMessage('a', 'b', 'compute 5*5', { taskId: team.tasks[0]!.id });
+    expect(isCurrentMail(team, liveAssignment)).toBe(true);
+    // 无 taskId 的纯聊天消息不受影响：
+    expect(isCurrentMail(team, createMessage('a', 'b', 'hi'))).toBe(true);
+  });
 });
 
 describe('receipt prefix (DESIGN §2.4)', () => {
@@ -215,7 +276,7 @@ describe('receipt prefix (DESIGN §2.4)', () => {
     const prompt = mailboxPrompt('default', 'b', [m]);
     expect(prompt.startsWith(RECEIPT_PREFIX)).toBe(true);
     expect(prompt).toContain('attempt_id');
-    expect(prompt).toContain('[Source task t1');
+    expect(prompt).toContain(`[Source task ${task.id}`);
     expect(mailboxBody('b', [m])).toContain('write 391');
   });
 });

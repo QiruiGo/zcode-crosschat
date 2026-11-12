@@ -1,6 +1,6 @@
 {
   "name": "zcode-crosschat",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Agent-team collaboration for independent ZCode sessions: a lead coordinates engine-provisioned teammate sessions, members self-start via prompt protocol, and a file mailbox remains the source of truth. v0.3 adds the cross-session peer axis: a machine-global peer registry, named-pipe transport, name-as-address addressing, and accept/hold/refuse inbound policy. v0.5 makes the lead a transferable metadata role, keeps user-spoken text verifiable end to end (origin=user), and bounds every injection surface by the receiver's declared context budget.",
   "description_i18n": {
     "en": "Lead-teammate collaboration across independent ZCode sessions plus a cross-session peer axis: machine-global peer registry, named-pipe transport, name-as-address addressing, accept/hold/refuse inbound policy, and structured attribution envelopes on every inbound peer message. v0.5: the lead is a transferable metadata role, user-spoken text stays verifiable end to end (origin=user), and every injection surface is bounded by the receiver's declared context budget.",

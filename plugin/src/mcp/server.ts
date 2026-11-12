@@ -22,9 +22,8 @@
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createToolCore, registerTools, resolveDeps, type ToolCore, type ToolDeps } from "./tools.js";
-import { withTaskEdges } from "./task-edges.js";
+import { startStaleSweeper, withTaskEdges } from "./task-edges.js";
 import { withGuards, registerSecurityTools } from "./guards.js";
 import { registerMemberTools } from "./member-tools.js";
 import { registerLeadTools } from "./lead-tools.js";
@@ -32,9 +31,10 @@ import { registerPeerTools } from "./peer-tools.js";
 import { withPeerDrain } from "./peer-drain.js";
 import { registerDoctorTool } from "./doctor-tool.js";
 import { stopPeerEndpoint } from "../transport/pipe.js";
+import { GuardedStdioTransport } from "../transport/mcpstdio.js";
 
 const SERVER_NAME = "zcode-crosschat";
-const SERVER_VERSION = "0.5.0";
+const SERVER_VERSION = "0.5.1";
 
 /** v0.3 工具核心组装链：包装顺序固定——先边沿后守卫，守卫（安全）最贴近工具入口，
  *  peer 投递排空最外层（tool-round 间隙把信封**追加为末尾 text 块 content[2]**，
@@ -73,11 +73,20 @@ export async function main(): Promise<void> {
     version: SERVER_VERSION, env: process.env, cwd: process.cwd(),
   });
 
-  const transport = new StdioServerTransport();
+  // v0.5.1（CONC-2 修复）：带大帧守卫的 stdio 传输——≥10MiB（SDK 默认上限）帧
+  // 不再「静默自退出（exit 0）」，32MiB 内正常入队（README「队内无此闸」承诺），
+  // 超限帧显式 JSON-RPC 拒收且 server 继续服务（transport/mcpstdio.ts）。
+  const transport = new GuardedStdioTransport();
   transport.onclose = () => {
     void shutdown();
   };
   await server.connect(transport);
+
+  // v0.5.1（故障注-8 修复）：周期僵尸清扫——README 配置表承诺「在途任务超过
+  // stale_task_minutes 无任何更新且成员无在途唤醒时，被引擎清扫回待领并回执队长」。
+  // E-b 边沿清扫只在有成员成功报告终态时运行，成员死后承诺落空；本定时器让运行中的
+  // server 进程独立兑现承诺（节拍由 XC_STALE_TASK_MINUTES 推导，unref 不改退出语义）。
+  startStaleSweeper(deps);
 
   // v0.3 EOF 纪律（FEASIBILITY-V0.3 §3.3）：SDK 不监听 stdin 'end'，必须自建。
   process.stdin.once("end", () => {

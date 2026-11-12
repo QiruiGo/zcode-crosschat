@@ -101,6 +101,12 @@ export interface StatusSnapshot {
   dag?: Record<string, string[]>;
   /** v2：引擎/配置面信息（§7.3.1 "engine"）。 */
   engine?: { wakeEnabled: boolean; maxMembers: number; inboundMode: string };
+  /**
+   * v0.5.1（故障注-2 修复）：孤儿任务引用（agentKey → 指向不存在任务的 id 列表）。
+   * 非空 = 真源任务段丢失（被清空/截断/整队重置）而邮箱残存信封仍在；仅在有
+   * 孤儿时出现（schema 只增可选字段，v0.1.0 构造的快照不受影响）。
+   */
+  orphanTasks?: Record<string, string[]>;
 }
 
 // ---------------------------------------------------------------------------

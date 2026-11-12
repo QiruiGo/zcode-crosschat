@@ -67,11 +67,34 @@ export function wakeFile(root: string, nonce: string): string {
 
 // --- teams ------------------------------------------------------------------
 
+/**
+ * teamId 段合法性（v0.5.1 BND-1 修复：xc_status.teamId 路径穿越）。
+ *
+ * teamId 会被直接拼进 `teams/<teamId>/…` 各路径构建器（join 不中和 `..` 段），
+ * 调用方传入的 teamId 必须先经本闸验证为**单个安全路径段**，否则
+ * `../../evil` 这类穿越串可逃出状态根建目录/写 snapshot.json。产品自身
+ * 创建的 teamId 只有 `default`（types.ts DEFAULT_TEAM_ID）；白名单放宽到
+ * 常见段字符（字母/数字开头，字母数字._-，≤128），覆盖操作者手工放置的
+ * 观测目标，同时结构性排除分隔符、`..`、盘符与 Windows 保留语法。
+ */
+export function isValidTeamId(teamId: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(teamId);
+}
+
 export function teamDir(root: string, teamId: string): string {
   return join(root, 'teams', teamId);
 }
 export function teamFile(root: string, teamId: string): string {
   return join(root, 'teams', teamId, 'team.json');
+}
+// v0.5.1（故障注-1 修复）：team.json 的 last-known-good 镜像与损坏现场保全件。
+// writeTeam 每次成功落盘后原子镜像同一内容到 .bak；readTeam 遇不可解析真源时
+// 先尝试从 .bak 自愈，无可用备份则带修复指引显式报错（不再裸抛 JSON 解析错误）。
+export function teamBackupFile(root: string, teamId: string): string {
+  return join(root, 'teams', teamId, 'team.json.bak');
+}
+export function teamCorruptFile(root: string, teamId: string): string {
+  return join(root, 'teams', teamId, 'team.json.corrupt');
 }
 export function inboxDir(root: string, teamId: string): string {
   return join(root, 'teams', teamId, 'inbox');

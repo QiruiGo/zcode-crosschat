@@ -39,6 +39,7 @@ import {
   encodeFrame,
   peerAuthLine,
   PEER_AUTH_DEADLINE_MS,
+  PEER_MAX_CONNECTIONS,
   PEER_MAX_LINE_BYTES,
   PEER_SEND_TIMEOUT_MS,
   PEER_TOKEN_RE,
@@ -129,7 +130,10 @@ export interface PeerEndpointOptions {
   authTimeoutMs?: number;
   /** 单行上限（默认 1 MiB；测试可缩小）。 */
   maxLineBytes?: number;
-  /** 并发连接上限（超过即回 busy 并断开）。 */
+  /**
+   * 并发连接上限（超过即回 busy 并断开）。缺省 {@link PEER_MAX_CONNECTIONS}
+   * （v0.5.1 起 128）。
+   */
   maxConnections?: number;
   /**
    * 注册表心跳间隔（毫秒）。默认 {@link PEER_HEARTBEAT_INTERVAL_MS}；
@@ -395,7 +399,7 @@ export async function startPeerEndpoint(options: PeerEndpointOptions): Promise<P
 
   const maxLineBytes = options.maxLineBytes ?? PEER_MAX_LINE_BYTES;
   const authTimeoutMs = options.authTimeoutMs ?? PEER_AUTH_DEADLINE_MS;
-  const maxConnections = options.maxConnections ?? 32;
+  const maxConnections = options.maxConnections ?? PEER_MAX_CONNECTIONS;
 
   rt.server.on('connection', (socket: Socket) => {
     if (rt.connections.size >= maxConnections) {

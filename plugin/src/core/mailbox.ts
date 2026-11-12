@@ -124,11 +124,37 @@ export function isCurrentMail(team: TeamState, message: TeamMessage): boolean {
         || message.sourceTaskStatus === task.status))) {
     return false;
   }
-  if (message.attemptId === undefined) return true;
+  if (message.attemptId === undefined) {
+    // v0.5.1（故障注-5 修复）：无 attemptId 的信封（分派/回执）此前无条件视为
+    // 现行——真源丢失重建后，旧时代分派借残存邮箱「复活」注入且与新时代任务
+    // 撞号。带 taskId 的信封必须仍指向存在的任务，否则判陈旧（就地丢弃并在
+    // check_inbox 的 stale 计数中披露）；无 taskId 的纯聊天消息不受影响。
+    if (message.taskId !== undefined && !team.tasks.some((task) => task.id === message.taskId)) {
+      return false;
+    }
+    return true;
+  }
   return team.tasks.some((task) => task.id === message.taskId
     && task.attemptId === message.attemptId
     && task.assignee === message.to
     && (task.status === 'claimed' || task.status === 'in_progress'));
+}
+
+/**
+ * v0.5.1（故障注-2 修复）：孤儿任务引用检测（纯函数）。
+ * 邮箱里仍有指向「team.tasks 中不存在的任务」的分派/回执信封时，说明真源
+ * 任务段丢失（被清空/截断/整队重置）而在途工作无声蒸发。返回缺失的任务 id
+ * 列表（去重、保序）；供 xc_status 告警与 xc_claim unknown-task 诊断富化。
+ */
+export function orphanTaskIds(team: TeamState, messages: readonly TeamMessage[]): string[] {
+  const known = new Set(team.tasks.map((task) => task.id));
+  const orphans: string[] = [];
+  for (const message of messages) {
+    const taskId = message.taskId;
+    if (taskId === undefined || known.has(taskId) || orphans.includes(taskId)) continue;
+    orphans.push(taskId);
+  }
+  return orphans;
 }
 
 /** Default malformed-line sink: skip + audit-log (DESIGN.md §2.7-5). */
@@ -147,6 +173,8 @@ export interface MailboxRead {
   messages: TeamMessage[];
   /** Named frames outside the whitelist (§7.4-I3): dropped from every view. */
   rejected: TeamMessage[];
+  /** v0.5.1（故障注-3 修复）：本次读取跳过的不可解析行（含行号与原因）。 */
+  malformed: MalformedLine[];
 }
 
 /**
@@ -154,6 +182,8 @@ export interface MailboxRead {
  * named frames. Rejected frames are audited `{event:"frame-rejected"}`
  * (best-effort) while not yet disposed on disk; after the team-locked sweep in
  * readCurrentMailboxLocked stamps them discardedAt, re-reads stay silent.
+ * v0.5.1（故障注-3 修复）：不可解析行照旧跳过+走原 sink（缺省=审计），同时
+ * 收集进返回值，让工具面能把「N 条不可读」披露给调用方而不是静默吞掉。
  */
 async function readMailboxDetailed(
   stateRoot: string,
@@ -163,7 +193,12 @@ async function readMailboxDetailed(
 ): Promise<MailboxRead> {
   const file = mailboxPath(stateRoot, teamId, agentKey);
   const sink = onMalformed ?? defaultOnMalformed(stateRoot, file);
-  const messages = (await readJsonl<TeamMessage>(file, isTeamMessage, sink)).map(normalizeMessage);
+  const malformed: MalformedLine[] = [];
+  const collectingSink = (info: MalformedLine): void => {
+    malformed.push(info);
+    sink(info);
+  };
+  const messages = (await readJsonl<TeamMessage>(file, isTeamMessage, collectingSink)).map(normalizeMessage);
   const kept: TeamMessage[] = [];
   const rejected: TeamMessage[] = [];
   for (const message of messages) {
@@ -185,7 +220,7 @@ async function readMailboxDetailed(
     }
     kept.push(message);
   }
-  return { messages: kept, rejected };
+  return { messages: kept, rejected, malformed };
 }
 
 /**
@@ -317,13 +352,23 @@ export async function discardMailboxMessages(
  * are additionally stamped discardedAt on disk under the lock (the only place
  * a mailbox mutation may run), so later lockless reads stop re-auditing them.
  */
+/** v0.5.1：读取诊断收集器（故障注-3/5）——不可解析行明细 + 就地丢弃的陈旧件数。 */
+export interface MailboxReadDiagnostics {
+  malformed: MalformedLine[];
+  discarded: number;
+}
+
 export async function readCurrentMailboxLocked(
   stateRoot: string,
   team: TeamState,
   recipient: string,
   onMalformed?: (malformed: MalformedLine) => void,
+  // v0.5.1（故障注-3 修复）：调用方可选诊断收集器——本次读取跳过的不可解析行
+  // 与就地丢弃的陈旧件数（工具面据此在响应中披露，不再静默当空箱/静默清扫）。
+  diagnostics?: MailboxReadDiagnostics,
 ): Promise<TeamMessage[]> {
   const read = await readMailboxDetailed(stateRoot, team.teamId, recipient, onMalformed);
+  if (diagnostics !== undefined) diagnostics.malformed.push(...read.malformed);
   const current: TeamMessage[] = [];
   const staleIds: string[] = read.rejected.map((message) => message.id);
   for (const message of read.messages) {
@@ -331,6 +376,7 @@ export async function readCurrentMailboxLocked(
     else staleIds.push(message.id);
   }
   await discardMailboxMessages(stateRoot, team.teamId, recipient, staleIds);
+  if (diagnostics !== undefined) diagnostics.discarded = staleIds.length;
   return current;
 }
 
@@ -345,14 +391,14 @@ export async function readCurrentMailbox(
   teamId: string,
   recipient: string,
   onMalformed?: (malformed: MalformedLine) => void,
-  options: { waitMs?: number } = {},
+  options: { waitMs?: number; diagnostics?: MailboxReadDiagnostics } = {},
 ): Promise<TeamMessage[]> {
   const names = teamLockNames(stateRoot, teamId);
   return withProcessLock(names.processKey, async () => {
     return withFileLock(stateRoot, names.file, async () => {
       const team = await readTeam(stateRoot, teamId);
       if (team === undefined) return [];
-      return readCurrentMailboxLocked(stateRoot, team, recipient, onMalformed);
+      return readCurrentMailboxLocked(stateRoot, team, recipient, onMalformed, options.diagnostics);
     }, options);
   });
 }

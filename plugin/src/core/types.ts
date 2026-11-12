@@ -180,7 +180,14 @@ export interface TeamState {
   leadHistory?: LeadHistoryEntry[];
   members: TeamMember[];
   tasks: Task[];
-  /** Monotonic counter used to allocate task ids (`t1`, `t2`, ...). */
+  /**
+   * v0.5.1（故障注-5 修复）：团队纪元令牌（建队时生成，8 hex）。
+   * 任务 id 由纪元前缀 + seq 组成（`<era>-t1`）。team.json 单文件丢失后重建
+   * （静默重置）时新时代拿到新纪元，其任务 id 与残存邮箱里的旧时代信封永不相撞；
+   * 旧记录（无 era 字段）宽容读取，任务 id 保持 `t1` 旧形态。
+   */
+  era?: string;
+  /** Monotonic counter used to allocate task ids (`<era>-t1`, `<era>-t2`, ...). */
   seq: number;
   createdAt: number;
 }
@@ -562,6 +569,8 @@ export function coerceTeamState(value: unknown, expectedTeamId: string): ParsedT
   if (createdAt === undefined) return { ok: false, defect: 'field "createdAt" missing or not a number' };
   // v0.2 optional leadKey (DESIGN-V0.2.md §3.1): absent on legacy teams.
   const leadKey = optionalString(value['leadKey']);
+  // v0.5.1（故障注-5 修复）：era 宽容读取——旧记录缺字段照常解析（任务 id 旧形态）。
+  const era = optionalString(value['era']);
   // v0.5（R-6）：leadSince/leadHistory 宽容读取——旧记录缺两字段照常解析；坏条目丢弃不拒文件。
   const leadSince = optionalFinite(value['leadSince']);
   const leadHistory = coerceLeadHistory(value['leadHistory']);
@@ -600,6 +609,7 @@ export function coerceTeamState(value: unknown, expectedTeamId: string): ParsedT
       founderKey,
       phase: phaseRaw as TeamPhase,
       ...(leadKey === undefined ? {} : { leadKey }),
+      ...(era === undefined ? {} : { era }),
       ...(leadSince === undefined ? {} : { leadSince }),
       ...(leadHistory === undefined || leadHistory.length === 0 ? {} : { leadHistory }),
       members,
