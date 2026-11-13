@@ -166,26 +166,54 @@ function pad(text: string, width: number): string {
   return oneLine.length <= width ? oneLine.padEnd(width, " ") : `${oneLine.slice(0, width - 1)}…`;
 }
 
+/** 任务板表头行（renderTaskTable 用；预算窗口的固定面记账同款，避免两处字面量漂移）。 */
+export const STATUS_TASK_TABLE_HEADER =
+  `${"ID".padEnd(COL.id)}  ${"STATUS".padEnd(COL.status)}  ${"ASSIGNEE".padEnd(COL.assignee)}  `
+  + `${"ATT".padEnd(COL.att)}  ${"RESULT/ERROR".padEnd(COL.result)}  TITLE`;
+
+/**
+ * 单条任务的人可读板面行（renderTaskTable 逐行同款）。
+ * v0.5.2（SCALE-1 修复）导出：xc_status 的板面注入预算窗口要按「人可读行 + JSON
+ * 条目」的联合成本估窗（与 xc_check_inbox 的 inboxEntry 成本口径一致），此处是
+ * 人可读面成本的单一事实源。
+ */
+export function statusTaskRowText(task: StatusSnapshotTask): string {
+  const att = `${task.attempt}@${task.attemptId ? shortId(task.attemptId) : "-"}`;
+  const outcome = task.error ? `ERR: ${task.error}` : (task.result ?? "");
+  return (
+    `${pad(task.id, COL.id)}  ${pad(task.status, COL.status)}  ${pad(task.assignee ?? "-", COL.assignee)}  `
+    + `${pad(att, COL.att)}  ${pad(outcome, COL.result)}  ${task.title}`
+  );
+}
+
 function renderTaskTable(snapshot: StatusSnapshot): string {
   const lines: string[] = [];
   if (snapshot.tasks.length === 0) {
     lines.push("Tasks: (none)");
     return lines.join("\n");
   }
-  lines.push(
-    `${"ID".padEnd(COL.id)}  ${"STATUS".padEnd(COL.status)}  ${"ASSIGNEE".padEnd(COL.assignee)}  ` +
-      `${"ATT".padEnd(COL.att)}  ${"RESULT/ERROR".padEnd(COL.result)}  TITLE`,
-  );
+  lines.push(STATUS_TASK_TABLE_HEADER);
   for (const t of snapshot.tasks) {
-    const att = `${t.attempt}@${t.attemptId ? shortId(t.attemptId) : "-"}`;
-    const outcome = t.error ? `ERR: ${t.error}` : (t.result ?? "");
-    lines.push(
-      `${pad(t.id, COL.id)}  ${pad(t.status, COL.status)}  ${pad(t.assignee ?? "-", COL.assignee)}  ` +
-        `${pad(att, COL.att)}  ${pad(outcome, COL.result)}  ${t.title}`,
-    );
+    lines.push(statusTaskRowText(t));
   }
   return lines.join("\n");
 }
+
+/**
+ * 任务板截断指针行（v0.5.2 SCALE-1 修复）。
+ * 板面按注入预算开窗口后，窗口外的任务不进本响应——人可读面给这一行，payload 面给
+ * `boardTruncated{shown,total,offset,budgetChars}`；`snapshot.json` 落盘的仍是全量
+ * （磁盘真源不受预算约束，R-21）。
+ */
+export function renderBoardTruncationNote(shown: number, total: number, budgetChars: number): string {
+  return (
+    `[任务板已按注入预算（${budgetChars} 字符）截断：本页 ${shown}/${total} 条；`
+    + `其余任务用 xc_status({offset:${shown}}) 分页读，snapshot.json 仍含全量]`
+  );
+}
+
+/** 截断指针行的字符上限（窗口预算的固定面预留量；数字位数已含余量）。 */
+export const BOARD_TRUNCATION_NOTE_MAX_CHARS = 220;
 
 /**
  * xc_status 的人可读任务板（v0.1.0 输出形态原样保留，DESIGN §4.2）；

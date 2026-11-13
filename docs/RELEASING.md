@@ -7,11 +7,11 @@
 
 > **版本占位**：下文 `<VER>` = 本次发布版本号（如 `v0.5.0`），`<VERNUM>` = 去掉 `v` 的版本号（如 `0.5.0`）。
 > 每次发布前先把 `<VER>` / `<VERNUM>` 替换为实值——占位未替换即发布是本 runbook 唯一的硬性失败模式。
-> 当前实例：`VER=v0.5.1` / `VERNUM=0.5.1`。
+> 当前实例：`VER=v0.5.2` / `VERNUM=0.5.2`。
 
 ## 1. 前置（全部满足才开工）
 - [ ] 本版功能与文档已合入 main（README 与 docs 反映本版能力；本机路径/会话 id 等敏感信息不入库）
-- [ ] `cd plugin && npm run typecheck && npm test` 全绿（上一版基线不回退：v0.5.1 的基线 = 48 文件 / 758 例）
+- [ ] `cd plugin && npm run typecheck && npm test` 全绿（上一版基线不回退：v0.5.2 的基线 = 53 文件 / 824 例）
 - [ ] `docs/RELEASE-RECON.md` 已提交；README 走查通过（DESIGN-V0.4 §4.5 检查单）
 
 ## 2. 版本冻结（唯一写入窗口）

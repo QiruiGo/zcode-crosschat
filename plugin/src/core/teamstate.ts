@@ -15,8 +15,10 @@
  */
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
 import { writeFileAtomic } from './atomic.js';
-import { inboxDir, snapshotFile, teamBackupFile, teamCorruptFile, teamDir, teamFile } from './paths.js';
+import { inboxDir, inboxFile, snapshotFile, teamBackupFile, teamCorruptFile, teamDir, teamFile } from './paths.js';
+import { sanitizeKey } from './sanitize.js';
 import {
   OPEN_TASK_STATUSES,
   TASK_TRANSITIONS,
@@ -49,6 +51,117 @@ function parseTeamText(raw: string, teamId: string): { state?: TeamState; defect
   const parsed = coerceTeamState(value, teamId);
   if (!parsed.ok) return { defect: parsed.defect };
   return { state: parsed.state };
+}
+
+// ---------------------------------------------------------------------------
+// v0.5.2（故障注-1 二番战修复）：备份恢复的进程内披露台账 + 回滚矛盾探测。
+//
+// 陈旧 .bak 自愈会把已 completed 的任务静默退回 pending（可被重新认领重复执行），
+// 而恢复事件此前只落 engine.jsonl，工具面零提示。两层披露：
+// 1. 恢复时刻：本台账记录最近一次备份恢复（writeTeam 成功落盘即清除——真源已被
+//    重写治好），`lastTeamRecoveryNotice`/`teamRecoveryWarning` 供工具面披露。
+// 2. 持续矛盾：回退后的任务板与邮箱里已发出的 completed 回执矛盾
+//    （`completedReceiptTaskIds` 纯探测），只要矛盾存在（含 server 重启后）就
+//    可被 xc_status / xc_claim 检出，不依赖台账内存。
+// 回执链只用于**检测与披露**，不改写任务状态（回执内容是协作消息，不能当真源
+// 写回——伪造回执不得变成伪造完成态）。
+// ---------------------------------------------------------------------------
+
+/** 一次备份恢复的披露记录（进程内；writeTeam 落盘成功即清除）。 */
+export interface TeamRecoveryNotice {
+  teamId: string;
+  /** 主文件缺陷描述。 */
+  defect: string;
+  /** 自愈使用的备份文件路径。 */
+  backup: string;
+  at: number;
+  /**
+   * 回滚矛盾探测：恢复态里非终态（pending/claimed/in_progress）但成员邮箱已持有
+   * 其 completed 回执的任务 id。非空 = 这次恢复把已完成工作退回了未完成态。
+   */
+  rolledBackTaskIds: string[];
+}
+
+const recoveryNotices = new Map<string, TeamRecoveryNotice>();
+
+function recoveryNoticeKey(stateRoot: string, teamId: string): string {
+  return `${resolve(stateRoot)}\u0000${teamId}`;
+}
+
+/** 最近一次备份恢复记录（undefined = 无未治好的恢复残留）。 */
+export function lastTeamRecoveryNotice(stateRoot: string, teamId: string): TeamRecoveryNotice | undefined {
+  return recoveryNotices.get(recoveryNoticeKey(stateRoot, teamId));
+}
+
+/**
+ * v0.5.2（故障注-1 修复）：备份恢复的工具面告警行（undefined = 无）。
+ * 有回滚矛盾时明示「已完成工作被退回」，无矛盾时仅提示验证任务板。
+ */
+export function teamRecoveryWarning(stateRoot: string, teamId: string): string | undefined {
+  const notice = lastTeamRecoveryNotice(stateRoot, teamId);
+  if (notice === undefined) return undefined;
+  if (notice.rolledBackTaskIds.length > 0) {
+    return (
+      `WARNING team state was recovered from backup (${notice.defect}) and that backup appears STALE: `
+      + `task(s) ${notice.rolledBackTaskIds.join(", ")} have completed receipt(s) on file (already delivered to `
+      + `the dispatcher) but came back as unfinished — completed work was rolled back. `
+      + `xc_claim on those tasks is refused until the state is re-persisted (any dispatch/claim write heals team.json).`
+    );
+  }
+  return (
+    `WARNING team state was recovered from the last-known-good backup (${notice.defect}); `
+    + 'verify the task board matches what members actually did.'
+  );
+}
+
+/**
+ * v0.5.2（故障注-1 修复）：回滚矛盾探测——哪些任务在恢复态里非终态，但成员邮箱
+ * 已持有其 completed 回执（sourceTaskId + sourceTaskStatus=completed 的信封）。
+ *
+ * 本地直读邮箱 JSONL（容错：坏行跳过），**不 import mailbox.ts**（那边 import
+ * 本模块，反向依赖会成环）。回执只需 from/to/字段形状判断，够用。
+ */
+async function completedReceiptTaskIds(
+  stateRoot: string,
+  teamId: string,
+  memberKeys: readonly string[],
+  tasks: readonly Task[],
+): Promise<string[]> {
+  const open = new Set(
+    tasks
+      .filter((task) => !TERMINAL_TASK_STATUSES.includes(task.status))
+      .map((task) => task.id),
+  );
+  if (open.size === 0) return [];
+  const found: string[] = [];
+  for (const key of memberKeys) {
+    let raw: string;
+    try {
+      raw = await readFile(inboxFile(stateRoot, teamId, sanitizeKey(key)), 'utf8');
+    } catch {
+      continue; // 无邮箱/读失败 → 该成员无可回执证据
+    }
+    for (const line of raw.split('\n')) {
+      const trimmed = line.trim();
+      if (trimmed === '') continue;
+      let value: unknown;
+      try {
+        value = JSON.parse(trimmed);
+      } catch {
+        continue;
+      }
+      if (typeof value !== 'object' || value === null) continue;
+      const record = value as Record<string, unknown>;
+      const sourceTaskId = record['sourceTaskId'];
+      if (typeof sourceTaskId === 'string'
+        && record['sourceTaskStatus'] === 'completed'
+        && open.has(sourceTaskId)
+        && !found.includes(sourceTaskId)) {
+        found.push(sourceTaskId);
+      }
+    }
+  }
+  return found;
 }
 
 /**
@@ -97,11 +210,31 @@ export async function readTeam(stateRoot: string, teamId: string): Promise<TeamS
     const backup = parseTeamText(backupRaw, teamId);
     if (backup.state !== undefined) {
       await preserveCorruptTeamFile(stateRoot, teamId, raw);
+      // v0.5.2（故障注-1 二番战修复）：恢复态与邮箱回执链对账——已完成任务的
+      // completed 回执已在派发方邮箱落盘，而恢复态把任务退回未完成 = 静默状态
+      // 回归。记录进披露台账（工具面经 teamRecoveryWarning 披露），审计附回滚
+      // 明细；台账由下一次 writeTeam（任意变更工具落盘治好真源）清除。
+      const rolledBackTaskIds = await completedReceiptTaskIds(
+        stateRoot,
+        teamId,
+        backup.state.members.map((member) => member.key),
+        backup.state.tasks,
+      );
+      recoveryNotices.set(recoveryNoticeKey(stateRoot, teamId), {
+        teamId,
+        defect: primary.defect ?? 'unparseable',
+        backup: backupPath,
+        at: Date.now(),
+        rolledBackTaskIds,
+      });
       await logEngineEvent(stateRoot, {
         event: 'team-state-recovered',
         teamId,
         defect: primary.defect,
         backup: backupPath,
+        ...(rolledBackTaskIds.length > 0
+          ? { rolledBackTaskIds, rollbackConflict: true }
+          : {}),
       });
       return backup.state;
     }
@@ -128,6 +261,9 @@ export async function writeTeam(stateRoot: string, team: TeamState): Promise<voi
   await mkdir(inboxDir(stateRoot, team.teamId), { recursive: true });
   const content = JSON.stringify(team, null, 2);
   await writeFileAtomic(teamFile(stateRoot, team.teamId), content);
+  // v0.5.2（故障注-1 二番战修复）：真源成功落盘 = 备份恢复残留已被治好，
+  // 清除该团队的恢复披露台账（xc_status 的恢复告警随之消失）。
+  recoveryNotices.delete(recoveryNoticeKey(stateRoot, team.teamId));
   try {
     await writeFileAtomic(teamBackupFile(stateRoot, team.teamId), content);
   } catch (error) {

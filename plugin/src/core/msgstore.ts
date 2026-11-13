@@ -27,11 +27,18 @@ export interface StoredMessage {
   origin?: 'user' | 'agent';
   originSessionId?: string;
   hopChain?: string[];
+  /**
+   * v0.5.2（二番战 SEC-5 修复）：接收方会话 id（store 落盘点 = 接收入队，即收方）。
+   * store 目录机器全局（peers/messages/），msgId alone 不证明「本会话收到过」——
+   * forwardOf 所有权校验依赖本字段；v0.5.2 之前的旧记录缺字段（见
+   * {@link resolvePeerMessage} 的 requireOwnership 兜底语义）。
+   */
+  toSessionId?: string;
 }
 
 /** store 的输入 = PeerQueueItem 的超集切片（msgId/text 必填，元数据可选）。 */
 export type StoreInput = Pick<StoredMessage, 'msgId' | 'text'> &
-  Partial<Pick<StoredMessage, 'from' | 'fromSessionId' | 'origin' | 'originSessionId' | 'hopChain'>>;
+  Partial<Pick<StoredMessage, 'from' | 'fromSessionId' | 'origin' | 'originSessionId' | 'hopChain' | 'toSessionId'>>;
 
 export function sha256Of(text: string): string {
   return createHash('sha256').update(text, 'utf8').digest('hex');
@@ -53,6 +60,7 @@ export async function storePeerMessageFull(
     ...(item.origin !== undefined ? { origin: item.origin } : {}),
     ...(item.originSessionId !== undefined ? { originSessionId: item.originSessionId } : {}),
     ...(item.hopChain !== undefined ? { hopChain: item.hopChain } : {}),
+    ...(item.toSessionId !== undefined ? { toSessionId: item.toSessionId } : {}),
   };
   const { mkdir } = await import('node:fs/promises');
   await mkdir(dirname(file), { recursive: true });
@@ -102,15 +110,37 @@ export interface ResolvedPeerMessage {
   hopChain?: string[];
 }
 
+/** {@link resolvePeerMessage} 的可选项。 */
+export interface ResolvePeerMessageOptions {
+  /**
+   * v0.5.2（二番战 SEC-5 修复）：所有权硬校验（forwardOf 用）。
+   * store 分支只在「store 记录的 toSessionId === 本会话」时返回；旧记录（v0.5.2
+   * 之前落盘，无 toSessionId）不可证明归属 → 不返回（fail-closed）。held/queue/
+   * inbox 分支按 sessionId 作用域定位，归属天然成立，不受影响。
+   * xc_peer_read 不带本选项（只读、msgId 为不可枚举 UUID，维持旧宽容口径）。
+   */
+  requireOwnership?: boolean;
+}
+
 /**
  * 解析一条本会话可引用的消息（forwardOf 与 xc_peer_read 的查找序，R-22）：
  * messages store（入队即落，主路径）→ held 隔离区 → queue → inbox（后三者兜底，尾部 2048 行）。
  */
 export async function resolvePeerMessage(
   root: string, sessionId: string, msgId: string,
+  options: ResolvePeerMessageOptions = {},
 ): Promise<ResolvedPeerMessage | undefined> {
   const stored = await readStored(root, msgId);
-  if (stored !== undefined) return toResolved(stored);       // P2 修复：store 分支回传完整元组
+  if (stored !== undefined) {       // P2 修复：store 分支回传完整元组
+    // v0.5.2（SEC-5）：store 目录机器全局——msgId 存在 ≠ 本会话收到过。收方落盘时
+    // 带收方 sessionId；非本会话的记录（或无法证明归属的旧记录）按未找到处理。
+    const owned = stored.toSessionId === sessionId;
+    if (owned || (!options.requireOwnership && stored.toSessionId === undefined)) {
+      return toResolved(stored);
+    }
+    // 归属不符 / requireOwnership 且旧记录无字段：继续查会话作用域文件（本会话
+    // 的 queue/inbox/held 里若真有，照样可用——不因 store 缺归属而误伤）。
+  }
   const { readdir, readFile: rf } = await import('node:fs/promises');
   try {
     for (const name of await readdir(peerHeldDir(root, sessionId))) {

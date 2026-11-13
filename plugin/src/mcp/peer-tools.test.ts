@@ -11,7 +11,10 @@
  * - 各工具的结果信封形状（人可读摘要行 + 机器 JSON）与错误映射；
  * - 回执六态原样透传；发送失败时带 `errorClass`（R-32）。
  */
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { z } from "zod";
 import {
   PeerInboxShape,
@@ -66,7 +69,16 @@ class FakeServer {
   }
 }
 
-const deps: ToolDeps = { stateRoot: "<stateRoot>", workspace: "<workspace>", env: {} };
+// v0.5.2（故障注-3 配套）：stateRoot 必须是**真实可写**目录。FI-3 起工具面会把
+// 「审计不可写」的内联告警追加为末尾 text 块——假路径（"<stateRoot>"）让每次
+// 审计写都失败，降级台账被点亮后所有工具结果都多一块 WARNING，面 B 的
+// 「无消息时逐字节相同（content.length===2）」等既有断言全部被污染。
+// 真实目录 → 审计写成功（健康路径，零结构变化），断言回到原语义。
+const testStateRoot = mkdtempSync(join(tmpdir(), "xc-peer-tools-test-"));
+afterAll(() => {
+  rmSync(testStateRoot, { recursive: true, force: true });
+});
+const deps: ToolDeps = { stateRoot: testStateRoot, workspace: "<workspace>", env: {} };
 
 function row(overrides: Partial<PeerRow> = {}): PeerRow {
   return {

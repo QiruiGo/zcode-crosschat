@@ -21,6 +21,8 @@ import { readFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { writeFileAtomic, stripLeadingBom } from './atomic.js';
 import { peerUservoiceFile } from './peerdir.js';
+import { readSession } from './registry.js';
+import { scanPeers } from './peerregistry.js';
 
 /** 单条原话上限（R-12：钩子记录不是消息本体）。 */
 export const USERVOICE_TEXT_MAX_CHARS = 64 * 1024;
@@ -125,4 +127,51 @@ export async function uservoiceMatchAndConsume(
   await writeFileAtomic(peerUservoiceFile(root, sessionId),
     `${JSON.stringify({ ...record, prompts }, null, 2)}\n`);
   return { hit: true, uses: matched.uses + 1 };
+}
+
+// ---------------------------------------------------------------------------
+// v0.5.2（二番战 SEC-1）：origin=user 盖章权的活性/锚定双重验证
+// ---------------------------------------------------------------------------
+
+/** 盖章权验证结论。 */
+export type StampAuthorityVerdict =
+  | { ok: true }
+  | { ok: false; reason: 'unanchored' | 'session-id-held-elsewhere' };
+
+/**
+ * origin=user 盖章前的会话归属核验（工具层在 {@link uservoiceMatchAndConsume}
+ * 之前调用；peer 轴与队内轴共用）。
+ *
+ * 背景（红队二番战 SEC-1，rtsec C2）：xc_peer_register 此前不校验 sessionId 归属，
+ * 攻击者纯 API 冒充受害者 sid → uservoiceMatchAndConsume 读到**受害者**的
+ * uservoice 记录 → 偷取 origin=user 权威标记。注册层的归属硬校验（peer-tools 的
+ * `session_id_in_use` 闸）堵住活体冒充的主路径；本函数是盖章面的第二道闸，两条
+ * 拒绝线（任一命中即拒绝）：
+ *
+ * 1. `session-id-held-elsewhere`：机器全局注册表里该 sid 被一个**别的活进程**持有
+ *    ——真实归属者正在活动，本进程不可能是它（覆盖旧版本遗留/直写注册表的冒充态）；
+ * 2. `unanchored`：本会话的工作区没有钩子锚定的会话记录
+ *    （`.crosschat/registry/sessions/<sid>.json`——SessionStart/refreshSessionLastSeen
+ *    对每个真会话都写）。跨工作区偷 sid 时，受害者的锚定记录在**受害者**的工作区，
+ *    攻击者工作区没有 → 拒绝。注意不能把「peers/base/<sid>.json 存在」当作锚：
+ *    该文件机器全局，偷来的 sid 同样查得到（非判别信号）；也不能把「本进程注册过
+ *    该 sid」当作锚——那正是冒充者自己造的状态。
+ *
+ * 残余边界（如实声明）：受害者已死亡且与攻击者同工作区时，锚定记录仍在、注册表
+ * 记录已被清扫 → 无法区分「复活的本人」与「小偷」——与 README 已知限制 12 的
+ * 威胁模型边界一致（不做密码学防御）。
+ */
+export async function verifyUservoiceStampAuthority(
+  root: string,
+  stateRoot: string,
+  sessionId: string,
+): Promise<StampAuthorityVerdict> {
+  const scanned = await scanPeers(root);
+  const holder = scanned.active.find((record) => record.sessionId === sessionId);
+  if (holder !== undefined && holder.pid !== process.pid) {
+    return { ok: false, reason: 'session-id-held-elsewhere' };
+  }
+  const anchored = await readSession(stateRoot, sessionId).catch(() => undefined);
+  if (anchored !== undefined) return { ok: true };
+  return { ok: false, reason: 'unanchored' };
 }

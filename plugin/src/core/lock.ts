@@ -16,6 +16,10 @@
  *    the lock file is older than LOCK_STALE_MS (120 s). The random `token`
  *    guards release: we only ever unlink the exact file we created (the design
  *    sketches `{pid, ts}`; the token is a safety addition, documented here).
+ *    v0.5.2 (并发与-2): a Windows sharing conflict on the lock-file open
+ *    (EPERM/EBUSY) is retried with a short backoff and then waits out like
+ *    ordinary contention (busy at the deadline, never a raw `internal`), with
+ *    a `lock-open-conflict` audit line — see LOCK_OPEN_CONFLICT_RETRIES.
  * 3. Global lock order: registry -> team. The only path that ever holds both
  *    is xc_register (bind name, then join team, rollback on failure, §2.7-3).
  *    No path may acquire team before registry (deadlock rule I8).
@@ -23,7 +27,7 @@
  * @module core/lock
  */
 import { closeSync, openSync, unlinkSync, writeSync } from 'node:fs';
-import { mkdir, readFile, stat, unlink } from 'node:fs/promises';
+import { mkdir, readFile, rmdir, rm, stat, unlink } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { lockFile, locksDir, registryLockNames, teamLockNames } from './paths.js';
 import { logEngineEvent } from './log.js';
@@ -82,6 +86,27 @@ export const LOCK_BACKOFF_MAX_MS = 500;
  * 从「每次 15s busy 永久饥饿」变为约 1 个宽限期后自愈。
  */
 export const UNPARSEABLE_LOCK_GRACE_MS = 1_000;
+
+/**
+ * v0.5.2（并发与-2 修复；边界与-R2-1 同根因顺带加固）：锁文件 openSync('wx')
+ * 的 Windows 共享冲突重试。锁文件已被某进程以不兼容的共享模式打开（持锁者
+ * 自己的 fd、实时杀软/索引器扫该目录）时，CreateFile 先判共享侵犯再判重名，
+ * openSync 抛 EPERM/EBUSY——红队二番战团队锁实测 7/4828 次 verbatim
+ * `EPERM: operation not permitted, open '…locks/team-<hash>-default.lock'`。
+ * 原实现直接抛出 → 工具层包成 `internal`、该次变更未落盘且审计零记录。
+ * 按 atomic.ts 的 Windows 临时冲突同型处理：短退避重试；仍冲突则与「锁被占」
+ * 同路继续退避等待（LOCK_WAIT_MS 后 busy，绝不 internal），按最终结局落审计
+ * `lock-open-conflict`。
+ */
+export const LOCK_OPEN_CONFLICT_RETRIES = 3;
+/** 短退避步长：第 n 次重试前睡 n×该值（总窗口 75ms，远小于 LOCK_WAIT_MS）。 */
+export const LOCK_OPEN_CONFLICT_RETRY_DELAY_MS = 25;
+/**
+ * 视为「可重试的打开共享冲突」的 errno：EPERM 是 Windows 共享侵犯在 Node fs
+ * 的典型形态（红队 verbatim 实测）；EBUSY 为同类资源占用。EACCES 等真实权限
+ * 错误不在内——保持原样抛出，不把配置错误洗成可重试冲突。
+ */
+const RETRYABLE_LOCK_OPEN_CODES = new Set(['EPERM', 'EBUSY']);
 
 /** Structured busy error: `toStructured()` is what the tool layer returns. */
 export class LockBusyError extends Error {
@@ -168,6 +193,62 @@ function tryCreateLockFile(path: string): string | undefined {
   return content.token;
 }
 
+type LockOpenOutcome =
+  | { status: 'created'; token: string }
+  /** EEXIST：锁已存在，交回主循环判陈旧/竞争。 */
+  | { status: 'held' }
+  /** EPERM/EBUSY 共享冲突重试后仍拿不到（v0.5.2 并发与-2）。 */
+  | { status: 'conflict'; code: string };
+
+/**
+ * tryCreateLockFile 的共享冲突重试版（v0.5.2，并发与-2 / 边界与-R2-1）：
+ * EEXIST → 'held'（正常竞争）；EPERM/EBUSY → 短退避重试
+ * LOCK_OPEN_CONFLICT_RETRIES 次，仍冲突 → 'conflict'（由主循环按「锁被占」
+ * 同路等待，最终 busy，绝不抛成 internal）；其余 errno 原样抛出（行为不变）。
+ */
+async function createLockFileWithRetry(path: string): Promise<LockOpenOutcome> {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      const token = tryCreateLockFile(path);
+      return token === undefined ? { status: 'held' } : { status: 'created', token };
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === undefined || !RETRYABLE_LOCK_OPEN_CODES.has(code)) throw error;
+      if (attempt >= LOCK_OPEN_CONFLICT_RETRIES) return { status: 'conflict', code };
+      await sleep(LOCK_OPEN_CONFLICT_RETRY_DELAY_MS * attempt);
+    }
+  }
+}
+
+/**
+ * v0.5.2（故障注-2 修复）：安全移除占位于锁路径的目录。
+ *
+ * 先 rmdir——只删**空**目录；若这其间锁位已被别的进程换成合法锁文件，rmdir 会
+ * ENOTDIR/ENOENT 失败，绝不误删一个活锁。仅当目录非空（ENOTEMPTY）才递归删：
+ * `locks/` 下的目录没有任何合法形态（锁文件恒为常规文件），非空残留同样是损坏。
+ *
+ * @returns 'removed'（本次移除成功）/ 'gone'（已被别人清走）/ 'failed'（仍占位，
+ *          调用方继续退避重试，最终 busy——不把移除失败洗成假成功）。
+ */
+async function removeDirAtLockPath(path: string): Promise<'removed' | 'gone' | 'failed'> {
+  try {
+    await rmdir(path);
+    return 'removed';
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    // 已被别的进程治好（ENOENT）或锁位已是文件（ENOTDIR）：无需再动。
+    if (code === 'ENOENT') return 'gone';
+    if (code !== 'ENOTEMPTY' && code !== 'EEXIST') return 'failed';
+  }
+  try {
+    await rm(path, { recursive: true, force: true });
+    return 'removed';
+  } catch {
+    // Lost the removal race -> loop and retry normally.
+    return 'failed';
+  }
+}
+
 /**
  * Acquire one cross-process lock, retrying with exponential backoff within
  * `waitMs`. Stale locks (owner pid dead, or file older than `staleMs`) are
@@ -181,9 +262,28 @@ export async function acquireFileLock(stateRoot: string, name: string, options: 
   const path = lockFile(stateRoot, name);
   const deadline = Date.now() + waitMs;
   let backoff = LOCK_BACKOFF_START_MS;
+  // v0.5.2（并发与-2）：重试后仍持续的打开共享冲突，按最终结局记一行审计
+  // （红队观测该失败 engine.jsonl 零记录）。一次获取最多一行。
+  let openConflictCode: string | undefined;
   for (;;) {
-    const token = tryCreateLockFile(path);
-    if (token !== undefined) {
+    // v0.5.2（故障注-2 修复）：个别平台（Linux）把「锁路径是目录」暴露为 open 的
+    // EISDIR 而非 EEXIST（Windows 实测是 EEXIST → 走下方 held 分支后由 readFile
+    // 的 EISDIR 捕获修复）。折成 'held'，让目录占位修复分支统一处理，不把磁盘
+    // 形态问题抛成 internal。
+    const open = await createLockFileWithRetry(path).catch((error: unknown) =>
+      (error as NodeJS.ErrnoException).code === 'EISDIR' ? { status: 'held' as const } : Promise.reject(error),
+    );
+    if (open.status === 'created') {
+      if (openConflictCode !== undefined) {
+        void logEngineEvent(stateRoot, {
+          event: 'lock-open-conflict',
+          lock: name,
+          code: openConflictCode,
+          retries: LOCK_OPEN_CONFLICT_RETRIES,
+          outcome: 'acquired',
+          note: 'windows sharing conflict on lock open; absorbed by retry/wait',
+        });
+      }
       return {
         name,
         release: async () => {
@@ -191,12 +291,15 @@ export async function acquireFileLock(stateRoot: string, name: string, options: 
           // was taken over meanwhile, the file on disk is somebody else's.
           try {
             const current = parseLockContent(await readFile(path, 'utf8'));
-            if (current?.token === token) await unlink(path);
+            if (current?.token === open.token) await unlink(path);
           } catch {
             // Missing file or unreadable content: nothing to clean up.
           }
         },
       };
+    }
+    if (open.status === 'conflict' && openConflictCode === undefined) {
+      openConflictCode = open.code;
     }
     // Held by someone: judge staleness from the current content.
     let holder: LockContent | undefined;
@@ -205,8 +308,31 @@ export async function acquireFileLock(stateRoot: string, name: string, options: 
       const raw = await readFile(path, 'utf8');
       holder = parseLockContent(raw);
       unparseable = holder === undefined; // 文件在但内容不可解析（0 字节/乱码/缺字段）
-    } catch {
-      holder = undefined; // vanished -> retry immediately
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        holder = undefined; // vanished -> retry immediately
+      } else {
+        // v0.5.2（故障注-2 修复）：读失败且不是消失——最常见是锁路径被目录占用
+        // （Windows readFile 目录 → EISDIR；红队二番战实测 openSync('wx') 对目录
+        // 返回 EEXIST 走进来、随后 readFile 抛 EISDIR）。旧代码把一切读失败当
+        // 「vanished」空转到 15s 超时：目录永不清除 → 全部变更类工具每次 15s→busy
+        // 的永久饥饿，人工删目录是唯一出路。目录不可能是合法锁文件（锁文件恒为
+        // tryCreateLockFile 新建的常规文件）：判定为残留，安全移除重建，审计
+        // `lock-repaired`，下一轮正常夺取。其余读失败（如 EPERM）维持原语义
+        // （重试到超时给 busy），不把权限问题洗成可删除残留。
+        const stats = await stat(path).then((s) => s, () => undefined);
+        if (stats !== undefined && stats.isDirectory()) {
+          const removal = await removeDirAtLockPath(path);
+          if (removal !== 'failed') {
+            void logEngineEvent(stateRoot, {
+              event: 'lock-repaired',
+              lock: name,
+              reason: 'lock-path-is-dir',
+            });
+          }
+        }
+        holder = undefined;
+      }
     }
     if (holder !== undefined) {
       const stale = !pidAlive(holder.pid) || Date.now() - holder.ts > staleMs;
@@ -229,12 +355,23 @@ export async function acquireFileLock(stateRoot: string, name: string, options: 
     } else if (unparseable) {
       // v0.5.1（故障注-6 修复）：不可解析残留锁的安全清除。此前此分支只会
       // 空转到 15s 超时且锁文件永不清除——崩溃写锁中断（半写/0 字节）或外部
-      // 损坏导致变更类操作永久饥饿。现在：超过宽限期仍不可解析即判定为无主
+      // 损坏导致变更类工具永久饥饿。现在：超过宽限期仍不可解析即判定为无主
       // 残留（无法提取 pid 证明活持有者），删除后下一轮 tryCreateLockFile 正常
       // 夺取；审计 `lock-repaired`。宽限期挡住「创建者 openSync 与 writeSync
       // 之间被打断」的瞬时 0 字节窗口，不误删刚被合法持有的锁。
-      const mtimeMs = await stat(path).then((s) => s.mtimeMs, () => Date.now());
-      if (Date.now() - mtimeMs > UNPARSEABLE_LOCK_GRACE_MS) {
+      // v0.5.2（故障注-2 修复，双保险）：个别平台 readFile 目录不抛错而是返回
+      // 空串（→ parseLockContent undefined 落进本分支）时，同样按目录占位处理。
+      const stats = await stat(path).then((s) => s, () => undefined);
+      if (stats !== undefined && stats.isDirectory()) {
+        const removal = await removeDirAtLockPath(path);
+        if (removal !== 'failed') {
+          void logEngineEvent(stateRoot, {
+            event: 'lock-repaired',
+            lock: name,
+            reason: 'lock-path-is-dir',
+          });
+        }
+      } else if (Date.now() - (stats?.mtimeMs ?? Date.now()) > UNPARSEABLE_LOCK_GRACE_MS) {
         try {
           unlinkSync(path);
           void logEngineEvent(stateRoot, {
@@ -247,7 +384,21 @@ export async function acquireFileLock(stateRoot: string, name: string, options: 
         }
       }
     }
-    if (Date.now() >= deadline) throw new LockBusyError(name);
+    if (Date.now() >= deadline) {
+      // v0.5.2（并发与-2）：共享冲突耗尽等待仍是结构化 busy（DEMO：15s 后
+      // busy，可重试），而非把 fs 错误抛成 internal；留审计行备查。
+      if (openConflictCode !== undefined) {
+        void logEngineEvent(stateRoot, {
+          event: 'lock-open-conflict',
+          lock: name,
+          code: openConflictCode,
+          retries: LOCK_OPEN_CONFLICT_RETRIES,
+          outcome: 'busy',
+          note: 'windows sharing conflict on lock open; gave up with busy',
+        });
+      }
+      throw new LockBusyError(name);
+    }
     await sleep(backoff);
     backoff = Math.min(backoff * 2, LOCK_BACKOFF_MAX_MS);
   }

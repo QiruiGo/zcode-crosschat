@@ -32,7 +32,7 @@
 import { randomUUID } from 'node:crypto';
 import { appendJsonl, readJsonl, rewriteJsonl, type MalformedLine } from './jsonl.js';
 import { sanitizeKey } from './sanitize.js';
-import { isRecord, isTeamMessage, normalizeMessage, type TeamMessage, type TeamState } from './types.js';
+import { isRecord, isTeamMessage, normalizeMessage, TERMINAL_TASK_STATUSES, type TeamMessage, type TeamState } from './types.js';
 import { logEngineEvent } from './log.js';
 import { withFileLock, withProcessLock } from './lock.js';
 import { inboxFile, teamLockNames } from './paths.js';
@@ -155,6 +155,32 @@ export function orphanTaskIds(team: TeamState, messages: readonly TeamMessage[])
     orphans.push(taskId);
   }
   return orphans;
+}
+
+/**
+ * v0.5.2（故障注-1 二番战修复）：任务板与回执链的矛盾检测（纯函数）。
+ * 邮箱里已有某任务的 **completed 回执**（sourceTaskStatus='completed' 的信封，
+ * xc_report 终态时写给派发方），而 team.tasks 里该任务仍是未完成态
+ * （pending/claimed/in_progress）= 真源被陈旧备份回滚/手工改坏——已完成工作
+ * 静默退回。与 orphanTaskIds 互补：孤儿检测管「任务不存在」，本函数管
+ * 「任务存在但状态倒退」。返回矛盾的任务 id 列表（去重、保序）。
+ * 合法路径不可能命中：终态无出边（TASK_TRANSITIONS），僵尸清扫回退附的是
+ * failed 回执而非 completed；completed 回执只能与「状态倒退」共存。
+ */
+export function staleCompletedReceiptTaskIds(team: TeamState, messages: readonly TeamMessage[]): string[] {
+  const open = new Set(
+    team.tasks
+      .filter((task) => !TERMINAL_TASK_STATUSES.includes(task.status))
+      .map((task) => task.id),
+  );
+  if (open.size === 0) return [];
+  const stale: string[] = [];
+  for (const message of messages) {
+    const taskId = message.sourceTaskId;
+    if (taskId === undefined || message.sourceTaskStatus !== 'completed') continue;
+    if (open.has(taskId) && !stale.includes(taskId)) stale.push(taskId);
+  }
+  return stale;
 }
 
 /** Default malformed-line sink: skip + audit-log (DESIGN.md §2.7-5). */

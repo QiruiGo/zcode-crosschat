@@ -597,3 +597,99 @@ W3/W7 环节的记录（§8.4）提到「若同事最终导出的名字与签名
 
 - **发布后匿名下载 `sha256sum -c` 复验与隔离安装冒测**（RELEASING §6 后半）：本机直连 github.com 下载通道按用户全局规则不保障，未执行匿名拉取；资产完整性由打包环节的 node crypto SHA256 + `.sha256` 随包发布保障，安装侧校验留给用户执行（README 第 1 步有指引）。
 - **真实宿主会话级验证**：同复验报告 §5.4，未执行（非本环节职责）。
+
+
+## 14. v0.5.2 修复集成收口环节记录（2026-11-14，v0.5.2 集成工程师）
+
+红队二番战（v0.5.1）21 项裁决（`deepseek-crosschat/evidence/adversarial/adjudication/adj051-round2.md`：19 confirmed + 1 unconfirmed + 1 合并）由五组修复员并行修复交付（22 文件修改 + 5 新增防回归测试文件）。本环节职责：跨组冲突检查、全量自测、v0.5.1 防回退抽验（18 项抽 6+4）、版本递增、README/DEMO 一致性核查、按物化规则刷新安装。集成中发现 1 项修复漏项（边界与-R2-5）按「小错直接修（留记录）」纪律补修（§14.6）。
+
+### 14.1 逐 bug 修复对照表（二番战裁决编号 ↔ 修复 ↔ 防回归单测）
+
+| # | 裁决 id | 定级 | 缺陷 | 修复（文件） | 防回归单测 |
+|---|---|---|---|---|---|
+| 1 | 边界与-R2-1 | P2 unconfirmed | 并发注册争抢 registry 锁泄漏 EPERM（未复现） | 顺带加固：`core/lock.ts` `createLockFileWithRetry` 对打开共享冲突（EPERM/EBUSY 等）指数退避重试吸收；registry 锁走同一 `acquireFileLock` 路径自动受益；重试耗尽仍结构化 busy（非 internal）+ `lock-open-conflict` 审计 | `core/lock-open-conflict.test.ts`（新文件）6 例：瞬态冲突重试后夺取、持续冲突→busy+审计、等待期冲突消散、非冲突错误不重试、registry 锁同路径保护 |
+| 2 | 边界与-R2-2 | P2 | peer 轴同 (name,sid) 重复注册非幂等（name_taken 硬拒） | `mcp/peer-tools.ts` `claimPeerName` 花名 claim 助手：占用者=本进程 ⇒ 幂等重认领（保留 formerNames；换名重注册旧名进 formerNames）；占用者=别的活会话 ⇒ 仍 name_taken | `mcp/peer-round2.test.ts`（新文件）：重认领成功、重认领后端点照常工作、活会话占用仍 name_taken（反向锁定）、formerNames 保留 |
+| 3 | 边界与-R2-3（含安全对-6 合并） | P3 | README 标注 xc_peer_review「免注册」实际 not_registered | 文档对齐行为：README 行改为「需先 xc_peer_register」+ DESIGN-V0.3 更正注记（审阅只操作本会话隔离区，免 sessionId 入参会让任意调用方读/放行他人隔离区） | `peer-round2.test.ts`：README 行文档锁 + not_registered 提示 + 注册后即可审阅 |
+| 4 | 边界与-R2-4 | P3 | peer 轴缺误用防护（保留名可注册可改名；自发自收 delivered） | `assertPeerNameNotReserved`（注册+改名同一道闸，RESERVED_MEMBER_KEYS 与队内轴同表同码 name_reserved）+ `cannot_send_self`（按 sessionId/pid 判定，formerNames 别名同拦） | `peer-round2.test.ts`：lead/default 注册拒绝、rename 同拒、自发三形态拒绝（当前名/accept 档/别名）、防过度拒绝（发别的活会话照常 delivered） |
+| 5 | 边界与-R2-5 | P3 | completed 证据路径无工作区遏制 | **五组交付漏项，集成环节补修（§14.6）**：`mcp/tools.ts` 证据门 resolve 后前缀比对遏制（Windows 大小写不敏感、分隔符边界防兄弟目录）→ `evidence_path_outside_workspace` | `mcp/evidence-gate.test.ts` +3 例：../ 穿越被拒且真源不动、绝对路径+兄弟前缀目录被拒、界内文件不受影响 |
+| 6 | 并发与-1 | P2 | xc_peer_rename 延迟随在线 peer 数线性恶化（N=6 超 60s） | 扇出改并行（Promise.all）：总耗时≈单次超时；单 peer 失败只写自己的 notified 行 | `peer-round2.test.ts`：N=6 慢回应 ≈单次延迟；单 peer 不可达不拖累他人 |
+| 7 | 并发与-2 | P2 | 高并发写 team 锁偶发 internal:EPERM | 同 #1（team 锁与 registry 锁同一 `acquireFileLock`），重试吸收 + 结构化 busy + 审计 | `lock-open-conflict.test.ts` 前 4 例（team 锁路径） |
+| 8 | 故障注-1 | P2 | 陈旧 .bak 回滚：已完成任务静默退回 pending 可重复执行 | 三层：`core/teamstate.ts` 恢复披露台账（writeTeam 落盘即清除）+ 回滚矛盾探测（恢复态 vs 邮箱 completed 回执）；`core/mailbox.ts` `staleCompletedReceiptTaskIds` 持续矛盾检测（磁盘态，重启后仍可检出）；`mcp/tools.ts` xc_status 强制披露 `staleCompletedReceipts`/`stateRecovery` + WARNING 行、xc_claim 对矛盾任务硬拒 `rollback_conflict`（回执链只做检测不改写状态——伪造回执不得变成伪造完成态） | `mcp/fault-injection-r2.test.ts`（新文件）FI-1 组：回滚矛盾披露 + claim 硬拒 + 恢复告警清除 + FI-1 根基回归（writeTeam 仍镜像 .bak） |
+| 9 | 故障注-2 | P3 | 锁路径被目录占用 → 15s→busy 永久饥饿 | `core/lock.ts`：EISDIR 折成 held；读失败非 ENOENT 时 stat 判目录 → `removeDirAtLockPath` 安全移除重建 + `lock-repaired` 审计（unparseable 分支同款双保险）；EPERM 维持重试语义不洗成可删残留 | `fault-injection-r2.test.ts` FI-2 组：目录占位自愈 + lock-repaired 审计 |
+| 10 | 故障注-3 | P3 | engine.jsonl 不可写审计静默全丢 | `core/log.ts` 进程内降级台账（首因错误+丢弃计数，写成功自动清除）；`mcp/tools.ts` runCore 与 `mcp/peer-tools.ts` call 末尾内联 `WARNING engine audit log is not writable`（健康时零开销零结构变化） | `fault-injection-r2.test.ts` FI-3 组：审计目录占位 → 工具响应内联告警 + 恢复自动消失 |
+| 11 | 故障注-4 | P3 | held 暂存件损坏静默跳过（审阅面「暂存区 0 条」假象） | `core/peerpolicy.ts` 枚举改 `scanHeldEntries` 透出 `corrupted[]`；`mcp/peer-tools.ts` PeerReviewResult 增 `corrupted` 字段 + `renderReviewSummary` 摘要行披露损坏计数 | `fault-injection-r2.test.ts` FI-4 组：损坏件计数披露 + 保持 fail-closed 不投递 |
+| 12 | 安全对-1 | P2 | 接受他人 sessionId 注册 → 冒充 + 偷 origin=user 盖章 | 两道闸：注册层 `session_id_in_use`（sid 被别的活进程持有即拒；本进程豁免幂等重注册；死记录不挡 --resume 续跑）+ 盖章层 `verifyUservoiceStampAuthority`（`core/uservoice.ts`：活性查持者 + 工作区锚定记录双验证，未锚定/被持有 → 拒绝盖章落 `uservoice-stamp-refused` 审计，消息照发 origin=agent fail-closed；队内轴 xc_message 同闸） | `mcp/peer-security-round2.test.ts`（新文件）：活体冒充拒绝、幂等重注册不误伤、死 sid 不挡续跑、盖章双闸两拒绝线、端到端冒充态偷盖章 → wire 无 origin + refused 审计、锚定会话正常盖章主路径护栏 |
+| 13 | 安全对-2 | P2 | sid 碰撞投递黑洞（delivered 回执 + 永不入队） | 同根因同闸（注册层 session_id_in_use 封碰撞源头）+ 发送层兜底：目标记录 sid==本会话 sid → `cannot_send_self` 显式失败不入队 | `peer-security-round2.test.ts`：注册层碰撞源封堵 + 发送层残留碰撞态显式失败 |
+| 14 | 安全对-3 | P3 | 死会话 peer 花名静默替换（无审计无留痕） | `claimPeerName` 死名接管留痕：审计 `peer-name-reclaimed` 带上任身份 + 新记录 `reclaimedFrom` 字段（`core/peerregistry.ts`/`core/peeraddr.ts`）→ `xc_peers` 行显示「接管自已离会会话」 | `peer-round2.test.ts`：注册接管留痕 + 改名接管留痕 + 无主花名不产生痕迹；一次扫描共享防接管证据被二次清扫的竞态 |
+| 15 | 安全对-4 | P3 | DEMO 承诺的三种伪造信封构造全部漏过（forged=false） | `core/peerenvelope.ts` 判定线前移：正文出现本域信封标签即 forged（闭对/全属性闭对/裸开标签/剥离残留全覆盖）；forged 载荷绕过幂等守卫重新包裹（防攻击者拷贝信封原样通过）；队内域维持原判定线（声明代价：合法回引也被标，fail-closed） | `core/peerenvelope.test.ts` SEC-4 组（三构造触发 + 剥离照做判定与剥离正交 + 已渲染载荷绕过守卫重包裹）+ `peer-security-round2.test.ts` 真管道端到端 forged=true |
+| 16 | 安全对-5 | P3 | forwardOf 只查全局存在性（他人消息可包装成「我转发」） | `core/msgstore.ts` store 记录增 `toSessionId`（收方落盘时带上）+ `resolvePeerMessage` 增 `requireOwnership`（forwardOf 用）：非本会话记录/旧版无字段记录 fail-closed 拒绝；xc_peer_read 不带此选项维持宽容口径 | `peer-security-round2.test.ts`：他人消息 forwardOf 被拒、本会话消息成功（R-13 保真）、旧记录 fail-closed + xc_peer_read 照常可读 |
+| 17 | 规模压-1 | P1 | xc_status 板面不按注入预算截断（700 任务 285K 直灌、预算未被查询） | `mcp/tools.ts` xc_status 板面窗口化（「人可读行+JSON 条目」联合成本、固定面先扣、history 面先花、保底一条）+ `boardTruncated`/`leadHistoryTruncated` 指针 + `xc_status({offset})` 分页，snapshot.json 落盘仍全量；配套 `mcp/peer-tools.ts` xc_peers 清单行窗口化（`rowsTruncated`）+ xc_agents peers 行窗口化（`peersTruncated`）；`mcp/render.ts` 导出 `statusTaskRowText`/`STATUS_TASK_TABLE_HEADER` 单一事实源 | `mcp/scale-round2.test.ts`（新文件）：小预算窗口前缀+指针+快照全量、声明预算改变输出（回归「XC_CONTEXT_CHARS=1000000 输出不变」）、装得下时 payload 与 v0.5.1 形状一致（行为兼容）、history 面窗口化 |
+| 18 | 规模压-2 | P1 | peer 入站队列深度 ~64/65 永久丢弃且未文档化 | `core/peermsg.ts` 默认 64→**1024** + `peerMaxQueueDepthFromEnv`（`XC_PEER_MAX_QUEUE_DEPTH` 可配，未设/非法回落默认）+ `admissionDropDetail` 丢弃原因可行动化（上限值+恢复动作）+ `xc_peer_send` 非送达终态摘要行如实改口「未投递」；plugin.json env 注入 + userConfig 新增 `peer_max_queue_depth`；README 已知限制 6a 文档化 | `scale-round2.test.ts`：深度 ≥64 不再 queue-full、env 可配+非法回落、detail 带上限值与恢复动作 |
+| 19 | 规模压-3 | P2 | xc_peer_inbox 超预算批次「消费即省略」 | `core/budget.ts` 导出 `cutInjectBlock`/`injectBlockCost`（窗口记账按 item 截断后成本）+ layoutInjectBlocks 首块保底硬切（绝不许降级成占位摘要）；`mcp/peer-tools.ts` inbox 改「窥视→预算窗口→只消费窗口内」；工具层窗口与排布同 budget 同源 | `scale-round2.test.ts`：20 条只消费窗口内、其余留队列、无「已省略」占位符、续拉对账 20/20；单条超预算保底一条 + xc_peer_read 指针 |
+| 20 | 规模压-4 | P2 | xc_peer_send 未文档化发送限速（30 条/10s） | 实现承诺（文档化）：README 已知限制 6b 声明 `PEER_RATE_LIMIT`/`PEER_RATE_WINDOW_MS` 值与恢复语义；peermsg.ts 常量注释对齐 | `scale-round2.test.ts`：常量值锁定（30/10000） |
+| — | （版本面） | — | plugin.json env 注入 `XC_PEER_MAX_QUEUE_DEPTH` + userConfig `peer_max_queue_depth`（0=内置 1024） | `plugin/.zcode-plugin/plugin.json` | README 配置表行同步 |
+
+### 14.2 跨组冲突检查（公共文件语义一致性，全量 diff 逐 hunk 实读）
+
+五组修复在 22 个文件上并行，交汇点逐一核对：
+
+- **`core/lock.ts`（并发加固组 × 自愈组）**：并发组（EPERM 打开冲突重试）与自愈组（锁路径目录占位修复）同函数交汇。核对结论：EISDIR 显式折成 `'held'` 统一进目录修复分支；EPERM/EBUSY 走重试不动目录逻辑；目录修复后下一轮正常夺取。两组语义正交且互补，`lock.test.ts` 既有 15 例 + 新 6 例全绿。
+- **`core/budget.ts`（规模组 × 全体注入面）**：`layoutInjectBlocks` 新增「首块保底硬切」改变三消费面（A 钩子 prompt-submit / B 工具间隙 peer-drain / C xc_peer_inbox）排布语义。核对结论：三面均「先消费后排布」（face A `drainPeerQueue` 先行、face B 收到的已是已排空 items、face C 窥视后只 drain 窗口内），硬切语义对三面一致；`xc_check_inbox`（队内消费面）不走 layoutInjectBlocks，不受影响（`injection-budget.test.ts` 全绿佐证）。
+- **`mcp/tools.ts` xc_status（规模组板面窗口化 × 自愈组恢复披露）**：核对顺序性——`writeSnapshot` 在窗口化**前**调用（snapshot.tasks 全量入盘，R-21 兑现）；payload/render 用 `windowedTasks`；`staleCompletedReceipts`/`stateRecovery` 全量计算不随窗口缩水；scale-round2 断言「snapshot.json 仍全量」锁定该顺序。
+- **`mcp/peer-tools.ts`（规模组 × peer 语义组 × 安全组 × 自愈组四组交汇）**：`storeAfterEnqueue` 签名变更（+toSessionId）两处落点（pipe 接受 / held 晋升）均更新；`admissionDropDetail`/`peerMaxQueueDepthFromEnv` 两入队闸调用点口径一致；`renderReviewSummary` 入参放宽 readonly 向后兼容；`call()` 审计告警追加在 face B 之前（结构不变）。
+- **import 环**：`uservoice.ts` 新增依赖 `registry.ts`（readSession）与 `peerregistry.ts`（scanPeers）——两者均不回导 uservoice，无环；`teamstate.ts` 回执探测刻意不 import mailbox.ts（反向会成环），本地直读邮箱 JSONL 并注释说明。
+- **`plugin.json`（规模组）**：env 注入 `XC_PEER_MAX_QUEUE_DEPTH` 与 userConfig 新增项同键名同语义，与 `peerMaxQueueDepthFromEnv` 未设/非法回落默认口径一致。
+
+### 14.3 全量自测（本环节亲跑，版本递增前后各跑一轮，结果一致）
+
+| # | 命令 | 结果 |
+|---|---|---|
+| 1 | `cd plugin && npm run typecheck` | **exit 0 零报错**（交付态、版本递增后、R2-5 补修后共三轮全绿） |
+| 2 | `cd plugin && npm test` | **53 文件 / 821 例全绿**（版本递增后复跑同结果；R2-5 补修后 53 文件 / **824 例**全绿，+3 例遏制用例）。基线核对：v0.5.1 = 48 文件 / 758 例 → 交付态 +5 新测试文件 / +63 例 = 821 → 遏制 +3 = 824，零删除 |
+| 3 | `ELECTRON_RUN_AS_NODE=1 <安装目录>/ZCode.exe <安装目录>/resources/<variant>/zcode.cjs plugins validate "D:/tools/zcode-crosschat/plugin"` | **`Plugin manifest is valid`**，exit 0 |
+| 4 | `cd plugin && npm run build` | `build ok`，5 产物齐；版本递增后 dist bundle 内 `"0.5.2"` 命中 1 处、`"0.5.1"` 0 处 |
+
+### 14.4 版本递增（五处 + RELEASING「当前实例」，RELEASING §2）
+
+`plugin/.zcode-plugin/plugin.json` / `marketplace.json` / `plugin/package.json` / `plugin/package-lock.json`（根 + packages[""] 两处）/ `plugin/src/mcp/server.ts SERVER_VERSION` 全部 **0.5.1 → 0.5.2**（grep 复核五处均 0.5.2、残留 `0.5.1` 命中均为历史注记；`docs/RELEASING.md` 当前实例同步 `VER=v0.5.2`，前置基线行更新为 53 文件/824 例）。任务书口径「版本三处」按 pack-release.mjs 五处断言（L72-76）扩到五处齐改，保持打包自断言绿色。
+
+### 14.5 v0.5.1 防回退抽验（reverify 18 项抽 6+4 项重放，本环节对最终 dist 实跑）
+
+重放车：`deepseek-crosschat/evidence/17-v051/reverify/_lib` 原样复制到 `deepseek-crosschat/evidence/18-v052/integration-replay/_lib`（仅改 RV 根路径，不覆写 v0.5.1 原始证据）；目标 = 仓库 `plugin/dist/mcp/server.mjs`（v0.5.2 构建）。抽验组合按任务书优先级（大帧/路径穿越/并发 busy/损坏自愈）+ 本轮改动高危面（budget.ts、lock.ts 被本轮修改，对应 17/13 项入选）：
+
+| 抽验项 | 重放脚本 | 结果 |
+|---|---|---|
+| 01 `xc_status.teamId` 路径穿越（BND-1） | `case-01-bnd1.mjs` | **PASS**：6 个穿越载荷全部 `invalid_params`，磁盘零逃逸产物（ESCAPED-ARTIFACTS: []） |
+| 06 大帧自退出（CONC-2） | `case-07-conc2.mjs` + 补 `case-07b2-raw-capture.mjs` | **PASS**：9/10/12/24MiB 全部 delivered（inboxB 9,437,316/19,923,208/32,506,252/57,672,208 与 v0.5.1 逐位一致，alive exit=null）；34MiB → 显式 JSON-RPC `-32700`（33554432-byte 上限文案）3.2s 返回、同连接 doctor 正常应答（自报 0.5.2）、stderr 0B |
+| 07 并发 endpoint busy（CONC-3） | `case-08-conc3.mjs` N=9/N=7 | **PASS**：45/45 delivered 0 busy（v0.5.0 是 13/45 busy）、35/35 delivered 0 busy；收方分页对账 45/45、35/35 |
+| 08 team.json 损坏自愈（FI-1） | `case-09-12-faultinj.mjs` #9 段 | **PASS**：.bak 存在 → 截断后 xc_status 正常（自愈）、dispatch 正常、team.json 恢复 1740B + 残损保全 665B + 审计 ×3；无备份变体显式诊断（文件路径+修复指引） |
+| 13 不可解析锁永久饥饿（FI-6） | `case-14-fi6.mjs` + `case-14b-fi6-livepid.mjs` | **PASS**：0 字节/乱码/空对象三变体 41~54ms 自愈 + `lock-repaired` 审计 ×4；**真活 PID 对照 15,199ms busy 被尊重、锁保留**（本轮 lock.ts 两组改动未破坏活锁语义）。注：case-14 内嵌 CONTROL 用 pid 999999999 在本机为死 pid（ESRCH）→ 42ms 清除属正确行为（死主锁应被清），活锁权威对照以 case-14b 为准 |
+| 17 批量消费无截断（SCALE-1'18） | `case-18-19-scale.mjs` #18 段 | **PASS**：pull1 消费 27/300、17,500 字符、batchTruncated=true、三处指针；排空 300/300（13 轮，maxRespChars 17,574）——budget.ts 本轮改动未回退 xc_check_inbox 窗口语义 |
+| 附带 | `case-09-12-faultinj.mjs` #10/#11/#12 段 | **PASS**：孤儿任务披露 + claim 拒 `orphan_task_reference`；inbox 坏行 `1 unreadable line(s) skipped` 披露；已读不重注入（pull2 count=0） |
+| 附带 | `case-19b-scale2-paginate.mjs`（#19 claim 600KB 截断） | **PASS**：claim 4,432 字符（v0.5.0: 600,234）、promptTruncated.sha256 与真源一致、分页拼回 **600,016/600,016 shaMatch=true**。注：复制的 `case-18-19-scale.mjs` #19 段自带 harness 缺陷（分页循环不推进 offset → assembled 640,000），与 v0.5.1 原始日志记录的同款偏差一致（`17-v051/reverify/logs/18-19-scale.jsonl` 即 `shaMatch:false`）；产品行为以修正版 case-19b 与自写探针 `probe-taskread-tail.mjs`（尾页 24,016 字符、hasMore=false、shaMatch=true）为准，xc_task_read 无回归 |
+
+**抽验结论：6+4 项全部通过，v0.5.1 修复零回退。** 其余 8 项未抽验项的防回归由单测层承载（既有相关测试全绿）。
+
+### 14.6 集成环节直接修（留记录）
+
+| # | 项 | 依据 | 处置 |
+|---|---|---|---|
+| 1 | **边界与-R2-5（P3）五组交付漏项**：completed 证据路径无工作区遏制——五组 22 文件 diff 中证据门零改动；本环节用探针 `probe-r2-5-containment.mjs` 对当前 dist 实测复现（`../outside-ev.txt` 与绝对路径均 completed 成功、现算 sha256 入库，与裁决记录一致） | 集成纪律「小错直接修（留记录）」（v0.5.1 §12.6 CONC-3 先例）；根因明确、改动面最小（证据门一处前缀比对） | `mcp/tools.ts` 证据门 resolve 后工作区前缀遏制（Windows 大小写不敏感、分隔符边界防兄弟目录绕过）→ 新错误码 `evidence_path_outside_workspace`（载荷附 workspace 路径）；工具描述同步；`evidence-gate.test.ts` +3 例（../ 穿越拒+真源不动 / 绝对路径+兄弟前缀拒 / 界内不受影响）；README xc_report 行与硬校验清单同步。补修后 typecheck 全绿 + 全量 824 例全绿 + 黑盒双腿复测均被拒（`evidence/18-v052/integration-replay/logs/probe-r2-5.jsonl`） |
+| 2 | 重放 harness 缺陷两处（不属产品）：`case-07b-conc2-raw.mjs` 摘除 client stdout 解析器后仍经 client 发 doctor → 必然 15s 超时崩溃（v0.5.1 复验文档只引用其原始捕获部分）；`case-18-19-scale.mjs` #19 分页循环不推进 offset（v0.5.1 原始日志即 shaMatch:false，文档数字出自修正版 case-19b） | 如实记录，防后续复验误读 | 补写 `case-07b2-raw-capture.mjs`（全原始流核对：拒收帧 + 同连接 doctor 均从同一采集器判读）与 `probe-taskread-tail.mjs`；产品侧以修正脚本结论为准 |
+| 3 | 修复期遗留疑点核查：监工日志 R6 记录的 `scale-replay-700.replay.test.ts`（00:41 落盘 3222B）最终交付态不存在——核查 `scale-round2.test.ts` 已含 SCALE-1 七百任务量级断言（板面窗口/预算/声明改变输出），重放覆盖未丢失，属修复组合并重构非覆盖丢失 | 监工快照 diff vs 交付态 | 无需处置（记录在案） |
+
+### 14.7 README 与 docs 一致性核查
+
+- **五组已更新的承诺面逐条与实现/单测对照**：README 工具行 xc_claim（rollback_conflict）/ xc_status（boardTruncated+offset+staleCompletedReceipts）/ xc_peers（rowsTruncated）/ xc_peer_send（非送达改口）/ xc_peer_inbox（窗口消费）/ xc_peer_review（需注册+corrupted 披露）/ xc_agents（peersTruncated）、防卡死段「快照/观测面同规」、已知限制 6a（队列上限 1024 可配）/ 6b（限速 30/10s 文档化）、DEMO busy 自愈与审计告警两行、DESIGN-V0.3 两处更正注记——与 §14.1 对照表逐一吻合，无承诺落空残留。
+- **集成补修同步**：README xc_report 行与硬校验清单句追加工作区遏制（`evidence_path_outside_workspace`，v0.5.2 起）；README 新增 v0.5.2 修复轮段（要点 + 未复现项加固 + 基线 53 文件/824 例）。
+- **peer-3 文档锁**：`peer-round2.test.ts` 内含 README 行回归锁（xc_peer_review 行不再标注「免注册」），文档-行为漂移被单测钉住。
+
+### 14.8 物化刷新（按 IMPLEMENTATION §9.3 物化规则，本环节实跑）
+
+`plugins marketplace update dev-zcode-crosschat`（快照刷新 → `Updated marketplace dev-zcode-crosschat (1 plugins)`；注：marketplace 管理挂在 `plugins marketplace …` 子命令下，裸 `marketplace update` 在 zcode 0.17.1 CLI 未识别回落 TUI 帮助）→ `plugins install zcode-crosschat@dev-zcode-crosschat` → **`Installed plugin zcode-crosschat@dev-zcode-crosschat (0.5.2) [enabled]`**（版本变化触发重新物化）→ `plugins list` 缓存路径 `…/cache/dev-zcode-crosschat/zcode-crosschat/0.5.2`（skills:1 commands:1 hooks:3 mcp:1）→ md5 比对：仓库 dist 5 产物（server.mjs `832ee8ab…` / wake-helper.mjs / hooks 3 件）与安装态**逐一相同**；缓存 `.zcode-plugin/plugin.json` version = **0.5.2**。未执行 `plugins uninstall`（v0.2 §2.4 事故先例：`--force` 清空 plugins.options 丢失 zcode_exe/zcode_cjs）。旧 0.5.1 缓存目录保留未动（多版本共存，宿主按安装版本取用）。
+
+### 14.9 本环节未执行项（如实声明）
+
+- **红队二番战 19 项的端到端黑盒逐项复验未执行**（属复验环节职责，evidence/18-v052/reverify/ 监视区；本环节交付 = 跨组冲突检查 + 全量单测层自测 + v0.5.1 抽验 6+4 + R2-5 漏项补修 + 版本冻结 + README 核查 + 物化刷新）。
+- **发布环节未执行**（RELEASING §3-§6：pack-release、commit/tag/push、gh release；版本五处已对齐其断言口径）。
+- **安全对-1 残余边界**：受害者已死亡且与攻击者同工作区时锚定记录仍在，无法区分「复活的本人」与「小偷」——与 README 已知限制 12 威胁模型一致，修复组已如实声明，本环节未扩大。

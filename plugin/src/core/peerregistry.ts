@@ -84,6 +84,8 @@ export interface PeerRecord {
   name?: string;
   /** Display name (may contain CJK; never used for addressing). */
   displayName?: string;
+  /** v0.5.2（peer-5 修复）：接管过来的前任身份（本花名此前属于一个已离会的会话）。 */
+  reclaimedFrom?: PeerReclaimedFrom;
   /** Released names (rename history), FIFO cap 32. */
   formerNames: { name: string; releasedAt: number }[];
   /** Team member sessions record their lead's session id. */
@@ -120,6 +122,25 @@ export interface PeerRecord {
 
 /** Why a record was classified dead. */
 export type PeerDeadReason = 'pid-dead' | 'lastSeen-stale';
+
+/**
+ * v0.5.2（二番战 peer-5 修复）：接管过来的前任身份。
+ *
+ * 死会话（pid 亡 / lastSeen 陈旧）占用的花名被新会话 reclaim 时，惰性清扫已经
+ * 摘除了死记录——若不在这里留痕，「活人顶替死花名」在观测面上完全静默：没有
+ * 审计事件，`xc_peers` 里也看不出这个地址换过人（旧名不会进任何 formerNames，
+ * 因为那条记录已经不存在）。optional 字段，旧版本读取时按缺省处理。
+ */
+export interface PeerReclaimedFrom {
+  /** 前任会话的 sessionId（稳定身份；ref 取其后 8 位）。 */
+  sessionId: string;
+  /** 前任记录的 pid（注册表文件名即 pid）。 */
+  pid: number;
+  /** 接管时刻（epoch ms）。 */
+  releasedAt: number;
+  /** 前任被判死的原因（pid-dead / lastSeen-stale）。 */
+  deadReason?: PeerDeadReason;
+}
 
 /** One scan result row. */
 export interface PeerScanRow {

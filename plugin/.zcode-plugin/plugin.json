@@ -1,6 +1,6 @@
 {
   "name": "zcode-crosschat",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "Agent-team collaboration for independent ZCode sessions: a lead coordinates engine-provisioned teammate sessions, members self-start via prompt protocol, and a file mailbox remains the source of truth. v0.3 adds the cross-session peer axis: a machine-global peer registry, named-pipe transport, name-as-address addressing, and accept/hold/refuse inbound policy. v0.5 makes the lead a transferable metadata role, keeps user-spoken text verifiable end to end (origin=user), and bounds every injection surface by the receiver's declared context budget.",
   "description_i18n": {
     "en": "Lead-teammate collaboration across independent ZCode sessions plus a cross-session peer axis: machine-global peer registry, named-pipe transport, name-as-address addressing, accept/hold/refuse inbound policy, and structured attribution envelopes on every inbound peer message. v0.5: the lead is a transferable metadata role, user-spoken text stays verifiable end to end (origin=user), and every injection surface is bounded by the receiver's declared context budget.",
@@ -35,6 +35,7 @@
         "XC_PEER_RECEIVE": "${user_config.peer_receive}",
         "XC_HOLD_TTL_MS": "${user_config.hold_ttl_ms}",
         "XC_MESSAGING_DIR": "${user_config.messaging_dir}",
+        "XC_PEER_MAX_QUEUE_DEPTH": "${user_config.peer_max_queue_depth}",
         "XC_CONTEXT_CHARS": "${user_config.context_chars}",
         "XC_INJECT_ITEM_CHARS": "${user_config.inject_item_chars}",
         "XC_INJECT_TOTAL_CHARS": "${user_config.inject_total_chars}",
@@ -126,6 +127,12 @@
       "default": "",
       "title": "peer 注册表目录（留空=插件数据目录）",
       "description": "机器全局的跨会话 peer 注册表根目录。留空时用插件数据目录（ZCODE_PLUGIN_DATA/peers）；填绝对路径可改到别处（例如做隔离演示）。"
+    },
+    "peer_max_queue_depth": {
+      "type": "number",
+      "default": 0,
+      "title": "peer 待投递队列上限（0=内置 1024）",
+      "description": "单个会话的跨会话（peer）待投递队列深度上限（经环境变量 XC_PEER_MAX_QUEUE_DEPTH 注入，v0.5.2 起；此前固定 64）。超限的入站消息被丢弃并给发送方 dropped 回执（附原因与恢复动作）。0 或留空 = 内置默认 1024；调大可容纳更长 fan-in 突发，调小可提早暴露消费不足。"
     },
     "context_chars": {
       "type": "number",

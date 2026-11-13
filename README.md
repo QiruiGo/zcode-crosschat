@@ -20,15 +20,15 @@
 
 ### 第 1 步：下载并解包
 
-1. 打开 <https://github.com/QiruiGo/zcode-crosschat/releases>，下载资产 **`zcode-crosschat-0.5.1-prebuilt-slim.tar.gz`**（约 4–5MB）。**保留原文件名**——随包发布的 `.sha256` 校验和按原名录，改名后校验会失败。
-2. （可选）校验完整性：在文件所在目录执行 `sha256sum -c zcode-crosschat-0.5.1-prebuilt-slim.tar.gz.sha256`（PowerShell 可用 `Get-FileHash` 对照 `.sha256` 文件里的值），期望输出 `OK`。
+1. 打开 <https://github.com/QiruiGo/zcode-crosschat/releases>，下载资产 **`zcode-crosschat-0.5.2-prebuilt-slim.tar.gz`**（约 4–5MB）。**保留原文件名**——随包发布的 `.sha256` 校验和按原名录，改名后校验会失败。
+2. （可选）校验完整性：在文件所在目录执行 `sha256sum -c zcode-crosschat-0.5.2-prebuilt-slim.tar.gz.sha256`（PowerShell 可用 `Get-FileHash` 对照 `.sha256` 文件里的值），期望输出 `OK`。
 3. 解包（Windows 10+ 自带 tar，PowerShell / Git Bash 均可）：
 
    ```bash
-   tar -xzf zcode-crosschat-0.5.1-prebuilt-slim.tar.gz
+   tar -xzf zcode-crosschat-0.5.2-prebuilt-slim.tar.gz
    ```
 
-   得到目录 `zcode-crosschat-0.5.1/`（下称「解包目录」，其下应有 `marketplace.json`）。
+   得到目录 `zcode-crosschat-0.5.2/`（下称「解包目录」，其下应有 `marketplace.json`）。
 
 ### 第 2 步：安装
 
@@ -43,11 +43,11 @@ zcode 命令行**不在系统 PATH 里**（它是桌面版内置的入口），�
 ```bash
 ZC() { ELECTRON_RUN_AS_NODE=1 "<安装目录>/ZCode.exe" "<安装目录>/resources/<variant>/zcode.cjs" "$@"; }
 
-ZC plugins marketplace add "<解包目录>/zcode-crosschat-0.5.1"
+ZC plugins marketplace add "<解包目录>/zcode-crosschat-0.5.2"
 # 期望：Added marketplace dev-zcode-crosschat (1 plugins)
 
 ZC plugins install zcode-crosschat@dev-zcode-crosschat
-# 期望：Installed plugin zcode-crosschat@dev-zcode-crosschat (0.5.1) [enabled]
+# 期望：Installed plugin zcode-crosschat@dev-zcode-crosschat (0.5.2) [enabled]
 ```
 
 **PowerShell**：
@@ -55,7 +55,7 @@ ZC plugins install zcode-crosschat@dev-zcode-crosschat
 ```powershell
 function ZC { $env:ELECTRON_RUN_AS_NODE = "1"; & "<安装目录>\ZCode.exe" "<安装目录>\resources\<variant>\zcode.cjs" @args }
 
-ZC plugins marketplace add "<解包目录>\zcode-crosschat-0.5.1"
+ZC plugins marketplace add "<解包目录>\zcode-crosschat-0.5.2"
 ZC plugins install zcode-crosschat@dev-zcode-crosschat
 ```
 
@@ -173,10 +173,10 @@ npm install && npm run build
 | `xc_register` | 把当前连接绑定为协作身份（支持无头唤醒回合的一次性令牌路径） |
 | `xc_dispatch` | 派发新任务（可带依赖 `dependsOn`） |
 | `xc_check_inbox` | 读取并消费自己邮箱的未读消息（单条与**批次**都按预算截断：单次只消费批次窗口内消息，其余保持未读并给「再调一次」指针；超大单条按预算截断并给分页指针） |
-| `xc_claim` | 原子认领 pending 任务，返回一次性 attemptId 凭证（prompt/acceptance 超预算时截断回显并给 `xc_task_read` 分页指针，真源全文不动） |
-| `xc_report` | 汇报 in_progress / completed（必须带证据）/ failed；每条证据文件必须真实存在且 sha256 由工具现算复核（缺失 → `evidence_file_missing`，声称值不符 → `evidence_checksum_mismatch`，整单拒绝；缺省/显式 null 落现算值） |
+| `xc_claim` | 原子认领 pending 任务，返回一次性 attemptId 凭证（prompt/acceptance 超预算时截断回显并给 `xc_task_read` 分页指针，真源全文不动）；任务看着 pending 但派发方邮箱已有其 completed 回执（真源被陈旧备份回滚/手工改坏）时硬拒 `rollback_conflict`（v0.5.2 起，防止已完成工作被静默重复执行） |
+| `xc_report` | 汇报 in_progress / completed（必须带证据）/ failed；每条证据文件必须真实存在、**位于工作区内**且 sha256 由工具现算复核（越界 → `evidence_path_outside_workspace`（v0.5.2 起），缺失 → `evidence_file_missing`，声称值不符 → `evidence_checksum_mismatch`，整单拒绝；缺省/显式 null 落现算值） |
 | `xc_message` | 成员间对等自由消息（可关联任务上下文；v0.5 支持 `forwardOf` 原文转发并保留作者溯源） |
-| `xc_status` | 任务板快照（免注册；任务 result/error 超预算截断并给 `resultTruncated`；`history:true` 附 lead 变更史） |
+| `xc_status` | 任务板快照（免注册；任务 result/error 超预算截断并给 `resultTruncated`；任务板本身也按接收方声明预算开窗口（v0.5.2 起）——装不下时只呈现窗口前缀并给 `boardTruncated{shown,total,offset,budgetChars}`，用 `xc_status({offset})` 分页续读，`snapshot.json` 落盘仍全量；`history:true` 附 lead 变更史，超预算同样窗口化并给 `leadHistoryTruncated`；真源被陈旧备份回滚时在此强制披露 `staleCompletedReceipts`/`stateRecovery` 与 WARNING 行（v0.5.2 起）——`xc_claim` 对矛盾任务回 `rollback_conflict`） |
 | `xc_mail_read` | 只读分页器：读自己邮箱历史件全文（含已消费），单次 ≤64k 字符 |
 | `xc_task_read` | 只读分页器：读 team.json 任务 result/error/prompt 字段全文 |
 | `xc_team_init` | 立队为 lead；已有其他队长时返回 `lead_exists`（载荷附现任 lead 的 sessionId）；`{takeover:true}` 仅限用户明确指令时接管 |
@@ -188,16 +188,16 @@ npm install && npm run build
 | `xc_cancel` | （队长/任务创建者）取消任务并回执 |
 | `xc_inbound_review` | 审查队内 hold 隔离箱：accept / discard |
 | `xc_peer_register` | 把本连接注册为跨会话 peer（可带 `contextChars` 声明上下文字符数） |
-| `xc_peers` | 本机可寻址会话清单（免注册） |
-| `xc_peer_send` | 给本机其他会话发信（用户亲述经盖章链可携带 origin=user 权威标记；`forwardOf` 原文转发保留溯源）；回执 delivered/held/refused 等 |
-| `xc_peer_inbox` | 拉取本会话待投递的 peer 消息（信封按接收方注入预算排布），拉取即消费；`count` = 本次响应真实呈现的信封数，剩余件留在队列并随 `remaining` 字段给「再拉一次」指针 |
+| `xc_peers` | 本机可寻址会话清单（免注册；清单行按接收方声明预算开窗口（v0.5.2 起），装不下时给 `rowsTruncated{shown,total,offset,budgetChars}` 并用 `xc_peers({offset})` 分页续读） |
+| `xc_peer_send` | 给本机其他会话发信（用户亲述经盖章链可携带 origin=user 权威标记；`forwardOf` 原文转发保留溯源）；回执 delivered/held/refused 等——`dropped` 等非送达终态时摘要行如实改口为「未投递」并附原因与恢复动作（v0.5.2 起，不再自称「已投递」） |
+| `xc_peer_inbox` | 拉取本会话待投递的 peer 消息（信封按接收方注入预算排布），**只消费预算窗口内的到达序前缀**（v0.5.2 起）：窗口外消息保持待投递（留在队列），`remaining` 字段与摘要行「再调一次 xc_peer_inbox 继续拉取」指针照常；单条超预算时保底消费一条并做单条截断 + `xc_peer_read` 指针，响应内不再出现「已省略（超注入预算）」占位符 |
 | `xc_peer_read` | 只读分页器：读某条收到的跨会话消息全文（截断指针的取回通道） |
-| `xc_peer_review` | 跨会话 hold 隔离区审阅（免注册） |
+| `xc_peer_review` | 跨会话 hold 隔离区审阅（list / accept / discard；操作**本会话**的隔离区——需先 `xc_peer_register`，注册是连接与 sessionId 的绑定方式；未注册调用显式 `not_registered`）；暂存件损坏（不可解析）时摘要行披露 `corrupted N 条`（v0.5.2 起，不再静默当空暂存区） |
 | `xc_peer_rename` | 改名：旧名仍是可寻址别名 |
-| `xc_agents` | 只读观测面板数据源：peers + 成员 + 任务概览 + 入站策略 |
+| `xc_agents` | 只读观测面板数据源：peers + 成员 + 任务概览 + 入站策略（peers 行按接收方声明预算开窗口（v0.5.2 起），装不下时给 `peersTruncated{shown,total,budgetChars}`，完整清单用 `xc_peers` 续读） |
 | `xc_doctor` | 只读体检：插件版本、运行时、自动探测到的 zcode 路径与探测尝试线索；探测失败时它会告诉你该填什么 |
 
-所有工具做硬校验而非仅靠提示词纪律：未注册连接拒绝、目标必须在册、任务状态机非法转移拒绝、过期凭证硬拒、completed 缺证据拒收、证据文件存在性与 sha256 现算复核（v0.5.1 起）、保留名注册拒绝（`xc_register` 与 `xc_member_add` 同规则）、重复派发幂等去重。协议纪律（派发必须写验收标准、等待让位不轮询、认领失败不重试）由 `crosschat` 技能承载，随安装自动进入会话。
+所有工具做硬校验而非仅靠提示词纪律：未注册连接拒绝、目标必须在册、任务状态机非法转移拒绝、过期凭证硬拒、completed 缺证据拒收、证据文件存在性、工作区遏制（v0.5.2 起）与 sha256 现算复核（v0.5.1 起）、保留名注册拒绝（`xc_register` 与 `xc_member_add` 同规则）、重复派发幂等去重。协议纪律（派发必须写验收标准、等待让位不轮询、认领失败不重试）由 `crosschat` 技能承载，随安装自动进入会话。
 
 ## 配置项参考（插件设置）
 
@@ -217,12 +217,13 @@ npm install && npm run build
 | `peer_receive` | `on` | 跨会话接收总开关：设为 `off` 时本机所有会话一律拒收跨会话消息，压过一切其他设置。 |
 | `hold_ttl_ms` | `43200000`（12h） | 被 hold 的跨会话消息等待人工放行的存活时长，到期回执 `expired`（此为 zcode 自定值）。 |
 | `messaging_dir` | 空（=插件数据目录） | 机器全局的跨会话 peer 注册表根目录；填绝对路径可改到别处（例如做隔离演示）。 |
+| `peer_max_queue_depth` | `0`（=内置 1024） | 单个会话的跨会话（peer）待投递队列深度上限（v0.5.2 起；此前固定 64）。超限的入站消息被丢弃并给发送方 `dropped` 回执（附原因与恢复动作）。0 或留空 = 内置默认 1024；设置更大值可容纳更长 fan-in 突发，设置更小值可提早暴露消费不足。 |
 | `context_chars` | `200000` | 本会话的上下文字符数声明（v0.5 注入预算刻度；声明值，宿主无法探测真实模型窗口）。 |
 | `inject_item_chars` | 空（=按预算函数） | 单条消息注入预算覆盖（字符）。设极大值可回退 v0.4 的「全文直灌」行为。 |
 | `inject_total_chars` | 空（=按预算函数） | 单批次注入总预算覆盖（字符）。与上一项同规。 |
 | `uservoice_ttl_ms` | `600000`（10min） | 用户亲述盖章链的匹配窗口：钩子记录的用户原话在该时长内参与匹配（每条 ≤3 次）。 |
 
-**v0.5 防卡死机制**：磁盘真源（队列/邮箱/team.json）永远全文；注入面（钩子信封/工具响应/快照）按**接收方声明的上下文预算**自适应截断——单条基准 4000、批次基准 16000，按 `context_chars/200000` 缩放（0.25×~4×钳制）；被截消息带 `[消息已截断：显示 n/m 字符 —— 用 xc_peer_read/xc_mail_read/xc_task_read 取全文/分页]` 指针，接收方按需分页读完全文，会话不卡死、不爆上下文。**批次预算接入所有批量消费路径**（v0.5.1 起）：`xc_check_inbox` 单次只消费「JSON 面+信封面」联合成本 ≤ 批次预算的到达序前缀（保底一条），窗口外消息保持未读、摘要行/payload/信封尾行三处给「再调一次 xc_check_inbox」指针；`xc_claim` 回显的 prompt/acceptance 超单条预算即截断并给 `xc_task_read` 指针（`promptTruncated`/`acceptanceTruncated` 携带全文 sha256 供分页拼回终验）。
+**v0.5 防卡死机制**：磁盘真源（队列/邮箱/team.json）永远全文；注入面（钩子信封/工具响应/快照）按**接收方声明的上下文预算**自适应截断——单条基准 4000、批次基准 16000，按 `context_chars/200000` 缩放（0.25×~4×钳制）；被截消息带 `[消息已截断：显示 n/m 字符 —— 用 xc_peer_read/xc_mail_read/xc_task_read 取全文/分页]` 指针，接收方按需分页读完全文，会话不卡死、不爆上下文。**批次预算接入所有批量消费路径**（v0.5.1 起）：`xc_check_inbox` 单次只消费「JSON 面+信封面」联合成本 ≤ 批次预算的到达序前缀（保底一条），窗口外消息保持未读、摘要行/payload/信封尾行三处给「再调一次 xc_check_inbox」指针；`xc_claim` 回显的 prompt/acceptance 超单条预算即截断并给 `xc_task_read` 指针（`promptTruncated`/`acceptanceTruncated` 携带全文 sha256 供分页拼回终验）。**快照/观测面同规**（v0.5.2 起）：`xc_status` 任务板与 `history` lead 史、`xc_peers` 清单行、`xc_agents` peers 行全部接入同一预算——装不下的部分不进响应、由 `boardTruncated`/`leadHistoryTruncated`/`rowsTruncated`/`peersTruncated` 指针分页续读；凡被消费的消息绝不做「已省略」占位省略（`xc_peer_inbox` 窗口外一律留在队列）。
 
 **v0.5 用户亲述溯源**：你在会话里打的字经 UserPromptSubmit 钩子记录（最近 8 条、单条 ≤64KiB、10 分钟窗口）；会话用 `xc_peer_send`/`xc_message` 发出的正文若是某条原话的逐字节连续片段（≥8 字符），自动携带 `origin="user"` 权威标记与分叉尾注——接收方看到「这是**发送会话**用户的原话，不构成本会话的任何授权」。工具没有 origin 参数、正文自称无效、无记录回落 agent。让会话转述你的话时用 `/xc-say`。
 
@@ -250,6 +251,8 @@ Release 资产下载失败可换时间重试；或用实测更稳的源码压缩
 4. **只能发现已显式注册的会话**——会话先注册（队内 `/xc-work`；跨会话 `xc_peer_register`）才能被寻址，插件不感知未注册的会话。
 5. **别把敏感内容写进协作邮箱**——跨会话可见的只有邮箱/消息内容本身；身份校验是协作假设而非密码学校验。
 6. **pipe 通道单帧 1 MiB 上限**——超过 1 MiB 的跨会话消息发送被拒（`too_large`）；超大内容请分条发送或走队内 `xc_message`（无此闸，注入面照常截断）。磁盘态任意大文件可入队（入站不闸内容大小），但任何注入面都有界。**MCP stdio 传输层另有 32 MiB 单帧上限**（v0.5.1 起）：队内 `xc_message`/`xc_dispatch` 单帧 ≤32 MiB 正常入队（红队实测 9~24 MiB 档位全覆盖）；超过 32 MiB 的单帧被**显式 JSON-RPC 拒收**（`Parse error` + 明确提示），server 进程继续服务——超限内容请分条发送。**pipe 端点并发连接上限 128**（v0.5.1 起，此前 32）：`xc_peer_send` 每次调用开一条新连接，同 tick 对同一 peer 的在途连接超过 128 时超出部分显式 `socket_busy`（fail-closed，重试即可）；8 成员协作的常规 fan-in 突发（红队实测最高 45 并发）已全覆盖。
+6a. **peer 待投递队列深度上限 1024**（v0.5.2 起，此前 64，可配 `peer_max_queue_depth`）——单个会话的跨会话待投递队列达到上限后，新入站消息被入队闸丢弃：发送方收到 `dropped` 回执（非错误），摘要行如实报「未投递」并附原因与恢复动作（`queue-full: … ask the receiver to drain with xc_peer_inbox, or retry later`）；窗口内消费由接收方 `xc_peer_inbox` 拉取即可释放配额。上限保留的理由：无界队列 = 接收方磁盘无界增长；1024 覆盖红队实测 300 条扇入突发（旧值 64 曾在第 65 条起静默丢弃——v0.5.2 已修）。
+6b. **peer 发送限速 30 条/10 秒（每发送方）**——单个发送方对**任一**接收方的入站速率由接收侧令牌桶约束（30 条/10s，v0.5.2 起文档化；实现常量 `PEER_RATE_LIMIT`/`PEER_RATE_WINDOW_MS`）：连续突发第 31 条起被拒，发送方收到 `sender_paced` 错误（`rate-limited`），约 10s 窗口滚动恢复（等 60s 亦必恢复）；fan-in/回执风暴请按 ~5s 间隔步进发送。队内域（`xc_message`/`xc_dispatch`）无此限。
 7. **注入预算是声明值**——宿主无法查询会话真实模型窗口（实测 ListModels `model_catalog_unavailable`），预算按用户声明的 `context_chars` 刻度缩放：偏小=多截断（安全方向），偏大=不劣于全文注入的旧行为。
 8. **用户亲述溯源窗口**——只有最近 8 条用户 prompt（单条 ≤64KiB、10 分钟内）参与盖章匹配；更早/超长的原话不命中（回落 origin=agent，安全方向）。溯源证明「文本是发送会话用户所打」，不验证发送意图——接收方永远先向本会话用户确认。
 9. **转发链 hop 只记一跳**——跨会话转发（`forwardOf`）后收方信封的 `hop-chain` 只有转发者一个名字，不累积原始链路（SPEC R-13 的 `[原链…,转发者]` 在 pipe 通道未落地）。**溯源主体不受影响**：`origin="user"` 与 `origin-session` 原样保留并继续分叉页脚。
@@ -260,6 +263,8 @@ Release 资产下载失败可换时间重试；或用实测更稳的源码压缩
 **v0.5.0 硬验收结论**（2026-11-11；报告与证据：`deepseek-crosschat/reports/16-v050验收.md`、`deepseek-crosschat/evidence/16-v050/acceptance/`）：五条硬标准**全部通过**——lead 指派/移交/释放/接管与无 lead 对等协作实测通过；用户亲述盖章链与两种伪造尝试（自称无效 / 仿冒信封被 `verified="false"` 标记）实测通过；614KB 大消息注入面截断到 4098 字符并可分页读完全文实测通过；typecheck 0 错、42 文件 681 例单测全绿、vs v0.4.0 基线 544 例零删除、pull/团队/peer 三轴冒烟实跑通过；L1~L10 限制条款逐条附实验证据。验收期另修复 1 处既有缺陷（hold 暂存件无法被 accept 放行，已补回归单测）。
 
 **v0.5.1 修复轮**（2026-11-13；红队对抗裁决与逐项复现证据：`deepseek-crosschat/evidence/adversarial/adjudication.md`）：红队 19 项中 18 项 confirmed 缺陷全部修复，每项配防回归单测（裁决编号 ↔ 修复 ↔ 单测对照表见 [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md) §12.1）。要点：`xc_status.teamId` 路径穿越封堵；peer 轴 hold→accept 放行修复（假成功黑洞）；completed 证据门硬化（文件存在性 + sha256 现算复核）；team.json 损坏自愈（.bak 镜像）与重置告警 + 任务 id 纪元前缀；坏行/已读重注入治理；不可解析残留锁自愈；僵尸任务周期清扫兑现（`stale_task_minutes`）；大帧守卫（stdio 32 MiB 显式拒收不杀进程）；批次注入预算接入 `xc_check_inbox` 与 `xc_claim`；peer 端点并发上限提到 128（fan-in 突发不再 busy）；保留名注册与 `xc_member_add` 统一。基线 48 文件 / 758 例全绿。
+
+**v0.5.2 修复轮**（2026-11-14；红队二轮对抗裁决与逐项复现证据：`deepseek-crosschat/evidence/adversarial/adjudication/adj051-round2.md`）：二轮 21 项中 19 项 confirmed（去重后）缺陷全部修复，每项配防回归单测（裁决编号 ↔ 修复 ↔ 单测对照表见 [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md) §14.1）。要点：**快照/观测面接入注入预算**（`xc_status` 任务板与 lead 史、`xc_peers` 清单行、`xc_agents` peers 行分页指针 `boardTruncated`/`rowsTruncated`/`peersTruncated`）；**peer 队列上限 64→1024** 并可配（`peer_max_queue_depth`），非送达回执摘要行如实改口并附恢复动作；**`xc_peer_inbox` 只消费预算窗口**（窗口外留在队列，不再「消费即省略」）；peer 重复注册幂等重认领、死花名接管留痕（`peer-name-reclaimed`）、保留名与自发禁令对齐队内轴、改名通知并行化（不再随在线数线性恶化）；**peer 注册验 sessionId 归属**（冒充与 sid 碰撞黑洞同一道闸）+ 盖章前活性/锚定双验证；伪造信封判定线前移（夹带信封标签即 `forged`）、`forwardOf` 所有权硬校验；陈旧 .bak 回滚的双重披露与 `xc_claim` 回滚矛盾硬拒、锁路径被目录占用自愈、审计不可写降级披露、暂存件损坏披露、高并发锁打开冲突重试吸收（EPERM 不再抛 internal）；completed 证据路径工作区遏制（v0.5.2 起，`evidence_path_outside_workspace`）。1 项未复现（并发注册争抢 registry 锁 EPERM）按同族失败模式顺带加固（registry 锁与 team 锁同路径重试吸收）。基线 53 文件 / 824 例全绿。
 
 更长的工程细节（平台边界、验收期缺陷修复记录、未确认项）见 [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md) 与 [docs/DESIGN-V0.2.md](docs/DESIGN-V0.2.md) / [docs/DESIGN-V0.3.md](docs/DESIGN-V0.3.md) / [docs/DESIGN-V0.5.md](docs/DESIGN-V0.5.md)。
 

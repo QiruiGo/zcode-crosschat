@@ -22,6 +22,7 @@
 
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
+import { resolve, sep } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { connectionKeyOf, identityStore, xcRegister } from "./identity.js";
@@ -42,7 +43,11 @@ import {
   renderRegister,
   renderReport,
   renderStatusTable,
+  renderBoardTruncationNote,
+  statusTaskRowText,
   writeSnapshot,
+  STATUS_TASK_TABLE_HEADER,
+  BOARD_TRUNCATION_NOTE_MAX_CHARS,
   type StatusSnapshot,
 } from "./render.js";
 import { isValidTeamId, resolveStateRoot } from "../core/paths.js";
@@ -55,12 +60,14 @@ import {
   applyReport,
   beginTaskAttempt,
   getTask,
+  lastTeamRecoveryNotice,
   makeTask,
   memberOpenTasks,
   newTeamState,
   noteTeamReset,
   readTeam,
   reportTransitionError,
+  teamRecoveryWarning,
   unsatisfiedDependencies,
   writeTeam,
 } from "../core/teamstate.js";
@@ -74,14 +81,15 @@ import {
   readCurrentMailboxLocked,
   readMailbox,
   readUnreadMailbox,
+  staleCompletedReceiptTaskIds,
 } from "../core/mailbox.js";
 import type { MailboxReadDiagnostics } from "../core/mailbox.js";
-import { logEngineEvent } from "../core/log.js";
+import { auditDegradationWarning, logEngineEvent } from "../core/log.js";
 import { attemptWake, findDuplicateMail } from "../engine/wake.js";
 // v0.5（M6 轴②③接线）：预算/分页（M1）、队内信封（M3）、盖章链（M4）、全文 sha256（M4）。
 import { batchWindowCount, contextCharsFromEnv, paginateText, receiverInjectBudget, truncateField, truncateNote } from "../core/budget.js";
 import { isTeamEnvelopeRendered, renderTeamEnvelope } from "../core/peerenvelope.js";
-import { uservoiceMatchAndConsume } from "../core/uservoice.js";
+import { uservoiceMatchAndConsume, verifyUservoiceStampAuthority } from "../core/uservoice.js";
 import { sha256Of } from "../core/msgstore.js";
 import { peerRootFromEnv } from "../core/peerdir.js";
 import { leadKeyOf } from "./member-tools.js";
@@ -136,7 +144,7 @@ export const ReportShape = {
       }),
     )
     .optional()
-    .describe("completed 必须至少 1 条；每条文件必须真实存在且 sha256 与工具现算值一致，否则拒绝（evidence_file_missing / evidence_checksum_mismatch）"),
+    .describe("completed 必须至少 1 条；每条文件必须真实存在且位于工作区内（v0.5.2 遏制）、sha256 与工具现算值一致，否则拒绝（evidence_path_outside_workspace / evidence_file_missing / evidence_checksum_mismatch）"),
 };
 export const MessageShape = {
   to: z.string().min(1),
@@ -148,6 +156,10 @@ export const MessageShape = {
 export const StatusShape = {
   teamId: z.string().optional(),
   history: z.boolean().optional().describe("附 lead 角色变更史（leadKey/leadSince/leadHistory，R-7；锁外只读 team.json）"),
+  // v0.5.2（SCALE-1 修复）：任务板分页起点。板面按注入预算开窗口（默认从第 0 条
+  // 起），窗口外的任务不进响应；截断时 payload 给 boardTruncated 与人可读面给
+  // 指针行，按此偏移继续读后续任务（snapshot.json 落盘的仍是全量）。
+  offset: z.number().int().min(0).optional().describe("任务板分页起点（条）；板面超注入预算时用 boardTruncated 指针续读"),
 };
 /** v0.5（R-22）：xc_mail_read 入参——读本人邮箱历史件（含已消费），只读不消费。 */
 export const MailReadShape = {
@@ -177,14 +189,27 @@ type TaskReadArgs = z.infer<z.ZodObject<typeof TaskReadShape>>;
 // 工具核心公共件
 // ---------------------------------------------------------------------------
 
-/** core 层统一入口：LockBusyError → {error:"busy"}，其余经 protocol.mapToolError。 */
-async function runCore(fn: () => Promise<ToolResult>): Promise<ToolResult> {
+/** core 层统一入口：LockBusyError → {error:"busy"}，其余经 protocol.mapToolError。
+ *
+ * v0.5.2（故障注-3 修复）：响应附带审计降级告警——engine.jsonl 不可写（被目录
+ * 占用/权限缺失）时此前全部工具照常成功、审计静默全丢、工具面零诊断。现在每次
+ * 工具响应都以末尾 text 块内联披露 `auditDegradationWarning(stateRoot)`（健康时
+ * 零开销、零结构变化），与 inbox 坏行的 `N unreadable line(s) skipped` 同一披露
+ * 口径；审计写成功即自动清除，告警随之消失。 */
+async function runCore(stateRoot: string, fn: () => Promise<ToolResult>): Promise<ToolResult> {
+  let result: ToolResult;
   try {
-    return await fn();
+    result = await fn();
   } catch (err) {
-    if (err instanceof LockBusyError) return errorResult(err.toStructured());
-    return mapToolError(err);
+    if (err instanceof LockBusyError) result = errorResult(err.toStructured());
+    else result = mapToolError(err);
   }
+  // v0.5.2（故障注-3 修复）：审计不可写时在响应末尾内联告警（健康时零开销）。
+  const auditWarning = auditDegradationWarning(stateRoot);
+  if (auditWarning !== undefined) {
+    result.content.push({ type: "text", text: auditWarning });
+  }
+  return result;
 }
 
 function requireMember(team: TeamState, agentKey: string): void {
@@ -326,7 +351,7 @@ export function createToolCore(deps: ToolDeps): ToolCore {
 
   return {
     async xc_register(args, connectionKey) {
-      return runCore(async () => {
+      return runCore(stateRoot, async () => {
         const outcome = await xcRegister(stateRoot, args, connectionKey);
         return okResult(
           renderRegister(sanitizeKey(args.name), args.sessionId, outcome.teamId, outcome.roster, outcome.warnings),
@@ -343,7 +368,7 @@ export function createToolCore(deps: ToolDeps): ToolCore {
     },
 
     async xc_dispatch(args, connectionKey) {
-      return runCore(async () => {
+      return runCore(stateRoot, async () => {
         const me = identityStore.require(connectionKey);
         const toKey = sanitizeKey(args.to);
         if (toKey === me.agentKey) throw invalidParamsError("cannot dispatch to yourself");
@@ -454,7 +479,7 @@ export function createToolCore(deps: ToolDeps): ToolCore {
     },
 
     async xc_check_inbox(_args, connectionKey) {
-      return runCore(async () => {
+      return runCore(stateRoot, async () => {
         const me = identityStore.require(connectionKey);
         const now = Date.now();
 
@@ -555,7 +580,7 @@ export function createToolCore(deps: ToolDeps): ToolCore {
     },
 
     async xc_claim(args, connectionKey) {
-      return runCore(async () => {
+      return runCore(stateRoot, async () => {
         const me = identityStore.require(connectionKey);
         const out = await withTeamLock(stateRoot, me.teamId, async () => {
           const team = await readTeam(stateRoot, me.teamId);
@@ -589,6 +614,26 @@ export function createToolCore(deps: ToolDeps): ToolCore {
               status: task.status,
               message: `task ${task.id} is ${task.status}; only pending tasks can be claimed`,
             });
+          }
+          // v0.5.2（故障注-1 二番战修复）：回滚矛盾闸。任务看着 pending，但派发方
+          // 邮箱已持有它的 completed 回执 = 真源被陈旧备份回滚/手工改坏，已完成
+          // 工作被静默退回。认领会重复执行已完成工作且与已发回执矛盾——硬拒并给
+          // 可行动指引（合成回执无法越过闸：回执信封由 xc_report 终态写入，收件人
+          // 恒为 task.createdBy；僵尸清扫回退附 failed 回执，不命中本闸）。
+          {
+            const createdByMail = await readMailbox(stateRoot, team.teamId, task.createdBy);
+            const stale = staleCompletedReceiptTaskIds(team, createdByMail);
+            if (stale.includes(task.id)) {
+              throw new ToolError({
+                error: "rollback_conflict",
+                taskId: task.id,
+                message:
+                  `task ${task.id} looks pending but the mailbox of its dispatcher "${task.createdBy}" ` +
+                  `holds a completed receipt for it — the team state was rolled back (stale backup restore or manual edit). ` +
+                  `Claiming would silently re-execute completed work; ask the dispatcher to reconcile the board ` +
+                  `(xc_status shows the staleCompletedReceipts warning) and re-dispatch a fresh task`,
+              });
+            }
           }
           const unmet = unsatisfiedDependencies(team.tasks, task.dependsOn);
           if (unmet.length > 0) {
@@ -654,15 +699,38 @@ export function createToolCore(deps: ToolDeps): ToolCore {
     },
 
     async xc_report(args, connectionKey) {
-      return runCore(async () => {
+      return runCore(stateRoot, async () => {
         const me = identityStore.require(connectionKey);
         // 慢操作在锁外：证据门（§2.8 evidence 格式；note 必填，缺省空串）。
         // 每条证据文件必须真实存在，sha256 一律由工具现算复核（边界与-3/边界与-4 修复）：
         // 文件缺失/不可读 → evidence_file_missing；调用方声明值（非 null）与现算值
         // 不符 → evidence_checksum_mismatch。声明值缺省或显式 null 均视为未声明，
         // 落库存现算值（工具描述承诺「缺省时由工具对文件现算」，不再落 sha256:null）。
+        // v0.5.2（边界与-R2-5 修复，集成环节补）：证据路径工作区遏制——`../` 穿越与
+        // 绝对路径此前均可指向工作区外的任意可读文件（路径+现算 sha256 入库并随回执
+        // 分发，红队二番战 r2-5 实测完成入库）。证据必须落在工作区内（resolve 后前缀
+        // 比对，Windows 按大小写不敏感；路径边界用分隔符防同前缀兄弟目录绕过）。
         const evidence: EvidenceItem[] = [];
+        const wsRoot = resolve(deps.workspace);
+        const wsPrefix = wsRoot.endsWith(sep) ? wsRoot : wsRoot + sep;
+        const samePath = (a: string, b: string): boolean =>
+          process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+        const underWorkspace = (abs: string): boolean =>
+          samePath(abs, wsRoot)
+          || (process.platform === "win32"
+            ? abs.toLowerCase().startsWith(wsPrefix.toLowerCase())
+            : abs.startsWith(wsPrefix));
         for (const e of args.evidence ?? []) {
+          const abs = resolve(e.path);
+          if (!underWorkspace(abs)) {
+            throw new ToolError({
+              error: "evidence_path_outside_workspace",
+              path: e.path,
+              workspace: wsRoot,
+              message: `evidence file "${e.path}" resolves outside the workspace (${wsRoot}); `
+                + `evidence must live inside the shared workspace (§2.6 evidence gate, v0.5.2 containment)`,
+            });
+          }
           const computed = await sha256File(e.path);
           if (computed === null) {
             throw new ToolError({
@@ -799,7 +867,7 @@ export function createToolCore(deps: ToolDeps): ToolCore {
     },
 
     async xc_message(args, connectionKey) {
-      return runCore(async () => {
+      return runCore(stateRoot, async () => {
         const me = identityStore.require(connectionKey);
         const toKey = sanitizeKey(args.to);
         if (toKey === me.agentKey) throw invalidParamsError("cannot message yourself");
@@ -823,8 +891,24 @@ export function createToolCore(deps: ToolDeps): ToolCore {
         // v0.5（R-12 盖章链）：落盘前把待发正文与本会话用户原话环形记录逐字节匹配——
         // 命中 → 消息带 origin:"user" + originSessionId（唯一 origin=user 产生路径；
         // 工具 schema 无 origin 参数，正文自称无效）。转发分支跳过（origin 来自被转消息）。
+        // v0.5.2（二番战 SEC-1 修复）：盖章前先验会话归属（verifyUservoiceStampAuthority，
+        // 与 peer 轴同一道闸）——uservoice/注册表锚均机器全局或可跨工作区共享，冒充
+        // 他人 sid 的会话此前能逐字节命中**受害者**的原话记录并偷走 origin=user
+        // 权威标记。未锚定或 sid 被别的活进程持有时拒绝盖章（消息照发，origin 缺省
+        // =agent，fail-closed），并落 uservoice-stamp-refused 审计。
         const stamp = args.forwardOf === undefined && args.content !== undefined
-          ? await uservoiceMatchAndConsume(peerRootFromEnv(deps.env), me.sessionId, args.content, now, deps.env)
+          ? await (async () => {
+              const authority = await verifyUservoiceStampAuthority(peerRootFromEnv(deps.env), stateRoot, me.sessionId);
+              if (!authority.ok) {
+                await logEngineEvent(stateRoot, {
+                  event: "uservoice-stamp-refused",
+                  sessionId: me.sessionId,
+                  reason: authority.reason,
+                });
+                return { hit: false as const, reason: authority.reason };
+              }
+              return await uservoiceMatchAndConsume(peerRootFromEnv(deps.env), me.sessionId, args.content!, now, deps.env);
+            })()
           : { hit: false as const, reason: "no-match" as const };
 
         const out = await withTeamLock(stateRoot, me.teamId, async () => {
@@ -948,7 +1032,7 @@ export function createToolCore(deps: ToolDeps): ToolCore {
     },
 
     async xc_status(args, connectionKey) {
-      return runCore(async () => {
+      return runCore(stateRoot, async () => {
         const teamId = args.teamId?.trim() || TEAM_ID;
         // v0.5.1（BND-1 修复）：调用方可控 teamId 在触碰任何路径构建器前先过
         // 段合法性闸——`../../evil` 之类穿越串此前会经 join 逃出状态根建目录并
@@ -1007,34 +1091,93 @@ export function createToolCore(deps: ToolDeps): ToolCore {
           // 邮箱信封指向 team.tasks 中不存在的任务 = 真源任务段丢失（被清空/
           // 截断/整队重置）而在途工作无声蒸发。非空时披露进快照与渲染行，
           // 静默丢任务变为可观测。
+          // v0.5.2（故障注-1 二番战修复）：同一批读取再顺带检测「任务板与回执链
+          // 矛盾」——邮箱已有某任务的 completed 回执而任务板上它仍是未完成态 =
+          // 真源被陈旧备份回滚（已完成工作静默退回，可被重复认领）。非空时披露
+          // 进快照（staleCompletedReceipts）与渲染 WARNING，矛盾持续可观测
+          // （含 server 重启后，纯磁盘态计算）。
           const orphanTasks: Record<string, string[]> = {};
+          const staleReceipts: Record<string, string[]> = {};
           for (const m of team.members) {
             const msgs = await readMailbox(stateRoot, teamId, m.key);
             snapshot.unread[m.key] = countUnread(team, msgs);
             const orphans = orphanTaskIds(team, msgs);
             if (orphans.length > 0) orphanTasks[m.key] = orphans;
+            const stale = staleCompletedReceiptTaskIds(team, msgs);
+            if (stale.length > 0) staleReceipts[m.key] = stale;
           }
           if (Object.keys(orphanTasks).length > 0) {
             snapshot.orphanTasks = orphanTasks;
+          }
+          if (Object.keys(staleReceipts).length > 0) {
+            snapshot.staleCompletedReceipts = staleReceipts;
           }
           if (me !== undefined) {
             snapshot.me = { agentKey: me.agentKey, unread: snapshot.unread[me.agentKey] ?? 0 };
           }
         }
+        // v0.5.2（故障注-1 二番战修复）：备份恢复披露——恢复态疑似陈旧（含回滚
+        // 矛盾明细）时在快照带 stateRecovery；台账在真源被任意变更工具重写后清除。
+        const recoveryNotice = lastTeamRecoveryNotice(stateRoot, teamId);
+        if (recoveryNotice !== undefined) {
+          snapshot.stateRecovery = {
+            at: recoveryNotice.at,
+            defect: recoveryNotice.defect,
+            backup: recoveryNotice.backup,
+            rolledBackTaskIds: recoveryNotice.rolledBackTaskIds,
+          };
+        }
 
         await writeSnapshot(stateRoot, teamId, snapshot); // §2.8/§4.3：每次调用刷新 snapshot.json
         const orphanTasks = snapshot.orphanTasks;
+        const staleCompletedReceipts = snapshot.staleCompletedReceipts;
+
+        // v0.5.2（SCALE-1 修复）：板面接入注入预算。此前 snapshot.tasks 全量进
+        // 响应（人可读表格 + JSON tasks 双份），700 任务 = 279,678 字符、1,000 任务
+        // = 399,382 字符，且 XC_CONTEXT_CHARS 声明 4× 预算输出不变（预算根本没被
+        // 查询）——README「注入面（钩子信封/工具响应/快照）按接收方声明的上下文
+        // 预算自适应截断」在板面失效。现在按「人可读行 + JSON 条目」联合成本开
+        // 到达序窗口（保底一条），窗口外任务不进响应、由 boardTruncated 指针 +
+        // xc_status{offset} 分页续读；**snapshot.json 落盘仍是全量**（R-21）。
+        const allTasks = snapshot.tasks;
+        const boardOffset = Math.max(0, Math.trunc(args.offset ?? 0));
+        const page = allTasks.slice(boardOffset);
+        // 固定面成本（表头/成员/孤儿告警/DAG 之外的非任务行人可读面 + JSON 面元数据
+        // + leadHistory + 截断指针行）先从批次预算里扣，剩余才给任务窗口。
+        const historyEntries = args.history === true && team !== undefined ? (team.leadHistory ?? []) : [];
+        const historyCosts = historyEntries.map((entry) => JSON.stringify(entry).length + 2);
+        const fixedChars =
+          renderStatusTable({ ...snapshot, tasks: [] }).length
+          + STATUS_TASK_TABLE_HEADER.length
+          + JSON.stringify({ ...snapshot, tasks: [] }).length
+          + BOARD_TRUNCATION_NOTE_MAX_CHARS;
+        const nonTaskBudget = Math.max(0, budget.total - fixedChars);
+        // history 面先花（通常很小），剩余给板面；两侧都保底一条（batchWindowCount 纪律）。
+        const historyShown = args.history === true
+          ? batchWindowCount(historyCosts, nonTaskBudget)
+          : 0;
+        const historySpent = historyCosts.slice(0, historyShown).reduce((sum, cost) => sum + cost, 0);
+        const boardCosts = page.map((t) => statusTaskRowText(t).length + JSON.stringify(t).length);
+        const boardShown = batchWindowCount(boardCosts, Math.max(0, nonTaskBudget - historySpent));
+        const windowedTasks = page.slice(0, boardShown);
+        const historyTruncated = historyShown < historyEntries.length;
+        const boardTruncated = boardOffset + boardShown < allTasks.length;
+
         await logEngineEvent(stateRoot, {
           event: "status",
           teamId,
           agentKey: me?.agentKey ?? null,
           tasks: snapshot.tasks.length,
           ...(orphanTasks !== undefined ? { orphanAgents: Object.keys(orphanTasks).length } : {}),
+          // v0.5.2（SCALE-1）：板面窗口化后，审计同时记本页呈现条数（截断时可观测）。
+          ...(boardTruncated ? { boardShown: boardShown, boardOffset: boardOffset, boardBudgetChars: budget.total } : {}),
         });
+
         // v0.5（R-7）：落盘 snapshot 与返回 payload 分离——持久化对象不含 isLead/leadHistory，
         // payload 在其上现算叠加（isLead 不入盘不入快照；history:true 附 lead 变更史）。
         const payload = {
           ...snapshot,
+          tasks: windowedTasks,
           members: team !== undefined
             ? snapshot.members.map((m) => ({ ...m, isLead: m.key === leadKeyOf(team) }))
             : snapshot.members,
@@ -1042,11 +1185,42 @@ export function createToolCore(deps: ToolDeps): ToolCore {
             ? {
                 leadKey: team.leadKey ?? null,
                 leadSince: team.leadSince ?? null,
-                leadHistory: team.leadHistory ?? [],
+                leadHistory: historyEntries.slice(0, historyShown),
+                ...(historyTruncated
+                  ? { leadHistoryTruncated: { shown: historyShown, total: historyEntries.length, budgetChars: budget.total } }
+                  : {}),
+              }
+            : {}),
+          ...(boardTruncated
+            ? {
+                boardTruncated: {
+                  shown: boardShown,
+                  total: allTasks.length,
+                  offset: boardOffset,
+                  budgetChars: budget.total,
+                },
               }
             : {}),
         };
-        return okResult(renderStatusTable(snapshot), payload);
+        // v0.5.2（故障注-1 二番战修复）：回滚矛盾与备份恢复的人可读 WARNING 行
+        // （与孤儿告警同款披露口径；结构化面已带 staleCompletedReceipts/stateRecovery）。
+        const rollbackWarnings: string[] = [];
+        if (staleCompletedReceipts !== undefined) {
+          const parts = Object.entries(staleCompletedReceipts)
+            .map(([agentKey, ids]) => `${agentKey}: ${ids.join(", ")}`)
+            .join("; ");
+          rollbackWarnings.push(
+            `WARNING board/receipt contradiction (tasks show unfinished but a completed receipt is on file — state was rolled back, claiming those tasks is refused): ${parts}`,
+          );
+        }
+        const recoveryWarning = teamRecoveryWarning(stateRoot, teamId);
+        if (recoveryWarning !== undefined) rollbackWarnings.push(recoveryWarning);
+        const text = renderStatusTable({ ...snapshot, tasks: windowedTasks })
+          + (boardTruncated
+            ? `\n${renderBoardTruncationNote(boardOffset + boardShown, allTasks.length, budget.total)}`
+            : "")
+          + (rollbackWarnings.length > 0 ? `\n${rollbackWarnings.join("\n")}` : "");
+        return okResult(text, payload);
       });
     },
 
@@ -1056,7 +1230,7 @@ export function createToolCore(deps: ToolDeps): ToolCore {
      * xc_check_inbox 截断视图的超读通道。
      */
     async xc_mail_read(args, connectionKey) {
-      return runCore(async () => {
+      return runCore(stateRoot, async () => {
         const me = identityStore.require(connectionKey);
         const message = (await readMailbox(stateRoot, me.teamId, me.agentKey)).find((m) => m.id === args.messageId);
         if (message === undefined) {
@@ -1076,7 +1250,7 @@ export function createToolCore(deps: ToolDeps): ToolCore {
      * 读路径无锁（tools.ts:397 读纪律同款）；xc_status 观测面截断的全文拉取通道。
      */
     async xc_task_read(args, connectionKey) {
-      return runCore(async () => {
+      return runCore(stateRoot, async () => {
         const me = identityStore.require(connectionKey);
         const team = await readTeam(stateRoot, me.teamId);
         if (team === undefined) throw new ToolError({ error: "no_team", message: "no team on disk yet" });
@@ -1122,7 +1296,7 @@ export function registerTools(server: McpServer, deps: ToolDeps, coreOverride?: 
   );
   server.tool(
     "xc_claim",
-    "Atomically claim a pending task; returns the attempt token required by xc_report.",
+    "Atomically claim a pending task; returns the attempt token required by xc_report. Refuses with rollback_conflict when the dispatcher's mailbox already holds a completed receipt for this task (team state was rolled back by a stale backup restore).",
     ClaimShape,
     async (args, extra) => core.xc_claim(args, connectionKeyOf(extra)),
   );
@@ -1140,7 +1314,7 @@ export function registerTools(server: McpServer, deps: ToolDeps, coreOverride?: 
   );
   server.tool(
     "xc_status",
-    "Team snapshot: members (with isLead), task board (oversized result/error truncated with resultTruncated markers), unread counts. history:true appends the lead role change history. Does not require registration; writes snapshot.json.",
+    "Team snapshot: members (with isLead), task board (oversized result/error truncated with resultTruncated markers), unread counts. history:true appends the lead role change history. The task board itself is windowed to the receiver's declared injection budget (v0.5.2): when the board does not fit, the response carries only the window prefix plus boardTruncated{shown,total,offset,budgetChars} — page the rest with xc_status({offset}). Does not require registration; writes snapshot.json (always the full board).",
     StatusShape,
     async (args, extra) => core.xc_status(args, connectionKeyOf(extra)),
   );

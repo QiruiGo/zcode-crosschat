@@ -11,7 +11,7 @@
  * 即该序列的可自动化断言。
  */
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
@@ -190,5 +190,63 @@ describe("证据门（completed 报告）", () => {
       conn,
     );
     expect(res.isError).toBeFalsy();
+  });
+});
+
+describe("证据路径工作区遏制（v0.5.2 边界与-R2-5 修复，集成环节补）", () => {
+  it("红队 R2-5 回归：../ 穿越到工作区外被拒（evidence_path_outside_workspace），真源不动", async () => {
+    const core = makeCore();
+    const { taskId, attemptId, conn } = await seedClaimedTask(core);
+    const outside = join(workDir, "..", "r2-5-outside-ev.txt");
+    writeFileSync(outside, "outside-evidence-content", "utf8");
+    try {
+      const res = await core.xc_report(
+        { taskId, attemptId, status: "completed", result: "391", evidence: [{ path: outside }] },
+        conn,
+      );
+      expect(res.isError).toBe(true);
+      const payload = payloadOf(res);
+      expect(payload["error"]).toBe("evidence_path_outside_workspace");
+      expect(payload["path"]).toBe(outside);
+      expect(payload["workspace"]).toBe(workDir);
+      // 真源不动：任务仍未完成、无回执发出
+      const rec = await taskOf(taskId);
+      expect(rec["status"]).not.toBe("completed");
+    } finally {
+      try { rmSync(outside, { force: true }); } catch { /* 尽力而为 */ }
+    }
+  });
+
+  it("绝对路径指到工作区外同样被拒；前缀兄弟目录（<ws>-evil）不因共享前缀绕过", async () => {
+    const core = makeCore();
+    const { taskId, attemptId, conn } = await seedClaimedTask(core);
+    const siblingRoot = `${workDir}-evil`;
+    const sibling = join(siblingRoot, "sibling-ev.txt");
+    mkdirSync(siblingRoot, { recursive: true });
+    writeFileSync(sibling, "sibling-content", "utf8");
+    try {
+      const res = await core.xc_report(
+        { taskId, attemptId, status: "completed", result: "391", evidence: [{ path: sibling }] },
+        conn,
+      );
+      expect(res.isError).toBe(true);
+      expect(payloadOf(res)["error"]).toBe("evidence_path_outside_workspace");
+    } finally {
+      try { rmSync(sibling, { force: true }); } catch { /* 尽力而为 */ }
+      try { rmSync(siblingRoot, { recursive: true, force: true }); } catch { /* 尽力而为 */ }
+    }
+  });
+
+  it("工作区内文件不受影响（遏制只挡界外）：现有主路径语义不变", async () => {
+    const core = makeCore();
+    const { taskId, attemptId, conn } = await seedClaimedTask(core);
+    const ev = writeEvidenceFile("inside.txt", "inside-content");
+    const res = await core.xc_report(
+      { taskId, attemptId, status: "completed", result: "391", evidence: [{ path: ev, sha256: sha256Of(ev) }] },
+      conn,
+    );
+    expect(res.isError).toBeFalsy();
+    const rec = await taskOf(taskId);
+    expect(rec["status"]).toBe("completed");
   });
 });

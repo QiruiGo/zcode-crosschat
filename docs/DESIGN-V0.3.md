@@ -597,8 +597,8 @@ interface PeerQueueItem {
 | `xc_peer_register` | `name*`, `sessionId*`, `displayName?`, `kind?`, `modeClass?` | 把本连接注册为跨会话 peer：监听管道 + 写 `<pid>.json` + 铸令牌 + 写 key 文件。`modeClass`(`bypass|prompting`) 是**兜底**：仅当钩子基记录里没有 `permissionMode` 时才用作本会话档类，并记审计 `peer-mode-class-fallback`（§6.2） | —（注册本身） |
 | `xc_peers` | `kind?` | ListAgents 等价物：self / member / session 三类行（名字、cwd、状态摘要、ref） | 否（只读观测） |
 | `xc_peer_send` | `to*`, `message*`, `summary?` | SendMessage 等价物：按名字（或 `名字 [ref]`）投递，参数形制对齐 CC `{"to","summary","message"}` `@34233387` | 是（需知道「我是谁」） |
-| `xc_peer_inbox` | `limit?` | 拉取本会话待投递的 peer 消息（渲染成信封），拉取即消费 | 否（按 sessionId 定位） |
-| `xc_peer_review` | `action?`(list/accept/discard), `ids?` | 跨会话 hold 隔离区的审阅面（**与队内 `xc_inbound_review` 分立**，见 §8.2 第 6 条） | 否（按 sessionId 定位） |
+| `xc_peer_inbox` | `limit?` | 拉取本会话待投递的 peer 消息（渲染成信封），拉取即消费 | 否（按 sessionId 定位）——v0.5.2 更正：实现按**注册绑定的连接**定位 sessionId（工具无 sessionId 入参），未注册连接显式 `not_registered` |
+| `xc_peer_review` | `action?`(list/accept/discard), `ids?` | 跨会话 hold 隔离区的审阅面（**与队内 `xc_inbound_review` 分立**，见 §8.2 第 6 条） | 否（按 sessionId 定位）——v0.5.2 更正：实现按**注册绑定的连接**定位 sessionId（审阅只操作本会话隔离区；免 sessionId 入参会让任意调用方读/放行他人隔离区），未注册连接显式 `not_registered` |
 | `xc_peer_rename` | `name*` | 改名：旧名进 `formerNames`，向相关会话发 `control:rename` | 是 |
 | `xc_agents` | — | 观测面板数据源：peers + 在队成员 + 任务概览，一次返回（criterion 4） | 否 |
 

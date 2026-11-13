@@ -84,6 +84,31 @@ export interface LayoutResult {
 }
 
 /**
+ * 单块的 item 截断（R-20；对齐 CC gca 的逐条截断）。
+ * 导出供**批次窗口记账**复用：xc_check_inbox / xc_peer_inbox / 快照板面在「消费前」
+ * 必须按同一口径预估每条的成本（截断后长度含尾注），否则窗口算小了会把装不下的
+ * 条目也算进窗口、排布阶段再降级成占位摘要（v0.5.2 SCALE-3 的「消费即省略」根因）。
+ */
+export function cutInjectBlock(
+  block: InjectBlock,
+  budget: InjectBudget,
+  pointer: InjectPointer,
+): { text: string; cut: boolean } {
+  if (block.rendered.length <= budget.item) return { text: block.rendered, cut: false };
+  const shown = Math.max(0, budget.item - 1);
+  return { text: `${block.rendered.slice(0, shown)}\n${truncateNote(pointer, block.msgId, shown, block.rendered.length)}`, cut: true };
+}
+
+/** 单块在本预算下的注入成本（= item 截断后的字符数；窗口记账用）。 */
+export function injectBlockCost(
+  block: InjectBlock,
+  budget: InjectBudget,
+  pointer: InjectPointer,
+): number {
+  return cutInjectBlock(block, budget, pointer).text.length;
+}
+
+/**
  * 注入排布（R-17）。花费按 ts 新→旧（CC gca recency 语义）；输出保持传入顺序
  * （到达序，行为兼容优先）。调用方对被截的跨会话域条目已先行 store 全文（R-21）。
  */
@@ -92,21 +117,32 @@ export function layoutInjectBlocks(
   budget: InjectBudget,
   pointer: InjectPointer,
 ): LayoutResult {
-  const itemCut = (b: InjectBlock): { text: string; cut: boolean } => {
-    if (b.rendered.length <= budget.item) return { text: b.rendered, cut: false };
-    const shown = Math.max(0, budget.item - 1);
-    return { text: `${b.rendered.slice(0, shown)}\n${truncateNote(pointer, b.msgId, shown, b.rendered.length)}`, cut: true };
-  };
+  const itemCut = (b: InjectBlock): { text: string; cut: boolean } => cutInjectBlock(b, budget, pointer);
   const order = blocks.map((b, i) => ({ b, i }));
   order.sort((x, y) => y.b.ts - x.b.ts);            // 新→旧花费；稳定（ts 相同保序）
   const spent: (string | undefined)[] = new Array<string | undefined>(blocks.length).fill(undefined);
   let remaining = budget.total;
   let truncatedCount = 0;
   let degradedCount = 0;
+  // v0.5.2（SCALE-3 修正）：三个消费面（A 钩子 / B 工具间隙 / C xc_peer_inbox）
+  // 都是**先消费后排布**——排布时块对应的队列项已被取走。因此第一块（最新）
+  // 在 item 截断后仍装不下时，必须硬切到剩余预算 + 指针，**绝不许降级成
+  // 「已省略」占位摘要**：占位摘要 = 消费即省略（红队 #20 的根因形态）。
+  // 旧块（在第一块完整呈现之后）仍按 CC gca 语义降一行摘要。
+  let presentedFull = false;
   for (const { b, i } of order) {
     const { text, cut } = itemCut(b);
     if (cut) truncatedCount += 1;
-    if (text.length <= remaining) { spent[i] = text; remaining -= text.length; continue; }
+    if (text.length <= remaining) { spent[i] = text; remaining -= text.length; presentedFull = true; continue; }
+    if (!presentedFull) {
+      // 保底一条：硬切到剩余预算 + 尾注（对齐 CC budget_truncated；消费面纪律）。
+      truncatedCount += 1;
+      const hard = b.rendered.slice(0, Math.max(0, remaining));
+      spent[i] = `${hard}\n${truncateNote(pointer, b.msgId, hard.length, b.rendered.length)}`;
+      remaining = 0;
+      presentedFull = true;
+      continue;
+    }
     // 超支：降一行摘要（最旧先牺牲——此时起后续（更旧）条目只尝试摘要行）。
     degradedCount += 1;                              // 该条未以全文/item 截断文完整进入（R-24 降级）
     if (b.summaryLine.length <= remaining) { spent[i] = b.summaryLine; remaining -= b.summaryLine.length; }
@@ -144,14 +180,19 @@ export function truncateField(text: string, itemBudget: number, sha256Of: (s: st
 }
 
 /**
- * 批次窗口计数（v0.5.1，SCALE-1 修复）：
+ * 批次窗口计数（v0.5.1 SCALE-1 修复引入，v0.5.2 起三个批量面共用）：
  * 给定每条消息在本响应两个面（机器 JSON 面 + 注入信封面）的联合成本，按**到达序
  * 前缀**累加，返回能放进 `budgetTotal` 的条数。保底第一条（单条超预算也返回 1，
  * 由调用方的 item 截断兜住单条上限）；`costs` 为空返回 0。
  *
  * 与 layoutInjectBlocks（peer 面 A/B/C 的注意力排布：新→旧花费、旧条降摘要）的
- * 差异是**有意的**：xc_check_inbox 是消费面（FIFO 服务队列），被窗口留在箱外的
- * 消息保持未读、下一批继续消费，不需要降级摘要行；预算口径同源（budget.total）。
+ * 差异是**有意的**：xc_check_inbox / xc_peer_inbox / xc_status 板面是消费面/观测面，
+ * 被窗口留在外面的消息保持未读（或留在队列）、下一批继续消费，不需要降级摘要行；
+ * 预算口径同源（budget.total）。
+ *
+ * 调用方纪律：成本必须按 {@link injectBlockCost}（item 截断后长度）计，不能按
+ * 原始渲染长度计——否则窗口内仍会装下超 item 的条目，排布阶段把它们降级成
+ * 「已省略」占位符，出现「已消费但没进上下文」的假消费（v0.5.2 SCALE-3）。
  */
 export function batchWindowCount(costs: readonly number[], budgetTotal: number): number {
   let sum = 0;

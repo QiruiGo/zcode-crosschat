@@ -24,7 +24,7 @@ import { randomUUID } from "node:crypto";
 import { lstat } from "node:fs/promises";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { logEngineEvent } from "../core/log.js";
+import { auditDegradationWarning, logEngineEvent } from "../core/log.js";
 import { readTeam } from "../core/teamstate.js";
 import {
   localPidDomain,
@@ -34,14 +34,17 @@ import {
   readPeerBaseRecord,
 } from "../core/peerdir.js";
 import {
-  isPeerNameFree,
   logPeerEvent,
+  PEER_FORMER_NAMES_MAX,
   readPeerKeyFile,
   scanPeers,
   touchPeerRecord,
   writePeerKeyFile,
   writePeerRecord,
+  type PeerDeadReason,
+  type PeerReclaimedFrom,
   type PeerRecord,
+  type PeerScanResult,
 } from "../core/peerregistry.js";
 import {
   formatPeerRows,
@@ -54,6 +57,7 @@ import {
   discardHeldMessages,
   holdPeerMessage,
   listHeldPeerMessages,
+  listHeldPeerMessagesDetailed,
   readReceiverModeClass,
   releaseHeldMessages,
   resolveInboundDecision,
@@ -68,19 +72,28 @@ import {
   appendPeerQueue,
   createRateBuckets,
   drainPeerQueue,
+  PEER_MAX_HOP_DEPTH,
+  PEER_RATE_LIMIT,
+  PEER_RATE_WINDOW_MS,
+  peerMaxQueueDepthFromEnv,
   peerQueueDepth,
+  readPeerQueue,
   type PeerQueueItem,
   type RateBuckets,
 } from "../core/peermsg.js";
 import { detectForgedEnvelope, queueItemToInjectBlock, renderPeerEnvelope } from "../core/peerenvelope.js";
 import {
+  batchWindowCount,
   contextCharsFromEnv,
+  injectBlockCost,
   layoutInjectBlocks,
   paginateText,
   receiverInjectBudget,
+  type InjectBudget,
 } from "../core/budget.js";
 import { resolvePeerMessage, storePeerMessageFull } from "../core/msgstore.js";
-import { uservoiceMatchAndConsume } from "../core/uservoice.js";
+import { uservoiceMatchAndConsume, verifyUservoiceStampAuthority } from "../core/uservoice.js";
+import { RESERVED_MEMBER_KEYS } from "../core/types.js";
 import { leadKeyOf } from "./member-tools.js";
 import {
   defaultPeerSocketPath,
@@ -176,6 +189,12 @@ export interface PeerReviewResult {
   held: { msgId: string; from: string; ts?: number; cause?: string }[];
   affected: string[];
   receipts: { msgId: string; receipt?: PeerReceipt; outcome?: string }[];
+  /**
+   * v0.5.2（故障注-4 修复）：暂存区里损坏（不可解析/形状非法、无法审阅也无法
+   * 处置）的条目明细。非空时由摘要行披露 `corrupted N 条`——此前坏件被静默跳过，
+   * 人工审阅者看到「暂存区 0 条」而发送方只知「已暂存」，消息无声消失。
+   */
+  corrupted?: { file: string; error: string }[];
 }
 
 export interface PeerRenameResult {
@@ -212,8 +231,13 @@ export interface PeerServices {
   send(input: PeerSendInput): Promise<PeerSendResult>;
   /** v0.5（R-22）：全文分页读（只读不消费）。 */
   read(input: PeerReadInput): Promise<PeerReadResult>;
-  /** v0.5.1（P3 count 口径修复）：返回体增 `remaining` = 排空后队列里剩余的待投递条数。 */
-  inbox(limit: number): Promise<{ items: PeerQueueItem[]; rendered: string[]; remaining: number }>;
+  /**
+   * v0.5.1（P3 count 口径修复）：返回体增 `remaining` = 排空后队列里剩余的待投递条数。
+   * v0.5.2（SCALE-3 修复）：入参增 `budget`（可选）——默认实现据此只消费
+   * 「注入成本 ≤ 批次预算」的到达序窗口，窗口外消息留在队列（消费面不再
+   * 「消费即省略」）。注入的假服务可忽略该参数。
+   */
+  inbox(limit: number, budget?: InjectBudget): Promise<{ items: PeerQueueItem[]; rendered: string[]; remaining: number }>;
   review(input: { action: 'list' | 'accept' | 'discard'; ids?: string[] }): Promise<PeerReviewResult>;
   rename(name: string): Promise<PeerRenameResult>;
   agents(): Promise<PeerAgentsPanel>;
@@ -348,13 +372,50 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
         throw new ToolError({ error: "invalid_params", reason: sanitized.reason }, sanitized.reason);
       }
       const name = sanitized.name;
+      // v0.5.2（二番战 peer-3 修复）：保留名防线与队内轴对齐（identity.ts /
+      // member-tools.ts 同一张 RESERVED_MEMBER_KEYS 表、同一个 name_reserved 码）。
+      // peer 轴此前只挡 addressing 层的 PEER_RESERVED_NAMES（main/team-lead/
+      // user/system），字面花名 lead/default 可以注册也可以改名过去——与 lead
+      // 角色语义、缺省 teamId 撞名，是一条注册旁路。
+      assertPeerNameNotReserved(name);
 
-      if (!(await isPeerNameFree(r, name))) {
+      // v0.5.2（二番战 SEC-1 / SEC-2 修复）：sessionId 归属硬校验——该 sid 已被
+      // 一个**别的活进程**注册时拒绝（session_id_in_use）。旧实现完全不查，攻击者
+      // 用公开 MCP API 冒充受害者 sid 即可三重得手（rtsec C2）：fromSessionId/
+      // originSessionId 归因到受害者、命中受害者的 uservoice 偷走 origin=user
+      // 权威标记、同一 sid 两条注册记录并存；sid 碰撞还会造成投递黑洞（rtsec C3：
+      // 发送方注册 sid=目标 sid 时回执 delivered 但消息永不到达）——两者共用同一
+      // 根因（注册不验归属），同一道闸封堵。校验对象是**活**记录：pid 已死的旧
+      // 记录不在活集（scanPeers 惰性清扫），会话重启/续跑（--resume 同 sid）照常
+      // 注册；本进程自己的记录豁免（幂等重注册，peer-1 修复语义）。
+      // v0.5.2（竞态修复）：这里只做**一次**扫描，归属校验与花名 claim 共享——
+      // scanPeers 会惰性删除死记录文件，两次独立扫描时第一次就把死花名的前任
+      // 证据删掉了，peer-name-reclaimed 接管留痕失明（peer-round2 单测锁定）。
+      const scannedOnce = await scanPeers(r);
+      const sidHolder = await findLiveSessionIdHolder(r, input.sessionId, scannedOnce);
+      if (sidHolder !== undefined) {
         throw new ToolError(
-          { error: "name_taken", name, message: `peer name "${name}" is already registered on this machine` },
-          `peer name "${name}" is already registered on this machine`,
+          {
+            error: "session_id_in_use",
+            sessionId: input.sessionId,
+            boundName: sidHolder.name ?? `pid-${sidHolder.pid}`,
+            boundPid: sidHolder.pid,
+            message: `sessionId "${input.sessionId}" is already registered by another live session ` +
+              `(name "${sidHolder.name ?? `pid-${sidHolder.pid}`}"); register with this session's own id ` +
+              "(the hook-injected sessionId), not another session's",
+          },
+          `sessionId "${input.sessionId}" is already registered by another live session`,
         );
       }
+
+      // v0.5.2（二番战 peer-1 / peer-5 修复）：一次扫描同时办三件事——
+      // ① 花名占用判定：占用者就是本进程 ⇒ 同一连接的重复注册（agent 重试 /
+      //    重连），幂等重认领自己的记录，不再 name_taken 硬拒；
+      // ② 占用者是别的**活**会话 ⇒ 仍 name_taken（名字即地址，冲突必须显式）；
+      // ③ 占用者已死（pid 亡 / lastSeen 陈旧，惰性清扫已摘除）⇒ 接管留痕：
+      //    审计 peer-name-reclaimed 带上任身份，否则「活人顶替死花名」在观测面
+      //    上完全静默（旧名既不进任何 formerNames，也没有任何事件）。
+      const reclaimedFrom = await claimPeerName(r, name, input.sessionId, scannedOnce);
 
       const tokens = mintPeerTokens();
       const explicit = deps.env["XC_MESSAGING_SOCKET_PATH"];
@@ -373,6 +434,17 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
       }
 
       const now = Date.now();
+      // v0.5.2（peer-1 修复的伴生防线）：重复注册不得把既有身份痕迹抹掉。
+      // 同名重认领 ⇒ 保留既有 formerNames（改名攒下的别名不因一次重试蒸发）；
+      // 换名重注册（本进程旧记录当前名 ≠ 新名）⇒ 旧名进 formerNames（与 rename
+      // 同语义，旧名保持可寻址，而不是静默消失）。
+      const mineBefore = (await scanPeers(r)).active.find((record) => record.pid === process.pid);
+      const formerNames = [...(mineBefore?.formerNames ?? [])];
+      if (mineBefore?.name !== undefined && mineBefore.name !== name
+        && !formerNames.some((entry) => entry.name === mineBefore.name)) {
+        formerNames.push({ name: mineBefore.name, releasedAt: now });
+        while (formerNames.length > PEER_FORMER_NAMES_MAX) formerNames.shift();
+      }
       const record: PeerRecord = {
         pid: process.pid,
         sessionId: input.sessionId,
@@ -384,7 +456,8 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
         name,
         ...(input.displayName !== undefined ? { displayName: input.displayName } : {}),
         ...(input.contextChars !== undefined ? { contextChars: input.contextChars } : {}),
-        formerNames: [],
+        ...(reclaimedFrom !== undefined ? { reclaimedFrom } : {}),
+        formerNames,
         workspace: deps.workspace,
         cwd: deps.workspace,
         startedAt: now,
@@ -498,6 +571,27 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
         );
       }
 
+      // v0.5.2（二番战 peer-3 修复）：禁止发给自己。peer 轴此前没有这道闸——
+      // to 指向本会话（当前名或本会话的 formerNames 别名）时，消息经自己的管道
+      // 回来，按当前入站策略处理：accept 档下回执 delivered 且真的入自己的队
+      // （下一回合注入自己的上下文），hold/自动档下回执 held 后躺在自己的隔离区
+      // 里、xc_peer_inbox 永远看不到（红队观察到的「delivered 但永不入队」）。
+      // 队内轴同款防护：tools.ts「cannot message yourself」。
+      // 判定按 sessionId（不是 pid）：formerNames 别名行解析回来时 pid 相同，
+      // 而 record.sessionId 是唯一稳定的会话身份。
+      if (record.sessionId === self.sessionId || record.pid === process.pid) {
+        throw new ToolError(
+          {
+            error: "cannot_send_self",
+            to: input.to,
+            name: resolved.row.name,
+            message: `cannot send to yourself: "${resolved.row.name}" is this session ` +
+              "(the team axis xc_message refuses self-targeting the same way)",
+          },
+          `cannot send to yourself: "${resolved.row.name}" is this session`,
+        );
+      }
+
       // 活性判定（R-4）：注册记录里的 pid 不在活集 → stale_socket。
       const scanned = await scanPeers(r);
       if (!scanned.active.some((row) => row.pid === record.pid)) {
@@ -533,7 +627,13 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
       let originSessionId: string | undefined;
       let hopChain: string[];
       if (input.forwardOf !== undefined) {
-        const orig = await resolvePeerMessage(r, self.sessionId, input.forwardOf);
+        // v0.5.2（二番战 SEC-5 修复）：requireOwnership——store 目录机器全局，msgId
+        // 存在 ≠ 本会话收到过。旧实现只查全局存在性，任何会话可把同机可见的任意
+        // msgId 包装成「我转发给你的」（rtsec C4c：forwardOf 越权引用 delivered）。
+        // 开启后 store 分支只认 toSessionId===本会话 的记录；旧记录（无字段）与
+        // 非本会话记录一律按未找到处理（held/queue/inbox 兜底分支按会话作用域，
+        // 归属天然成立）。xc_peer_read 不带此选项（只读，维持旧宽容口径）。
+        const orig = await resolvePeerMessage(r, self.sessionId, input.forwardOf, { requireOwnership: true });
         if (orig === undefined) {
           throw new ToolError(
             {
@@ -553,7 +653,24 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
       } else {
         text = input.message!;
         hopChain = [self.name ?? "peer"];
-        const stamp = await uservoiceMatchAndConsume(r, self.sessionId, text, Date.now(), deps.env);
+        // v0.5.2（二番战 SEC-1 修复）：盖章前先验会话归属——uservoice 记录机器全局
+        // （peers/uservoice/<sid>.json），冒充他人 sid 的会话能逐字节命中**受害者**
+        // 的原话记录并偷走 origin=user 权威标记（rtsec C2）。注册层的 session_id_in_use
+        // 闸堵住活体冒充主路径；这里对存量/篡改状态再盖一道：未锚定或 sid 被别的
+        // 活进程持有时拒绝盖章（消息照发，origin 缺省=agent，fail-closed），并落
+        // uservoice-stamp-refused 审计供交叉核查。
+        const authority = await verifyUservoiceStampAuthority(r, deps.stateRoot, self.sessionId);
+        const stamp = authority.ok
+          ? await uservoiceMatchAndConsume(r, self.sessionId, text, Date.now(), deps.env)
+          : ({ hit: false as const, reason: authority.reason });
+        if (!authority.ok) {
+          await logPeerEvent(r, {
+            event: "uservoice-stamp-refused",
+            msgId,
+            sessionId: self.sessionId,
+            reason: authority.reason,
+          });
+        }
         if (stamp.hit) {
           origin = "user";
           originSessionId = self.sessionId;
@@ -668,7 +785,28 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
       return { msgId: input.msgId, total: page.total, offset: page.offset, text: page.text, hasMore: page.hasMore };
     },
 
-    async inbox(limit: number): Promise<{ items: PeerQueueItem[]; rendered: string[]; remaining: number }> {
+    /**
+     * v0.5.2（SCALE-3 修复）：批次拉取改为「窥视 → 预算窗口 → 只消费窗口内」。
+     *
+     * 旧实现 `drainPeerQueue(limit)` 把整批取走，再由工具层的 layoutInjectBlocks
+     * 把装不下的条目降级成 `[已省略 …（超注入预算）]` 占位摘要——**消费即省略**：
+     * 窗口外消息既没进模型上下文、也不再留在队列（`remaining:0`、无再拉指针），
+     * 与 README「剩余件留在队列并随 remaining 字段给『再拉一次』指针」及队内轴
+     * 「窗口外消息保持未读」（README L225）双双不符（红队实测 20 条一批只呈现
+     * 9/11 个信封、其余 11 条已消费）。
+     *
+     * 现在：先只读窥视队列（readPeerQueue 不消费）→ 按每条在预算下的注入成本
+     * （injectBlockCost，item 截断后长度）算到达序窗口（保底一条）→ 只 drain 窗口
+     * 内条目；窗口外消息**留在队列**，`remaining` 与摘要行的「再拉一次」指针
+     * 因此名副其实（内容全程可经 xc_peer_read 取回，store 在接收入队时已落盘）。
+     *
+     * @param budget 调用方的注入预算（缺省按本会话 env 现算；工具层传入以保持
+     *   「同一响应内窗口与排布同源」）。注入的假服务可忽略它（单测脚本化场景）。
+     */
+    async inbox(
+      limit: number,
+      budget?: InjectBudget,
+    ): Promise<{ items: PeerQueueItem[]; rendered: string[]; remaining: number }> {
       const r = root();
       if (self === undefined) {
         throw new ToolError(
@@ -676,12 +814,23 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
           "not registered: call xc_peer_register first",
         );
       }
-      const items = await drainPeerQueue(r, self.sessionId, limit);
-      const rendered = items.map((item) => renderPeerEnvelope(item));
+      const effective = budget ?? receiverInjectBudget(contextCharsFromEnv(deps.env), deps.env);
+      // 窥视（不消费）：候选 = 队列前 limit 条（到达序）。
+      const queued = await readPeerQueue(r, self.sessionId);
+      const candidates = queued.slice(0, Math.max(0, limit));
+      const rendered = candidates.map((item) => renderPeerEnvelope(item));
+      const costs = candidates.map((item, i) =>
+        injectBlockCost(queueItemToInjectBlock(item, rendered[i]!), effective, "peer"));
+      const windowCount = batchWindowCount(costs, effective.total);
+      // 只消费窗口内条目；窗口外留在队列文件里（drain 的 rename 换出 + 半行写回
+      // 语义不变，leftover 原样写回）。
+      const items = windowCount > 0 ? await drainPeerQueue(r, self.sessionId, windowCount) : [];
+      const shownRendered = items.map((item, i) =>
+        candidates[i]?.msgId === item.msgId ? rendered[i]! : renderPeerEnvelope(item));
       // v0.5.1（P3 count 口径修复）：排空后的剩余深度随结果返回，调用面据此给
-      // 「再拉一次」指针（拉取即消费，剩余件留在 queue 不丢）。
+      // 「再拉一次」指针（窗口外消息留在 queue 不丢）。
       const remaining = await peerQueueDepth(r, self.sessionId);
-      return { items, rendered, remaining };
+      return { items, rendered: shownRendered, remaining };
     },
 
     async review(input: { action: 'list' | 'accept' | 'discard'; ids?: string[] }): Promise<PeerReviewResult> {
@@ -692,7 +841,13 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
           "not registered: call xc_peer_register first",
         );
       }
-      const held = await listHeldPeerMessages(r, self.sessionId);
+      // v0.5.2（故障注-4 修复）：枚举改走 detailed 扫描——损坏暂存件（不可解析/
+      // 形状非法）此前只进审计后静默跳过，审阅面看到「暂存区 0 条」，消息对人工
+      // 审阅者完全不可见且无处置线索。现在 corrupted 计数随结果披露（队列内 inbox
+      // 坏行的 malformedLines 同款口径），损坏件保持 fail-closed 不投递。
+      const heldScan = await listHeldPeerMessagesDetailed(r, self.sessionId);
+      const held = heldScan.held;
+      const corrupted = heldScan.corrupted;
       const heldView = held.map((message) => ({
         msgId: message.item.msgId,
         from: message.item.from,
@@ -701,7 +856,7 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
       }));
 
       if (input.action === "list") {
-        return { action: "list", held: heldView, affected: [], receipts: [] };
+        return { action: "list", held: heldView, affected: [], receipts: [], ...(corrupted.length > 0 ? { corrupted } : {}) };
       }
       const ids = input.ids ?? held.map((message) => message.item.msgId);
 
@@ -739,13 +894,16 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
               hopChain: message.item.hopChain ?? [message.item.from],
               selfSent: message.item.selfSent ?? false,
               queueDepth: await peerQueueDepth(r, self?.sessionId ?? ""),
+              // v0.5.2（SCALE-2）：入队闸的队列上限可配（XC_PEER_MAX_QUEUE_DEPTH）。
+              maxQueueDepth: peerMaxQueueDepthFromEnv(deps.env),
               buckets: rateBucketsFor(r),
             });
             if (!admitted.ok) return { ok: false, reason: admitted.reason };
             const promoted = heldItemToQueueItem(message.item);
             await appendPeerQueue(r, self?.sessionId ?? "", promoted);
             // v0.5（F-3 5b）：晋升入队即落 store（幂等；失败不阻断投递）。
-            await storeAfterEnqueue(r, promoted);
+            // v0.5.2（SEC-5）：store 记录带收方 sessionId（forwardOf 所有权字段）。
+            await storeAfterEnqueue(r, promoted, self?.sessionId ?? "");
             return true;
           },
           // 放行后的终态回执（DESIGN §9.3「A 侧收到 delivered」/§6.3「accept → 放行
@@ -775,6 +933,7 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
             ...(result.receipt !== undefined ? { receipt: result.receipt } : {}),
             outcome: result.outcome,
           })),
+          ...(corrupted.length > 0 ? { corrupted } : {}),
         };
       }
 
@@ -798,6 +957,7 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
           ...(result.receipt !== undefined ? { receipt: result.receipt } : {}),
           outcome: result.outcome,
         })),
+        ...(corrupted.length > 0 ? { corrupted } : {}),
       };
     },
 
@@ -814,6 +974,8 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
         throw new ToolError({ error: "invalid_params", reason: sanitized.reason }, sanitized.reason);
       }
       const next = sanitized.name;
+      // v0.5.2（二番战 peer-3 修复）：改名与注册同一道保留名闸（见 register）。
+      assertPeerNameNotReserved(next);
       const previous = self.name;
       if (next === previous) {
         throw new ToolError(
@@ -821,12 +983,10 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
           `already named "${next}"`,
         );
       }
-      if (!(await isPeerNameFree(r, next))) {
-        throw new ToolError(
-          { error: "name_taken", name: next, message: `peer name "${next}" is already registered on this machine` },
-          `peer name "${next}" is already registered on this machine`,
-        );
-      }
+      // v0.5.2（二番战 peer-1 / peer-5 修复）：与注册共用一个花名claim助手
+      // （占用判定 + 死名接管审计）。本进程持有 previous 而非 next，故「占用者是
+      // 本进程」这条豁免对改名不成立——冲突仍然显式 name_taken。
+      const reclaimedFrom = await claimPeerName(r, next, self.sessionId);
 
       const now = Date.now();
       const scanned = await scanPeers(r);
@@ -835,7 +995,11 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
       if (previous !== undefined) formerNames.push({ name: previous, releasedAt: now });
       while (formerNames.length > 32) formerNames.shift();
 
-      await touchPeerRecord(r, process.pid, { name: next, formerNames });
+      await touchPeerRecord(r, process.pid, {
+        name: next,
+        formerNames,
+        ...(reclaimedFrom !== undefined ? { reclaimedFrom } : {}),
+      });
       self = { ...self, name: next };
       setPeerSessionContext({
         sessionId: self.sessionId,
@@ -846,25 +1010,33 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
       });
 
       // 通知相关会话（R-13 的 control:rename 帧）。
-      const notified: { name: string; ok: boolean; errorClass?: string }[] = [];
-      for (const record of scanned.active) {
-        if (record.pid === process.pid) continue;
-        const key = await readPeerKey(record);
-        if (!key.ok) {
-          notified.push({ name: record.name ?? `pid-${record.pid}`, ok: false, errorClass: key.errorClass });
-          continue;
-        }
-        const result = await sendPeerFrame({
-          socketPath: record.messagingSocketPath,
-          token: key.peerToken,
-          frame: { type: "control", action: "rename", name: next, sessionId: self.sessionId },
-        });
-        notified.push({
-          name: record.name ?? `pid-${record.pid}`,
-          ok: result.ok,
-          ...(result.ok ? {} : { errorClass: result.errorClass }),
-        });
-      }
+      // v0.5.2（二番战 CONC-1 修复）：扇出改**并行**。旧实现逐个 await
+      // sendPeerFrame（默认 10s 超时）——N 个不回应/慢回应的 peer 让改名耗时
+      // N×10s 线性恶化（红队实测 N=6 超 60s，rename 面实际不可用）。并行后总
+      // 耗时≈单次超时；单个 peer 的失败/超时只写进它自己的 notified 行
+      // （ok:false + errorClass），不拖累其他会话，fail-closed 语义不变。
+      // sessionId 先取到局部：闭包里读可变 self 会丢掉收窄后的非空类型。
+      const notifySessionId = self.sessionId;
+      const notified = await Promise.all(
+        scanned.active
+          .filter((record) => record.pid !== process.pid)
+          .map(async (record): Promise<{ name: string; ok: boolean; errorClass?: string }> => {
+            const key = await readPeerKey(record);
+            if (!key.ok) {
+              return { name: record.name ?? `pid-${record.pid}`, ok: false, errorClass: key.errorClass };
+            }
+            const result = await sendPeerFrame({
+              socketPath: record.messagingSocketPath,
+              token: key.peerToken,
+              frame: { type: "control", action: "rename", name: next, sessionId: notifySessionId },
+            });
+            return {
+              name: record.name ?? `pid-${record.pid}`,
+              ok: result.ok,
+              ...(result.ok ? {} : { errorClass: result.errorClass }),
+            };
+          }),
+      );
 
       await logPeerEvent(r, {
         event: "peer-renamed",
@@ -942,6 +1114,90 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
       };
     },
   };
+}
+
+/**
+ * v0.5.2（二番战 peer-3 修复）：peer 花名的保留名闸，与队内轴同一张表同一个码。
+ *
+ * `identity.ts`（xc_register）与 `member-tools.ts`（xc_member_add）都用
+ * `RESERVED_MEMBER_KEYS` 拒绝 lead/default：字面成员名会与 lead 角色语义、缺省
+ * teamId 撞名。peer 轴此前只受 addressing 层 `PEER_RESERVED_NAMES`
+ * （main/team-lead/user/system）约束，lead/default 可以注册也可以改名过去，
+ * 与队内轴规则不一致，构成一条注册旁路。注册与改名共用本函数（两入口同规则）。
+ */
+function assertPeerNameNotReserved(name: string): void {
+  if ((RESERVED_MEMBER_KEYS as readonly string[]).includes(name)) {
+    const reason = `peer name "${name}" is reserved (${RESERVED_MEMBER_KEYS.join("/")})`;
+    throw new ToolError({ error: "name_reserved", name, message: reason }, reason);
+  }
+}
+
+/**
+ * v0.5.2（二番战 SEC-1 / SEC-2 修复）：查找「已被别的活进程持有的 sid」的注册记录。
+ *
+ * 机器全局注册表按 pid 存文件（sessions/<pid>.json），同一 sessionId 出现在两条
+ * **活**记录里 = 冒充（rtsec C2）或碰撞（rtsec C3）。本进程自己的记录豁免（同连接
+ * 幂等重注册）；死记录不在 `scanPeers().active`（惰性清扫），不挡会话重启/续跑。
+ *
+ * `scanned`：调用方已算好的扫描结果（可选）。注册路径必须与 {@link claimPeerName}
+ * 共享**同一次**扫描——scanPeers 会惰性删除死记录文件，两次独立扫描时第一次就把
+ * 死记录的证据删掉了，第二次的接管留痕（peer-name-reclaimed）就再也看不到前任。
+ */
+async function findLiveSessionIdHolder(
+  root: string,
+  sessionId: string,
+  scanned?: PeerScanResult,
+): Promise<PeerRecord | undefined> {
+  const result = scanned ?? await scanPeers(root);
+  return result.active.find((record) => record.sessionId === sessionId && record.pid !== process.pid);
+}
+
+/**
+ * v0.5.2（二番战 peer-1 / peer-5 修复）：花名claim助手——注册与改名共用。
+ *
+ * 一次 `scanPeers`（顺带惰性清扫死记录）办三件事：
+ * 1. **占用者是本进程** ⇒ 同一连接的重复注册（agent 重试 / 重连）：幂等重认领，
+ *    直接刷新自己的记录。旧实现在这里 `name_taken` 硬拒，活会话重新注册自己的
+ *    花名永远失败（红队 peer-1）。
+ * 2. **占用者是别的活会话** ⇒ `name_taken`。名字即地址，跨会话冲突必须显式，
+ *    这条不变（`isPeerNameFree` 的原语义）。
+ * 3. **占用者已死** ⇒ 记录已被惰性清扫摘除，花名可以接管，但必须留痕：审计
+ *    `peer-name-reclaimed` 带上任身份，并把前任写进新记录的 `reclaimedFrom`
+ *    （`xc_peers` 因此能显示「这个地址换过人」）。旧实现两者都没有——死花名
+ *    被静默替换（红队 peer-5）。
+ *
+ * @returns 接管过来的前任身份；花名此前无主时为 undefined。
+ */
+async function claimPeerName(
+  root: string,
+  name: string,
+  sessionId: string,
+  scanned?: PeerScanResult,
+): Promise<PeerReclaimedFrom | undefined> {
+  // `scanned`：与 sid 归属校验（findLiveSessionIdHolder）共享同一次扫描——scanPeers
+  // 的惰性清扫会删掉死记录文件，独立两次扫描时第二次就看不到死花名的前任了
+  // （接管留痕失明的竞态，peer-round2 单测锁定）。
+  const result = scanned ?? await scanPeers(root);
+  const holders = result.active.filter((record) => record.name === name);
+  if (holders.length > 0 && !holders.some((record) => record.pid === process.pid)) {
+    const reason = `peer name "${name}" is already registered on this machine`;
+    throw new ToolError({ error: "name_taken", name, message: reason }, reason);
+  }
+  const previous = result.dead.find((row) => row.record.name === name);
+  if (previous === undefined) return undefined;
+  const reclaimedFrom: PeerReclaimedFrom = {
+    sessionId: previous.record.sessionId,
+    pid: previous.record.pid,
+    releasedAt: Date.now(),
+    ...(previous.reason !== undefined ? { deadReason: previous.reason } : {}),
+  };
+  await logPeerEvent(root, {
+    event: "peer-name-reclaimed",
+    name,
+    sessionId,
+    previous: reclaimedFrom,
+  });
+  return reclaimedFrom;
 }
 
 /** 档类来源判定：基记录优先，其次显式兜底（并记审计 peer-mode-class-fallback）。 */
@@ -1059,6 +1315,7 @@ async function receivePeerMessage(
   }
 
   // accept → 入队闸（限速 / 去重 / 环路 / 队列上限）。
+  // v0.5.2（SCALE-2）：队列上限可配（XC_PEER_MAX_QUEUE_DEPTH，默认 1024）。
   const admitted = admitPeerMessage({
     now: Date.now(),
     sender: frame.from,
@@ -1066,6 +1323,7 @@ async function receivePeerMessage(
     hopChain: item.hopChain,
     selfSent: false,
     queueDepth: await peerQueueDepth(root, mine.sessionId),
+    maxQueueDepth: peerMaxQueueDepthFromEnv(deps.env),
     buckets: rateBucketsFor(root),
   });
   if (!admitted.ok) {
@@ -1079,14 +1337,19 @@ async function receivePeerMessage(
       type: "status",
       msgId: frame.msgId,
       state: "dropped",
-      detail: admitted.reason ?? "admission-gate",
+      // v0.5.2（SCALE-2）：丢弃原因对发方**可行动**。旧 detail 只有裸原因码
+      // （"queue-full"），发送方工具响应又是非错误的 `receipt:"dropped"`，模型
+      // 极易忽略——现在带上限值与恢复动作（队列满 → 让收方排空或稍后重试）。
+      detail: admissionDropDetail(admitted.reason, peerMaxQueueDepthFromEnv(deps.env)),
     };
   }
 
   await appendPeerQueue(root, mine.sessionId, item);
   // v0.5（F-3）：store 入队即落——排空即消费后 queue/inbox/held 皆空，xc_peer_read
   // 与 forwardOf 必须仍能解析原文与 origin 元数据（P2）。幂等；失败不阻断投递。
-  await storeAfterEnqueue(root, item);
+  // v0.5.2（SEC-5）：store 记录带收方 sessionId——机器全局 store 里 msgId 存在
+  // 不等于「本会话收到过」，forwardOf 的所有权校验依赖本字段。
+  await storeAfterEnqueue(root, item, mine.sessionId);
   await logPeerEvent(root, {
     event: "peer-delivered",
     msgId: frame.msgId,
@@ -1099,8 +1362,10 @@ async function receivePeerMessage(
 /**
  * v0.5（F-3）：把队列项全文 + 溯源元数据幂等落进 `peers/messages/<msgId>.json`。
  * 两个入队落点（pipe 接受 / held 晋升）共用；失败只审计（store 不是投递链的一环）。
+ * v0.5.2（SEC-5）：`toSessionId` = 接收方会话 id——机器全局 store 的所有权字段，
+ * forwardOf 的 requireOwnership 校验据此判定「本会话收到过」。
  */
-async function storeAfterEnqueue(root: string, item: PeerQueueItem): Promise<void> {
+async function storeAfterEnqueue(root: string, item: PeerQueueItem, toSessionId: string): Promise<void> {
   try {
     await storePeerMessageFull(root, {
       msgId: item.msgId,
@@ -1110,6 +1375,7 @@ async function storeAfterEnqueue(root: string, item: PeerQueueItem): Promise<voi
       ...(item.origin !== undefined ? { origin: item.origin } : {}),
       ...(item.originSessionId !== undefined ? { originSessionId: item.originSessionId } : {}),
       hopChain: item.hopChain,
+      toSessionId,
     });
   } catch (error) {
     await logPeerEvent(root, {
@@ -1117,6 +1383,31 @@ async function storeAfterEnqueue(root: string, item: PeerQueueItem): Promise<voi
       msgId: item.msgId,
       message: error instanceof Error ? error.message : String(error),
     });
+  }
+}
+
+/**
+ * v0.5.2（SCALE-2 修复）：入队闸丢弃原因 → 发给发送方的**可行动** detail。
+ *
+ * 背景：`receipt:"dropped"` 在 `xc_peer_send` 里不是错误（isError=false），
+ * 旧 detail 只有裸原因码（`queue-full` / `rate-limited`），红队实测「发送方
+ * 工具响应成功但载荷 dropped，模型极易忽略」。现在把上限值与恢复动作写进
+ * detail，并由 xc_peer_send 的摘要行透出（README 已知限制同步文档化）。
+ */
+export function admissionDropDetail(reason: string | undefined, maxQueueDepth: number): string {
+  switch (reason) {
+    case 'queue-full':
+      return `queue-full: the receiver's pending peer queue is at its cap (${maxQueueDepth} messages) — `
+        + 'this message was NOT delivered; ask the receiver to drain with xc_peer_inbox, or retry later';
+    case 'rate-limited':
+      return `rate-limited: the receiver's per-sender inbound rate limit is ${PEER_RATE_LIMIT} messages / `
+        + `${PEER_RATE_WINDOW_MS / 1000}s — this message was NOT delivered; pace your sends (e.g. ~5s apart) and retry`;
+    case 'duplicate':
+      return 'duplicate: this msgId was already accepted by the receiver (de-duplication window) — nothing to retry';
+    case 'loop-depth':
+      return `loop-depth: the relay chain is deeper than ${PEER_MAX_HOP_DEPTH} hops — forwarding loops are dropped`;
+    default:
+      return reason ?? 'admission-gate';
   }
 }
 
@@ -1146,9 +1437,25 @@ export function countReleaseOutcomes(
  * accept 现按终态分组如实播报；list/discard 的旧文案不变（discard 的全部
  * 结果就是 discarded，「影响 N 条」属实）。
  */
-export function renderReviewSummary(result: PeerReviewResult): string {
+/**
+ * v0.5.2（故障注-3/4 配套）：入参放宽为只读结构视图——本函数只读不写，
+ * readonly 数组（测试夹具 `as const` 等）与既有 PeerReviewResult（可变数组）
+ * 都可传入；PeerReviewResult 结构上满足该视图。
+ */
+export function renderReviewSummary(result: {
+  action: 'list' | 'accept' | 'discard';
+  held: readonly { msgId: string; from: string; ts?: number; cause?: string }[];
+  affected: readonly string[];
+  receipts: readonly { msgId: string; receipt?: PeerReceipt; outcome?: string }[];
+  corrupted?: readonly { file: string; error: string }[];
+}): string {
+  // v0.5.2（故障注-4 修复）：损坏暂存件计数披露——审阅面不再显示干净假象的
+  // 「暂存区 0 条」，坏件条数随动作（list/accept/discard）一并向人工审阅者可见。
+  const corruptedNote = (result.corrupted?.length ?? 0) > 0
+    ? `；⚠ ${result.corrupted!.length} 条暂存件损坏（不可解析，无法审阅/处置——文件名见 structured.corrupted，修复或手工删除后重试）`
+    : "";
   if (result.action !== "accept") {
-    return `暂存区 ${result.held.length} 条；本次动作 ${result.action}，影响 ${result.affected.length} 条。`;
+    return `暂存区 ${result.held.length} 条；本次动作 ${result.action}，影响 ${result.affected.length} 条${corruptedNote}。`;
   }
   const counts = countReleaseOutcomes(result.receipts);
   const parts: string[] = [];
@@ -1157,7 +1464,7 @@ export function renderReviewSummary(result: PeerReviewResult): string {
   if (counts.refused > 0) parts.push(`策略拒绝 ${counts.refused} 条（消息已删除）`);
   if (counts["still-held"] > 0) parts.push(`仍滞留 ${counts["still-held"]} 条（未放行）`);
   if (counts.other > 0) parts.push(`其他终态 ${counts.other} 条`);
-  return `暂存区 ${result.held.length} 条；accept 结果：${parts.length > 0 ? parts.join("、") : "无可处理的暂存件"}。`;
+  return `暂存区 ${result.held.length} 条；accept 结果：${parts.length > 0 ? parts.join("、") : "无可处理的暂存件"}${corruptedNote}。`;
 }
 
 /** W4 的暂存项 → W5 的队列项（hopChain 在 W4 侧可选）；v0.5：origin/originSessionId/forged 随 item 透传不丢（P8-4d）。 */
@@ -1233,6 +1540,8 @@ export const PeerRegisterShape = {
 };
 export const PeerListShape = {
   kind: z.enum(["self", "member", "session"]).optional().describe("只看某一类；缺省返回三类（self / member / session）"),
+  // v0.5.2（SCALE-1 配套）：清单分页起点。行清单超注入预算时由 rowsTruncated 指针续读。
+  offset: z.number().int().min(0).optional().describe("清单分页起点（行）；rowsTruncated 指针给出的续读偏移"),
 };
 export const PeerSendShape = {
   to: z.string().min(1).describe("目标 peer 名（重名时用 \"名字 [ref]\" 消歧）"),
@@ -1313,6 +1622,12 @@ export function registerPeerTools(server: McpServer, deps: PeerToolDeps): void {
         result = errorResult({ error: "internal", message });
       }
     }
+    // v0.5.2（故障注-3 修复）：审计不可写时在响应末尾内联告警（与队内工具
+    // runCore 同款披露口径；健康时零开销、零结构变化）。
+    const auditWarning = auditDegradationWarning(deps.stateRoot);
+    if (auditWarning !== undefined) {
+      result.content.push({ type: "text", text: auditWarning });
+    }
     if (opts.skipFaceB === true) return result;
     // 面 B（DESIGN §7.1）：peer 工具调用结束后，也在 tool-round 间隙把待投递的
     // peer 消息排空、**追加为末尾 text 块**（content[0]/content[1] 不变）。
@@ -1348,13 +1663,36 @@ export function registerPeerTools(server: McpServer, deps: PeerToolDeps): void {
     PeerListShape,
     async (args) =>
       call(async () => {
-        const rows = await services.list(args.kind);
-        // 行文本用 W3 的规范渲染器（DESIGN §5.2：`<名字> [<kind>] [<ref>] cwd=… status=… seen=…`，
-        // `[ref]` 仅在同名歧义时追加；身份串只进结构化字段，不进紧凑行文本）。
-        const lines = formatPeerRows(rows);
+        const all = await services.list(args.kind);
+        // v0.5.2（SCALE-1 配套）：清单行接入注入预算。30 peers 时人类行 + 全量 JSON
+        // 双份 ≈ 37k 字符（红队实测），100+ peers 会越过 64k 钳制——按「行文本 +
+        // JSON 行」联合成本开到达序窗口，窗口外行由 rowsTruncated + offset 分页续读。
+        const offset = Math.max(0, Math.trunc(args.offset ?? 0));
+        const page = all.slice(offset);
+        const budget = receiverInjectBudget(contextCharsFromEnv(deps.env), deps.env);
+        const lines = formatPeerRows(page);
+        const rowCosts = page.map((row, i) => (lines[i]?.length ?? 0) + JSON.stringify(row).length);
+        const shown = batchWindowCount(rowCosts, budget.total);
+        const windowedRows = page.slice(0, shown);
+        const windowedLines = lines.slice(0, shown);
+        const rowsTruncated = offset + shown < all.length;
+        const text = all.length === 0
+          ? "本机没有可寻址的跨会话 peer。"
+          : `可寻址 peer ${all.length} 个${rowsTruncated ? `（本页 ${offset + shown}/${all.length}）` : ""}：\n${windowedLines.join("\n")}`
+            + (rowsTruncated
+              ? `\n[清单已按注入预算（${budget.total} 字符）截断：其余 ${all.length - offset - shown} 行用 xc_peers({offset:${offset + shown}}) 续读]`
+              : "");
         return okResult(
-          rows.length === 0 ? "本机没有可寻址的跨会话 peer。" : `可寻址 peer ${rows.length} 个：\n${lines.join("\n")}`,
-          { count: rows.length, rows } as unknown as ToolPayload,
+          text,
+          {
+            count: windowedRows.length,
+            rows: windowedRows,
+            total: all.length,
+            offset,
+            ...(rowsTruncated
+              ? { rowsTruncated: { shown: offset + shown, total: all.length, offset, budgetChars: budget.total } }
+              : {}),
+          } as unknown as ToolPayload,
         );
       }),
   );
@@ -1373,10 +1711,15 @@ export function registerPeerTools(server: McpServer, deps: PeerToolDeps): void {
           ...(args.forwardOf !== undefined ? { forwardOf: args.forwardOf } : {}),
           ...(args.summary !== undefined ? { summary: args.summary } : {}),
         });
-        return okResult(
-          `已投递给 ${result.to}：回执 ${result.receipt}（通道 ${result.via}，msgId=${result.msgId}）。`,
-          result as unknown as ToolPayload,
-        );
+        // v0.5.2（SCALE-2 修复）：dropped 回执不是工具错误（isError=false），但
+        // 「已投递给」字样 + 裸原因码让模型极易把它当成功（红队：236 条被丢，
+        // 发送方响应全部 success）。摘要行对非送达终态如实改口并把可行动的
+        // detail 前置（delivered/held 之外终态一律不再自称「已投递」）。
+        const deliveredLike = result.receipt === "delivered";
+        const summaryLine = deliveredLike
+          ? `已投递给 ${result.to}：回执 delivered（通道 ${result.via}，msgId=${result.msgId}）。`
+          : `未投递给 ${result.to}：回执 ${result.receipt}（通道 ${result.via}，msgId=${result.msgId}）${result.detail !== undefined ? ` —— ${result.detail}` : ""}。`;
+        return okResult(summaryLine, result as unknown as ToolPayload);
       }),
   );
 
@@ -1392,11 +1735,15 @@ export function registerPeerTools(server: McpServer, deps: PeerToolDeps): void {
       // 误判「丢了 5 条」（红队 conc1 误判消息丢失的直接原因）。抑制后：count =
       // envelopes = 本次真实呈现数；剩余件留在 queue，由 remaining 字段给「再拉一次」指针。
       call(async () => {
-        const result = await services.inbox(args.limit ?? 10);
+        // v0.5.2（SCALE-3 修复）：预算先算，同一个 budget 对象既给服务面的「消费
+        // 窗口」（窗口外消息留在队列），也给本响应的排布——两处口径同源，窗口内
+        // 条目不会再被降级成「已省略」占位符（消费即省略的根因）。
+        const budget = receiverInjectBudget(contextCharsFromEnv(deps.env), deps.env);
+        const result = await services.inbox(args.limit ?? 10, budget);
         // v0.5（R-23 面 C）：渲染 → 预算排布（花费新→旧、输出保到达序）。
         // store 已在接收入队时落盘（F-3），面内不落——注入面只渲染+排布。
-        // 契约变化（§2.2 清单）：envelopes 条数可能 < count（超支条目降一行摘要/省略）。
-        const budget = receiverInjectBudget(contextCharsFromEnv(deps.env), deps.env);
+        // v0.5.2 起：服务面窗口已保证 sum(cost) ≤ budget.total，排布只兜
+        // 「单条超 item 预算」的截断（+ xc_peer_read 指针），不再产生占位摘要。
         const injectBlocks = result.items
           .map((item, i) => queueItemToInjectBlock(item, result.rendered[i] ?? renderPeerEnvelope(item)))
           .filter((b) => b.rendered !== "");
@@ -1478,10 +1825,23 @@ export function registerPeerTools(server: McpServer, deps: PeerToolDeps): void {
     async () =>
       call(async () => {
         const panel = await services.agents();
+        // v0.5.2（SCALE-1 修复）：观测面板接入注入预算。面板的任务计数天然有界，
+        // 但 `peers` 行（cwd/identity 全量 JSON）随 peer 数无界增长——30 peers 时
+        // xc_peers 面 37k 字符，xc_agents 同源数据同病。按声明预算开窗口，窗口外
+        // 行省略并给 xc_peers({offset}) 续读指针（完整清单以 xc_peers 为准）。
+        const budget = receiverInjectBudget(contextCharsFromEnv(deps.env), deps.env);
+        const fixed = JSON.stringify({ ...panel, peers: [] }).length + 64;
+        const peerCosts = panel.peers.map((row) => JSON.stringify(row).length);
+        const shownPeers = batchWindowCount(peerCosts, Math.max(0, budget.total - fixed));
+        const peersTruncated = shownPeers < panel.peers.length;
+        const windowed: PeerAgentsPanel = {
+          ...panel,
+          peers: panel.peers.slice(0, shownPeers),
+        };
         return okResult(
           [
             panel.self !== undefined ? `self: ${panel.self.name} (${panel.self.status ?? "unknown"})` : "self: 未注册",
-            `peers: ${panel.peers.length}`,
+            `peers: ${panel.peers.length}${peersTruncated ? `（本页列 ${shownPeers}，其余用 xc_peers({offset:${shownPeers}}) 续读）` : ""}`,
             `members: ${panel.members.length}`,
             `tasks: pending ${panel.tasks.pending} / in_progress ${panel.tasks.inProgress} / done ${panel.tasks.done}`,
             panel.inboundPolicy !== undefined
@@ -1494,7 +1854,12 @@ export function registerPeerTools(server: McpServer, deps: PeerToolDeps): void {
                   : "")
               : "inboundPolicy: 未知",
           ].join("\n"),
-          panel as unknown as ToolPayload,
+          {
+            ...windowed,
+            ...(peersTruncated
+              ? { peersTruncated: { shown: shownPeers, total: panel.peers.length, budgetChars: budget.total } }
+              : {}),
+          } as unknown as ToolPayload,
         );
       }),
   );

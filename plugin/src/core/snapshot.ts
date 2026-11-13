@@ -107,6 +107,23 @@ export interface StatusSnapshot {
    * 孤儿时出现（schema 只增可选字段，v0.1.0 构造的快照不受影响）。
    */
   orphanTasks?: Record<string, string[]>;
+  /**
+   * v0.5.2（故障注-1 二番战修复）：任务板与回执链矛盾（agentKey → 矛盾任务 id 列表）。
+   * 邮箱已有某任务的 completed 回执而任务板上它仍是未完成态 = 真源被陈旧备份
+   * 回滚/手工改坏，已完成工作静默退回。仅在矛盾存在时出现。
+   */
+  staleCompletedReceipts?: Record<string, string[]>;
+  /**
+   * v0.5.2（故障注-1 二番战修复）：最近一次 team.json 损坏自愈的披露（进程内台账；
+   * 真源被任意变更工具重写后清除）。恢复态疑似陈旧（rolledBackTaskIds 非空）时
+   * 调用方必须显式提示人工核对。
+   */
+  stateRecovery?: {
+    at: number;
+    defect: string;
+    backup: string;
+    rolledBackTaskIds: string[];
+  };
 }
 
 // ---------------------------------------------------------------------------

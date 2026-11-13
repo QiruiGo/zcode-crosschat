@@ -82,6 +82,8 @@ export interface PeerRow {
   lastSeenMs?: number;
   /** For alias rows: when the name was released (epoch ms). */
   releasedAt?: number;
+  /** v0.5.2（peer-5 修复）：本花名接管自已离会会话（死记录被惰性清扫后 reclaim）。 */
+  reclaimedFrom?: { sessionId: string; pid: number; releasedAt: number };
   /** Human-facing display name (may contain CJK; never addressable). */
   displayName?: string;
 }
@@ -99,6 +101,8 @@ export interface PeerRecordLike {
   status?: PeerStatus;
   lastSeen?: number;
   formerNames?: { name: string; releasedAt: number }[];
+  /** v0.5.2（peer-5 修复）：接管过来的前任身份（结构视图，与 W1 的 PeerReclaimedFrom 同形）。 */
+  reclaimedFrom?: { sessionId: string; pid: number; releasedAt: number };
 }
 
 /** Outcome of resolving a `to` string (SPEC R-9). */
@@ -194,6 +198,7 @@ export function peerRowsFromRecord(rec: PeerRecordLike, kind: PeerRowKind): Peer
       status: rec.status,
       lastSeenMs: rec.lastSeen,
       displayName: rec.displayName,
+      ...(rec.reclaimedFrom !== undefined ? { reclaimedFrom: rec.reclaimedFrom } : {}),
     });
   }
   const former = Array.isArray(rec.formerNames) ? rec.formerNames : [];
@@ -269,6 +274,10 @@ export function peerRowKindLabel(row: PeerRow): string {
  * The `[ref]` suffix is appended **only when the bare name is not enough**
  * (CC `@8463662`): the caller passes `ambiguous` computed over the whole
  * row set. The structured payload always carries `ref` separately.
+ *
+ * v0.5.2（peer-5 修复）：接管行追加 ` (接管自已离会会话 <ref>)`——死会话占用的
+ * 花名被 reclaim 时，旧记录已被惰性清扫、旧名不会进任何 formerNames，行文本是
+ * 「这个地址换过人」的唯一可见信号（另有审计 peer-name-reclaimed）。
  */
 export function formatPeerRowText(row: PeerRow, ambiguous: boolean, now: number = Date.now()): string {
   const head = `${row.name} [${peerRowKindLabel(row)}]`;
@@ -277,7 +286,10 @@ export function formatPeerRowText(row: PeerRow, ambiguous: boolean, now: number 
   const status = row.status ? ` status=${row.status}` : '';
   const seen = ` seen=${relativeAge(row.lastSeenMs, now)}`;
   const former = row.former ? ` (现名 ${row.currentName})` : '';
-  return `${head}${ref}${cwd}${status}${seen}${former}`;
+  const reclaimed = row.reclaimedFrom !== undefined
+    ? ` (接管自已离会会话 ${peerRef(row.reclaimedFrom.sessionId)})`
+    : '';
+  return `${head}${ref}${cwd}${status}${seen}${former}${reclaimed}`;
 }
 
 /**

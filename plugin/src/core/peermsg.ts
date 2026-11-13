@@ -28,7 +28,7 @@
  * | per-sender token bucket | 30 messages / 10 s |
  * | msgId de-duplication | last 256 msgIds on the receiving side |
  * | relay-depth guard | depth > 2 is dropped (zcode's stricter face) |
- * | in-flight queue cap | 64 |
+ * | in-flight queue cap | 1024 (v0.5.2 起；此前 64，可配 `XC_PEER_MAX_QUEUE_DEPTH`) |
  *
  * NOTE on the relay-depth gate and `selfSent`: CC's `k()` lets a self-sent
  * message through as the FIRST branch (`if(e?.selfSent) return {policy:"accept"}`
@@ -96,8 +96,27 @@ export const PEER_RATE_LIMIT = 30;
 export const PEER_RATE_WINDOW_MS = 10_000;
 /** De-duplication window size (recently accepted msgIds). */
 export const PEER_DEDUP_LIMIT = 256;
-/** In-flight queue cap per session. */
-export const PEER_MAX_QUEUE_DEPTH = 64;
+/**
+ * In-flight queue cap per session.
+ *
+ * v0.5.2（SCALE-2 修复）：默认 64 → **1024**。红队二番战实测（10 发送方 ×10 条、
+ * 不 drain）队列在第 64/65 条起以 `queue-full` 永久丢弃，而队内邮箱同规模
+ * （1,000 条）全部入队——peer 轴这道闸既未文档化又与队内行为不一致。
+ * 提高默认值后 fan-in 突发（红队 300 条扇入）不再丢消息；上限本身保留
+ * （无界队列 = 接收方磁盘无界增长），且改为可配（`XC_PEER_MAX_QUEUE_DEPTH`）。
+ */
+export const PEER_MAX_QUEUE_DEPTH = 1024;
+
+/**
+ * 入站队列深度上限（可配：env `XC_PEER_MAX_QUEUE_DEPTH`）。
+ * 口径与 `XC_INJECT_*` 一致：未设 / 空串 / 非正 / 非安全整数 = 未设 → 内置默认。
+ */
+export function peerMaxQueueDepthFromEnv(env: NodeJS.ProcessEnv): number {
+  const raw = env['XC_PEER_MAX_QUEUE_DEPTH'];
+  if (raw === undefined || raw.trim() === '') return PEER_MAX_QUEUE_DEPTH;
+  const n = Number(raw);
+  return Number.isSafeInteger(n) && n > 0 ? n : PEER_MAX_QUEUE_DEPTH;
+}
 /** Relay depth above which a message is dropped. */
 export const PEER_MAX_HOP_DEPTH = 2;
 /** Hold quarantine capacity (CC `Q` = 100, @34182692). */
@@ -307,6 +326,11 @@ export interface PeerAdmissionInput {
   selfSent: boolean;
   /** Current in-flight queue depth. */
   queueDepth: number;
+  /**
+   * Queue cap override (v0.5.2 SCALE-2：`XC_PEER_MAX_QUEUE_DEPTH` 可配)。
+   * 缺省 = {@link PEER_MAX_QUEUE_DEPTH}。
+   */
+  maxQueueDepth?: number;
   /** Rate + de-duplication state (mutated on admission). */
   buckets: RateBuckets;
 }
@@ -355,6 +379,7 @@ export function consumePeerRate(buckets: RateBuckets, sender: string, now: numbe
  */
 export function admitPeerMessage(input: PeerAdmissionInput): PeerAdmissionVerdict {
   const { now, sender, msgId, hopChain, selfSent, queueDepth, buckets } = input;
+  const maxQueueDepth = input.maxQueueDepth ?? PEER_MAX_QUEUE_DEPTH;
 
   if (!consumePeerRate(buckets, sender, now)) {
     return { ok: false, reason: 'rate-limited' };
@@ -365,7 +390,7 @@ export function admitPeerMessage(input: PeerAdmissionInput): PeerAdmissionVerdic
   if (!selfSent && hopChain.length > PEER_MAX_HOP_DEPTH) {
     return { ok: false, reason: 'loop-depth' };
   }
-  if (queueDepth >= PEER_MAX_QUEUE_DEPTH) {
+  if (queueDepth >= maxQueueDepth) {
     return { ok: false, reason: 'queue-full' };
   }
   rememberPeerMsgId(buckets, msgId);

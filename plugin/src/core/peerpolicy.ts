@@ -870,27 +870,45 @@ function isHeldMessage(value: unknown): value is PeerHeldMessage {
 }
 
 /**
+ * 暂存区枚举结果（v0.5.2 故障注-4 修复）：可读条目 + 损坏条目明细。
+ *
+ * 损坏件（不可解析 JSON / 形状非法）此前只落审计 `peer-held-malformed` 后被静默
+ * 跳过——人工审阅面（xc_peer_review）看到的是「暂存区 0 条」，消息既不可见也不
+ * 可处置、无任何计数（红队二番战 FI-9d）。现在枚举把损坏件透出，由工具面披露
+ * `corrupted N 条`。
+ */
+export interface HeldScanResult {
+  entries: HeldEntry[];
+  corrupted: { file: string; error: string }[];
+}
+
+/**
  * 暂存区枚举（**容错读**：别的写入方落下的记录形状可能少字段）。
  *
  * - `expiresAt` 缺失 → 按 `heldAt + 默认 TTL` 补（审批期限从首次暂存起算）；
  * - `announcedCauses` 缺失 → 视为 `[cause]`（已播报过一次，避免重复播报）。
+ *
+ * v0.5.2（故障注-4 修复）：不可解析/形状非法的文件不再只进审计——收进
+ * `corrupted` 列表随枚举结果返回，供审阅面披露计数与定位。
  */
-async function listHeldEntries(root: string, sessionId: string): Promise<HeldEntry[]> {
+async function scanHeldEntries(root: string, sessionId: string): Promise<HeldScanResult> {
   const dir = peerHeldDir(root, sessionId);
   let names: string[];
   try {
     names = await readdir(dir);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { entries: [], corrupted: [] };
     throw error;
   }
   const entries: HeldEntry[] = [];
+  const corrupted: { file: string; error: string }[] = [];
   for (const name of names) {
     if (!name.endsWith('.json')) continue;
     try {
       const parsed: unknown = JSON.parse(stripLeadingBom(await readFile(join(dir, name), 'utf8')));
       if (!isHeldMessage(parsed)) {
         await logPeerEvent(root, { event: 'peer-held-malformed', file: name });
+        corrupted.push({ file: name, error: 'not a valid held-message record' });
         continue;
       }
       const cause = parsed['cause'] as PeerHoldCause;
@@ -907,17 +925,30 @@ async function listHeldEntries(root: string, sessionId: string): Promise<HeldEnt
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
       await logPeerEvent(root, { event: 'peer-held-malformed', file: name, error: String(error) });
+      corrupted.push({ file: name, error: String(error) });
     }
   }
   entries.sort(
     (a, b) => (a.held.heldAt - b.held.heldAt) || a.held.item.msgId.localeCompare(b.held.item.msgId),
   );
-  return entries;
+  return { entries, corrupted };
+}
+
+/**
+ * v0.5.2（故障注-4 修复）：暂存区枚举 + 损坏件计数（审阅面披露用）。
+ * 坏件（不可解析/形状非法）进 `corrupted`，不再对人工审阅者完全不可见。
+ */
+export async function listHeldPeerMessagesDetailed(
+  root: string,
+  sessionId: string,
+): Promise<{ held: PeerHeldMessage[]; corrupted: { file: string; error: string }[] }> {
+  const scan = await scanHeldEntries(root, sessionId);
+  return { held: scan.entries.map((entry) => entry.held), corrupted: scan.corrupted };
 }
 
 /** 列出暂存区全部消息（按 heldAt 升序，再按 msgId 稳定排序）。 */
 export async function listHeldPeerMessages(root: string, sessionId: string): Promise<PeerHeldMessage[]> {
-  return (await listHeldEntries(root, sessionId)).map((entry) => entry.held);
+  return (await scanHeldEntries(root, sessionId)).entries.map((entry) => entry.held);
 }
 
 async function writeHeldMessage(
@@ -959,7 +990,7 @@ export async function holdPeerMessage(
   const ttlMs = options.ttlMs ?? holdTtlMsFromEnv();
   const capacity = options.capacity ?? HOLD_CAPACITY;
 
-  const entries = await listHeldEntries(root, sessionId);
+  const entries = (await scanHeldEntries(root, sessionId)).entries;
   const existingEntry = entries.find((entry) => entry.held.item.msgId === item.msgId);
   const existing = existingEntry?.held;
 
@@ -975,7 +1006,7 @@ export async function holdPeerMessage(
     : { item, cause, announcedCauses: [cause], heldAt: now, expiresAt: now + ttlMs };
 
   if (!existing) {
-    const current = await listHeldEntries(root, sessionId);
+    const current = (await scanHeldEntries(root, sessionId)).entries;
     while (current.length >= capacity) {
       const oldest = current.shift();
       if (oldest === undefined) break;
@@ -1041,7 +1072,7 @@ export async function releaseHeldMessages(
   options: ReleaseHeldOptions = {},
 ): Promise<PeerHeldReleaseResult[]> {
   const now = options.now ?? Date.now();
-  const all = await listHeldEntries(root, sessionId);
+  const all = (await scanHeldEntries(root, sessionId)).entries;
   const wanted = new Set(ids);
   const selected = ids.length === 0 ? all : all.filter((entry) => wanted.has(entry.held.item.msgId));
   const results: PeerHeldReleaseResult[] = [];
@@ -1125,7 +1156,7 @@ export async function discardHeldMessages(
   ids: readonly string[],
   options: ReleaseHeldOptions = {},
 ): Promise<PeerHeldReleaseResult[]> {
-  const all = await listHeldEntries(root, sessionId);
+  const all = (await scanHeldEntries(root, sessionId)).entries;
   const wanted = new Set(ids);
   const selected = ids.length === 0 ? all : all.filter((entry) => wanted.has(entry.held.item.msgId));
   const results: PeerHeldReleaseResult[] = [];
@@ -1166,7 +1197,7 @@ export async function expireHeldMessages(
   options: ReleaseHeldOptions & { now?: number } = {},
 ): Promise<PeerHeldReleaseResult[]> {
   const now = options.now ?? Date.now();
-  const all = await listHeldEntries(root, sessionId);
+  const all = (await scanHeldEntries(root, sessionId)).entries;
   const results: PeerHeldReleaseResult[] = [];
   for (const entry of all) {
     const held = entry.held;
@@ -1206,7 +1237,7 @@ export async function discardAllHeldMessages(
   sessionId: string,
   options: ReleaseHeldOptions = {},
 ): Promise<PeerHeldReleaseResult[]> {
-  const all = await listHeldEntries(root, sessionId);
+  const all = (await scanHeldEntries(root, sessionId)).entries;
   const results: PeerHeldReleaseResult[] = [];
   for (const entry of all) {
     const held = entry.held;

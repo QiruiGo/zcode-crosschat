@@ -137,7 +137,8 @@ xc_status        # t1: completed（attempt 1）
 - 两个会话必须共用同一 `<workspace>`（v1 边界）。
 - 每条新的 MCP 连接（每次无头回合 / 每个新会话）都要先 `xc_register`；被引擎唤醒的回合 prompt 会自带 sid 与一次性 wakeToken，属正常机制。
 - `xc_claim` 返回的 `attemptId` 是 `xc_report` 的唯一凭证；stale 即拒。
-- 若变更类工具返回 `{"error":"busy"}`：跨进程锁 15 秒等待后仍被占，稍后重试一次。
+- 若变更类工具返回 `{"error":"busy"}`：跨进程锁 15 秒等待后仍被占，稍后重试一次。（锁文件损坏或锁路径被目录占用的残留会自愈并审计 `lock-repaired`，不进入 busy。）
+- 任一工具响应末尾出现 `WARNING engine audit log is not writable`：`logs/engine.jsonl` 不可写（被目录占用/权限缺失），该工作区的引擎审计在此期间**不完整**——恢复该路径可写后告警自动消失（v0.5.2 起；此前审计静默全丢、零诊断）。
 - 不要在派发后 busy-poll；回执会唤醒你，或下一回合自动注入未读提示。
 
 ---
