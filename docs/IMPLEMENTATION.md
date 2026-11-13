@@ -589,7 +589,9 @@ W3/W7 环节的记录（§8.4）提到「若同事最终导出的名字与签名
 - push：`git push origin main v0.5.1`；
 - 打包：`node scripts/pack-release.mjs v0.5.1`（worktree 导出 tag 树 → npm ci → build → prune → dist 冒测 IMPORT_OK → tar + SHA256；五处版本断言过）；
 - 发布：`gh release create v0.5.1 --target <SHA> --notes-file .scratch-release/notes-v0.5.1.md` + `gh release upload` 两资产（tgz + .sha256）；
-- 发布后自检：`gh release view`（isDraft=false、资产在、body 引用复验报告）。
+- 发布后自检：`gh release view`（isDraft=false、资产在、body 引用复验报告）；API 复核 body 9,410 字符、18 个 `### #` 小节、SHA256 在、无死链；
+- **发布后 body 修正 1 处**（本环节 tag 后文档跟进提交记录）：初版 notes 给复验报告加了 `github.com/QiruiGo/deepseek-crosschat/...` 外链，实测该仓库未发布到公网（`gh repo view` 404）——死链；已按仓库既有惯例（README/IMPLEMENTATION 均用纯文本工作区路径引用证据）改为纯文本路径 `deepseek-crosschat/reports/17-v051复验.md` 并注明「证据工作区未发布到公网」，`gh release edit` 更新 body。tag 保持在发布 commit 未动。
+- **发布产物**：release URL <https://github.com/QiruiGo/zcode-crosschat/releases/tag/v0.5.1>；资产 `zcode-crosschat-0.5.1-prebuilt-slim.tar.gz`（4,687,571 B，SHA256 `542050f8d035eaf0a48a01b24bddb79eb5e4787675c9c61044194e4f837e232d`）+ 同名 `.sha256`。
 
 ### 13.6 本环节未执行项（如实声明）
 
