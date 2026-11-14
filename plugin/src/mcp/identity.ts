@@ -7,7 +7,9 @@
  *   必须重新注册。绑定随连接消亡 = 随进程消亡，模块级单例即连接级（V8 两种结果
  *   都成立；Map 结构为未来 HTTP 形态预留 per-session 键）。
  * - 路径 1（hook 锚定）：registry/sessions/<sid>.json 存在（任意年龄；lastSeen
- *   超 10 分钟仅告警不拒绝）∧ 名字未被其他 sid 绑定 ∧ sid 未被其他名字绑定。
+ *   超 10 分钟仅告警不拒绝）∧ 名字未被其他 sid 绑定 ∧ sid 未被其他名字绑定 ∧
+ *   v0.6.1（安全对-1）sid 未被另一个**活进程**注册（peer 轴 session_id_in_use
+ *   同语义同闸；合法重启重绑不受影响）。
  *   v0.6（DESIGN-V0.6.md §2.2 行 2）：regToken 锚定硬闸砍除——(name, sid) 精确对
  *   重绑幂等成功；软校验三件套（name_taken / session_already_bound / removed 门）不变。
  * - 路径 2（wakeToken 回退）：registry/wake/<nonce>.json 命中未过期未使用且
@@ -29,7 +31,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { invalidParamsError, notRegisteredError, ToolError } from "./protocol.js";
 import { withRegistryThenTeamLocks } from "../core/lock.js";
-import { sanitizeKey } from "../core/sanitize.js";
+import { validateMemberName } from "../core/sanitize.js";
 import {
   WAKE_INFLIGHT_MS,
   bindName,
@@ -43,8 +45,10 @@ import {
 import { readPeerBaseRecord, writePeerBaseRecord } from "../core/peerdir.js";
 import { newTeamState, noteTeamReset, readTeam, writeTeam } from "../core/teamstate.js";
 import { logEngineEvent } from "../core/log.js";
-import { DEFAULT_TEAM_ID, memberState, RESERVED_MEMBER_KEYS } from "../core/types.js";
+import { DEFAULT_TEAM_ID, memberState } from "../core/types.js";
 import type { MemberRole, SessionRecord, TeamMember, TeamState } from "../core/types.js";
+import { findLiveSessionIdHolder } from "../core/peerregistry.js";
+import type { PeerRecord } from "../core/peerregistry.js";
 
 export { DEFAULT_TEAM_ID };
 
@@ -147,21 +151,19 @@ export async function xcRegister(
 ): Promise<RegisterOutcome> {
   const name = args.name.trim();
   if (!name) throw invalidParamsError("name is required");
-  const agentKey = sanitizeKey(name);
-  if (!agentKey) {
-    throw invalidParamsError(`name ${JSON.stringify(name)} sanitizes to an empty key`);
+  // v0.6.1（红队四番战 安全对-2 修复）：花名严格校验——拒绝任何会被 sanitizeKey
+  // 静默归一到**碰撞键**的写法（全角/同形字/路径符/控制符/空白/连字符变形），
+  // 与 peer 轴严格文法同一口径（两轴一致）；CJK 等规范键形名字不受影响。保留名
+  // 校验（lead/default + peer 轴保留集 main/team-lead/user/system，安全对-5）
+  // 随同一道闸。锁外快拒：hook/wake 任何路径都到不了绑定，零副作用。
+  const nameCheck = validateMemberName(name);
+  if (!nameCheck.ok) {
+    throw new ToolError(
+      { error: nameCheck.error, name: nameCheck.name, message: nameCheck.message },
+      nameCheck.message,
+    );
   }
-  // v0.5.1（BND-5 修复）：保留名规则与 xc_member_add 统一（member-tools.ts 同码）。
-  // 此前 xc_register 放行 lead/default：字面成员名与 lead 角色语义 / 缺省 teamId
-  // 撞名（xc_lead_transfer{to:"lead"} 会把角色授予字面成员 "lead"），两入口
-  // 不一致构成注册旁路。锁外快拒，任何路径（hook/wake）都到不了绑定。
-  if ((RESERVED_MEMBER_KEYS as readonly string[]).includes(agentKey)) {
-    throw new ToolError({
-      error: "name_reserved",
-      name: agentKey,
-      message: `member name "${agentKey}" is reserved (${RESERVED_MEMBER_KEYS.join("/")})`,
-    });
-  }
+  const agentKey = nameCheck.key;
   const sessionId = args.sessionId.trim();
   if (!sessionId) throw invalidParamsError("sessionId is required");
   const role: MemberRole = args.role ?? "peer";
@@ -175,6 +177,10 @@ export async function xcRegister(
     // v0.5.3（a6）：锚定记录（hook 路径读取；wake 路径为代写后的记录）——重绑属主
     // 校验要读它的 regToken，故提升到双路径分支之外声明。
     let sess: SessionRecord | undefined;
+    // v0.6.1（验收员复验后定位修复）：hook 路径的 sid 归属/活性闸**查询结果**——
+    // 在名字/sid 交叉校验之后才抛（见下方 `sidHolder` 处），以保住 v0.6.0 起文档化的
+    // `name_taken` / `session_already_bound` 错误码契约（历史回归断言按旧码判）。
+    let sidHolder: PeerRecord | undefined;
 
     // ---- v0.2（DESIGN-V0.2 §7.4-I5/§7.3.3）：removed 成员的注册一律拒绝 ----
     // xc_member_stop 后花名不释放（roster 记录保留）；重新启用必须由 lead 走
@@ -240,6 +246,27 @@ export async function xcRegister(
             "use a wakeToken (headless rounds) or verify the hook ran",
         });
       }
+      // ---- v0.6.1（红队四番战 安全对-1 修复，P0）：sid 归属/活性硬闸 ----
+      // 该 sid 已被**另一个活进程**注册（peer 轴活记录：pid 存活 ∧ lastSeen 由
+      // 15s 心跳保鲜）时拒绝——与 peer 轴 session_id_in_use 同一语义、同一实现
+      // （findLiveSessionIdHolder，core/peerregistry.ts）。旧实现只验「workspace
+      // 锚定记录存在 ∧ 花名未被别的 sid 绑」，而锚定记录同工作区任意会话可读、
+      // sid 本身经 xc_overview 的 members[].sessionId 公开——零凭据冒名成立
+      // （红队 sec1：rogue 用受害者 sid 注册成功，并以其身份派单/读箱）。
+      // 不误伤合法流程：本进程自己的记录豁免（agent 重试/重连的幂等重注册）；
+      // 死记录不在 active（只读扫描，惰性清扫留给花名 claim 路径）——会话重启/
+      // 续跑（--resume 同 sid、新进程）照常重绑。wake 路径不设本闸：一次性 nonce
+      // 已是更强的归属证明，且无头回合与交互会话可能同 sid 并存，误闸会破坏合法
+      // 唤醒流程。
+      // v0.6.1（验收员复验后定位修复）：闸口查询改用**只读扫描**（sweep:false），
+      // 且抛错点移到名字/sid 交叉校验之后——前者避免把死前任的 peer 记录提前删掉
+      // 而使 peer-name-reclaimed 接管留痕失明；后者保住 v0.6.0 文档化的
+      // name_taken / session_already_bound 错误码（不同名占用 sid 的旧语义在前）。
+      // 冒名主场景（同花名 + 他人 sid）两个旧校验都放行，仍由本闸以
+      // session_id_in_use 硬拒，P0 防护不减弱。
+      if (options.peerRoot !== undefined) {
+        sidHolder = await findLiveSessionIdHolder(options.peerRoot, sessionId);
+      }
       const ageMs = now - sess.lastSeen;
       if (ageMs > STALE_LASTSEEN_WARN_MS) {
         warnings.push(`session lastSeen is ${Math.round(ageMs / 60000)}m old (warn only, not rejected)`);
@@ -268,6 +295,27 @@ export async function xcRegister(
         boundName: conflicting[0],
         message: `session "${sessionId}" is already bound to name "${conflicting[0]}"`,
       });
+    }
+
+    // ---- v0.6.1（安全对-1 修复，P0）：sid 归属/活性硬闸的抛错点 ----
+    // 放在名字/sid 交叉校验之后：文档化的 name_taken / session_already_bound 先行
+    // （保住 v0.6.0 错误码契约），本闸兜住「同花名 + 他人 sid」的零凭据冒名
+    // （旧实现在这条路径上完全放行，红队 sec1 即由此得手）。
+    if (sidHolder !== undefined) {
+      const boundName = sidHolder.name ?? `pid-${sidHolder.pid}`;
+      throw new ToolError(
+        {
+          error: "session_id_in_use",
+          sessionId,
+          boundName,
+          boundPid: sidHolder.pid,
+          message:
+            `sessionId "${sessionId}" is already registered by another live session (name "${boundName}"); ` +
+            "a sessionId belongs to the session that owns it — register with this session's own " +
+            "hook-injected id, not another session's",
+        },
+        `sessionId "${sessionId}" is already registered by another live session`,
+      );
     }
 
     // ---- v0.6（DESIGN-V0.6.md §2.2 行 2）：重绑属主硬闸（identity_token_required）砍除 ----

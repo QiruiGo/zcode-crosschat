@@ -15,11 +15,18 @@
  *
  * 接管（T1 #5）：name 已在队内花名册但绑定 sid ≠ 本次 sessionId 时，缺省
  * name_taken（不猜测旧持有者死活）；`takeover:true`（显式，对齐 xc_team takeover
- * 的 R-1/F-4 先例）过两道活信号闸（在途唤醒标记 15min 内 → takeover_inflight；
- * peer 轴活 sid 冲突 → session_id_in_use）后立即换绑 + 名下 OPEN 任务（含
- * blocked）revokeAttempt 回池 + 给创建者回执 + 审计 + leadHistory（lead 名被
- * 接管时 reason=member-rebind-takeover）。误判可恢复：被接管者的下份 report 得
- * stale_attempt 硬拒，按守则停手重取单（README 威胁模型声明）。
+ * 的 R-1/F-4 先例）过三道活信号闸（在途唤醒标记 15min 内 → takeover_inflight；
+ * 接管方新 sid 活冲突 → session_id_in_use；**v0.6.1 安全对-4：旧持有者 sid 仍被
+ * 活进程持有 → takeover_live_holder**——真实活信号，不依赖默认关闭的
+ * wake_enabled）后立即换绑 + 名下 OPEN 任务（含 blocked）revokeAttempt 回池 +
+ * 给创建者回执 + 审计 + leadHistory（lead 名被接管时 reason=member-rebind-takeover）。
+ * 误判可恢复：被接管者的下份 report 得 stale_attempt 硬拒，按守则停手重取单
+ * （README 威胁模型声明）。
+ *
+ * v0.6.1（安全对-2/边界-2）：花名严格校验（validateMemberName）覆盖注册/改名/
+ * 接管全路径——拒绝会被 sanitizeKey 静默归一到碰撞键的写法（全角/同形字/路径符/
+ * 控制符/空白/连字符变形），与 peer 轴严格文法同一口径；保留名（lead/default +
+ * peer 保留集）两轴一致（安全对-5）。
  */
 
 import { z } from "zod";
@@ -30,12 +37,15 @@ import { withTeamLock, withRegistryThenTeamLocks } from "../core/lock.js";
 import { appendMailbox, createMessage, readMailbox } from "../core/mailbox.js";
 import { logEngineEvent } from "../core/log.js";
 import { readNames, unbindName, findInflightWakeNonce, WAKE_INFLIGHT_MS } from "../core/registry.js";
-import { sanitizeKey } from "../core/sanitize.js";
+import { sanitizeKey, validateMemberName } from "../core/sanitize.js";
 import { DEFAULT_TEAM_ID } from "../core/types.js";
 import { memberOpenTasks, readTeam, writeTeam } from "../core/teamstate.js";
 import { revokeAttempt } from "../core/graph.js";
 import { peerRootFromEnv } from "../core/peerdir.js";
-import { getPeerServices, findLiveSessionIdHolder, type PeerRegisterResult } from "./peer-services.js";
+// v0.6.1（安全对-1 修复）：findLiveSessionIdHolder 唯一实现移入 core/peerregistry.ts
+// （队内轴 sid 归属校验也要用它；经 peer-services.ts import 会与 tools-team.ts 成环）。
+import { findLiveSessionIdHolder } from "../core/peerregistry.js";
+import { getPeerServices, type PeerRegisterResult } from "./peer-services.js";
 import { getPeerSessionContext } from "./peer-drain.js";
 import { pushLeadHistory } from "./tools-team.js";
 import type { ToolDeps } from "./core.js";
@@ -48,13 +58,15 @@ const TEAM_ID = DEFAULT_TEAM_ID;
 // ---------------------------------------------------------------------------
 
 export const IdentifyShape = {
-  name: z.string().min(1).describe("要注册的名字（sanitizeKey 归一；保留名 lead/default 拒绝）"),
+  name: z.string().min(1).describe(
+    "要注册的名字（须已是规范键形：字母/数字/单个连字符，≤48 字符；全角/同形字/路径符/控制符/空格/下划线等会被静默归一的写法一律拒绝；保留名 lead/default/main/team-lead/user/system 拒绝）",
+  ),
   sessionId: z.string().min(1).describe(
     "本会话的 sessionId——交互会话取 SessionStart 钩子注入的值；wake 回合取唤醒 prompt 显式给出的值。不要编造",
   ),
   role: z.enum(["peer", "worker"]).optional().describe("队内角色；缺省 peer"),
   takeover: z.boolean().optional().describe(
-    "显式接管：name 在册但绑定旧 sid 已死（进程被杀/崩溃）时立即换绑并回池其未完任务。缺省 false=同名校验与现行一致（name_taken）。误判可恢复",
+    "显式接管：name 在册但绑定旧 sid 已死（进程被杀/崩溃）时立即换绑并回池其未完任务。缺省 false=同名校验与现行一致（name_taken）。旧持有者仍活着（peer 轴活记录）时拒（takeover_live_holder）——真实活信号，与 wake_enabled 无关。误判可恢复",
   ),
   wakeToken: z.string().optional().describe("无头唤醒回合的引擎令牌；缺省走钩子锚定路径"),
   displayName: z.string().optional().describe("展示名（可含中文，不参与寻址）"),
@@ -129,11 +141,21 @@ async function teamMemberCleanForRename(
   return { clean: true };
 }
 
-/** takeover 的两道活信号闸（T1 #5）。 */
+/**
+ * takeover 的活信号闸（T1 #5；v0.6.1 红队四番战 安全对-4 修复后为三道）。
+ *
+ * 安全对-4（P1，confirmed）：`takeover:true` 可夺走**活着**的成员的队内身份与
+ * lead——唯一实质闸门是在途唤醒标记，而它依赖默认关闭的 wake_enabled
+ * （XC_WAKE_ENABLED=false 时永不落盘）；原 ② 查的是**接管方自己的新 sid**，
+ * 对旧持有者死活完全不设防。修复 = 补第三道闸：旧持有者 sid 仍被活进程持有
+ * （peer 轴活记录：pid 存活 + 15s 心跳）即拒——真实活信号，不依赖 wake_enabled，
+ * 也与 peer 轴 reclaim 语义对齐（死记录被惰性清扫后才可接管）。
+ */
 async function takeoverGates(
   deps: ToolDeps,
   agentKey: string,
   sessionId: string,
+  oldSessionId: string,
   now: number,
 ): Promise<void> {
   // ① 在途唤醒标记：磁盘可跨进程读；15min 内命中 → 旧持有者可能正跑长回合。
@@ -148,16 +170,38 @@ async function takeoverGates(
         `window ${WAKE_INFLIGHT_MS} ms) — takeover refused: the old holder may still be running a long turn`,
     });
   }
-  // ② peer 轴活 sid 冲突（本进程可判定的活连接冲突）。
-  const holder = await findLiveSessionIdHolder(peerRootFromEnv(deps.env), sessionId);
-  if (holder !== undefined) {
+  // ② 接管方自己的新 sid 已被别的活进程持有 → 拒。放在换绑前：否则 unbindName
+  //    已发生而随后的注册才失败，花名会卡在「已解绑未重绑」的中间态。
+  const newHolder = await findLiveSessionIdHolder(peerRootFromEnv(deps.env), sessionId);
+  if (newHolder !== undefined) {
     throw new ToolError({
       error: "session_id_in_use",
       sessionId,
-      boundName: holder.name ?? `pid-${holder.pid}`,
-      boundPid: holder.pid,
+      boundName: newHolder.name ?? `pid-${newHolder.pid}`,
+      boundPid: newHolder.pid,
       message: `sessionId "${sessionId}" is already registered by another live session — takeover refused`,
     });
+  }
+  // ③ v0.6.1（安全对-4 修复）：旧持有者活性闸——旧 sid 仍被**活进程**持有
+  //    （peer 轴活记录）→ 接管拒。takeover 的文档语义是「接管已死持有者的花名」
+  //    （进程被杀/崩溃后）；旧持有者还活着时必须走正常流程（它自己改名、或
+  //    lead 的 member-stop / xc_team transfer）。死持有者的记录不在 active
+  //    （惰性清扫）→ 合法 dead-sid 接管不受影响。
+  if (oldSessionId !== "") {
+    const oldHolder = await findLiveSessionIdHolder(peerRootFromEnv(deps.env), oldSessionId);
+    if (oldHolder !== undefined) {
+      const boundName = oldHolder.name ?? `pid-${oldHolder.pid}`;
+      throw new ToolError({
+        error: "takeover_live_holder",
+        agentKey,
+        sessionId: oldSessionId,
+        boundName,
+        boundPid: oldHolder.pid,
+        message: `member "${agentKey}" is still held by a live session (sid "${oldSessionId}", name "${boundName}") — ` +
+          "takeover refused: wait for the old holder to exit (its process dead), or use the normal flows " +
+          "(the holder renames itself; the lead runs xc_team transfer / member-stop)",
+      });
+    }
   }
 }
 
@@ -224,6 +268,17 @@ export async function handleIdentify(deps: ToolDeps, rawArgs: IdentifyArgs, conn
         message: `name ${JSON.stringify(rawArgs.name)} sanitizes to an empty key`,
       });
     }
+    // ---- v0.6.1（红队四番战 安全对-2 / 边界-2 修复）：花名严格校验 ----
+    // 注册/改名/接管全路径同一道闸（改名路径此前只 sanitizeKey、不验保留名也不
+    // 验文法——"LEAD" 可改名成 roster 键 lead 并自任 founder/lead，边界-2）。
+    // 校验在任何状态变更（unbindName / 成员 key 换绑 / 注册）之前，拒绝即零副作用。
+    const nameCheck = validateMemberName(rawArgs.name);
+    if (!nameCheck.ok) {
+      throw new ToolError(
+        { error: nameCheck.error, name: nameCheck.name, message: nameCheck.message },
+        nameCheck.message,
+      );
+    }
 
     // ---- wake 回合（wakeToken 在场）：只绑队内轴（唤醒回合不监听 peer 管道）----
     if (rawArgs.wakeToken !== undefined && rawArgs.wakeToken.trim() !== "") {
@@ -252,6 +307,9 @@ export async function handleIdentify(deps: ToolDeps, rawArgs: IdentifyArgs, conn
       const teamRename = await teamMemberCleanForRename(deps.stateRoot, existing.teamId, existing.agentKey);
       let peerRename: Awaited<ReturnType<typeof services.rename>> | undefined;
       let formerName: string | undefined;
+      // 边界-1 修复（P1）：本次队内 key 换绑是否带动了 leadKey/founderKey（审计/回显用）。
+      let leadKeyFollowed = false;
+      let founderKeyFollowed = false;
       if (teamRename.clean) {
         // 队内花名换绑（registry 锁内：unbind 旧名 → bind 新名 → member key 换绑）。
         await withRegistryThenTeamLocks(deps.stateRoot, existing.teamId, async () => {
@@ -261,6 +319,19 @@ export async function handleIdentify(deps: ToolDeps, rawArgs: IdentifyArgs, conn
             const idx = team.members.findIndex((m) => m.key === existing.agentKey);
             if (idx >= 0) {
               team.members[idx] = { ...team.members[idx]!, key: newKey, lastSeen: now };
+              // 边界-1 修复（P1）：lead/founder 花名随动——成员 key 换绑而
+              // leadKey/founderKey 不随动会悬空，把现任 lead 锁死在
+              // transfer/release/init 之外（not_lead / lead_exists），且 idle
+              // 收件人与 overview 的 founder 行指向不存在的成员。角色跟随会话
+              // 本人（同一 sid），不改变 lead 归属语义。
+              if (team.leadKey === existing.agentKey) {
+                team.leadKey = newKey;
+                leadKeyFollowed = true;
+              }
+              if (team.founderKey === existing.agentKey) {
+                team.founderKey = newKey;
+                founderKeyFollowed = true;
+              }
               await writeTeam(deps.stateRoot, team);
             }
           }
@@ -276,6 +347,8 @@ export async function handleIdentify(deps: ToolDeps, rawArgs: IdentifyArgs, conn
           from: existing.agentKey,
           to: newKey,
           sessionId: existing.sessionId,
+          ...(leadKeyFollowed ? { leadKeyFollowed: true } : {}),
+          ...(founderKeyFollowed ? { founderKeyFollowed: true } : {}),
         });
       }
       // peer 轴改名（已注册时）：formerNames + control:rename 通知（xc_peer_rename 现状行为）。
@@ -298,14 +371,18 @@ export async function handleIdentify(deps: ToolDeps, rawArgs: IdentifyArgs, conn
           },
         );
       }
+      const roleFollowed = leadKeyFollowed || founderKeyFollowed;
       return okResult(
         `Renamed to ${rawArgs.name}${formerName !== undefined ? ` (former: ${formerName})` : ""} on both axes; ` +
-          `roster key is now "${newKey}".`,
+          `roster key is now "${newKey}".` +
+          (roleFollowed ? ` leadKey/founderKey updated to "${newKey}" (role follows this session).` : ""),
         {
           renamed: { peer: peerContext !== undefined, team: true },
           ...(peerRename !== undefined ? { peer: peerRename } : {}),
           teamId: existing.teamId,
           agentKey: newKey,
+          ...(leadKeyFollowed ? { leadKeyFollowed: true } : {}),
+          ...(founderKeyFollowed ? { founderKeyFollowed: true } : {}),
         },
       );
     }
@@ -316,8 +393,8 @@ export async function handleIdentify(deps: ToolDeps, rawArgs: IdentifyArgs, conn
     const teamNow = await readTeam(deps.stateRoot, TEAM_ID);
     const rosterMember = teamNow?.members.find((m) => m.key === newKey);
     if (heldByOther && rawArgs.takeover === true && rosterMember !== undefined && rosterMember.sessionId !== rawArgs.sessionId) {
-      // 两道活信号闸（在途唤醒 / peer 轴活 sid 冲突）。
-      await takeoverGates(deps, newKey, rawArgs.sessionId, now);
+      // 三道活信号闸（在途唤醒 / 接管方新 sid 活冲突 / v0.6.1 安全对-4：旧持有者活性）。
+      await takeoverGates(deps, newKey, rawArgs.sessionId, rosterMember.sessionId, now);
       // 名下 OPEN（含 blocked）任务回池 + 创建者回执 + lead 追加审计。
       const revoked = await takeoverRevokeTasks(deps.stateRoot, newKey, `takeover-by:${rawArgs.sessionId}`, now);
       // 花名换绑：unbind 旧 sid 绑定，交给 xcRegister 重新绑定（registry→team 锁序）。
@@ -428,8 +505,9 @@ export function registerIdentifyTools(
 ): void {
   const description =
     "Register/rebind/rename/take over this session's identity on BOTH axes in one call (replaces xc_register + xc_peer_register + xc_peer_rename). " +
-    "The name is the address on each axis; sessionId comes from the SessionStart hook (interactive) or the wake prompt (headless) - never invent it. " +
-    "takeover:true (explicit) rebinds a dead holder's name and requeues its open tasks with receipts; it refuses while an in-flight wake round exists. " +
+    "The name is the address on each axis; sessionId comes from the SessionStart hook (interactive) or the wake prompt (headless) - never invent it: a sessionId already held by another live session is refused (session_id_in_use, team axis included). " +
+    "Names must already be in canonical key form (letters/digits/single dashes, ≤48 chars); silently-normalizing spellings (fullwidth, homoglyphs, path/control characters, spaces, underscores) are refused - same strict grammar as the peer axis. " +
+    "takeover:true (explicit) rebinds a dead holder's name and requeues its open tasks with receipts; it refuses while an in-flight wake round exists or the old holder is still live (takeover_live_holder). " +
     "Soft validation only: name_taken on live conflicts, session_id_in_use on live sid clashes, idempotent exact-pair rebind. No regToken (removed in v0.6).";
   const handler = async (args: Record<string, unknown>, extra: unknown): Promise<ToolResult> =>
     handleIdentify(deps, args as unknown as IdentifyArgs, connectionKeyOf(extra));

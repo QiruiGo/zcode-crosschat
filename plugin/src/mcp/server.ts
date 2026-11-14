@@ -34,7 +34,7 @@ import { stopPeerEndpoint } from "../transport/pipe.js";
 import { GuardedStdioTransport } from "../transport/mcpstdio.js";
 
 const SERVER_NAME = "zcode-crosschat";
-const SERVER_VERSION = "0.6.0";
+const SERVER_VERSION = "0.6.1";
 
 let shuttingDown = false;
 

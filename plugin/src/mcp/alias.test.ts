@@ -33,7 +33,6 @@ import { registerTeamTools } from "./tools-team.js";
 import { registerReviewTools } from "./tools-review.js";
 import { registerDoctorTool } from "./doctor-tool.js";
 import { writeSession } from "../core/registry.js";
-import { readTeam } from "../core/teamstate.js";
 import { storePeerMessageFull } from "../core/msgstore.js";
 import { resetPeerServicesForTests } from "./peer-services.js";
 
@@ -79,6 +78,7 @@ const RENAMED: Array<{ old: string; replacement: string; args: Record<string, un
 let workDir = "";
 let client: Client;
 let server: McpServer;
+let registry: PrimaryRegistry;
 
 beforeAll(async () => {
   workDir = await mkdtemp(join(tmpdir(), "xc-v06-alias-"));
@@ -87,7 +87,7 @@ beforeAll(async () => {
     XC_WAKE_ENABLED: "false",
   } as NodeJS.ProcessEnv);
   const core = composeCore(deps);
-  const registry: PrimaryRegistry = new Map();
+  registry = new Map();
   server = new McpServer({ name: "zcode-crosschat", version: "0.6.0" });
   registerIdentifyTools(server, deps, core, registry);
   registerTaskTools(server, deps, core, registry);
@@ -108,7 +108,7 @@ beforeAll(async () => {
 
   // 前置态：hook 路径要求 registry/sessions/<sid>.json 在场（SessionStart 钩子产物）。
   const stateRoot = join(workDir, ".crosschat");
-  for (const sid of ["sess-a", "sess-lead"]) {
+  for (const sid of ["sess-a", "sess-b", "sess-lead"]) {
     await writeSession(stateRoot, { sessionId: sid, cwd: workDir, startedAt: Date.now(), lastSeen: Date.now() });
   }
 
@@ -274,9 +274,7 @@ describe("T1-b-4：别名路径身份连续性（L1：extra 透传）", () => {
 
 describe("T1-c：新名主路径端到端（dispatcher + 家族实现，未经别名层）", () => {
   it("xc_identify → dispatch → claim → report(completed) → read(inbox) → overview 全链路", async () => {
-    const { writeTeam } = await import("../core/teamstate.js");
     const { writeFile } = await import("node:fs/promises");
-    const stateRoot = join(workDir, ".crosschat");
 
     // ① identify（新名直调）：alice 注册并建队（founder）。
     const identify = await client.callTool({
@@ -285,16 +283,17 @@ describe("T1-c：新名主路径端到端（dispatcher + 家族实现，未经�
     });
     expect(identify.isError).toBeFalsy();
 
-    // ② 直接把 bob 加进花名册（dispatch 的 to 必须是已注册成员）。
-    const team = (await readTeam(stateRoot, "default"))!;
-    team.members.push({
-      key: "bob",
-      sessionId: "sess-b",
-      role: "worker",
-      joinedAt: Date.now(),
-      lastSeen: Date.now(),
-    });
-    await writeTeam(stateRoot, team);
+    // ② bob 经第二连接注册（dispatch 的 to 必须是已注册成员）。v0.6.1（红队四番战
+    //    安全对-3 修复）起 claim 只允许受领人本人——bob 的认领/回报步骤走 conn-bob
+    //    连接（connectionKeyOf(extra).sessionId 即连接键，与 stdio 实跑同机制）。
+    const bobConn = { sessionId: "conn-bob" };
+    const bobReg = (await dispatchForTest(
+      registry,
+      "xc_identify",
+      { name: "bob", sessionId: "sess-b" },
+      bobConn,
+    )) as { isError?: boolean };
+    expect(bobReg.isError).toBeFalsy();
 
     // ③ dispatch（新名直调；带 priority——C2 新参）。
     const dispatched = await client.callTool({
@@ -305,32 +304,40 @@ describe("T1-c：新名主路径端到端（dispatcher + 家族实现，未经�
     const taskId = jsonPayloadOf(dispatched)["taskId"] as string;
     expect(typeof taskId).toBe("string");
 
-    // ④ claim（同一连接=alice；状态机允许认领 pending 单）。
-    const claimed = await client.callTool({ name: "xc_claim", arguments: { taskId } });
+    // ④ claim（受领人 bob 的连接；派发方 alice claim 会得 not_assignee——见
+    //    claim-assignee 回归单测）。
+    const claimed = (await dispatchForTest(registry, "xc_claim", { taskId }, bobConn)) as {
+      isError?: boolean;
+      content: Array<{ type: string; text: string }>;
+    };
     expect(claimed.isError).toBeFalsy();
     const attemptId = jsonPayloadOf(claimed)["attemptId"] as string;
     expect(typeof attemptId).toBe("string");
 
     // ⑤ report in_progress（状态机要求 claimed → in_progress → completed）。
-    const progress = await client.callTool({
-      name: "xc_report",
-      arguments: { taskId, attemptId, status: "in_progress" },
-    });
+    const progress = (await dispatchForTest(
+      registry,
+      "xc_report",
+      { taskId, attemptId, status: "in_progress" },
+      bobConn,
+    )) as { isError?: boolean };
     expect(progress.isError).toBeFalsy();
 
     // ⑥ report completed（evidence 文件+摘要，无哈希）。
     const evidencePath = join(workDir, "e2e-evidence.txt");
     await writeFile(evidencePath, "done", "utf8");
-    const reported = await client.callTool({
-      name: "xc_report",
-      arguments: {
+    const reported = (await dispatchForTest(
+      registry,
+      "xc_report",
+      {
         taskId,
         attemptId,
         status: "completed",
         result: "finished",
         evidence: [{ path: evidencePath, note: "产物" }],
       },
-    });
+      bobConn,
+    )) as { isError?: boolean; content: Array<{ type: string; text: string }> };
     expect(reported.isError).toBeFalsy();
     expect(jsonPayloadOf(reported)["status"]).toBe("completed");
 

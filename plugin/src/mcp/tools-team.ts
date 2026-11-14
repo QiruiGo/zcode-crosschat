@@ -28,14 +28,13 @@ import { LockBusyError, withRegistryThenTeamLocks, withTeamLock } from "../core/
 import { logEngineEvent } from "../core/log.js";
 import { appendMailbox, createMessage, readMailbox, readUnreadMailbox } from "../core/mailbox.js";
 import { bindName, readSession, writeSession } from "../core/registry.js";
-import { sanitizeKey } from "../core/sanitize.js";
+import { sanitizeKey, validateMemberName } from "../core/sanitize.js";
 import { getTask, memberOpenTasks, newTeamState, readTeam, transitionTask, unblockTask, writeTeam } from "../core/teamstate.js";
 import { taskJournalPath, writeArchive } from "../core/archive.js";
 import {
   DEFAULT_TEAM_ID,
   MAX_LEAD_HISTORY,
   OPEN_TASK_STATUSES,
-  RESERVED_MEMBER_KEYS,
   TERMINAL_TASK_STATUSES,
   memberState,
 } from "../core/types.js";
@@ -111,7 +110,7 @@ export const LeadTransferShape = {
 } as const;
 export const LeadReleaseShape = {} as const;
 export const MemberAddShape = {
-  name: z.string().min(1).describe("新成员名（sanitizeKey 归一；保留名 lead/default 拒绝）"),
+  name: z.string().min(1).describe("新成员名（须已是规范键形：字母/数字/单个连字符，≤48 字符；全角/同形/路径符/控制符等碰撞写法与保留名 lead/default/main/team-lead/user/system 拒绝）"),
   model: z.string().optional().describe("成员模型 id；缺省用 member_model 配置，再缺省用枚举首个"),
   reasoningLevel: z.string().optional().describe("成员推理档位；缺省用 member_reasoning 配置（默认 max）"),
   note: z.string().optional().describe("备注（仅入审计日志，不参与逻辑）"),
@@ -269,15 +268,18 @@ interface MemberAddPlan {
 
 async function memberAdd(deps: ToolDeps, args: { name: string; model?: string; reasoningLevel?: string; note?: string; contextChars?: number }, me: BoundIdentity): Promise<ToolResult> {
   const { stateRoot, workspace, env } = deps;
-  const key = sanitizeKey(args.name);
-  if (key === "") throw invalidParamsError(`name ${JSON.stringify(args.name)} sanitizes to an empty key`);
-  if ((RESERVED_MEMBER_KEYS as readonly string[]).includes(key)) {
-    throw new ToolError({
-      error: "name_reserved",
-      name: key,
-      message: `member name "${key}" is reserved (${RESERVED_MEMBER_KEYS.join("/")})`,
-    });
+  // v0.6.1（红队四番战 安全对-2/安全对-5 修复）：与 xc_identify 同一道花名闸
+  // （validateMemberName：严格文法 + 保留名两轴一致）。此前这里只 sanitizeKey +
+  // RESERVED_MEMBER_KEYS，全角/同形等碰撞写法可入册（"Ａｌｉｃｅ" → 键 alice，
+  // 抢占/覆盖他人花名）。锁外快拒，零副作用。
+  const nameCheck = validateMemberName(args.name);
+  if (!nameCheck.ok) {
+    throw new ToolError(
+      { error: nameCheck.error, name: nameCheck.name, message: nameCheck.message },
+      nameCheck.message,
+    );
   }
+  const key = nameCheck.key;
   const maxMembers = maxMembersFromEnv(env);
   const bootstrapTimeoutMs = bootstrapTimeoutFromEnv(env);
   const now = Date.now();

@@ -353,8 +353,18 @@ export function peerIsAlive(record: PeerRecord, now: number, staleMs: number = P
  * - dead records (pid dead, or lastSeen stale) are deleted lazily; a concurrent
  *   scanner that already deleted the file gets ENOENT, which is tolerated
  *   (FEASIBILITY-V0.3 §5.3: two scanners, both `errors: []`).
+ *
+ * v0.6.1（验收员复验后定位修复）：`opts.sweep === false` = **只读扫描**——死记录照常
+ * 进 `dead`（调用方据此判定「该花名可被接管」并留痕），但不删文件。纯查询路径（sid
+ * 归属/活性闸）必须用只读扫描：它若在花名 claim 之前扫一次，就会把死前任的记录文件
+ * 提前删掉，随后 claim 的单次扫描再也看不到前任，`peer-name-reclaimed` 接管留痕失明
+ * （claimPeerName 的 `scanned` 共享契约，peer-services.ts:1244-1246 自载该 hazard）。
  */
-export async function scanPeers(root: string, now: number = Date.now()): Promise<PeerScanResult> {
+export async function scanPeers(
+  root: string,
+  now: number = Date.now(),
+  opts: { sweep?: boolean } = {},
+): Promise<PeerScanResult> {
   const result: PeerScanResult = { active: [], dead: [], foreign: [], skipped: 0 };
   let entries: string[];
   try {
@@ -381,6 +391,7 @@ export async function scanPeers(root: string, now: number = Date.now()): Promise
     }
     const reason: PeerDeadReason = pidAlive(record.pid) ? 'lastSeen-stale' : 'pid-dead';
     result.dead.push({ record, reason });
+    if (opts.sweep === false) continue; // 只读扫描：查询不得有清扫副作用
     try {
       await rm(peerRecordFile(root, pid), { force: true });
     } catch {
@@ -411,6 +422,38 @@ export async function isPeerNameFree(root: string, name: string, now: number = D
 export async function findPeerByName(root: string, name: string, now: number = Date.now()): Promise<PeerRecord | undefined> {
   const scan = await scanPeers(root, now);
   return scan.active.find((record) => record.name === name);
+}
+
+/**
+ * v0.5.2（二番战 SEC-1 / SEC-2 修复）：查找「已被别的活进程持有的 sid」的注册记录。
+ *
+ * 机器全局注册表按 pid 存文件（sessions/<pid>.json），同一 sessionId 出现在两条
+ * **活**记录里 = 冒充（rtsec C2）或碰撞（rtsec C3）。本进程自己的记录豁免（同连接
+ * 幂等重注册）；死记录不在 `scanPeers().active`（惰性清扫），不挡会话重启/续跑。
+ *
+ * v0.6.1（红队四番战 安全对-1 修复）：从 mcp/peer-services.ts 移入本模块——
+ * 队内轴 xc_register（identity.ts）也要做同一道 sid 归属/活性校验，而
+ * peer-services.ts 反向依赖 tools-team.ts → identity.ts，从 identity.ts  import
+ * peer-services.ts 会成环；语义唯一副本留在这里（W1 注册表查询的归属），
+ * peer-services.ts 与原 tools-identify.ts 的 import 改从本模块转出。
+ *
+ * `scanned`：调用方已算好的扫描结果（可选）。注册路径必须与 claim 花名共享
+ * **同一次**扫描——scanPeers 会惰性删除死记录文件，两次独立扫描时第一次就把
+ * 死记录的证据删掉了，第二次的接管留痕（peer-name-reclaimed）就再也看不到前任。
+ *
+ * v0.6.1（验收员复验后定位修复）：本函数是**纯查询**（"这个 sid 有没有被别的活进程
+ * 持有"），自建扫描改用只读模式（`sweep:false`）——否则队内轴/takeover 闸口每问一次
+ * 就把死前任的记录文件删掉，紧随其后的 peer 花名 claim 因看不到前任而丢留痕
+ * （r3 regression-battery F8.*.reclaim-audited 由 PASS 转 FAIL 的根因）。
+ * 已持有共享扫描的调用方（peer 注册路径）仍传 `scanned`，语义不变。
+ */
+export async function findLiveSessionIdHolder(
+  root: string,
+  sessionId: string,
+  scanned?: PeerScanResult,
+): Promise<PeerRecord | undefined> {
+  const result = scanned ?? (await scanPeers(root, Date.now(), { sweep: false }));
+  return result.active.find((record) => record.sessionId === sessionId && record.pid !== process.pid);
 }
 
 // ---------------------------------------------------------------------------

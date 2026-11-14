@@ -309,6 +309,12 @@ export interface NewTaskInput {
   acceptance?: string;
   dependsOn?: string[];
   /**
+   * v0.6.1（红队四番战 安全对-3 修复）：派发时指定的受领成员（sanitized key）。
+   * xc_claim 据此校验「只有受领人可认领」（与 xc_report 的 not_assignee 对齐）；
+   * 引擎特权重置回池（graph.revokeAttempt）会清除它——回池即共享待领池。
+   */
+  to?: string;
+  /**
    * v0.6（C2）：排序建议优先级；缺省/非法值不落盘（absent = normal，读侧归一）。
    * 影响展示/取单顺序，不做抢占（DESIGN-V0.6.md §3.2）。
    */
@@ -353,6 +359,8 @@ export function makeTask(team: TeamState, input: NewTaskInput, now: number = Dat
     evidence: [],
     history: [],
     ...(priority === undefined ? {} : { priority }),
+    // v0.6.1（安全对-3 修复）：受领人落盘（claim 侧硬闸的依据；旧记录无此字段）。
+    ...(input.to === undefined ? {} : { to: input.to }),
   };
   team.seq += 1;
   team.tasks.push(task);

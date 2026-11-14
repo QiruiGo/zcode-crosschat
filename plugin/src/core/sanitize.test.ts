@@ -102,3 +102,78 @@ describe('sanitizeKey 同形字归一（v0.5.3 A11：西里尔/希腊混淆字�
     expect(sanitizeKey('小明')).not.toBe(sanitizeKey('小红'));
   });
 });
+
+// ─────────────────── v0.6.1（红队四番战 安全对-2 修复）：花名严格校验闸 ───────────────────
+//
+// sanitizeKey 的折叠本身保留（mailbox 路径等既有调用不变）；新增的
+// validateMemberName 是**注册/改名入口闸**：凡会被 sanitizeKey 静默归一到
+// 碰撞键的写法一律拒（全角/同形字/路径符/控制符/空白/下划线/连字符变形/超长），
+// 与 peer 轴严格文法同一口径；CJK 等规范键形不受影响。
+import { MEMBER_NAME_MAX_LENGTH, validateMemberName } from './sanitize.js';
+
+describe('validateMemberName（v0.6.1 安全对-2：注册/改名/member-add 同一道闸）', () => {
+  it('规范键形放行；返回值即 sanitizeKey 结果（幂等）', () => {
+    for (const name of ['alice', 'alice-2', '1bot', '小明', 'café', 'a', 'x'.repeat(MEMBER_NAME_MAX_LENGTH)]) {
+      const checked = validateMemberName(name);
+      expect(checked.ok, name).toBe(true);
+      if (checked.ok) {
+        expect(checked.key).toBe(sanitizeKey(name));
+        expect(sanitizeKey(checked.key)).toBe(checked.key);
+      }
+    }
+    // 大小写折叠是既有文档化行为（队内键大小写不敏感）——放行但键为小写。
+    const upper = validateMemberName('Alice');
+    expect(upper.ok && upper.key).toBe('alice');
+  });
+
+  it('碰撞归一写法一律 invalid_name（全角/同形字/路径符/控制符/空白/下划线/连字符变形）', () => {
+    const cases: Array<[string, string]> = [
+      ['fullwidth', String.fromCodePoint(0xff41, 0xff4c, 0xff49, 0xff43, 0xff45)], // ＡＬＩＣＥ
+      ['cyrillic-homoglyph', `vi${String.fromCodePoint(0x0441)}tim`], // viсtim
+      ['slash', 'a/b'],
+      ['backslash', 'a\b'],
+      ['dotdot', '..'],
+      ['dot', 'a.b'],
+      ['space', 'a b'],
+      ['nul', 'a\u0000b'],
+      ['tab', 'a\tb'],
+      ['underscore', 'a_b'],
+      ['double-dash', 'a--b'],
+      ['edge-dash', '-a'],
+      ['trailing-dash', 'a-'],
+      ['punctuation-only', '!!!'],
+      ['empty-after-trim', '   '],
+    ];
+    for (const [label, name] of cases) {
+      const checked = validateMemberName(name);
+      expect(checked.ok, `${label} must be refused`).toBe(false);
+      if (!checked.ok) expect(checked.error).toBe('invalid_name');
+    }
+  });
+
+  it('超长 → name_too_long（键长上限，不再静默截断+摘要）', () => {
+    const checked = validateMemberName('x'.repeat(MEMBER_NAME_MAX_LENGTH + 1));
+    expect(checked.ok).toBe(false);
+    if (!checked.ok) expect(checked.error).toBe('name_too_long');
+  });
+
+  it('保留名（两轴并集）→ name_reserved', () => {
+    for (const name of ['lead', 'default', 'main', 'team-lead', 'user', 'system']) {
+      const checked = validateMemberName(name);
+      expect(checked.ok, name).toBe(false);
+      if (!checked.ok) expect(checked.error).toBe('name_reserved');
+    }
+    // 大小写/空白变体归一到同一把保留键后同样拒。
+    expect(validateMemberName('LEAD').ok).toBe(false);
+    expect(validateMemberName(' team-lead ').ok).toBe(false);
+  });
+
+  it('拒绝信息可操作（指出会被归一成哪把键）', () => {
+    const checked = validateMemberName('Ａｌｉｃｅ');
+    expect(checked.ok).toBe(false);
+    if (!checked.ok) {
+      expect(checked.message).toContain('alice');
+      expect(checked.message).toContain('normalized');
+    }
+  });
+});

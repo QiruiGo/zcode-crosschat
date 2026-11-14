@@ -39,6 +39,7 @@ import {
   readPeerBaseRecord,
 } from "../core/peerdir.js";
 import {
+  findLiveSessionIdHolder,
   logPeerEvent,
   peerRegistryLockName,
   PEER_FORMER_NAMES_MAX,
@@ -1211,24 +1212,12 @@ export function assertPeerNameNotReserved(name: string): void {
 }
 
 /**
- * v0.5.2（二番战 SEC-1 / SEC-2 修复）：查找「已被别的活进程持有的 sid」的注册记录。
- *
- * 机器全局注册表按 pid 存文件（sessions/<pid>.json），同一 sessionId 出现在两条
- * **活**记录里 = 冒充（rtsec C2）或碰撞（rtsec C3）。本进程自己的记录豁免（同连接
- * 幂等重注册）；死记录不在 `scanPeers().active`（惰性清扫），不挡会话重启/续跑。
- *
- * `scanned`：调用方已算好的扫描结果（可选）。注册路径必须与 {@link claimPeerName}
- * 共享**同一次**扫描——scanPeers 会惰性删除死记录文件，两次独立扫描时第一次就把
- * 死记录的证据删掉了，第二次的接管留痕（peer-name-reclaimed）就再也看不到前任。
+ * v0.6.1（红队四番战 安全对-1 修复）：`findLiveSessionIdHolder` 的唯一实现已
+ * 移入 core/peerregistry.ts（W1 注册表查询的归属；identity.ts 的队内轴 sid
+ * 归属校验也要用它，从本模块 import 会与 tools-team.ts ⇄ identity.ts 成环）。
+ * 此处按原路径转出，既有 import 方（含单测）不变。
  */
-export async function findLiveSessionIdHolder(
-  root: string,
-  sessionId: string,
-  scanned?: PeerScanResult,
-): Promise<PeerRecord | undefined> {
-  const result = scanned ?? await scanPeers(root);
-  return result.active.find((record) => record.sessionId === sessionId && record.pid !== process.pid);
-}
+export { findLiveSessionIdHolder } from "../core/peerregistry.js";
 
 /**
  * v0.5.2（二番战 peer-1 / peer-5 修复）：花名claim助手——注册与改名共用。

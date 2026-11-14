@@ -218,6 +218,12 @@ export function collectDependencyOutputs(tasks: readonly Task[], taskId: string)
  * attempt 代数 +1 的依据：§5.4 明文「attempt 代数 +1」——被清扫前的 attemptId 即使
  * 被并发者持有，其产物也随代数失配而失效（isCurrentMail 的 attempt 裁决）。
  *
+ * v0.6.1（红队四番战 安全对-3 修复）：受领人预留（task.to）一并清除——本函数是
+ * **引擎特权**回池（原受领人被判定僵尸/已停止/已被接管），语义即上方 dsh 原文的
+ * "shared pending pool"：回池后任何成员可认领（红队旧案「他人领不走」解除不回退；
+ * 原受领人回来时同样可 reclaim）。fresh pending 任务（从未被重置）的 to 不动——
+ * xc_claim 仍只放行受领人本人，防他人抢认把正主锁死在 task_not_pending。
+ *
  * @returns 是否发生了重置；terminal/pending 任务为 no-op（幂等安全），返回 false。
  */
 export function revokeAttempt(
@@ -230,6 +236,7 @@ export function revokeAttempt(
   task.assignee = null;
   task.attemptId = null;
   task.attempt = (task.attempt ?? 0) + 1;
+  delete task.to; // 安全对-3 修复：引擎回池 = 共享待领池（见上方声明）
   clearAttemptResult(task);
   appendTaskHistory(task, options.event ?? "revoked-stale", options.by ?? "engine", undefined, now);
   return true;

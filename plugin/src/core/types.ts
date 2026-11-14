@@ -128,9 +128,22 @@ export type MemberIdentity = (typeof MEMBER_IDENTITIES)[number];
 
 /**
  * Reserved member keys (DESIGN-V0.2.md §3.1, CC 保留名纪律等效移植): the lead
- * role name and the default team name. xc_member_add rejects them.
+ * role name, the default team name, and the peer-axis addressing reserved set
+ * (core/peeraddr.ts PEER_RESERVED_NAMES — keep the two lists in sync).
+ * xc_member_add / xc_register / peer 注册与改名共用本表拒绝。
+ *
+ * v0.6.1（红队四番战 安全对-5 修复）：两轴保留名合一——此前队内轴只保留
+ * lead/default，system/user/main/team-lead 可注册进队内花名册（peer 轴早已
+ * 拒），同一花名两轴策略不一致构成注册旁路（adjudication.md 安全对-5）。
  */
-export const RESERVED_MEMBER_KEYS: readonly string[] = ['lead', 'default'];
+export const RESERVED_MEMBER_KEYS: readonly string[] = [
+  'lead',
+  'default',
+  'main',
+  'team-lead',
+  'user',
+  'system',
+];
 
 /** v1 keeps exactly one team (DESIGN.md §2.2); the schema stays multi-team-ready. */
 export const DEFAULT_TEAM_ID = 'default';
@@ -185,6 +198,15 @@ export interface Task {
   blockedAt?: number;
   /** v0.6（C2）：解除目标态（进入 blocked 前的 status）；unblock 校验 ∈ OPEN_TASK_STATUSES。 */
   preBlockedStatus?: TaskStatus;
+  /**
+   * v0.6.1（红队四番战 安全对-3 修复）：派发时指定的受领成员（sanitized key，
+   * = xc_dispatch 的 to）。xc_claim 只允许受领人本人认领（与 xc_report 的
+   * not_assignee 硬闸对齐），防他人抢认 fresh pending 任务锁死正主。
+   * 引擎特权重置（清扫/停止/接管回池，graph.revokeAttempt）**清除**本字段——
+   * 回池即共享待领池（红队旧案「他人领不走」解除不回退；原受领人回来也可 reclaim）。
+   * absent = 旧记录（v0.6.1 之前落盘）或已回池任务，无受领人信息，认领面兼容开放。
+   */
+  to?: string;
 }
 
 /**
@@ -546,6 +568,9 @@ function coerceTask(value: unknown): Task | undefined {
   const preBlockedStatus = preBlockedRaw !== undefined && TASK_STATUSES.includes(preBlockedRaw as TaskStatus)
     ? (preBlockedRaw as TaskStatus)
     : undefined;
+  // v0.6.1（安全对-3 修复）：受领人字段宽容读取——非法值丢弃（absent=无受领人
+  // 信息，认领面兼容开放），绝不整文件拒绝（§11.1 纪律）。
+  const to = optionalString(value['to']);
   return {
     id,
     title,
@@ -567,6 +592,7 @@ function coerceTask(value: unknown): Task | undefined {
     ...(blockedReason === undefined ? {} : { blockedReason }),
     ...(blockedAt === undefined ? {} : { blockedAt }),
     ...(preBlockedStatus === undefined ? {} : { preBlockedStatus }),
+    ...(to === undefined ? {} : { to }),
   };
 }
 

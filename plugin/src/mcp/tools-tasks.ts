@@ -223,11 +223,15 @@ export function createTaskCore(deps: ToolDeps): TaskCore {
 
           // 建任务（pending，M1 makeTask 推进 seq 并入队）+ 写 to 邮箱（§2.8）。
           // v0.6（C2）：priority 透传（makeTask 防御性收敛，枚举外归 absent）。
+          // v0.6.1（红队四番战 安全对-3 修复）：受领人 toKey 落盘——xc_claim 只
+          // 允许受领人本人认领（与 xc_report 的 not_assignee 硬闸对齐），防他人
+          // 抢认 pending 任务把正主锁死在 task_not_pending。
           const task = makeTask(team, {
             title: args.title.trim(),
             prompt: args.prompt,
             acceptance: args.acceptance?.trim() || undefined,
             dependsOn: args.dependsOn,
+            to: toKey,
             createdBy: me.agentKey,
             ...(args.priority !== undefined ? { priority: args.priority } : {}),
           }, now);
@@ -316,6 +320,20 @@ export function createTaskCore(deps: ToolDeps): TaskCore {
               taskId: task.id,
               status: task.status,
               message: `task ${task.id} is ${task.status}; only pending tasks can be claimed`,
+            });
+          }
+          // v0.6.1（红队四番战 安全对-3 修复）：受让人硬闸——fresh pending 且已
+          // 指派（dispatch 带 to）的任务只有受领人本人可认领，与 xc_report 的
+          // not_assignee 同一口径（修复前任何成员可抢认别人的 pending 任务，把正主
+          // 锁死在 task_not_pending）。absent = 旧记录（v0.6.1 前落盘）或已被引擎
+          // 回池的任务（revokeAttempt 清 to = 共享待领池，红队旧案「他人领不走」
+          // 解除不回退）→ 认领面兼容开放。
+          if (task.to !== undefined && task.to !== me.agentKey) {
+            throw new ToolError({
+              error: "not_assignee",
+              taskId: task.id,
+              assignee: task.to,
+              message: `task ${task.id} is assigned to "${task.to}", not you`,
             });
           }
           // v0.5.2（故障注-1 二番战修复）：回滚矛盾闸。
@@ -610,7 +628,7 @@ export function registerTaskTools(
   );
   reg(
     "xc_claim",
-    "Atomically claim a pending task; returns the attempt token required by xc_report. Refuses with rollback_conflict when the dispatcher's mailbox already holds a completed receipt for this task (team state was rolled back by a stale backup restore).",
+    "Atomically claim a pending task; returns the attempt token required by xc_report. Only the member the task was dispatched to may claim it (not_assignee otherwise, same gate as xc_report). Refuses with rollback_conflict when the dispatcher's mailbox already holds a completed receipt for this task (team state was rolled back by a stale backup restore).",
     ClaimShape,
     async (args, extra) => taskCore.xc_claim(args as unknown as ClaimArgs, connectionKeyOf(extra)),
   );

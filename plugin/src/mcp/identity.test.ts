@@ -250,9 +250,11 @@ describe("identity: removed 成员注册拒绝（v0.2 §7.4-I5）", () => {
 // 红队原始复现（adjudication.md #5 / cases.md C-4）：xc_register{name:"default"}
 // 与 {name:"lead"} 均成功入册，而 xc_member_add 同名硬拒 name_reserved；
 // xc_lead_transfer{to:"lead"} 把 lead 角色授予字面成员。修复后与 member_add
-// 同一规则（RESERVED_MEMBER_KEYS 唯一定义处 core/types.ts:91），锁外快拒、
+// 同一规则（RESERVED_MEMBER_KEYS 唯一定义处 core/types.ts），锁外快拒、
 // 零副作用（names.json / team.json 不落）。
-describe("identity: 保留名注册拒绝（BND-5，与 xc_member_add 规则统一）", () => {
+// v0.6.1（红队四番战 安全对-5 修复）：保留名表扩为两轴并集——队内轴此前只保留
+// lead/default，peer 轴保留集（main/team-lead/user/system）可注册进队内花名册。
+describe("identity: 保留名注册拒绝（BND-5 + 安全对-5，与 xc_member_add/peer 轴规则统一）", () => {
   it("hook 路径：name=default / lead → name_reserved（错误信封与 member_add 同码）", async () => {
     for (const name of ["default", "lead"]) {
       const payload = await errorPayload(() =>
@@ -260,8 +262,21 @@ describe("identity: 保留名注册拒绝（BND-5，与 xc_member_add 规则统�
       );
       expect(payload.error).toBe("name_reserved");
       expect(payload.name).toBe(name);
-      expect(payload.message).toContain(`member name "${name}" is reserved (lead/default)`);
+      expect(payload.message).toContain(`member name "${name}" is reserved (lead/default/main/team-lead/user/system)`);
     }
+  });
+
+  it("peer 轴保留集（system/user/main/team-lead）同样拒（两轴一致，安全对-5）", async () => {
+    for (const name of ["system", "user", "main", "team-lead"]) {
+      const payload = await errorPayload(() =>
+        xcRegister(stateRoot, { name, sessionId: "sess-a" }, nextConn()),
+      );
+      expect(payload.error).toBe("name_reserved");
+      expect(payload.name).toBe(name);
+    }
+    // 零副作用：保留名拒尽后花名册不落盘。
+    expect(existsSync(join(stateRoot, "registry", "names.json"))).toBe(false);
+    expect(existsSync(join(stateRoot, "teams", "default", "team.json"))).toBe(false);
   });
 
   it("先于锚定/绑定校验：无 session 记录也报 name_reserved（锁外快拒，与 member_add 同位）", async () => {
@@ -308,38 +323,79 @@ describe("identity: 保留名注册拒绝（BND-5，与 xc_member_add 规则统�
 
 // ─────────────────────────── v0.5.3（A11 修复）：同形字花名注册闸 ───────────────────────────
 
-describe("identity: 同形字花名归一（v0.5.3 A11：西里尔同形字与真名撞同一把 name_taken 闸）", () => {
-  it("adj052 A11 攻击重放：victim 注册后，viсtim（с=U+0441）注册 → name_taken 指向同一绑定", async () => {
+// ─────────────────── v0.6.1（红队四番战 安全对-2 修复）：同形字花名严格拒绝 ───────────────────
+//
+// 策略变更（supersedes v0.5.3 A11 的「折叠到同一把 name_taken 闸」）：
+// A11 把同形写法归一到真名键，靠 name_taken 挡**后到**的攻击者；但攻击者
+// **先到**时反而能抢占真名、锁死真人、把派给真人的任务重定向到自己邮箱
+// （adjudication.md 安全对-2，P1：squatter 先注册 Ａｌｉｃｅ → 真人 alice 得
+// name_taken，敏感任务落入 squatter 箱）。且 peer 轴对同一手法一直是严格正则
+// 直接拒（invalid-name），队内轴静默收纳=两轴不一致。修复=队内轴同一道闸：
+// 会被 sanitizeKey 静默归一到碰撞键的写法，注册时直接 invalid_name 拒，
+// 零副作用（names.json / team.json 不落）。
+describe("identity: 同形字/全角花名严格拒绝（v0.6.1 安全对-2；supersedes v0.5.3 A11 折叠策略）", () => {
+  it("adj052 A11 攻击重放（先到顺序）：viсtim（с=U+0441）注册 → invalid_name，花名册零残留", async () => {
     await writeSession(stateRoot, { sessionId: "sess-victim", cwd: workDir, startedAt: 1, lastSeen: Date.now() });
     await writeSession(stateRoot, { sessionId: "sess-homoglyph", cwd: workDir, startedAt: 1, lastSeen: Date.now() });
-    await xcRegister(stateRoot, { name: "victim", sessionId: "sess-victim" }, nextConn());
 
     const homoglyph = `vi${String.fromCodePoint(0x0441)}tim`; // viсtim
-    const taken = await errorPayload(() =>
+    const refused = await errorPayload(() =>
       xcRegister(stateRoot, { name: homoglyph, sessionId: "sess-homoglyph" }, nextConn()),
     );
-    expect(taken.error).toBe("name_taken");
-    expect(taken.boundSessionId).toBe("sess-victim"); // 归一到真名的既有绑定
+    expect(refused.error).toBe("invalid_name");
+    expect(refused.message).toContain("silently normalized");
 
-    // 花名册里始终只有 victim 一个键（修复前 viсtim 以独立键并存）。
+    // 真人此时注册 victim 不受任何影响（修复前 squatter 先到会锁死真人）。
+    const ok = await xcRegister(stateRoot, { name: "victim", sessionId: "sess-victim" }, nextConn());
+    expect(ok.sessionKey).toBe("xc:default:victim");
     const team = (await readTeam(stateRoot, "default"))!;
     expect(team.members.map((m) => m.key).sort()).toEqual(["victim"]);
   });
 
-  it("全角同形（ｖｉｃｔｉｍ）同样撞闸；不同真名互不影响", async () => {
-    await writeSession(stateRoot, { sessionId: "sess-v", cwd: workDir, startedAt: 1, lastSeen: Date.now() });
+  it("全角同形（ｖｉｃｔｉｍ）先到也拒；随后真人 victim 正常注册", async () => {
     await writeSession(stateRoot, { sessionId: "sess-f", cwd: workDir, startedAt: 1, lastSeen: Date.now() });
-    await writeSession(stateRoot, { sessionId: "sess-x", cwd: workDir, startedAt: 1, lastSeen: Date.now() });
-    await xcRegister(stateRoot, { name: "victim", sessionId: "sess-v" }, nextConn());
+    await writeSession(stateRoot, { sessionId: "sess-v", cwd: workDir, startedAt: 1, lastSeen: Date.now() });
 
     const fullwidth = String.fromCodePoint(0xff56, 0xff49, 0xff43, 0xff54, 0xff49, 0xff4d);
-    const taken = await errorPayload(() =>
+    const refused = await errorPayload(() =>
       xcRegister(stateRoot, { name: fullwidth, sessionId: "sess-f" }, nextConn()),
     );
-    expect(taken.error).toBe("name_taken");
+    expect(refused.error).toBe("invalid_name");
 
-    // 无关真名照常注册成功（归一只折叠形近字符，不扩大化）。
-    const ok = await xcRegister(stateRoot, { name: "小明", sessionId: "sess-x" }, nextConn());
-    expect(ok.sessionKey).toBe("xc:default:小明");
+    // 真人照常注册成功（严格闸只拒碰撞写法，不扩大化）。
+    const ok = await xcRegister(stateRoot, { name: "victim", sessionId: "sess-v" }, nextConn());
+    expect(ok.sessionKey).toBe("xc:default:victim");
+  });
+
+  it("规范键形的 Unicode 名字（CJK/带音调）保持合法可读（sanitize.ts 模块头纪律不破）", async () => {
+    await writeSession(stateRoot, { sessionId: "sess-x", cwd: workDir, startedAt: 1, lastSeen: Date.now() });
+    await writeSession(stateRoot, { sessionId: "sess-y", cwd: workDir, startedAt: 1, lastSeen: Date.now() });
+    const xiaoming = await xcRegister(stateRoot, { name: "小明", sessionId: "sess-x" }, nextConn());
+    expect(xiaoming.sessionKey).toBe("xc:default:小明");
+    const cafe = await xcRegister(stateRoot, { name: "café", sessionId: "sess-y" }, nextConn());
+    expect(cafe.sessionKey).toBe("xc:default:café");
+  });
+
+  it("路径符/控制符/空白/下划线/连续连字符等碰撞写法一律 invalid_name", async () => {
+    await writeSession(stateRoot, { sessionId: "sess-p", cwd: workDir, startedAt: 1, lastSeen: Date.now() });
+    for (const bad of ["a/b", "a\\b", "..", "a.b", "a b", "a\u0001b", "a_b", "a--b", "-a", "a-", "!!!"]) {
+      const refused = await errorPayload(() =>
+        xcRegister(stateRoot, { name: bad, sessionId: "sess-p" }, nextConn()),
+      );
+      expect(refused.error, `name ${JSON.stringify(bad)} must be refused`).toBe("invalid_name");
+    }
+    // 对照：同一 sid 的规范写法照常注册。
+    const ok = await xcRegister(stateRoot, { name: "a-b", sessionId: "sess-p" }, nextConn());
+    expect(ok.sessionKey).toBe("xc:default:a-b");
+  });
+
+  it("超长名 → name_too_long（键长上限 48；不再静默截断+摘要）", async () => {
+    await writeSession(stateRoot, { sessionId: "sess-l", cwd: workDir, startedAt: 1, lastSeen: Date.now() });
+    const refused = await errorPayload(() =>
+      xcRegister(stateRoot, { name: "x".repeat(49), sessionId: "sess-l" }, nextConn()),
+    );
+    expect(refused.error).toBe("name_too_long");
+    const ok = await xcRegister(stateRoot, { name: "x".repeat(48), sessionId: "sess-l" }, nextConn());
+    expect(ok.sessionKey).toBe(`xc:default:${"x".repeat(48)}`);
   });
 });
