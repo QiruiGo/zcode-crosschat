@@ -20,8 +20,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { payloadOf } from "./protocol.js";
-import { createToolCore } from "./tools.js";
-import type { ToolCore } from "./tools.js";
+import { createToolCore } from "./core.js";
+import type { ToolCore } from "./core.js";
 import type { ToolResult } from "./protocol.js";
 import { writeSession } from "../core/registry.js";
 import { readTeam, writeTeam } from "../core/teamstate.js";
@@ -151,7 +151,7 @@ describe("FI-3/FI-4 邮箱读取（故障注-3/4）", () => {
   it("首行截断：好行照常投递 + 摘要行披露 `1 unreadable line(s) skipped`（故障注-3）", async () => {
     await seedTeamWithUnreadAssignment();
     // 再派发一条好消息（其信封行在坏行之后）
-    await core.xc_message({ to: "b", content: "second message" }, "conn-a");
+    await core.xc_message({ to: "b", msg: "second message" }, "conn-a");
     const inboxFile = join(stateRoot, "teams", "default", "inbox", "b.jsonl");
     const raw = await readFile(inboxFile, "utf8");
     const lines = raw.split("\n");

@@ -12,8 +12,11 @@ import {
   memberOpenTasks,
   newTeamState,
   nextTaskId,
+  priorityRank,
   readTeam,
   reportTransitionError,
+  sortTasksForBoard,
+  unblockTask,
   unsatisfiedDependencies,
   writeTeam,
 } from './teamstate.js';
@@ -145,7 +148,8 @@ describe('report hard validation + state machine (状态机非法转移拒绝)',
       evidence: [{ path: 'x', sha256: null, note: '' }],
     }, 'b')).toMatch(/cannot move from "claimed" to "completed"/);
     expect(canTransition(task, 'completed')).toBe(false);
-    expect(allowedTransitions(task)).toEqual(['in_progress', 'failed', 'cancelled']);
+    // v0.6（C2）：claimed 增 blocked 出边（认领者显式申报暂停）。
+    expect(allowedTransitions(task)).toEqual(['in_progress', 'blocked', 'failed', 'cancelled']);
     // And applyReport refuses to apply it either:
     expect(() => applyReport(task, { status: 'completed', attemptId: attempt }, 'b')).toThrow(/illegal transition/);
   });
@@ -249,5 +253,168 @@ describe('getTask', () => {
     const task = makeTask(team, { title: 't', prompt: 'p', createdBy: 'a' });
     expect(getTask(team, task.id)?.id).toBe(task.id);
     expect(getTask(team, `${team.era}-t9`)).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.6（C2，DESIGN-V0.6.md §3.2/§4.2-M2）：blocked 生命周期 + 优先级排序。
+// ---------------------------------------------------------------------------
+
+describe('v0.6 C2 blocked：进入（report blocked，reason 必填）', () => {
+  it('blocked 无 error/reason → reportTransitionError 拒绝（谁卡住谁申报）', () => {
+    const team = setup();
+    const task = makeTask(team, { title: 't', prompt: 'p', createdBy: 'a' });
+    const attempt = beginTaskAttempt(task, 'b');
+    expect(reportTransitionError(task, { status: 'blocked', attemptId: attempt }, 'b'))
+      .toMatch(/requires a non-blank reason/);
+    expect(reportTransitionError(task, { status: 'blocked', attemptId: attempt, error: '   ' }, 'b'))
+      .toMatch(/requires a non-blank reason/);
+    expect(reportTransitionError(task, { status: 'blocked', attemptId: attempt, error: '等待依赖输入' }, 'b'))
+      .toBeUndefined();
+  });
+
+  it('pending 任务不能 report blocked（L-n3 死边：pending 无 attempt）', () => {
+    const team = setup();
+    const task = makeTask(team, { title: 't', prompt: 'p', createdBy: 'a' });
+    expect(reportTransitionError(task, { status: 'blocked', error: 'x' }, 'a'))
+      .toMatch(/cannot move from "pending" to "blocked"/);
+    expect(() => applyReport(task, { status: 'blocked', error: 'x' }, 'a')).toThrow(/illegal transition/);
+  });
+
+  it('claimed→blocked：preBlockedStatus/blockedReason/blockedAt 落位，attempt 保留，history 记 blocked', () => {
+    const team = setup();
+    const task = makeTask(team, { title: 't', prompt: 'p', createdBy: 'a' });
+    const attempt = beginTaskAttempt(task, 'b');
+    const now = 1_700_000_000_000;
+    applyReport(task, { status: 'blocked', attemptId: attempt, error: '等待外网恢复' }, 'b', now);
+    expect(task.status).toBe('blocked');
+    expect(task.preBlockedStatus).toBe('claimed');
+    expect(task.blockedReason).toBe('等待外网恢复');
+    expect(task.blockedAt).toBe(now);
+    expect(task.error).toBeNull(); // 设计分离：error=attempt 失败痕迹；阻塞原因走 blockedReason
+    expect(task.attemptId).toBe(attempt); // 暂停而非作废
+    expect(task.assignee).toBe('b');
+    expect(task.history.at(-1)).toMatchObject({ event: 'blocked', by: 'b', attemptId: attempt });
+  });
+
+  it('blocked 占用成员单开槽位（OPEN 含 blocked；不可他领——status 非 pending）', () => {
+    const team = setup();
+    const task = makeTask(team, { title: 't', prompt: 'p', createdBy: 'a' });
+    const attempt = beginTaskAttempt(task, 'b');
+    applyReport(task, { status: 'blocked', attemptId: attempt, error: 'x' }, 'b');
+    expect(memberOpenTasks(team.tasks, 'b').map((t) => t.id)).toEqual([task.id]);
+    // 解除回 claimed 后槽位仍被占，完成后释放。
+    expect(unblockTask(task, Date.now(), { by: 'lead' })).toBeUndefined();
+    expect(memberOpenTasks(team.tasks, 'b')).toHaveLength(1);
+  });
+});
+
+describe('v0.6 C2 blocked：解除（xc_team unblock 的 core 半边）', () => {
+  it('unblock 回 preBlockedStatus（claimed），markers 清空、原因保留为历史痕迹', () => {
+    const team = setup();
+    const task = makeTask(team, { title: 't', prompt: 'p', createdBy: 'a' });
+    const attempt = beginTaskAttempt(task, 'b');
+    applyReport(task, { status: 'blocked', attemptId: attempt, error: 'x' }, 'b');
+    const now = 1_800_000_000_000;
+    expect(unblockTask(task, now, { by: 'lead' })).toBeUndefined();
+    expect(task.status).toBe('claimed'); // 复位到进入前的 claimed
+    expect(task.preBlockedStatus).toBeUndefined(); // clearBlockedMarkers
+    expect(task.blockedReason).toBe('x'); // 历史痕迹保留
+    expect(task.blockedAt).toBeDefined();
+    expect(task.attemptId).toBe(attempt); // attempt 仍保留（认领者继续持有）
+    expect(task.history.at(-1)).toMatchObject({ event: 'unblocked->claimed', by: 'lead' });
+  });
+
+  it('in_progress 进入的 blocked 解除后回 in_progress；by 缺省 lead-or-creator', () => {
+    const team = setup();
+    const task = makeTask(team, { title: 't', prompt: 'p', createdBy: 'a' });
+    const attempt = beginTaskAttempt(task, 'b');
+    applyReport(task, { status: 'in_progress', attemptId: attempt }, 'b');
+    applyReport(task, { status: 'blocked', attemptId: attempt, error: 'x' }, 'b');
+    expect(unblockTask(task, Date.now())).toBeUndefined();
+    expect(task.status).toBe('in_progress');
+    expect(task.history.at(-1)).toMatchObject({ event: 'unblocked->in_progress', by: 'lead-or-creator' });
+  });
+
+  it('非 blocked 任务 unblock → task_not_blocked；二次 unblock 被清理挡住', () => {
+    const team = setup();
+    const task = makeTask(team, { title: 't', prompt: 'p', createdBy: 'a' });
+    expect(unblockTask(task, Date.now())).toBe('task_not_blocked');
+    const attempt = beginTaskAttempt(task, 'b');
+    applyReport(task, { status: 'blocked', attemptId: attempt, error: 'x' }, 'b');
+    expect(unblockTask(task, Date.now())).toBeUndefined();
+    expect(unblockTask(task, Date.now())).toBe('task_not_blocked');
+  });
+
+  it('preBlockedStatus 缺失（手工编辑/宽容丢弃）兜底回 pending（防御边）', () => {
+    const team = setup();
+    const task = makeTask(team, { title: 't', prompt: 'p', createdBy: 'a' });
+    const attempt = beginTaskAttempt(task, 'b');
+    applyReport(task, { status: 'blocked', attemptId: attempt, error: 'x' }, 'b');
+    delete (task as { preBlockedStatus?: string }).preBlockedStatus;
+    expect(unblockTask(task, Date.now())).toBeUndefined();
+    expect(task.status).toBe('pending');
+    expect(task.history.at(-1)?.event).toBe('unblocked->pending');
+  });
+
+  it('认领者自解 report(in_progress)：status 复位、markers 清理、history 追加 unblocked-self', () => {
+    const team = setup();
+    const task = makeTask(team, { title: 't', prompt: 'p', createdBy: 'a' });
+    const attempt = beginTaskAttempt(task, 'b');
+    applyReport(task, { status: 'blocked', attemptId: attempt, error: 'x' }, 'b');
+    applyReport(task, { status: 'in_progress', attemptId: attempt }, 'b');
+    expect(task.status).toBe('in_progress');
+    expect(task.preBlockedStatus).toBeUndefined(); // 二次 unblock 已被挡
+    expect(unblockTask(task, Date.now())).toBe('task_not_blocked');
+    const events = task.history.map((h) => h.event);
+    expect(events).toContain('unblocked-self');
+    expect(events[events.length - 1]).toBe('unblocked-self');
+    expect(task.blockedReason).toBe('x'); // 历史痕迹
+  });
+
+  it('自解后可继续走完闭环（blocked→in_progress→completed）', () => {
+    const team = setup();
+    const task = makeTask(team, { title: 't', prompt: 'p', createdBy: 'a' });
+    const attempt = beginTaskAttempt(task, 'b');
+    applyReport(task, { status: 'blocked', attemptId: attempt, error: 'x' }, 'b');
+    applyReport(task, { status: 'in_progress', attemptId: attempt }, 'b');
+    applyReport(task, {
+      status: 'completed', attemptId: attempt, result: 'r',
+      evidence: [{ path: 'p', sha256: null, note: '' }],
+    }, 'b');
+    expect(task.status).toBe('completed');
+  });
+});
+
+describe('v0.6 C2 优先级（makeTask 落盘 + 任务板排序）', () => {
+  it('makeTask 携带 priority；非法值不落盘（absent = normal）', () => {
+    const team = setup();
+    const high = makeTask(team, { title: 'h', prompt: 'p', createdBy: 'a', priority: 'high' });
+    const bad = makeTask(team, {
+      title: 'b', prompt: 'p', createdBy: 'a',
+      priority: 'urgent' as unknown as 'high',
+    });
+    expect(high.priority).toBe('high');
+    expect(bad.priority).toBeUndefined();
+  });
+
+  it('sortTasksForBoard：high→normal→low，同秩按 createdAt，absent 归 normal，不改入参', () => {
+    const team = setup();
+    const lowOld = makeTask(team, { title: 'lo', prompt: 'p', createdBy: 'a', priority: 'low' });
+    const normalNew = makeTask(team, { title: 'nn', prompt: 'p', createdBy: 'a' });
+    const highNew = makeTask(team, { title: 'hn', prompt: 'p', createdBy: 'a', priority: 'high' });
+    const highOld = makeTask(team, { title: 'ho', prompt: 'p', createdBy: 'a', priority: 'high' });
+    // makeTask 用同一 now？——显式改 createdAt 构造同秩次序：
+    lowOld.createdAt = 100; normalNew.createdAt = 200; highNew.createdAt = 300; highOld.createdAt = 100;
+    const board = [lowOld, normalNew, highNew, highOld];
+    const sorted = sortTasksForBoard(board);
+    expect(sorted.map((t) => t.title)).toEqual(['ho', 'hn', 'nn', 'lo']);
+    expect(board.map((t) => t.title)).toEqual(['lo', 'nn', 'hn', 'ho']); // 入参不动
+  });
+
+  it('priorityRank：absent 归 normal（旧记录兼容）', () => {
+    expect(priorityRank(undefined)).toBe(priorityRank('normal'));
+    expect(priorityRank('high')).toBeLessThan(priorityRank(undefined));
+    expect(priorityRank('low')).toBeGreaterThan(priorityRank('normal'));
   });
 });

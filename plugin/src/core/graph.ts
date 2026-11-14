@@ -19,6 +19,7 @@
  */
 import {
   OPEN_TASK_STATUSES,
+  SWEEPABLE_TASK_STATUSES,
   type Task,
   type TeamMessage,
 } from "./types.js";
@@ -200,9 +201,14 @@ export function collectDependencyOutputs(tasks: readonly Task[], taskId: string)
 // ---------------------------------------------------------------------------
 
 /**
- * 引擎特权重置一个**开放**（claimed/in_progress）任务回 pending（§5.4）：
- * status→pending、assignee→null、attemptId→null、attempt 代数 +1、结果/证据清空
- * （clearAttemptResult：重试必须重新产出证据）、history 记 `revoked-stale`（或指定事件名）。
+ * 引擎特权重置一个**开放**（claimed/in_progress/blocked——v0.6 C2 起 OPEN 含 blocked）任务回
+ * pending（§5.4）：status→pending、assignee→null、attemptId→null、attempt 代数 +1、
+ * 结果/证据清空（clearAttemptResult：重试必须重新产出证据）、history 记 `revoked-stale`
+ * （或指定事件名）。
+ *
+ * v0.6（C2，DESIGN-V0.6.md §3.2）：blocked ∈ 可撤销域——接管（xc_identify takeover）
+ * 与成员 stop 把名下 blocked 任务一并回池；清扫路径不受影响（staleTasks 已改用
+ * SWEEPABLE，blocked 不被 sweep，两者口径不同）。
  *
  * 状态机豁免声明（§5.4）：`claimed|in_progress → pending` 不是 xc_report 可走的转移
  * （TASK_TRANSITIONS 无此边）——这是**引擎特权重置**，对齐 dsh 派发失败回滚
@@ -231,13 +237,17 @@ export function revokeAttempt(
 
 /**
  * 僵尸任务候选（§5.4 清扫规则的第一步，纯判定）：
- * status ∈ {claimed, in_progress} ∧ now - updatedAt > thresholdMs。
+ * status ∈ SWEEPABLE_TASK_STATUSES（{claimed, in_progress}）∧ now - updatedAt > thresholdMs。
+ * v0.6（C2，DESIGN-V0.6.md §3.2）：过滤式从 OPEN_TASK_STATUSES 改用 SWEEPABLE——
+ * blocked 是认领者显式申报的合法暂停（有属主、attempt 保留），**不进清扫**；
+ * OPEN 已扩含 blocked（revokeAttempt 可撤销域 / 单开槽位），若沿用旧口径会把
+ * 暂停任务在 XC_STALE_TASK_MINUTES 后误回收。
  * 「该成员无在途 wake nonce」的豁免条件涉及 registry 扫描（IO），由调用方
  * （task-edges 的 E-b 边沿）在锁内补查后再 revokeAttempt。
  */
 export function staleTasks(tasks: readonly Task[], now: number, thresholdMs: number): Task[] {
   return tasks.filter(
-    (task) => OPEN_TASK_STATUSES.includes(task.status) && now - task.updatedAt > thresholdMs,
+    (task) => SWEEPABLE_TASK_STATUSES.includes(task.status) && now - task.updatedAt > thresholdMs,
   );
 }
 

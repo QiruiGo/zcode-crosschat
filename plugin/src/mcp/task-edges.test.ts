@@ -16,7 +16,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { payloadOf, type ToolResult } from "./protocol.js";
-import { createToolCore, type ToolCore, type ToolDeps } from "./tools.js";
+import { createToolCore, type ToolCore, type ToolDeps } from "./core.js";
 import { withTaskEdges } from "./task-edges.js";
 import { readMailbox } from "../core/mailbox.js";
 import { createWakeNonce, writeSession } from "../core/registry.js";

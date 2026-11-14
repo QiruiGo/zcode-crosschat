@@ -1,6 +1,5 @@
 /**
- * M3 server：stdio MCP 入口（DESIGN.md §1.3、§2.8；v0.2 组装链见 DESIGN-V0.2.md §9；
- * v0.3 增量见 DESIGN-V0.3.md §2.3、§11.1；v0.4 增量见 DESIGN-V0.4.md §2.5）。
+ * v0.6 server：stdio MCP 入口（DESIGN-V0.6.md §4.2-M8 组装块）。
  *
  * manifest 经 mcpServers.crosschat 拉起本进程（command:"node",
  * args:["${CLAUDE_PLUGIN_ROOT}/dist/mcp/server.mjs"], cwd:"${ZCODE_PROJECT_DIR}"），
@@ -8,43 +7,34 @@
  *
  * stdio 纪律：协议独占 stdout——任何日志/报错只准写 stderr，否则握手即坏。
  *
- * v0.3 组装链：
- *   base(createToolCore) → W3 withTaskEdges → W5 withGuards → W6 withPeerDrain
- * 注册：v0.1.0 七工具 + W2 member-tools + W4 lead-tools + W5 security-tools
- *       + W6 peer-tools（xc_peer_register / xc_peers / xc_peer_send /
- *         xc_peer_inbox / xc_peer_review / xc_peer_rename / xc_agents）
- *       + doctor-tool（v0.4：xc_doctor，只读体检，免注册）
+ * v0.6 工具面（26→10）：server.tool() 只注册 10 个新名（tools/list 恰 10 个——
+ * 条款 1 硬验收）；旧名 22 个的可调用性由 alias.ts 覆盖层实现（CallTool 处理器
+ * 整体替换，参数映射 + 弃用警告 + payload.deprecated；DESIGN §1.3）。
+ * 「双入口单实现」：dispatcher 与 server.tool 回调共用同一 handler（PrimaryRegistry）。
  *
- * v0.3 端点纪律（FEASIBILITY-V0.3 §3.3 实测硬约束）：MCP SDK 的 StdioServerTransport
- * 不监听 stdin 'end'，一旦进程内持有 net server（管道监听），stdin EOF 时事件循环被
- * server 撑着、进程永不退出、管道继续对外可连接（僵尸端点）。故 v0.3 自建 EOF 纪律：
- * process.stdin 的 'end'/'close' 也要走优雅关闭（删注册表记录 + 关管道 + exit(0)）。
+ * 组装链不变：composeCore = base → withTaskEdges → withGuards → withPeerDrain。
+ * GuardedStdioTransport / startStaleSweeper / stdin EOF 纪律全部原样保留。
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { createToolCore, registerTools, resolveDeps, type ToolCore, type ToolDeps } from "./tools.js";
-import { startStaleSweeper, withTaskEdges } from "./task-edges.js";
-import { withGuards, registerSecurityTools } from "./guards.js";
-import { registerMemberTools } from "./member-tools.js";
-import { registerLeadTools } from "./lead-tools.js";
-import { registerPeerTools } from "./peer-tools.js";
-import { withPeerDrain } from "./peer-drain.js";
+import { z } from "zod";
+import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
+import { composeCore, resolveDeps, type PrimaryRegistry, type ToolDeps } from "./core.js";
+import { installAliasLayer } from "./alias.js";
+import { registerIdentifyTools } from "./tools-identify.js";
+import { registerTaskTools } from "./tools-tasks.js";
+import { registerReadTools } from "./tools-read.js";
+import { registerRelay } from "./tools-relay.js";
+import { registerOverviewTools } from "./tools-overview.js";
+import { registerTeamTools } from "./tools-team.js";
+import { registerReviewTools } from "./tools-review.js";
 import { registerDoctorTool } from "./doctor-tool.js";
+import { startStaleSweeper } from "./task-edges.js";
 import { stopPeerEndpoint } from "../transport/pipe.js";
 import { GuardedStdioTransport } from "../transport/mcpstdio.js";
 
 const SERVER_NAME = "zcode-crosschat";
-const SERVER_VERSION = "0.5.3";
-
-/** v0.3 工具核心组装链：包装顺序固定——先边沿后守卫，守卫（安全）最贴近工具入口，
- *  peer 投递排空最外层（tool-round 间隙把信封**追加为末尾 text 块 content[2]**，
- *  content[0]/content[1] 逐字节不变——§7.1「面 B 的插入形态」）。 */
-export function composeCore(deps: ToolDeps): ToolCore {
-  const base = createToolCore(deps);
-  const edges = withTaskEdges(base, deps);
-  const guarded = withGuards(edges, deps);
-  return withPeerDrain(guarded, deps);
-}
+const SERVER_VERSION = "0.6.0";
 
 let shuttingDown = false;
 
@@ -61,31 +51,64 @@ async function shutdown(): Promise<void> {
 }
 
 export async function main(): Promise<void> {
-  const deps = resolveDeps(process.cwd(), process.env);
+  const deps: ToolDeps = resolveDeps(process.cwd(), process.env);
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
   const core = composeCore(deps);
-  registerTools(server, deps, core);      // v0.1.0 七工具，注入包装后的 core
-  registerMemberTools(server, deps);      // W2：xc_member_add / xc_member_stop
-  registerLeadTools(server, deps);        // W4：xc_team_init / xc_idle / xc_cancel
-  registerSecurityTools(server, deps);    // W5：xc_inbound_review
-  registerPeerTools(server, deps);         // v0.3 W6：跨会话 peer 工具面
-  registerDoctorTool(server, {            // v0.4：xc_doctor（只读体检，免注册）
+  const registry: PrimaryRegistry = new Map();
+
+  // v0.6：家族注册器——server.tool()（tools/list 发现面）+ registry（分发面）。
+  registerIdentifyTools(server, deps, core, registry);   // xc_identify
+  registerTaskTools(server, deps, core, registry);       // xc_dispatch / xc_claim / xc_report
+  registerReadTools(server, deps, core, registry);       // xc_read
+  registerRelay(server, deps, core, registry);           // xc_relay（M4 家族注册器）
+  registerOverviewTools(server, deps, core, registry);   // xc_overview
+  registerTeamTools(server, deps, core, registry);       // xc_team
+  registerReviewTools(server, deps, core, registry);     // xc_review
+  registerDoctorTool(server, {                           // xc_doctor（免注册只读体检）
     version: SERVER_VERSION, env: process.env, cwd: process.cwd(),
   });
+  // doctor 的 handler 也登记进分发面（alias 层接管 CallTool 后的唯一通路）。
+  registry.set("xc_doctor", {
+    description: "Read-only self check: plugin version, runtime, auto-detected zcode_exe/zcode_cjs paths and probe attempts. Does not require registration.",
+    shape: {},
+    handler: async () => {
+      const { buildDoctorReport } = await import("./doctor-tool.js");
+      const report = buildDoctorReport({ version: SERVER_VERSION, env: process.env, cwd: process.cwd() });
+      const lines = [
+        `zcode-crosschat ${report.plugin.version}`,
+        `runtime: node ${report.runtime.node} @ ${report.runtime.execPath} (${report.runtime.platform})`,
+        `zcode_exe/zcode_cjs: env(set=${report.spawnPaths.zcode_exe_env_set}/${report.spawnPaths.zcode_cjs_env_set})` +
+          ` locate(found=${report.spawnPaths.locate.found}, source=${report.spawnPaths.locate.source || "-"})`,
+        `exe: ${report.spawnPaths.locate.exe || "(未定)"}`,
+        `cjs: ${report.spawnPaths.locate.cjs || "(未定)"}`,
+        `member_model(XC_MEMBER_MODEL): ${report.spawnPaths.member_model_env_value || "(空=枚举表自动选第一个)"}`,
+        ...(report.spawnPaths.locate.configError !== undefined ? [`WARNING: ${report.spawnPaths.locate.configError}`] : []),
+        ...report.spawnPaths.locate.attempts.map((a) => `- [${a.hit ? "命中" : "未中"}] ${a.step}: ${a.detail}`),
+        ...(report.guidance !== "" ? [`指引: ${report.guidance}`] : []),
+      ];
+      return {
+        content: [
+          { type: "text" as const, text: lines.join("\n") },
+          { type: "text" as const, text: JSON.stringify(report) },
+        ],
+      };
+    },
+  });
 
-  // v0.5.1（CONC-2 修复）：带大帧守卫的 stdio 传输——≥10MiB（SDK 默认上限）帧
-  // 不再「静默自退出（exit 0）」，32MiB 内正常入队（README「队内无此闸」承诺），
-  // 超限帧显式 JSON-RPC 拒收且 server 继续服务（transport/mcpstdio.ts）。
+  // v0.6（§1.3）：旧名弃用覆盖层——必须全部注册之后、connect 之前安装。
+  // dispatcher 对 PRIMARY 名做 zod 校验（与 SDK 同款 InvalidParams 错误）后调
+  // registry 的 handler；未知名抛标准 "Tool not found"。
+  installAliasLayer(server, (name, args, extra) => dispatchPrimary(registry, name, args, extra));
+
+  // v0.5.1（CONC-2 修复）：带大帧守卫的 stdio 传输——≥10MiB 帧 JSON-RPC 拒收且
+  // server 继续服务（transport/mcpstdio.ts）。
   const transport = new GuardedStdioTransport();
   transport.onclose = () => {
     void shutdown();
   };
   await server.connect(transport);
 
-  // v0.5.1（故障注-8 修复）：周期僵尸清扫——README 配置表承诺「在途任务超过
-  // stale_task_minutes 无任何更新且成员无在途唤醒时，被引擎清扫回待领并回执队长」。
-  // E-b 边沿清扫只在有成员成功报告终态时运行，成员死后承诺落空；本定时器让运行中的
-  // server 进程独立兑现承诺（节拍由 XC_STALE_TASK_MINUTES 推导，unref 不改退出语义）。
+  // v0.5.1（故障注-8 修复）：周期僵尸清扫（unref 不改退出语义）。
   startStaleSweeper(deps);
 
   // v0.3 EOF 纪律（FEASIBILITY-V0.3 §3.3）：SDK 不监听 stdin 'end'，必须自建。
@@ -95,6 +118,27 @@ export async function main(): Promise<void> {
   process.stdin.once("close", () => {
     void shutdown();
   });
+}
+
+/** PRIMARY 分发：zod 校验（SDK 同款错误口径）→ handler（extra 原样透传，L1）。 */
+export async function dispatchPrimary(
+  registry: PrimaryRegistry,
+  name: string,
+  args: Record<string, unknown>,
+  extra: unknown,
+): Promise<unknown> {
+  const entry = registry.get(name);
+  if (entry === undefined) {
+    throw new McpError(ErrorCode.InvalidParams, `Tool ${name} not found`);
+  }
+  const parsed = z.object(entry.shape).safeParse(args);
+  if (!parsed.success) {
+    const message = parsed.error.issues
+      .map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`)
+      .join("; ");
+    throw new McpError(ErrorCode.InvalidParams, `Input validation error: Invalid arguments for tool ${name}: ${message}`);
+  }
+  return await entry.handler(parsed.data as Record<string, unknown>, extra);
 }
 
 // 只在直接执行（dist 产物被 node 运行）时启动；被测试 import 时不自启。

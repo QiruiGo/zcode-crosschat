@@ -10,7 +10,7 @@ import {
   leadKeyOf,
   maxMembersFromEnv,
   resolveReprovision,
-} from './member-tools.js';
+} from './tools-team.js';
 import type { TeamMember, TeamState } from '../core/types.js';
 
 function teamWith(members: TeamMember[], leadKey?: string): TeamState {

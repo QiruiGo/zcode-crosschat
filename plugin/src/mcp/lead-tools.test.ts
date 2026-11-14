@@ -19,7 +19,7 @@ import {
   pushLeadHistory,
   sanitizeLeadReason,
   type LeadToolCore,
-} from "./lead-tools.js";
+} from "./tools-team.js";
 import { identityStore } from "./identity.js";
 import { readMailbox } from "../core/mailbox.js";
 import { engineLogFile } from "../core/paths.js";

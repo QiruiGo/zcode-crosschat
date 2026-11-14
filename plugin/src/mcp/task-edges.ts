@@ -42,7 +42,7 @@
  */
 
 import { payloadOf } from "./protocol.js";
-import type { ToolCore, ToolDeps } from "./tools.js";
+import type { ToolCore, ToolDeps } from "./core.js";
 import { findInflightWakeNonce } from "../core/registry.js";
 import { appendMailbox, createMessage, readMailbox } from "../core/mailbox.js";
 import { logEngineEvent } from "../core/log.js";

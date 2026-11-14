@@ -26,7 +26,7 @@ import { drainPeerQueue, renderPeerEnvelope, type PeerQueueItem } from "../core/
 import { queueItemToInjectBlock } from "../core/peerenvelope.js";
 import { contextCharsFromEnv, layoutInjectBlocks, receiverInjectBudget } from "../core/budget.js";
 import type { ToolResult } from "./protocol.js";
-import type { ToolCore, ToolDeps } from "./tools.js";
+import type { ToolCore, ToolDeps } from "./core.js";
 
 /** 本进程内的 peer 会话上下文（注册后由 peer-tools.ts 写入）。 */
 export interface PeerSessionContext {
@@ -149,7 +149,34 @@ export async function appendPeerEnvelopes(
       .map((item) => queueItemToInjectBlock(item as PeerQueueItem, backend.render(item)))
       // v0.4 行为兼容：空渲染结果（注入后端自定义 render 可能返回 ""）不进排布。
       .filter((b) => b.rendered !== "");
-    const layout = layoutInjectBlocks(injectBlocks, budget, "peer");
+    // v0.6（C1，DESIGN-V0.6.md §3.1/§4.2-M3 面 B urgent-first）：urgent 块置首且
+    // 优先全文——两段式排布：第一段只用 urgent 块按**全量预算**排布，第二段用剩余
+    // 预算排布普通块（沿用 layoutInjectBlocks 原语，预算口径同源）。无 urgent 块时
+    // 退化为单次排布，与 v0.5 行为逐字节一致。预算总量不变——只是「谁先花」的
+    // 优先级翻转（urgent 优先全文，普通件维持现有降级形态）。
+    const isUrgent = (item: unknown): boolean => (item as PeerQueueItem | undefined)?.urgent === true;
+    const urgentItems = items.filter(isUrgent);
+    const normalItems = items.filter((item) => !isUrgent(item));
+    let urgentLayout: ReturnType<typeof layoutInjectBlocks> | undefined;
+    let normalBudget = budget;
+    if (urgentItems.length > 0) {
+      const urgentBlocks = urgentItems
+        .map((item) => queueItemToInjectBlock(item as PeerQueueItem, backend.render(item)))
+        .filter((b) => b.rendered !== "");
+      urgentLayout = layoutInjectBlocks(urgentBlocks, budget, "peer");
+      const urgentUsed = urgentLayout.totalChars;
+      normalBudget = { ...budget, total: Math.max(0, budget.total - urgentUsed) };
+    }
+    const normalBlocks = normalItems
+      .map((item) => queueItemToInjectBlock(item as PeerQueueItem, backend.render(item)))
+      .filter((b) => b.rendered !== "");
+    const normalLayout = layoutInjectBlocks(normalBlocks, normalBudget, "peer");
+    const layout = {
+      blocks: [...(urgentLayout?.blocks ?? []), ...normalLayout.blocks],
+      truncatedCount: (urgentLayout?.truncatedCount ?? 0) + normalLayout.truncatedCount,
+      budgetTruncated: (urgentLayout?.budgetTruncated ?? false) || normalLayout.budgetTruncated,
+      totalChars: (urgentLayout?.totalChars ?? 0) + normalLayout.totalChars,
+    };
     block = layout.blocks.join("\n\n");
     // budgetTruncated 时另记（R-24，对齐 CC budget_truncated @9950531）。
     if (layout.budgetTruncated) {
@@ -160,6 +187,7 @@ export async function appendPeerEnvelopes(
         truncatedCount: layout.truncatedCount,
         totalChars: layout.totalChars,
         sessionId: context.sessionId,
+        ...(urgentLayout !== undefined ? { urgentCount: urgentItems.length } : {}),
       });
     }
   } catch (error) {

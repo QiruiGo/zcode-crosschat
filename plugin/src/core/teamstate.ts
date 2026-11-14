@@ -21,6 +21,8 @@ import { inboxDir, inboxFile, snapshotFile, teamBackupFile, teamCorruptFile, tea
 import { sanitizeKey } from './sanitize.js';
 import {
   OPEN_TASK_STATUSES,
+  TASK_PRIORITIES,
+  TASK_PRIORITY_RANK,
   TASK_TRANSITIONS,
   TERMINAL_TASK_STATUSES,
   transitionError,
@@ -29,6 +31,7 @@ import {
   type MemberRole,
   type Task,
   type TaskHistoryEntry,
+  type TaskPriority,
   type TaskStatus,
   type TeamMember,
   type TeamState,
@@ -305,6 +308,11 @@ export interface NewTaskInput {
   prompt: string;
   acceptance?: string;
   dependsOn?: string[];
+  /**
+   * v0.6（C2）：排序建议优先级；缺省/非法值不落盘（absent = normal，读侧归一）。
+   * 影响展示/取单顺序，不做抢占（DESIGN-V0.6.md §3.2）。
+   */
+  priority?: TaskPriority;
   createdBy: string;
 }
 
@@ -322,6 +330,11 @@ export function nextTaskId(team: TeamState): string {
  * seq. Mutates `team` — callers persist via writeTeam afterwards.
  */
 export function makeTask(team: TeamState, input: NewTaskInput, now: number = Date.now()): Task {
+  // v0.6（C2）：priority 防御性收敛——枚举外值不落盘（absent = normal），与读侧
+  // coerceTask 的宽容纪律一致（非法值丢弃，不炸派发）。
+  const priority = input.priority !== undefined && TASK_PRIORITIES.includes(input.priority)
+    ? input.priority
+    : undefined;
   const task: Task = {
     id: nextTaskId(team),
     title: input.title,
@@ -339,6 +352,7 @@ export function makeTask(team: TeamState, input: NewTaskInput, now: number = Dat
     error: null,
     evidence: [],
     history: [],
+    ...(priority === undefined ? {} : { priority }),
   };
   team.seq += 1;
   team.tasks.push(task);
@@ -355,7 +369,7 @@ export function unsatisfiedDependencies(tasks: readonly Task[], dependencies: re
   return dependencies.filter((id) => byId.get(id)?.status !== 'completed');
 }
 
-/** Open (claimed/in_progress) tasks currently owned by one member. */
+/** Open (claimed/in_progress/blocked——v0.6 C2 起含 blocked 单开槽位) tasks owned by one member. */
 export function memberOpenTasks(tasks: readonly Task[], assignee: string): Task[] {
   return tasks.filter((task) => task.assignee === assignee && OPEN_TASK_STATUSES.includes(task.status));
 }
@@ -432,6 +446,11 @@ export function reportTransitionError(task: Task, input: ReportInput, reporter: 
       return `completing task ${task.id} requires at least one evidence entry`;
     }
   }
+  // v0.6（C2，DESIGN-V0.6.md §3.2）：blocked 必填阻塞原因（error=阻塞原因，非空）。
+  // 谁卡住谁申报——无 reason 的 blocked 与「暂停」语义无差，拒绝空申报。
+  if (input.status === 'blocked' && (input.error === undefined || input.error.trim() === '')) {
+    return `reporting blocked for task ${task.id} requires a non-blank reason in "error"`;
+  }
   return undefined;
 }
 
@@ -440,6 +459,12 @@ export function applyReport(task: Task, input: ReportInput, reporter: string, no
   const previous = task.status;
   if (transitionError(previous, input.status) !== undefined) {
     throw new Error(`applyReport called with illegal transition ${previous} -> ${input.status}`);
+  }
+  // v0.6（C2，DESIGN-V0.6.md §3.2/M2）：blocked 独立分支——attempt 保留（暂停而非
+  // 作废），标记 preBlockedStatus/blockedReason/blockedAt，history 记 'blocked'。
+  if (input.status === 'blocked') {
+    applyReportBlocked(task, input.error ?? '', now);
+    return;
   }
   task.status = input.status;
   if (input.result !== undefined) task.result = input.result;
@@ -450,6 +475,83 @@ export function applyReport(task: Task, input: ReportInput, reporter: string, no
   // matching terminal status snapshot; clearing the token would make the
   // receipt stale and the dispatcher would never learn the result.
   appendTaskHistory(task, input.status, reporter, task.attemptId ?? undefined, now);
+  // v0.6（C2）：认领者自解路径（blocked → in_progress，唯一经 report 的解除边）——
+  // 与 xc_team unblock 共用 clearBlockedMarkers（防二次 unblock 误回跳），history
+  // 追加 'unblocked-self'（与 lead 侧 'unblocked-><status>' 区分，M2 共享块注记）。
+  if (previous === 'blocked') {
+    clearBlockedMarkers(task);
+    appendTaskHistory(task, 'unblocked-self', reporter, task.attemptId ?? undefined, now);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// v0.6（C2）blocked 态：进入 / 解除（DESIGN-V0.6.md §3.2 / §4.2-M2 共享块）
+// ---------------------------------------------------------------------------
+
+/**
+ * 进入 blocked（调用方已过 transitionError：claimed|in_progress → blocked 合法，
+ * 且 reportTransitionError 已确保 reason 非空）。attempt 保留——暂停而非作废。
+ * 解除目标态记入 preBlockedStatus（∈ {claimed, in_progress}），unblock 据此复位。
+ */
+export function applyReportBlocked(task: Task, reason: string, now: number): void {
+  task.preBlockedStatus = task.status;
+  task.status = 'blocked';
+  task.blockedReason = reason;
+  task.blockedAt = now;
+  task.updatedAt = now;
+  // 调用路径上 assignee === reporter（reportTransitionError 的 assigned-to 校验）。
+  appendTaskHistory(task, 'blocked', task.assignee ?? 'unknown', task.attemptId ?? undefined, now);
+}
+
+/**
+ * 解除 blocked（xc_team unblock 的 core 半边；回投 unblock-notice + wake 在工具层）。
+ * 复位目标 = preBlockedStatus；缺失（手工编辑/宽容读取丢弃）时兜底回 pending
+ * （TASK_TRANSITIONS.blocked 的防御边）。
+ *
+ * @returns 错误消息，undefined = 已解除。非 blocked 任务 → 'task_not_blocked'。
+ */
+export function unblockTask(
+  task: Task,
+  now: number,
+  options: { by?: string } = {},
+): string | undefined {
+  if (task.status !== 'blocked') return 'task_not_blocked';
+  const back = task.preBlockedStatus ?? 'pending';
+  const err = transitionError('blocked', back);
+  if (err) return err;
+  task.status = back;
+  task.updatedAt = now;
+  clearBlockedMarkers(task);
+  appendTaskHistory(task, `unblocked->${back}`, options.by ?? 'lead-or-creator', task.attemptId ?? undefined, now);
+  return undefined;
+}
+
+/**
+ * L5：两条解除路径（xc_team unblock / 认领者自解 report(in_progress)）共用的清理——
+ * 解除目标标记必须清，防二次 unblock 误回跳；blockedReason/blockedAt 保留作历史
+ * 痕迹（journal 之外的磁盘痕迹）。
+ */
+export function clearBlockedMarkers(task: Task): void {
+  task.preBlockedStatus = undefined;
+}
+
+/** v0.6（C2）：priority 展示/取单秩——absent 归一为 normal（旧记录兼容）。 */
+export function priorityRank(priority?: TaskPriority): number {
+  return TASK_PRIORITY_RANK[priority ?? 'normal'];
+}
+
+/**
+ * v0.6（C2）：任务板统一排序（priority → createdAt，stable；DESIGN-V0.6.md §3.2）。
+ * xc_overview 任务板 / 未领池呈现 / 唤醒建议序共用此序；不改传入数组。
+ * 同秩同刻按 id 全序化，保证跨调用呈现稳定。
+ */
+export function sortTasksForBoard(tasks: readonly Task[]): Task[] {
+  return [...tasks].sort(
+    (a, b) =>
+      priorityRank(a.priority) - priorityRank(b.priority)
+      || a.createdAt - b.createdAt
+      || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
+  );
 }
 
 /**
@@ -494,7 +596,7 @@ export async function createTeam(
   return team;
 }
 
-/** The member's single open (claimed/in_progress) task, if any (dsh 同名约束). */
+/** The member's single open (claimed/in_progress/blocked——v0.6 C2 起含 blocked) task, if any (dsh 同名约束). */
 export function memberOpenTask(team: TeamState, agentKey: string): Task | undefined {
   return memberOpenTasks(team.tasks, agentKey)[0];
 }

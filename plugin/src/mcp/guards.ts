@@ -38,7 +38,7 @@ import {
   readHeldMessages,
   readInboundPolicy,
 } from "../core/policy.js";
-import type { ToolCore, ToolDeps } from "./tools.js";
+import type { ToolCore, ToolDeps } from "./core.js";
 import type { TeamMessage } from "../core/types.js";
 
 /** §9.2 契约出口：帧类型白名单的唯一定义在 core/mailbox.ts（读取侧执行），此处转出。 */
@@ -108,7 +108,9 @@ export function withGuards(core: ToolCore, deps: ToolDeps): ToolCore {
   }
 
   /** chat 入站策略执行（§7.4-I4）：仅 chat 到这里；source 字段不成对/自发消息等
-   * 异常参数原样透传给内层校验（保持 v0.1.0 错误口径不变）。 */
+   * 异常参数原样透传给内层校验（保持 v0.1.0 错误口径不变）。
+   * v0.6：xc_message 入参为 RelayArgs（`msg` 必填；forwardOf 已砍）——hold 隔离副本
+   * 的 forwardOf 指针占位一并移除（转发机制在 alias 层即被显式拒绝，不可达）。 */
   const guardedMessage: ToolCore["xc_message"] = (args, connectionKey) =>
     gated(args, connectionKey, async (a, ck) => {
       const me = identityStore.require(ck);
@@ -122,19 +124,13 @@ export function withGuards(core: ToolCore, deps: ToolDeps): ToolCore {
       if (policy.mode === "accept") return core.xc_message(a, ck);
 
       if (policy.mode === "hold") {
-        // v0.5（M6 forwardOf 波及的最小适配）：MessageShape.content 改为可选（forwardOf
-        // 转发不携带正文，R-13），hold 隔离副本对转发消息落 forwardOf 指针占位——原文
-        // 不在隔离副本中（core 侧才解析 forwardOf），accept 后收件人可见转发引用。
-        const msg = createMessage(
-          me.agentKey,
-          toKey,
-          a.content ?? (a.forwardOf !== undefined ? `[forwardOf:${a.forwardOf}]` : ""),
-          chatExtrasOf(a),
-        );
+        // hold 隔离副本保留 urgent 标记（C1：接受审阅后插队不丢）。
+        const msg = createMessage(me.agentKey, toKey, a.msg, chatExtrasOf(a));
+        if (a.urgent === true) msg.urgent = true;
         await appendHeld(stateRoot, me.teamId, toKey, msg);
         return okResult(
           `Message held by inbound policy (mode=hold, source=${policy.source}): quarantined in ` +
-          `${toKey}.held.jsonl; hooks/wakes never see it until xc_inbound_review accepts it.`,
+            `${toKey}.held.jsonl; hooks/wakes never see it until xc_review accepts it.`,
           { messageId: msg.id, from: me.agentKey, to: toKey, delivered: "held", policy: "hold" },
         );
       }

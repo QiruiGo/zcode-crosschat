@@ -14,11 +14,17 @@
  * @module core/types
  */
 
-/** Six-state task machine statuses (DESIGN.md §2.6). */
+/**
+ * Task machine statuses (DESIGN.md §2.6).
+ * v0.6（C2，DESIGN-V0.6.md §3.2）：扩为七态——`blocked` 是「认领者显式申报的暂停」：
+ * 唯一入口 = 认领者 xc_report(status:"blocked", error=阻塞原因必填)（attempt 保留）；
+ * 退出 = xc_team unblock（回 preBlockedStatus）/ 认领者自解 report(in_progress) / cancel。
+ */
 export const TASK_STATUSES = [
   'pending',
   'claimed',
   'in_progress',
+  'blocked',
   'completed',
   'failed',
   'cancelled',
@@ -32,17 +38,53 @@ export const TERMINAL_TASK_STATUSES: readonly TaskStatus[] = [
   'cancelled',
 ];
 
-/** Statuses that count as "open work" for the one-open-task-per-member rule. */
-export const OPEN_TASK_STATUSES: readonly TaskStatus[] = ['claimed', 'in_progress'];
+/**
+ * Statuses that count as "open work" for the one-open-task-per-member rule and
+ * for revokeAttempt's revocable domain.
+ * v0.6（C2）：blocked 在内——暂停的任务仍占用成员的单开槽位（不可他领：status 非
+ * pending，claim 天然拒绝），unblock 复位后不破坏单开不变量；成员 stop / 接管
+ * （T1 #5）经 revokeAttempt 把 blocked 任务一并回池。
+ */
+export const OPEN_TASK_STATUSES: readonly TaskStatus[] = ['claimed', 'in_progress', 'blocked'];
+
+/**
+ * v0.6（C2）：僵尸清扫的候选口径——**必须比 OPEN 窄**（DESIGN-V0.6.md §3.2）。
+ * blocked 被 staleTasks/graph.staleTasks 过滤式排除：合法暂停的任务不得在
+ * XC_STALE_TASK_MINUTES 后被 sweeper 误回收（blocked 有属主、attempt 保留、滞留确定）。
+ */
+export const SWEEPABLE_TASK_STATUSES: readonly TaskStatus[] = ['claimed', 'in_progress'];
+
+/**
+ * v0.6（C2）：任务优先级枚举（排序建议，非抢占——claim 仍是显式 taskId）。
+ * absent = normal（旧记录兼容，priorityRank 归一）。
+ */
+export const TASK_PRIORITIES = ['high', 'normal', 'low'] as const;
+export type TaskPriority = (typeof TASK_PRIORITIES)[number];
+
+/** priority → 展示/取单序的秩（小者在前；absent 由 priorityRank 归一为 normal）。 */
+export const TASK_PRIORITY_RANK: Readonly<Record<TaskPriority, number>> = {
+  high: 0,
+  normal: 1,
+  low: 2,
+};
 
 /**
  * The allowed task status transitions, keyed by current status.
  * Port of state.js:115-122, all edges preserved verbatim.
+ * v0.6（C2，DESIGN-V0.6.md §3.2 转移表）：
+ * - pending **不**列 blocked（L-n3：blocked 唯一入口是认领者 report——需 attempt，
+ *   pending 无 attempt 无认领者，该边不可达，删除而非保留死配置）。
+ * - claimed/in_progress → blocked：认领者 xc_report(status:"blocked") 显式申报。
+ * - blocked → pending 仅作 unblock 兜底的防御边（preBlockedStatus 缺失时回池）；
+ *   正常解除回到 preBlockedStatus ∈ {claimed, in_progress}。
+ * - blocked → failed 故意无此边：阻塞中放弃先自解（report in_progress）再 failed，
+ *   或由 lead/创建者 cancel（blocked → cancelled 合法）。
  */
 export const TASK_TRANSITIONS: Readonly<Record<TaskStatus, readonly TaskStatus[]>> = {
   pending: ['claimed', 'cancelled'],
-  claimed: ['in_progress', 'failed', 'cancelled'],
-  in_progress: ['completed', 'failed', 'cancelled'],
+  claimed: ['in_progress', 'blocked', 'failed', 'cancelled'],
+  in_progress: ['completed', 'blocked', 'failed', 'cancelled'],
+  blocked: ['pending', 'claimed', 'in_progress', 'cancelled'],
   completed: [],
   failed: [],
   cancelled: [],
@@ -132,6 +174,17 @@ export interface Task {
   error: string | null;
   evidence: EvidenceItem[];
   history: TaskHistoryEntry[];
+  /**
+   * v0.6（C2）：排序建议优先级；absent = normal（旧记录兼容，priorityRank 归一）。
+   * 影响展示/取单顺序，不做抢占（DESIGN-V0.6.md §3.2）。
+   */
+  priority?: TaskPriority;
+  /** v0.6（C2）：status=blocked 必有——阻塞原因（report error 原文）。解除后保留作历史痕迹。 */
+  blockedReason?: string;
+  /** v0.6（C2）：进入 blocked 的时刻（epoch ms）。 */
+  blockedAt?: number;
+  /** v0.6（C2）：解除目标态（进入 blocked 前的 status）；unblock 校验 ∈ OPEN_TASK_STATUSES。 */
+  preBlockedStatus?: TaskStatus;
 }
 
 /**
@@ -242,6 +295,8 @@ export interface TeamMessage {
   originSessionId?: string;
   /** v0.5（R-15-2）：渲染层判定的可疑信封标记（渲染时现算+审计，落盘值仅供参考）。 */
   forged?: boolean;
+  /** v0.6（C1）：urgent 消息在一切读取面排最前（urgentFirst 排序键）。absent=false。 */
+  urgent?: boolean;
 }
 
 /** One session record in `registry/sessions/<sessionId>.json` (DESIGN.md §2.2). */
@@ -347,6 +402,8 @@ export function isTeamMessage(value: unknown): value is TeamMessage {
   // （sourceTaskStatus 枚举同款纪律）。
   const origin = absent(value['origin']);
   const forged = absent(value['forged']);
+  // v0.6（C1）：urgent 宽容增量——旧记录缺省照读；在场时必须布尔（forged 同款纪律）。
+  const urgent = absent(value['urgent']);
   return (
     isNonBlankString(value['id'])
     && isNonBlankString(value['from'])
@@ -366,6 +423,7 @@ export function isTeamMessage(value: unknown): value is TeamMessage {
     && (origin === undefined || origin === 'user' || origin === 'agent')
     && absentOrString(value['originSessionId'])
     && (forged === undefined || typeof forged === 'boolean')
+    && (urgent === undefined || typeof urgent === 'boolean')
   );
 }
 
@@ -399,6 +457,8 @@ export function normalizeMessage(value: TeamMessage): TeamMessage {
   if (value.origin === 'user' || value.origin === 'agent') out.origin = value.origin;
   if (typeof value.originSessionId === 'string') out.originSessionId = value.originSessionId;
   if (typeof value.forged === 'boolean') out.forged = value.forged;
+  // v0.6（C1）：urgent 宽容拷贝（origin 同款纪律）。
+  if (typeof value.urgent === 'boolean') out.urgent = value.urgent;
   return out;
 }
 
@@ -474,6 +534,18 @@ function coerceTask(value: unknown): Task | undefined {
   const attemptId = optionalString(value['attemptId']) ?? null;
   const result = optionalString(value['result']) ?? null;
   const error = optionalString(value['error']) ?? null;
+  // v0.6（C2）宽容增量（§11.1 纪律）：新字段非法值丢弃、绝不整文件拒绝——
+  // v0.5.3 六态旧记录缺省照读（DESIGN-V0.6.md §6-4 迁移兼容），新记录读写无损。
+  const priorityRaw = optionalString(value['priority']);
+  const priority = priorityRaw !== undefined && TASK_PRIORITIES.includes(priorityRaw as TaskPriority)
+    ? (priorityRaw as TaskPriority)
+    : undefined;
+  const blockedReason = optionalString(value['blockedReason']);
+  const blockedAt = optionalFinite(value['blockedAt']);
+  const preBlockedRaw = optionalString(value['preBlockedStatus']);
+  const preBlockedStatus = preBlockedRaw !== undefined && TASK_STATUSES.includes(preBlockedRaw as TaskStatus)
+    ? (preBlockedRaw as TaskStatus)
+    : undefined;
   return {
     id,
     title,
@@ -491,6 +563,10 @@ function coerceTask(value: unknown): Task | undefined {
     error,
     evidence,
     history,
+    ...(priority === undefined ? {} : { priority }),
+    ...(blockedReason === undefined ? {} : { blockedReason }),
+    ...(blockedAt === undefined ? {} : { blockedAt }),
+    ...(preBlockedStatus === undefined ? {} : { preBlockedStatus }),
   };
 }
 

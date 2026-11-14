@@ -14,7 +14,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { ProvisionError, provisionMember } from "./provision.js";
-import type { ToolDeps } from "../mcp/tools.js";
+import type { ToolDeps } from "../mcp/core.js";
 
 const BAD_EXE = "E:\\nonexistent-dir-9999\\ZCode.exe";
 

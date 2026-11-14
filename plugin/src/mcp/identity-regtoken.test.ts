@@ -1,19 +1,20 @@
 /**
- * v0.5.3 红队三番战 A6（安全对-1）防回归单测：(name, sessionId) 精确对重放冒充。
+ * v0.6（DESIGN-V0.6.md §2.2 行 2）改判测试：regToken 身份锚定硬闸砍除。
  *
- * 攻击链（evidence/adversarial/adjudication/adj052/cases/a6-impersonate.mjs 重放）：
- * 1. 免注册连接 xc_status 读到 victim ↔ sid 精确对；
- * 2. 新连接 xc_register{name:"victim", sessionId: victim 的真 sid} → 命中「已绑定
- *    精确对」的幂等重绑路径 → 成功绑定 victim 身份；
- * 3. 冒充者 xc_check_inbox 偷消费 victim 邮箱、xc_lead_transfer 移走 lead，
- *    victim 零告警。
- *
- * 根因：(name, sid) 对可经 xc_status 公开读到，本身不是凭据；重绑路径无属主证明。
- * 修复：SessionStart 钩子铸造锚定令牌 regToken（只注入本会话上下文 + 落锚定记录），
- * 重绑已绑定 (name, sid) 对必须出示与锚定记录一致的 regToken（identity_token_required）。
- * 豁免：同连接幂等重试（peer-1 语义）/ wakeToken 路径（一次性 nonce 即属主凭据）/
- * 升级前旧锚（无 regToken，放行 + 告警披露，不静默）。
+ * 原 v0.5.3 A6（安全对-1）攻击链重放（adj052 a6-impersonate.mjs）在 v0.6 的
+ * 改判结论（条款 2a 台账「改编」类）：
+ * - 旧断言 identity_token_required（无令牌重绑 → 硬拒）**已移除**——个人/内部
+ *   场景威胁模型不成立，重绑降级为软校验；
+ * - 保留的硬点（本文件新断言）：① (name, sid) 精确对重绑 → **幂等成功**
+ *   （bug-02 语义：刷新 lastSeen/成员记录，不抛错）；② 新花名+他人 sid →
+ *   session_already_bound 仍拒（bug-12 活性冲突语义）；③ 花名+他人 sid 的名字
+ *   → name_taken 仍拒；④ wakeToken 路径不变（一次性 nonce 即属主凭据，服务端
+ *   代写保留锚定令牌字段——仅作钩子延续用，不再构成闸）。
+ * - 原「精确对重放（新连接、无令牌）→ identity_token_required」攻击步骤改判为
+ *   「不再存在该闸」：重放方会拿到同一身份（bug-02 幂等），这是 v0.6 的显式
+ *   取舍（README 威胁模型：同机冒充不做密码学防御）。
  */
+
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -84,36 +85,35 @@ describe("A6：xc_register 精确对重放属主校验", () => {
     expect(token).toMatch(/^rt-/);
   });
 
-  it("精确对重放（新连接、无令牌）→ identity_token_required（a6 攻击重放，闸生效）", async () => {
+  it("v0.6 改判：精确对重放（新连接）→ 幂等成功（regToken 闸已砍；bug-02 语义）", async () => {
     await anchorLikeHook("sess-vic");
     await xcRegister(stateRoot, { name: "victim", sessionId: "sess-vic" }, nextConn(), { peerRoot });
 
-    // 攻击者：新连接出示公开可读的精确对（xc_status 读者），无 regToken。
-    const payload = await errorPayload(() =>
-      xcRegister(stateRoot, { name: "victim", sessionId: "sess-vic" }, nextConn(), { peerRoot }),
-    );
-    expect(payload.error).toBe("identity_token_required");
-    expect(payload.name).toBe("victim");
-    expect(payload.sessionId).toBe("sess-vic");
+    // 旧版：新连接无 regToken → identity_token_required 硬拒。
+    // v0.6（§2.2 行 2）：闸已砍——精确对重绑幂等刷新（同 name+sid 的合法 --resume 重连）。
+    const replay = await xcRegister(stateRoot, { name: "victim", sessionId: "sess-vic" }, nextConn(), { peerRoot });
+    expect(replay.via).toBe("hook");
+    expect(replay.sessionKey).toBe("xc:default:victim");
+    expect(replay.warnings).toEqual([]);
   });
 
-  it("精确对重放（令牌错误）→ identity_token_required", async () => {
+  it("v0.6 改判：令牌错误的重绑同样幂等成功（regToken 参数不再被读取）", async () => {
     await anchorLikeHook("sess-vic", { regToken: "rt-true-token" });
-    await xcRegister(stateRoot, { name: "victim", sessionId: "sess-vic", regToken: "rt-true-token" }, nextConn(), { peerRoot });
+    await xcRegister(stateRoot, { name: "victim", sessionId: "sess-vic" }, nextConn(), { peerRoot });
 
-    const payload = await errorPayload(() =>
-      xcRegister(stateRoot, { name: "victim", sessionId: "sess-vic", regToken: "rt-forged" }, nextConn(), { peerRoot }),
-    );
-    expect(payload.error).toBe("identity_token_required");
+    // 旧版：regToken:"rt-forged" → identity_token_required。v0.6：参数不入 RegisterArgs，
+    // 重绑幂等（令牌错误与否与身份绑定无关）。
+    const replay = await xcRegister(stateRoot, { name: "victim", sessionId: "sess-vic" }, nextConn(), { peerRoot });
+    expect(replay.sessionKey).toBe("xc:default:victim");
   });
 
-  it("精确对重绑（令牌正确）→ 成功（--resume 新回合 / MCP 进程重启的合法重连）", async () => {
+  it("精确对重绑（另一连接）→ 成功（--resume 新回合 / MCP 进程重启的合法重连）", async () => {
     await anchorLikeHook("sess-vic", { regToken: "rt-true-token" });
-    const first = await xcRegister(stateRoot, { name: "victim", sessionId: "sess-vic", regToken: "rt-true-token" }, nextConn(), { peerRoot });
+    const first = await xcRegister(stateRoot, { name: "victim", sessionId: "sess-vic" }, nextConn(), { peerRoot });
     expect(first.via).toBe("hook");
 
     // 同一 (name, sid) 对、另一条连接（真实语义：会话重连后的新 MCP server 进程）。
-    const second = await xcRegister(stateRoot, { name: "victim", sessionId: "sess-vic", regToken: "rt-true-token" }, nextConn(), { peerRoot });
+    const second = await xcRegister(stateRoot, { name: "victim", sessionId: "sess-vic" }, nextConn(), { peerRoot });
     expect(second.via).toBe("hook");
     expect(second.sessionKey).toBe("xc:default:victim");
   });
@@ -126,22 +126,22 @@ describe("A6：xc_register 精确对重放属主校验", () => {
     expect(retry.via).toBe("hook");
   });
 
-  it("升级前旧锚（无 regToken）→ 重绑放行但告警披露（不静默）", async () => {
+  it("旧锚（无 regToken 字段）→ 重绑放行且无令牌类告警（v0.6 无令牌闸可言）", async () => {
     await writeSession(stateRoot, {
       sessionId: "sess-old",
       cwd: workDir,
       startedAt: Date.now(),
       lastSeen: Date.now(),
-      // 无 regToken：v0.5.3 之前的锚定记录
+      // 无 regToken：v0.5.3 之前的锚定记录（v0.6 起令牌字段不再参与任何校验）
     });
     await xcRegister(stateRoot, { name: "old", sessionId: "sess-old" }, nextConn(), { peerRoot });
 
     const out = await xcRegister(stateRoot, { name: "old", sessionId: "sess-old" }, nextConn(), { peerRoot });
     expect(out.via).toBe("hook");
-    expect(out.warnings.some((w) => w.includes("regToken"))).toBe(true);
+    expect(out.warnings).toEqual([]);
   });
 
-  it("wakeToken 路径重绑不需要 regToken（一次性 nonce 即属主凭据），且代写保留锚定令牌", async () => {
+  it("wakeToken 路径重绑不需要令牌（一次性 nonce 即属主凭据），且代写保留锚定令牌字段", async () => {
     const token = await anchorLikeHook("sess-w");
     // 先以 wake 路径注册（无头回合）。
     const { token: wake } = await createWakeNonce(stateRoot, { teamId: "default", agentKey: "m", sid: "sess-w" });
@@ -215,32 +215,23 @@ describe("A6：完整攻击链重放（偷邮箱在闸前失效）", () => {
   it("冒充者注册被拒后，victim 邮箱原封不动（对照 adj052 a6-impersonate.jsonl 的 containsSecret=true）", async () => {
     const token = await anchorLikeHook("sess-vic");
     const victimConn = nextConn();
-    await xcRegister(stateRoot, { name: "victim", sessionId: "sess-vic", regToken: token }, victimConn, { peerRoot });
+    await xcRegister(stateRoot, { name: "victim", sessionId: "sess-vic" }, victimConn, { peerRoot });
 
     // attacker（真实会话）种一封密信。
     const attackerConn = nextConn();
     await anchorLikeHook("sess-att", { regToken: "rt-att" });
-    await xcRegister(stateRoot, { name: "attacker", sessionId: "sess-att", regToken: "rt-att" }, attackerConn, { peerRoot });
+    await xcRegister(stateRoot, { name: "attacker", sessionId: "sess-att" }, attackerConn, { peerRoot });
     const secret = createMessage("attacker", "victim", "REDTEAM-SECRET-COORDINATION-9f3a", {});
     await appendMailbox(stateRoot, "default", "victim", secret);
 
-    // 攻击者新连接精确对重放 → 拒。
-    const payload = await errorPayload(() =>
-      xcRegister(stateRoot, { name: "victim", sessionId: "sess-vic" }, nextConn(), { peerRoot }),
-    );
-    expect(payload.error).toBe("identity_token_required");
+    // v0.6 改判（a6 攻击链）：精确对重放不再被拒——重放方拿到同一身份（bug-02 幂等）。
+    // 这是显式取舍：个人/内部威胁模型下不做密码学防御（README 威胁模型声明）。
+    const replay = await xcRegister(stateRoot, { name: "victim", sessionId: "sess-vic" }, nextConn(), { peerRoot });
+    expect(replay.sessionKey).toBe("xc:default:victim");
 
-    // 冒充连接未获得身份：require 抛 not_registered，邮箱读不到。
-    const impostorConn = nextConn();
-    try {
-      identityStore.require(impostorConn);
-      throw new Error("expected require to throw");
-    } catch (err) {
-      expect((err as ToolError).payload.error).toBe("not_registered");
-    }
-
-    // victim 的邮箱还在：密信未被消费。
+    // 重放连接此刻**是** victim 身份（同一 (name, sid) 对）——邮箱内容不变
+    // （不丢：JSONL 追加真源；不串号：身份与任务板归属一致）。
     const box = await readMailbox(stateRoot, "default", "victim");
-    expect(box.some((m) => m.id === secret.id && m.readAt === undefined)).toBe(true);
+    expect(box.some((m) => m.id === secret.id)).toBe(true);
   });
 });

@@ -10,8 +10,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { createToolCore, type ToolCore, type ToolDeps } from "./tools.js";
-import { InboundReviewShape, FRAME_TYPES, registerSecurityTools, withGuards } from "./guards.js";
+import { createToolCore, type ToolCore, type ToolDeps } from "./core.js";
+import type { PrimaryRegistry } from "./core.js";
+import { FRAME_TYPES, withGuards } from "./guards.js";
+import { ReviewShape as InboundReviewShape, registerReviewTools as registerSecurityTools } from "./tools-review.js";
 import { payloadOf, type ToolResult } from "./protocol.js";
 import { heldInboxFile, policyFile, writeInboundPolicy } from "../core/policy.js";
 import { writeSession } from "../core/registry.js";
@@ -87,7 +89,7 @@ function captureSecurityHandler(): SecurityHandler {
       handlers.push(handler);
     },
   } as unknown as McpServer;
-  registerSecurityTools(server, deps);
+  registerSecurityTools(server as unknown as McpServer, deps, createToolCore(deps), new Map());
   return handlers[handlers.length - 1]!;
 }
 
@@ -102,7 +104,7 @@ async function securityCall(
 describe("withGuards: accept 模式（默认）= v0.1.0 行为不变（回归红线）", () => {
   it("chat 端到端入箱 + delivered=mailbox（wake 未启用）", async () => {
     const { connA } = await registerTeam();
-    const res = await guarded.xc_message({ to: "b", content: "hello teammate" }, connA);
+    const res = await guarded.xc_message({ to: "b", msg: "hello teammate" }, connA);
     expect(res.isError).toBeFalsy();
     expect(payloadOf(res)["delivered"]).toBe("mailbox");
     expect(mainInboxLines("b")).toHaveLength(1);
@@ -124,7 +126,7 @@ describe("withGuards: removed 成员硬拒（§7.3.3，错误码 member_removed�
       () => guarded.xc_check_inbox({}, connB),
       () => guarded.xc_claim({ taskId: "t1" }, connB),
       () => guarded.xc_report({ taskId: "t1", attemptId: "x", status: "failed", error: "stopped" }, connB),
-      () => guarded.xc_message({ to: "a", content: "am I still here?" }, connB),
+      () => guarded.xc_message({ to: "a", msg: "am I still here?" }, connB),
     ]) {
       const res = await call();
       expect(res.isError).toBe(true);
@@ -145,7 +147,7 @@ describe("withGuards: hold 策略（§7.4-I4）", () => {
     const { connA, connB } = await registerTeam();
     await writeInboundPolicy(stateRoot, "default", "hold");
 
-    const res = await guarded.xc_message({ to: "b", content: "quarantine me" }, connA);
+    const res = await guarded.xc_message({ to: "b", msg: "quarantine me" }, connA);
     expect(res.isError).toBeFalsy();
     expect(payloadOf(res)["delivered"]).toBe("held");
     expect(mainInboxLines("b")).toHaveLength(0); // 主邮箱为零
@@ -158,7 +160,7 @@ describe("withGuards: hold 策略（§7.4-I4）", () => {
     // xc_inbound_review：list → 1；accept → 主邮箱 1 行、held 清空。
     const list = await securityCall(connB, { action: "list" });
     expect(list["count"]).toBe(1);
-    const heldId = (list["messages"] as Array<{ id: string }>)[0]!.id;
+    const heldId = (list["rows"] as Array<{ msgId: string }>)[0]!.msgId;
     const accept = await securityCall(connB, { action: "accept", ids: [heldId] });
     expect(accept["count"]).toBe(1);
     expect(mainInboxLines("b")).toHaveLength(1);
@@ -174,7 +176,7 @@ describe("withGuards: hold 策略（§7.4-I4）", () => {
   it("review discard：直接丢弃不投递", async () => {
     const { connA, connB } = await registerTeam();
     await writeInboundPolicy(stateRoot, "default", "hold");
-    await guarded.xc_message({ to: "b", content: "junk" }, connA);
+    await guarded.xc_message({ to: "b", msg: "junk" }, connA);
     const discard = await securityCall(connB, { action: "discard" });
     expect(discard["count"]).toBe(1);
     expect(mainInboxLines("b")).toHaveLength(0);
@@ -190,7 +192,7 @@ describe("withGuards: hold 策略（§7.4-I4）", () => {
     await writeInboundPolicy(stateRoot, "default", "hold");
 
     const held = await guarded.xc_message(
-      { to: "a", content: "progress note", sourceTaskId: taskId, sourceAttemptId: attemptId },
+      { to: "a", msg: "progress note", sourceTaskId: taskId, sourceAttemptId: attemptId },
       connB,
     );
     expect(payloadOf(held)["delivered"]).toBe("held");
@@ -201,7 +203,7 @@ describe("withGuards: hold 策略（§7.4-I4）", () => {
     expect(heldRaw.sourceTaskId).toBe(taskId);
     expect(heldRaw.sourceAttemptId).toBe(attemptId);
 
-    const unpaired = await guarded.xc_message({ to: "a", content: "x", sourceTaskId: taskId }, connB);
+    const unpaired = await guarded.xc_message({ to: "a", msg: "x", sourceTaskId: taskId }, connB);
     expect(unpaired.isError).toBe(true);
     expect(payloadOf(unpaired)["error"]).toBe("invalid_params");
   });
@@ -212,7 +214,7 @@ describe("withGuards: refuse 策略（§7.4-I4，错误码 inbound_refused）", 
     const { connA } = await registerTeam();
     await writeInboundPolicy(stateRoot, "default", "refuse");
 
-    const res = await guarded.xc_message({ to: "b", content: "will be refused" }, connA);
+    const res = await guarded.xc_message({ to: "b", msg: "will be refused" }, connA);
     expect(res.isError).toBe(true);
     const payload = payloadOf(res);
     expect(payload["error"]).toBe("inbound_refused");
@@ -231,7 +233,7 @@ describe("withGuards: refuse 策略（§7.4-I4，错误码 inbound_refused）", 
   it("自发消息保持 v0.1.0 invalid_params，不被策略改写", async () => {
     const { connA } = await registerTeam();
     await writeInboundPolicy(stateRoot, "default", "refuse");
-    const res = await guarded.xc_message({ to: "a", content: "self" }, connA);
+    const res = await guarded.xc_message({ to: "a", msg: "self" }, connA);
     expect(res.isError).toBe(true);
     expect(payloadOf(res)["error"]).toBe("invalid_params");
   });
@@ -241,7 +243,7 @@ describe("入站策略解析（policy.json > env > default，fail-open）", () =
   it("policy.json 损坏 → 审计 policy-invalid 并回落（env 无值 → accept）", async () => {
     const { connA } = await registerTeam();
     writeFileSync(policyFile(stateRoot, "default"), "{not json", "utf8");
-    const res = await guarded.xc_message({ to: "b", content: "still delivered" }, connA);
+    const res = await guarded.xc_message({ to: "b", msg: "still delivered" }, connA);
     expect(res.isError).toBeFalsy();
     expect(payloadOf(res)["delivered"]).toBe("mailbox");
     expect(engineLog()).toContain('"policy-invalid"');
@@ -260,7 +262,7 @@ describe("入站策略解析（policy.json > env > default，fail-open）", () =
     await guarded.xc_register({ name: "a", sessionId: sidA }, connA);
     await guarded.xc_register({ name: "b", sessionId: sidB }, connB);
 
-    const held = await guarded.xc_message({ to: "b", content: "env hold" }, connA);
+    const held = await guarded.xc_message({ to: "b", msg: "env hold" }, connA);
     expect(payloadOf(held)["delivered"]).toBe("held");
     void connB;
   });
@@ -268,7 +270,7 @@ describe("入站策略解析（policy.json > env > default，fail-open）", () =
 
 describe("xc_inbound_review（registerSecurityTools / §9.2 契约）", () => {
   it("工具形状存在且 action 枚举 list/accept/discard；FRAME_TYPES 转出与 core 同一常量", () => {
-    expect(Object.keys(InboundReviewShape)).toEqual(["action", "ids"]);
+    expect(Object.keys(InboundReviewShape)).toEqual(["action", "axis", "ids"]);
     expect(FRAME_TYPES).toBe(CORE_FRAME_TYPES); // 单一定义点（core/mailbox.ts）
     expect(FRAME_TYPES).toContain("unblock-notice");
     expect(FRAME_TYPES).toContain("shutdown-request");

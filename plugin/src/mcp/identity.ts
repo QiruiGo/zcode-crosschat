@@ -8,17 +8,16 @@
  *   都成立；Map 结构为未来 HTTP 形态预留 per-session 键）。
  * - 路径 1（hook 锚定）：registry/sessions/<sid>.json 存在（任意年龄；lastSeen
  *   超 10 分钟仅告警不拒绝）∧ 名字未被其他 sid 绑定 ∧ sid 未被其他名字绑定。
- *   v0.5.3（安全对-1/a6 修复）：**重绑已绑定的 (name, sid) 精确对**还须出示锚定
- *   令牌 regToken（SessionStart 铸造、只注入本会话上下文；同连接幂等重试与旧锚
- *   免除外）——(name, sid) 对可经 xc_status 免注册读到，本身不是凭据，不验令牌
- *   即可精确重放冒充任意成员（偷邮箱/移 lead/零告警）。
+ *   v0.6（DESIGN-V0.6.md §2.2 行 2）：regToken 锚定硬闸砍除——(name, sid) 精确对
+ *   重绑幂等成功；软校验三件套（name_taken / session_already_bound / removed 门）不变。
  * - 路径 2（wakeToken 回退）：registry/wake/<nonce>.json 命中未过期未使用且
  *   {teamId, agentKey, sid} 匹配 → 直接绑定（允许覆盖同名旧绑定：无头回合身份以
  *   nonce 为准），并由服务端代写 sessions/<sid>.json（消除对钩子落盘的依赖；
- *   v0.5.3 起代写保留/补铸 regToken），nonce 标记 used（M1 consumeWakeNonce）。
+ *   v0.5.3 起代写保留/补铸 regToken——字段照写，仅作钩子延续用，不再构成闸），
+ *   nonce 标记 used（M1 consumeWakeNonce）。
  * - v0.5.3（安全对-3/a8 修复）：注册成功后把 boundName 盖到机器全局基记录
- *   peers/base/<sid>.json（options.peerRoot 给出时）——peer 轴据此对「已绑定
- *   队内身份的 sid」强制验 regToken。
+ *   peers/base/<sid>.json（options.peerRoot 给出时）——peer 轴据此识别「已绑定
+ *   队内身份的 sid」（v0.6 起不再强制验令牌，仅观测面保留标记）。
  * - 锁序全局固定：registry → team（§2.7-3）。xc_register 是唯一同时持两把锁的
  *   路径，直接用 M1 的 withRegistryThenTeamLocks（先 registry 绑名、后 team 入队；
  *   join 失败经 unbindName 回滚绑名——M1 专门为回滚设计的条件删除）。
@@ -59,9 +58,10 @@ export const STALE_LASTSEEN_WARN_MS = 10 * 60 * 1000;
 const PROTOCOL_CANON = [
   "zcode-crosschat/1",
   "mailbox=inbox/<agentKey>.jsonl",
-  "transitions=pending>claimed|cancelled;claimed>in_progress|failed|cancelled;in_progress>completed|failed|cancelled;terminal=no-out-edge",
+  // v0.6（DESIGN-V0.6.md §3.2）：七态状态机（blocked 入列）；evidence 砍哈希复核。
+  "transitions=pending>claimed|cancelled;claimed>in_progress|blocked|failed|cancelled;in_progress>completed|blocked|failed|cancelled;blocked>pending|claimed|in_progress|cancelled;terminal=no-out-edge",
   "attempt=capability-token;report-requires-current-attempt",
-  "evidence>=1+sha256-on-completion",
+  "evidence>=1+file-path-on-completion",
 ].join(";");
 export const PROTOCOL_DIGEST = createHash("sha256").update(PROTOCOL_CANON).digest("hex").slice(0, 12);
 
@@ -103,8 +103,11 @@ export class IdentityStore {
 export const identityStore = new IdentityStore();
 
 /** 从 SDK 请求 extra 提取连接键（stdio：undefined → "__stdio__"）。 */
-export function connectionKeyOf(extra: { sessionId?: string } | undefined): string {
-  return extra?.sessionId ?? "__stdio__";
+export function connectionKeyOf(extra: unknown): string {
+  // v0.6（L1 透传纪律）：SDK extra 形状由传输层决定（stdio 下 undefined→常量键）。
+  // 收窄为 unknown——家族注册器的 handler 把 extra 原样透传（alias 层与 server.tool
+  // 双入口共用同一 handler，形状必须兼容两者）。
+  return (extra as { sessionId?: string } | undefined)?.sessionId ?? "__stdio__";
 }
 
 export interface RegisterArgs {
@@ -112,14 +115,9 @@ export interface RegisterArgs {
   sessionId: string;
   role?: MemberRole;
   wakeToken?: string;
-  /**
-   * v0.5.3（安全对-1/a6 修复）：锚定令牌——SessionStart 钩子铸造并只注入到本会话
-   * 上下文的凭据。(name, sessionId) 对可经 xc_status 公开读到，不构成凭据；重绑
-   * 已绑定的 (name, sid) 对时必须出示与锚定记录一致的 regToken，否则精确对重放
-   * 冒充（偷邮箱/移 lead/零告警）成立。wakeToken 路径不需要它（一次性 nonce 即
-   * 属主凭据）。
-   */
-  regToken?: string;
+  // v0.6（DESIGN-V0.6.md §2.2 行 2）：regToken 身份锚定硬闸已砍除（个人/内部
+  // 威胁模型不成立）。软身份校验保留：name_taken 同名显式拒、session_already_bound
+  // 活性冲突拒（bug-12 语义）、同 (name, sid) 精确对重绑幂等成功（bug-02 语义）。
 }
 
 export interface RegisterOutcome {
@@ -272,47 +270,10 @@ export async function xcRegister(
       });
     }
 
-    // ---- v0.5.3（安全对-1/a6 修复）：重绑属主校验 ----
-    // (name, sid) 精确对可经 xc_status 免注册读到，本身不构成凭据：已绑定对的再次
-    // 出示必须附带锚定令牌（SessionStart 铸造、只注入本会话上下文），否则精确对
-    // 重放可完全冒充任意成员（偷消费邮箱 / xc_lead_transfer 移走 lead / 零告警）。
-    // 豁免三条：
-    // ① 本连接已绑定同一身份 ⇒ 同一连接的幂等重试（agent 重试语义），不再索要；
-    // ② wakeToken 路径 ⇒ 一次性 nonce 即属主凭据（via === "wake"）；
-    // ③ 锚定记录缺 regToken（v0.5.3 之前铸的旧锚）⇒ 放行 + 告警（不静默：该会话
-    //    下次 SessionStart 即携带令牌，过渡窗口在响应 warnings 与审计里如实披露）。
-    // 错误码 identity_token_required：与 name_taken/session_already_bound（仍先行
-    // 触发，行为不变）区分开——那里挡「对不上」，这里挡「对得上但不是你」。
-    const pairAlreadyBound = existingBinding !== undefined && existingBinding.sessionId === sessionId;
-    const connBound = identityStore.get(connectionKey);
-    const sameConnectionRetry = connBound !== undefined
-      && connBound.agentKey === agentKey
-      && connBound.sessionId === sessionId;
-    if (pairAlreadyBound && via === "hook" && !sameConnectionRetry) {
-      if (sess?.regToken !== undefined) {
-        if (args.regToken?.trim() !== sess.regToken) {
-          await logEngineEvent(stateRoot, {
-            event: "register-replay-blocked",
-            teamId,
-            agentKey,
-            sessionId,
-            tokenPresented: args.regToken !== undefined,
-          });
-          throw new ToolError({
-            error: "identity_token_required",
-            name: agentKey,
-            sessionId,
-            message: `pair (name "${agentKey}", session "${sessionId}") is already bound; re-binding it from a new connection ` +
-              "requires the session's regToken (injected by the SessionStart hook into this session's own context). " +
-              "A (name, sessionId) pair readable via xc_status is not a credential — presenting it alone is rejected.",
-          });
-        }
-      } else {
-        warnings.push(
-          "anchor predates regToken protection (v0.5.3): exact-pair replay protection inactive for this session until its next SessionStart",
-        );
-      }
-    }
+    // ---- v0.6（DESIGN-V0.6.md §2.2 行 2）：重绑属主硬闸（identity_token_required）砍除 ----
+    // (name, sid) 精确对重绑从「须出示 regToken」降级为**幂等成功**（bug-02 语义：
+    // 同一对重绑照常刷新 lastSeen/成员记录；不同 sid 抢名仍 name_taken 显式拒）。
+    // 威胁模型声明随 README 更新：同机冒充不做密码学防御（与 v0.5 L2 口径延续）。
 
     // 先绑名（registry），后 team 入队；入队失败经 unbindName 回滚（§2.7-3 原顺序）。
     await bindName(stateRoot, agentKey, { sessionId, role, registeredAt: now });

@@ -22,8 +22,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { payloadOf } from "./protocol.js";
-import { createToolCore } from "./tools.js";
-import type { ToolCore } from "./tools.js";
+import { createToolCore } from "./core.js";
+import type { ToolCore } from "./core.js";
 import type { ToolResult } from "./protocol.js";
 import { writeSession } from "../core/registry.js";
 import { readTeam, teamRecoveryWarning, writeTeam } from "../core/teamstate.js";
@@ -31,7 +31,7 @@ import { engineLogFile, lockFile, teamBackupFile, teamFile } from "../core/paths
 import { acquireFileLock } from "../core/lock.js";
 import { auditDegradation, auditDegradationWarning, logEngineEvent } from "../core/log.js";
 import { writePeerBaseRecord } from "../core/peerdir.js";
-import { renderReviewSummary } from "./peer-tools.js";
+import { renderReviewSummary } from "./peer-services.js";
 import {
   holdPeerMessage,
   listHeldPeerMessages,
@@ -39,7 +39,7 @@ import {
   releaseHeldMessages,
 } from "../core/peerpolicy.js";
 import { stopPeerEndpoint } from "../transport/pipe.js";
-import { createDefaultPeerServices } from "./peer-tools.js";
+import { createDefaultPeerServices } from "./peer-services.js";
 
 let workDir: string;
 let stateRoot: string;

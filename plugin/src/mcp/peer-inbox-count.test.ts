@@ -12,11 +12,15 @@
  * 指针。其他 peer 工具（xc_peers 等）不自主排空，面 B 投递语义保持不变。
  */
 import { describe, expect, it } from "vitest";
-import { registerPeerTools, type PeerServices } from "./peer-tools.js";
+import type { PeerServices } from "./peer-services.js";
+import { registerReadTools } from "./tools-read.js";
+import { registerOverviewTools } from "./tools-overview.js";
+import { createToolCore } from "./core.js";
+import { setPeerServicesForTests } from "./peer-services.js";
 import type { PeerQueueItem } from "../core/peermsg.js";
 import { payloadOf } from "./protocol.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import type { ToolDeps } from "./tools.js";
+import type { ToolDeps } from "./core.js";
 
 type Handler = (args: Record<string, unknown>, extra: unknown) => Promise<import("./protocol.js").ToolResult>;
 
@@ -82,7 +86,14 @@ const faceBDrainBackend = {
 
 function setup(services: PeerServices): FakeServer {
   const server = new FakeServer();
-  registerPeerTools(server as unknown as McpServer, { ...deps, peer: services, peerDrain: faceBDrainBackend });
+  // v0.6（T5）：xc_peer_inbox 并入 xc_read（scope=peer）——假服务经
+  // setPeerServicesForTests 装进 getPeerServices 单例（等价旧 peer 注入字段）。
+  setPeerServicesForTests(services);
+  const core = createToolCore({ ...deps });
+  const registry = new Map<string, { description: string; shape: unknown; handler: (args: Record<string, unknown>, extra: unknown) => Promise<import("./protocol.js").ToolResult> }>();
+  void faceBDrainBackend;
+  registerReadTools(server as unknown as McpServer, deps, core, registry as never);
+  registerOverviewTools(server as unknown as McpServer, deps, core, registry as never);
   return server;
 }
 
@@ -100,7 +111,7 @@ describe("P3: xc_peer_inbox count 口径（面 B 双排空抑制 + remaining 指
   it("count = envelopes = 本次真实呈现数；面 B 不再叠加 content[2]（content.length===2）", async () => {
     await withPeerSession(async () => {
       const server = setup(fakeServices(3, 7));
-      const result = await server.find("xc_peer_inbox").handler({ limit: 10 }, {});
+      const result = await server.find("xc_read").handler({ scope: "peer", limit: 10 }, {});
       // 旧行为：content.length === 3（面 B 追加 5 条文本块）；修复后恒为 2。
       expect(result.content).toHaveLength(2);
       const payload = payloadOf(result) as { count: number; envelopes: string[]; remaining: number };
@@ -116,37 +127,39 @@ describe("P3: xc_peer_inbox count 口径（面 B 双排空抑制 + remaining 指
   it("remaining>0 → 摘要行与 JSON payload 都给「再拉一次」指针", async () => {
     await withPeerSession(async () => {
       const server = setup(fakeServices(3, 7));
-      const result = await server.find("xc_peer_inbox").handler({ limit: 10 }, {});
+      const result = await server.find("xc_read").handler({ scope: "peer", limit: 10 }, {});
       const payload = payloadOf(result) as { count: number; remaining: number };
       expect(payload.remaining).toBe(7);
       expect(result.content[0]?.text).toContain("另有 7 条待投递");
-      expect(result.content[0]?.text).toContain("xc_peer_inbox");
+      expect(result.content[0]?.text).toContain("xc_read");
     });
   });
 
   it("remaining=0 → 摘要行不带指针（与 v0.5.0 输出一致）", async () => {
     await withPeerSession(async () => {
       const server = setup(fakeServices(1, 0));
-      const result = await server.find("xc_peer_inbox").handler({}, {});
+      const result = await server.find("xc_read").handler({ scope: "peer" }, {});
       const payload = payloadOf(result) as { count: number; remaining: number };
       expect(payload.remaining).toBe(0);
       expect(result.content[0]?.text).toBe("取到 1 条跨会话消息（已消费）。");
     });
   });
 
-  it("面 B 语义不扩伤：xc_peers（非自主排空面）仍走面 B 追加 content[2]", async () => {
+  it("v0.6 改判：xc_peers 并入 xc_overview view=peers（面 B 投递由 peer-drain 组装链承担）", async () => {
     await withPeerSession(async () => {
       const server = setup(fakeServices(0, 0));
-      const result = await server.find("xc_peers").handler({}, {});
-      expect(result.content).toHaveLength(3);
-      expect(String((result.content[2] as { text?: string }).text)).toContain("from-face-B");
+      // v0.6（T7）：xc_peers 面已并入 xc_overview；面 B（tool-round 间隙排空）的
+      // 注入由 withPeerDrain 组装链对队内工具统一承担（peer-tools 旧面撤销），
+      // 本文件的 count 口径回归由上方 xc_read(scope=peer) 三例覆盖。
+      const result = await server.find("xc_overview").handler({ view: "peers" }, {});
+      expect(result.isError).toBeUndefined();
     });
   });
 
   it("工具描述声明 count 口径与 remaining 翻页语义（schema 面回归锁定）", () => {
     const server = setup(fakeServices(0, 0));
-    const description = server.find("xc_peer_inbox").description;
-    expect(description).toContain("count = envelopes presented in this response");
+    const description = server.find("xc_read").description;
+    expect(description).toContain("count = what this response actually presents");
     expect(description).toContain("remaining");
   });
 });

@@ -37,11 +37,11 @@ import {
   type PeerRecord,
 } from "../core/peerregistry.js";
 import { stopPeerEndpoint } from "../transport/pipe.js";
-import { createDefaultPeerServices } from "./peer-tools.js";
+import { createDefaultPeerServices } from "./peer-services.js";
 import { ToolError } from "./protocol.js";
 import { acquireFileLock, LockBusyError } from "../core/lock.js";
 import { peerRegistryLockName, scanPeers } from "../core/peerregistry.js";
-import type { ToolDeps } from "./tools.js";
+import type { ToolDeps } from "./core.js";
 
 let root = "";
 let workspace = "";
@@ -237,16 +237,18 @@ describe("peer-1 修复：同 name+sid 的活会话重复注册是幂等重认�
 
 // ─────────────────────────── peer-2：xc_peer_review 免注册假标 ───────────────────────────
 
-describe("peer-2 修复：xc_peer_review 的注册要求与文档一致（README 不再标免注册）", () => {
-  it("README 的 xc_peer_review 行不再标注「免注册」（文档-行为一致性回归锁）", async () => {
+describe("peer-2 修复：审阅面的注册要求与文档一致（v0.6：README 的 xc_review 行不标免注册）", () => {
+  it("README 的 xc_review 行不再标注「免注册」（文档-行为一致性回归锁；v0.6 旧名行已按收敛纪律移出主文）", async () => {
     const { readFile: read } = await import("node:fs/promises");
     const { fileURLToPath } = await import("node:url");
     const readmePath = join(fileURLToPath(new URL(".", import.meta.url)), "..", "..", "..", "README.md");
     const readme = await read(readmePath, "utf8");
-    const row = readme.split("\n").find((line) => line.trimStart().startsWith("| `xc_peer_review`"));
+    const row = readme.split("\n").find((line) => line.trimStart().startsWith("| `xc_review("));
     expect(row).toBeDefined();
     expect(row).not.toContain("免注册");
-    expect(row).toContain("xc_peer_register");
+    // 主文不得再出现旧名行（v0.6 工具面收敛；旧名只允许在 MIGRATION 与弃用说明语境）。
+    const oldRow = readme.split("\n").find((line) => line.trimStart().startsWith("| `xc_peer_review`"));
+    expect(oldRow).toBeUndefined();
   });
 
   it("未注册调用 → not_registered 且提示先注册（未注册会话不可能有暂存件）", async () => {
@@ -255,7 +257,7 @@ describe("peer-2 修复：xc_peer_review 的注册要求与文档一致（README
     expect(refused).toBeInstanceOf(ToolError);
     const payload = (refused as ToolError).payload as { error?: string; message?: string };
     expect(payload.error).toBe("not_registered");
-    expect(payload.message).toContain("xc_peer_register");
+    expect(payload.message).toContain("xc_identify");
   });
 
   it("注册后即可审阅（重启丢注册的会话：重新注册即取回隔离区）", async () => {

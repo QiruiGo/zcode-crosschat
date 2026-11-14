@@ -2,6 +2,10 @@ import { describe, expect, it } from 'vitest';
 import {
   MEMBER_IDENTITIES,
   MEMBER_STATES,
+  OPEN_TASK_STATUSES,
+  SWEEPABLE_TASK_STATUSES,
+  TASK_PRIORITIES,
+  TASK_PRIORITY_RANK,
   TASK_STATUSES,
   TASK_TRANSITIONS,
   coerceNameBindings,
@@ -14,11 +18,16 @@ import {
   type Task,
 } from './types.js';
 
-/** The DESIGN.md §2.6 transition table, transcribed verbatim for cross-check. */
+/**
+ * The DESIGN.md §2.6 transition table, transcribed verbatim for cross-check.
+ * v0.6（C2，DESIGN-V0.6.md §3.2）扩为七态：claimed/in_progress 增 blocked 出边、
+ * 新增 blocked 行（pending 无 blocked 入边——L-n3 死边；blocked→failed 故意无此边）。
+ */
 const DESIGN_TRANSITIONS: Record<string, string[]> = {
   pending: ['claimed', 'cancelled'],
-  claimed: ['in_progress', 'failed', 'cancelled'],
-  in_progress: ['completed', 'failed', 'cancelled'],
+  claimed: ['in_progress', 'blocked', 'failed', 'cancelled'],
+  in_progress: ['completed', 'blocked', 'failed', 'cancelled'],
+  blocked: ['pending', 'claimed', 'in_progress', 'cancelled'],
   completed: [],
   failed: [],
   cancelled: [],
@@ -406,5 +415,129 @@ describe('v0.5 TeamMessage origin 三字段（R-11）', () => {
     expect(normalized.origin).toBe('user');
     expect(normalized.forged).toBe(false);
     expect(normalized.originSessionId).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.6 C2/C1 schema（DESIGN-V0.6.md §3.2/§4.2-M2）：七态状态机、SWEEPABLE 口径、
+// 优先级枚举、Task blocked/priority 字段与 TeamMessage.urgent——宽容读取，旧六态
+// 记录零破坏（§6-4 迁移兼容）。
+// ---------------------------------------------------------------------------
+
+describe('v0.6 C2 七态状态机（blocked）', () => {
+  it('TASK_STATUSES 恰为七态且 blocked 在 claimed/in_progress 之后', () => {
+    expect(TASK_STATUSES).toEqual([
+      'pending', 'claimed', 'in_progress', 'blocked', 'completed', 'failed', 'cancelled',
+    ]);
+  });
+
+  it('blocked 的全部合法出边（回 preBlockedStatus / 防御回池 / cancel）', () => {
+    expect(transitionError('blocked', 'claimed')).toBeUndefined();
+    expect(transitionError('blocked', 'in_progress')).toBeUndefined();
+    expect(transitionError('blocked', 'pending')).toBeUndefined(); // 防御兜底边
+    expect(transitionError('blocked', 'cancelled')).toBeUndefined();
+  });
+
+  it('pending→blocked 是死边（L-n3：blocked 唯一入口=认领者 report，pending 无 attempt）', () => {
+    expect(transitionError('pending', 'blocked')).toBeDefined();
+  });
+
+  it('blocked→failed/completed 拒绝（阻塞中放弃先自解再 failed，或走 cancel）', () => {
+    expect(transitionError('blocked', 'failed')).toBeDefined();
+    expect(transitionError('blocked', 'completed')).toBeDefined();
+  });
+
+  it('claimed/in_progress → blocked 合法（认领者显式申报的唯一入口）', () => {
+    expect(transitionError('claimed', 'blocked')).toBeUndefined();
+    expect(transitionError('in_progress', 'blocked')).toBeUndefined();
+  });
+
+  it('OPEN 含 blocked（单开槽位/可撤销域）；SWEEPABLE 不含（清扫豁免）且窄于 OPEN', () => {
+    expect(OPEN_TASK_STATUSES).toEqual(['claimed', 'in_progress', 'blocked']);
+    expect(SWEEPABLE_TASK_STATUSES).toEqual(['claimed', 'in_progress']);
+    for (const s of SWEEPABLE_TASK_STATUSES) expect(OPEN_TASK_STATUSES).toContain(s);
+    expect(OPEN_TASK_STATUSES.length).toBeGreaterThan(SWEEPABLE_TASK_STATUSES.length);
+  });
+});
+
+describe('v0.6 C2 优先级枚举（排序建议，非抢占）', () => {
+  it('TASK_PRIORITIES 恰为 high/normal/low；秩 high<normal<low', () => {
+    expect(TASK_PRIORITIES).toEqual(['high', 'normal', 'low']);
+    expect(TASK_PRIORITY_RANK['high']).toBeLessThan(TASK_PRIORITY_RANK['normal']);
+    expect(TASK_PRIORITY_RANK['normal']).toBeLessThan(TASK_PRIORITY_RANK['low']);
+  });
+});
+
+describe('v0.6 C2 Task 新字段宽容读取（§6-4 迁移垫片）', () => {
+  function taskWith(extra: Record<string, unknown>): Record<string, unknown> {
+    const team = sampleTeam() as Record<string, unknown>;
+    const task = (team['tasks'] as Record<string, unknown>[])[0]!;
+    Object.assign(task, extra);
+    return team;
+  }
+
+  it('v0.5.3 六态旧记录（无新字段）照常解析，新字段全 absent', () => {
+    const parsed = coerceTeamState(sampleTeam(), 'default');
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      const task = parsed.state.tasks[0]!;
+      expect(task.priority).toBeUndefined();
+      expect(task.blockedReason).toBeUndefined();
+      expect(task.blockedAt).toBeUndefined();
+      expect(task.preBlockedStatus).toBeUndefined();
+    }
+  });
+
+  it('合法新字段（priority/blockedReason/blockedAt/preBlockedStatus）读写无损', () => {
+    const parsed = coerceTeamState(taskWith({
+      status: 'blocked', priority: 'high', blockedReason: '等待输入',
+      blockedAt: 42, preBlockedStatus: 'in_progress',
+    }), 'default');
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      const task = parsed.state.tasks[0]!;
+      expect(task.status).toBe('blocked');
+      expect(task.priority).toBe('high');
+      expect(task.blockedReason).toBe('等待输入');
+      expect(task.blockedAt).toBe(42);
+      expect(task.preBlockedStatus).toBe('in_progress');
+    }
+  });
+
+  it('非法新字段值丢弃、不拒文件（宽容纪律，不丢/不崩）', () => {
+    for (const extra of [
+      { priority: 'banana' },
+      { priority: 3 },
+      { blockedReason: 42 },
+      { blockedAt: 'x' },
+      { preBlockedStatus: 'banana' },
+      { preBlockedStatus: null },
+    ]) {
+      const parsed = coerceTeamState(taskWith(extra), 'default');
+      expect(parsed.ok).toBe(true);
+      if (parsed.ok) {
+        const task = parsed.state.tasks[0]! as unknown as Record<string, unknown>;
+        for (const key of ['priority', 'blockedReason', 'blockedAt', 'preBlockedStatus']) {
+          expect(task[key]).toBeUndefined();
+        }
+      }
+    }
+  });
+});
+
+describe('v0.6 C1 TeamMessage.urgent（读取面 urgent-first 的排序键）', () => {
+  const base = { id: 'x1', from: 'a', to: 'b', content: 'hi', ts: 1 };
+
+  it('urgent=true/false 读入并经 normalizeMessage 保留；缺省照读', () => {
+    expect(isTeamMessage({ ...base, urgent: true })).toBe(true);
+    expect(normalizeMessage({ ...base, urgent: true }).urgent).toBe(true);
+    expect(normalizeMessage({ ...base, urgent: false }).urgent).toBe(false);
+    expect(isTeamMessage(base)).toBe(true);
+    expect(normalizeMessage(base).urgent).toBeUndefined();
+  });
+
+  it('urgent 非布尔整行拒绝（forged 同款纪律）', () => {
+    expect(isTeamMessage({ ...base, urgent: 'yes' })).toBe(false);
+    expect(isTeamMessage({ ...base, urgent: 1 })).toBe(false);
   });
 });

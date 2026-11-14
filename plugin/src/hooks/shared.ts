@@ -32,7 +32,7 @@
 import { readFileSync } from 'node:fs';
 import { resolveStateRoot, workspaceFromEnv } from '../core/paths.js';
 import { readNames, namesBoundToSession, readSession, refreshSessionLastSeen } from '../core/registry.js';
-import { readUnreadMailbox } from '../core/mailbox.js';
+import { readUnreadMailbox, urgentFirst } from '../core/mailbox.js';
 import { withRegistryLock } from '../core/lock.js';
 import { logEngineEvent, type EngineEvent } from '../core/log.js';
 import { DEFAULT_TEAM_ID, type NameBindings, type SessionRecord, type TeamMessage } from '../core/types.js';
@@ -195,6 +195,11 @@ export interface UnreadSummary {
   senders: string[];
   /** Newest-first unread messages (for callers that want previews). */
   messages: TeamMessage[];
+  /**
+   * v0.6（C1，DESIGN-V0.6.md §3.1 读取序 2）：urgent 未读数单列——钩子注入与
+   * 预算排布据此可给 urgent 全文优先（计数口径 = urgent===true 的未读件）。
+   */
+  urgentCount: number;
 }
 
 /**
@@ -203,14 +208,19 @@ export interface UnreadSummary {
  * actually returns the mail to the model (DESIGN.md §2.8 xc_check_inbox), so
  * the hook count can over-count stale mail but never destroys anything.
  * Malformed JSONL lines are skipped + audited by the M1 reader.
+ *
+ * v0.6（C1，DESIGN-V0.6.md §3.1 读取序 2）：messages 改为 urgentFirst 排序
+ * （urgent 在前、类内 ts 升序）——消费方按序渲染时 urgent 全文优先占预算；
+ * senders 的「最新优先」口径不变（对全体未读按 ts 降序去重）。
  */
 export async function unreadSummary(stateRoot: string, name: string): Promise<UnreadSummary> {
-  const messages = await readUnreadMailbox(stateRoot, DEFAULT_TEAM_ID, name);
+  const messages = urgentFirst(await readUnreadMailbox(stateRoot, DEFAULT_TEAM_ID, name));
   const senders: string[] = [];
   for (const message of [...messages].sort((a, b) => b.ts - a.ts)) {
     if (!senders.includes(message.from)) senders.push(message.from);
   }
-  return { count: messages.length, senders, messages };
+  const urgentCount = messages.filter((message) => message.urgent === true).length;
+  return { count: messages.length, senders, messages, urgentCount };
 }
 
 /**

@@ -29,7 +29,7 @@
 
 import { DEFAULT_TEAM_ID } from "../core/types.js";
 import { createWakeNonce, readNames } from "../core/registry.js";
-import type { ToolDeps } from "../mcp/tools.js";
+import type { ToolDeps } from "../mcp/core.js";
 import { AppServerKeeper, type ModelRef } from "./appserver.js";
 import { resolveZcodeSpawnConfig } from "./zcode-locate.js";
 // 守则 v2 全文由 W3 交付于 wake.ts（DESIGN-V0.2.md §9.2 钉死导出 MEMBER_RULES_V2）；

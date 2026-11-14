@@ -21,9 +21,9 @@ import { localPidDomain, writePeerBaseRecord } from "../core/peerdir.js";
 import { holdPeerMessage } from "../core/peerpolicy.js";
 import { writePeerKeyFile, writePeerRecord } from "../core/peerregistry.js";
 import { stopPeerEndpoint } from "../transport/pipe.js";
-import { createDefaultPeerServices } from "./peer-tools.js";
+import { createDefaultPeerServices } from "./peer-services.js";
 import { ToolError } from "./protocol.js";
-import type { ToolDeps } from "./tools.js";
+import type { ToolDeps } from "./core.js";
 
 const TOKEN = "d".repeat(32);
 

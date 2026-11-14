@@ -16,7 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { payloadOf } from "./protocol.js";
-import { createToolCore, type ToolCore, type ToolDeps } from "./tools.js";
+import { createToolCore, type ToolCore, type ToolDeps } from "./core.js";
 import { readMailbox } from "../core/mailbox.js";
 import { readTeam } from "../core/teamstate.js";
 import { writeSession } from "../core/registry.js";
@@ -109,43 +109,49 @@ describe("证据门（completed 报告）", () => {
     expect(box.filter((m) => m.content.includes('"task-receipt"'))).toHaveLength(0);
   });
 
-  it("红队 #4 回归：伪造 sha256 与现算不符被拒（evidence_checksum_mismatch）", async () => {
+  it("v0.6 改判：伪造 sha256 不再触发复核拒绝（哈希复核已砍；sha256 忽略+披露，文件存在门保留）", async () => {
     const core = makeCore();
     const { taskId, attemptId, conn } = await seedClaimedTask(core);
     const forged = writeEvidenceFile("forged.txt", "real content");
-    const realSha = sha256Of(forged);
     const fake = "deadbeef" + "0".repeat(56);
-    expect(fake).not.toBe(realSha);
 
+    // v0.6（方案 §1-B）：哈希复核砍除——伪造 sha256 不再被拒；参数忽略并在
+    // payload 以 ignored:["evidence[].sha256"] 披露。保留门：文件存在 +
+    // 工作区内路径（round1 #03/#16 重放面，见上方两例）。
     const res = await core.xc_report(
       { taskId, attemptId, status: "completed", result: "391", evidence: [{ path: forged, sha256: fake, note: "forged checksum" }] },
       conn,
     );
-    expect(res.isError).toBe(true);
-    const payload = payloadOf(res);
-    expect(payload["error"]).toBe("evidence_checksum_mismatch");
-    expect(payload["claimed"]).toBe(fake);
-    expect(payload["computed"]).toBe(realSha);
+    expect(res.isError).toBeUndefined();
+    const payload = payloadOf(res) as { status: string; ignored?: string[] };
+    expect(payload.status).toBe("completed");
+    expect(payload.ignored).toEqual(["evidence[].sha256"]);
 
+    // 落库 sha256 恒 null（非文件证据同款）；note 透传保留。
     const task = await taskOf(taskId);
-    expect(task["status"]).toBe("in_progress");
+    expect(task["status"]).toBe("completed");
+    expect((task["evidence"] as Array<Record<string, unknown>>)[0]).toMatchObject({
+      path: forged,
+      sha256: null,
+      note: "forged checksum",
+    });
   });
 
-  it("正确声明的 sha256 通过；缺省/显式 null 均落现算值（不再落 null）", async () => {
+  it("v0.6 改判：sha256 一律落 null（不再现算）；note 透传；completed 仍要求 result+≥1 证据", async () => {
     const core = makeCore();
 
-    // 第一单：正确声明值 → 通过，落库值 == 现算值。
+    // 声明值/缺省/null 三种形态行为一致：通过 + sha256 落 null。
     const { taskId, attemptId, conn } = await seedClaimedTask(core);
     const ok = writeEvidenceFile("result.txt", "391");
     const res = unwrap(payloadOf(await core.xc_report(
-      { taskId, attemptId, status: "completed", result: "391", evidence: [{ path: ok, sha256: sha256Of(ok) }] },
+      { taskId, attemptId, status: "completed", result: "391", evidence: [{ path: ok, sha256: sha256Of(ok), note: "n1" }] },
       conn,
     )));
     expect(res["status"]).toBe("completed");
     const task = await taskOf(taskId);
-    expect((task["evidence"] as Array<Record<string, unknown>>)[0]!["sha256"]).toBe(sha256Of(ok));
+    expect((task["evidence"] as Array<Record<string, unknown>>)[0]).toMatchObject({ path: ok, sha256: null, note: "n1" });
 
-    // 第二单：缺省 sha256 → 现算。
+    // 缺省 sha256 → 同样落 null。
     const t2 = unwrap(payloadOf(await core.xc_dispatch({ to: "b", title: "再算", prompt: "P" }, "conn-a")))["taskId"] as string;
     const c2 = unwrap(payloadOf(await core.xc_claim({ taskId: t2 }, "conn-b")));
     await core.xc_report({ taskId: t2, attemptId: c2["attemptId"] as string, status: "in_progress" }, "conn-b");
@@ -155,9 +161,9 @@ describe("证据门（completed 报告）", () => {
       "conn-b",
     )));
     const t2rec = (await readTeam(stateRoot, "default"))!.tasks.find((t) => t.id === t2)!;
-    expect(t2rec.evidence![0]!.sha256).toBe(sha256Of(ev2));
+    expect(t2rec.evidence![0]).toMatchObject({ path: ev2, sha256: null });
 
-    // 第三单：显式 sha256:null → 同缺省，现算（修复前原样落 null）。
+    // 显式 sha256:null → 同缺省。
     const t3 = unwrap(payloadOf(await core.xc_dispatch({ to: "b", title: "三算", prompt: "P" }, "conn-a")))["taskId"] as string;
     const c3 = unwrap(payloadOf(await core.xc_claim({ taskId: t3 }, "conn-b")));
     await core.xc_report({ taskId: t3, attemptId: c3["attemptId"] as string, status: "in_progress" }, "conn-b");
@@ -167,7 +173,7 @@ describe("证据门（completed 报告）", () => {
       "conn-b",
     )));
     const t3rec = (await readTeam(stateRoot, "default"))!.tasks.find((t) => t.id === t3)!;
-    expect(t3rec.evidence![0]!.sha256).toBe(sha256Of(ev3));
+    expect(t3rec.evidence![0]).toMatchObject({ path: ev3, sha256: null });
   });
 
   it("证据门适用于一切携带证据的 report（in_progress 带缺失文件同样被拒）", async () => {

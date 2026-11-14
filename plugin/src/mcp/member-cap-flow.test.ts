@@ -15,13 +15,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { payloadOf, type ToolResult } from "./protocol.js";
-import { registerMemberTools } from "./member-tools.js";
+import { createMemberToolCore } from "./tools-team.js";
 import { identityStore } from "./identity.js";
 import { writeSession } from "../core/registry.js";
 import { readTeam, writeTeam } from "../core/teamstate.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { TeamMember, TeamState } from "../core/types.js";
-import type { ToolDeps } from "./tools.js";
+import type { ToolDeps } from "./core.js";
 
 // provisionMember 替身：m1 模拟欢迎回合失败（ProvisionError→member_provision_failed），
 // 其余成员供给成功。ProvisionError/bootstrapTimeoutFromEnv 保留真实现（member-tools
@@ -96,15 +96,15 @@ async function bindLead(): Promise<void> {
   });
 }
 
-const addTool = (server: ReturnType<typeof fakeServer>) => server.tools.find((t) => t.name === "xc_member_add")!.handler;
+// v0.6（T8）：xc_member_add 并入 xc_team action=member-add——直驱 member core（同 handler 主体）。
+const memberCore = () => createMemberToolCore(deps);
 
 describe("member_add 名额闸（A12 修复重放：max=2，lead+failed 不计）", () => {
   it("m1 供给失败 → m2 放行供给成功（旧实现此处 team_at_member_cap）→ 第 3 个活成员仍被硬拒", async () => {
     await bindLead();
     await writeTeam(stateRoot, teamWith([member("ldr1", "ready")]));
-    const server = fakeServer();
-    registerMemberTools(server as unknown as McpServer, deps);
-    const add = addTool(server);
+        const add = (args: Record<string, unknown>, extra?: { sessionId?: string }) =>
+      memberCore().xc_member_add(args as Parameters<ReturnType<typeof memberCore>["xc_member_add"]>[0], (extra?.sessionId ?? "conn-lead") as string);
     const extra = { sessionId: "conn-lead" };
 
     // ① m1：供给失败（mock 欢迎回合失败）→ member_provision_failed，roster state=failed
@@ -145,9 +145,8 @@ describe("member_add 名额闸（A12 修复重放：max=2，lead+failed 不计�
   it("removed 重加也放行（v0.5.2 行为保留，新口径下净增量一致）", async () => {
     await bindLead();
     await writeTeam(stateRoot, teamWith([member("ldr1", "ready"), member("old", "removed")]));
-    const server = fakeServer();
-    registerMemberTools(server as unknown as McpServer, deps);
-    const add = addTool(server);
+    const add = (args: Record<string, unknown>, extra?: { sessionId?: string }) =>
+      memberCore().xc_member_add(args as never, (extra?.sessionId ?? "conn-lead") as string);
     const r = await add({ name: "newbie" }, { sessionId: "conn-lead" });
     expect(r.isError).toBeFalsy(); // removed 不计 → 0 活成员 +1 = 1 ≤ 2
     const states = Object.fromEntries((await readTeam(stateRoot, "default"))!.members.map((m) => [m.key, m.state]));
@@ -161,9 +160,7 @@ describe("member_add 名额闸（A12 修复重放：max=2，lead+failed 不计�
       sessionKey: "xc:default:peon", teamId: "default", name: "peon", agentKey: "peon",
       sessionId: "sess_peon", role: "worker", boundAt: Date.now(),
     });
-    const server = fakeServer();
-    registerMemberTools(server as unknown as McpServer, deps);
-    const r = await addTool(server)({ name: "m9" }, { sessionId: "conn-other" });
+    const r = await memberCore().xc_member_add({ name: "m9" } as never, "conn-other");
     expect(r.isError).toBe(true);
     expect((payloadOf(r) as { error: string }).error).toBe("not_lead");
   });

@@ -31,7 +31,6 @@
  */
 import { randomUUID } from 'node:crypto';
 import { appendJsonl, readJsonl, rewriteJsonl, type MalformedLine } from './jsonl.js';
-import { appendMailIntegrityRecord } from './mailintegrity.js';
 import { sanitizeKey } from './sanitize.js';
 import { isRecord, isTeamMessage, normalizeMessage, TERMINAL_TASK_STATUSES, type TeamMessage, type TeamState } from './types.js';
 import { logEngineEvent } from './log.js';
@@ -97,14 +96,40 @@ const RECEIPT_SUFFIX = ']';
 
 /** Build a fresh message record (port of state.js:371-373 createMessage + extras).
  *  v0.5（M3 帧域契约）：extra 白名单扩含 origin/originSessionId（队内盖章写入，R-11/R-12；
- *  只有 'origin' | 'originSessionId' 两个新增键，其余白名单行逐字节不动）。 */
+ *  只有 'origin' | 'originSessionId' 两个新增键，其余白名单行逐字节不动）。
+ *  v0.6（C1，DESIGN-V0.6.md §3.1 数据面）：白名单再扩含 urgent——xc_relay
+ *  urgent/interrupt 写入侧唯一新增键，其余白名单行逐字节不动。 */
 export function createMessage(
   from: string,
   to: string,
   content: string,
-  extra: Partial<Pick<TeamMessage, 'taskId' | 'attemptId' | 'sourceTaskId' | 'sourceAttemptId' | 'sourceTaskStatus' | 'deliveryClaimedAt' | 'origin' | 'originSessionId'>> = {},
+  extra: Partial<Pick<TeamMessage, 'taskId' | 'attemptId' | 'sourceTaskId' | 'sourceAttemptId' | 'sourceTaskStatus' | 'deliveryClaimedAt' | 'origin' | 'originSessionId' | 'urgent'>> = {},
 ): TeamMessage {
   return { id: randomUUID(), from, to, content, ts: Date.now(), ...extra };
+}
+
+// ---------------------------------------------------------------------------
+// v0.6（C1，DESIGN-V0.6.md §4.2-M3）：urgent-first 呈现序（唯一实现，读取面共用）
+// ---------------------------------------------------------------------------
+
+/**
+ * urgent 消息在一切读取面排最前（DESIGN-V0.6.md §3.1 读取序）。
+ *
+ * 规则：urgent=true 在前；两类内部按 ts 升序（JSONL 到达序）；ts 相同按原下标
+ * （stable）。**物序不动，只动呈现序**——邮箱 JSONL 追加真源纪律不受影响：
+ * 本函数只对已读入内存的数组排序，不回写磁盘。
+ *
+ * 调用面（M3）：readCurrentMailboxLocked（xc_check_inbox 消费序）、
+ * hooks/shared.ts unreadSummary（钩子未读摘要）、peermsg.ts 排空面
+ * （drainPeerFile/readPeerQueue 同款规则）。engine/wake.ts buildWakePrompt 的
+ * urgent 首位走 WakePromptInput.urgent 横幅（M4），不经本函数（单消息携带）。
+ */
+export function urgentFirst<T extends { ts: number; urgent?: boolean }>(items: readonly T[]): T[] {
+  const rank = (m: T) => (m.urgent === true ? 0 : 1);
+  return items
+    .map((m, i) => ({ m, i, r: rank(m) }))
+    .sort((a, b) => (a.r !== b.r ? a.r - b.r : a.m.ts - b.m.ts || a.i - b.i))
+    .map((x) => x.m);
 }
 
 /**
@@ -293,11 +318,10 @@ export async function readPendingMailbox(
 
 /**
  * Append one message as the next JSONL line (cross-process O_APPEND write).
- * v0.5.3（安全对-5 a10 修复）：落信同步写完整性链记录（sidecar
- * `<agent>.jsonl.int`，{@link appendMailIntegrityRecord}）——链头读取+
- * 邮箱行+链记录三步在专用完整性锁内原子完成；校验面（xc_mail_read /
- * xc_check_inbox）据此检测磁盘篡改并告警。链记录追加失败不阻断投递
- * （fail-open：该件落为 unverified，与存量旧件同待遇）。
+ * v0.6（DESIGN-V0.6.md §2.2 行 1）：邮箱哈希链 sidecar（`.jsonl.int`）已砍除——
+ * 「不丢」底线由 JSONL 追加真源 + 坏行跳过审计（jsonl.ts）承担，防磁盘篡改的
+ * 对抗件在个人/内部威胁模型下不成立。mailbox JSONL 追加语义与 v0.5.3 逐字节一致
+ * （只是不再写 sidecar；存量 `.jsonl.int` 文件成为无害孤儿，不做迁移）。
  */
 export async function appendMailbox(
   stateRoot: string,
@@ -305,8 +329,7 @@ export async function appendMailbox(
   agentKey: string,
   message: TeamMessage,
 ): Promise<void> {
-  await appendMailIntegrityRecord(stateRoot, teamId, agentKey, message, () =>
-    appendJsonl(mailboxPath(stateRoot, teamId, agentKey), [JSON.stringify(message)]));
+  await appendJsonl(mailboxPath(stateRoot, teamId, agentKey), [JSON.stringify(message)]);
 }
 
 /**
@@ -412,7 +435,12 @@ export async function readCurrentMailboxLocked(
   }
   await discardMailboxMessages(stateRoot, team.teamId, recipient, staleIds);
   if (diagnostics !== undefined) diagnostics.discarded = staleIds.length;
-  return current;
+  // v0.6（C1，DESIGN-V0.6.md §3.1 读取序 1）：消费面 urgent-first——urgent 消息排到
+  // 一切未读之前（类内 ts 升序，stable）。xc_check_inbox 的批次窗口（batchWindowCount
+  // 按到达序前缀开窗）据此先消费 urgent；JSONL 物理序不动（追加真源纪律）。
+  // 生产调用面唯一（mcp/tools.ts xc_check_inbox）；mail_read 历史分页走 readMailbox
+  // （到达序），不受本排序影响。
+  return urgentFirst(current);
 }
 
 /**

@@ -17,7 +17,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { payloadOf } from "./protocol.js";
-import { createLeadToolCore, type LeadToolCore } from "./lead-tools.js";
+import { createLeadToolCore, type LeadToolCore } from "./tools-team.js";
 import { identityStore } from "./identity.js";
 import { readMailbox } from "../core/mailbox.js";
 import { engineLogFile } from "../core/paths.js";

@@ -20,7 +20,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { payloadOf } from "./protocol.js";
-import { createToolCore, type ToolCore, type ToolDeps } from "./tools.js";
+import { createToolCore, type ToolCore, type ToolDeps } from "./core.js";
 import {
   startStaleSweeper,
   sweepStaleTasksOnce,

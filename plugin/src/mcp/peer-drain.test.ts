@@ -18,7 +18,7 @@ import {
   type PeerDrainBackend,
 } from "./peer-drain.js";
 import { okResult, payloadOf, type ToolResult } from "./protocol.js";
-import type { ToolCore, ToolDeps } from "./tools.js";
+import type { ToolCore, ToolDeps } from "./core.js";
 
 const deps: ToolDeps = { stateRoot: "<stateRoot>", workspace: "<workspace>", env: {} };
 
@@ -91,7 +91,7 @@ describe("面 B · 无待投递消息时结果逐字节不变", () => {
     const backend = fakeBackend([{ msgId: "m-1" }]);
     const core = withPeerDrain(fakeCore(), { ...deps, peerDrain: backend });
 
-    const result = await core.xc_message({ to: "b", content: "hi" }, "conn-1");
+    const result = await core.xc_message({ to: "b", msg: "hi" }, "conn-1");
 
     expect(result.content).toHaveLength(2);
     expect(backend.calls).toHaveLength(0);
@@ -170,7 +170,7 @@ describe("面 B · 七个队内工具都被包裹", () => {
     await core.xc_check_inbox({}, "c");
     await core.xc_claim({ taskId: "t" }, "c");
     await core.xc_report({ taskId: "t", attemptId: "a", status: "completed" }, "c");
-    await core.xc_message({ to: "b", content: "c" }, "c");
+    await core.xc_message({ to: "b", msg: "c" }, "c");
     await core.xc_status({}, "c");
 
     expect(backend.calls).toHaveLength(7);

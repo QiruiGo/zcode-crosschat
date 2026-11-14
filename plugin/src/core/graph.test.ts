@@ -267,6 +267,33 @@ describe("staleTasks（清扫候选判定）", () => {
     ];
     expect(staleTasks(tasks, now, threshold).map((t) => t.id)).toEqual(["t1", "t2"]);
   });
+
+  // v0.6（C2，DESIGN-V0.6.md §3.2）：blocked 不进清扫候选（SWEEPABLE 口径）——
+  // 合法暂停的任务有属主、attempt 保留，超时也不得被 sweeper 误回收。
+  it("v0.6 blocked 超时也不入清扫候选（SWEEPABLE 不含 blocked）", () => {
+    const now = 1_000_000;
+    const threshold = 30 * 60_000;
+    const tasks = [
+      task({ id: "tb", status: "blocked", assignee: "m1", updatedAt: now - threshold - 3_600_000 }),
+      task({ id: "tc", status: "claimed", assignee: "m2", updatedAt: now - threshold - 1 }),
+    ];
+    expect(staleTasks(tasks, now, threshold).map((t) => t.id)).toEqual(["tc"]);
+  });
+
+  // v0.6（C2）：revokeAttempt 的可撤销域 = OPEN（含 blocked）——接管/成员 stop 把
+  // 名下 blocked 任务一并回池（清扫豁免与可撤销域是两个口径）。
+  it("v0.6 blocked 任务可被 revokeAttempt 回池（接管语义）", () => {
+    const t = task({
+      id: "tb", status: "blocked", assignee: "m1", attempt: 1, attemptId: "at-1",
+      error: "等待输入", blockedReason: "等待输入", blockedAt: 2_000,
+    });
+    (t as { preBlockedStatus?: string }).preBlockedStatus = "in_progress";
+    expect(revokeAttempt(t, { by: "engine", now: 9_000, event: "revoked-rebind" })).toBe(true);
+    expect(t.status).toBe("pending");
+    expect(t.assignee).toBeNull();
+    expect(t.attempt).toBe(2);
+    expect(t.history[t.history.length - 1]!.event).toBe("revoked-rebind");
+  });
 });
 
 // ─────────────────────────── findTaskRecipient（收件人扫描） ───────────────────────────

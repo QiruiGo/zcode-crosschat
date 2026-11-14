@@ -1,13 +1,13 @@
 /**
  * 预算接入防回归单测（v0.5.1，预算修复员组）：
  *
- * - SCALE-1（裁决 #18，P1）：xc_check_inbox 批量消费无批次预算截断——300 条积压
+ * - SCALE-1（裁决 #18，P1）：xc_read 批量消费无批次预算截断——300 条积压
  *   单次直灌 201,193 字符且无指针。修复 = 批次窗口（到达序前缀、JSON 面+信封面
  *   联合成本 ≤ budget.total、保底一条），窗口外消息保持未读，摘要行/JSON payload/
- *   信封尾行三处给「再调一次 xc_check_inbox」指针。
+ *   信封尾行三处给「再调一次 xc_read」指针。
  * - SCALE-2（裁决 #19，P2）：xc_claim 全文回显 600KB prompt（600,234 字符响应）。
  *   修复 = prompt/acceptance 接入 item 预算截断 + promptTruncated{shown,total,sha256}
- *   + xc_task_read 分页指针（team.json 真源全文不动）。
+ *   + xc_read 分页指针（team.json 真源全文不动）。
  * - CONC-2 工具层腿（裁决 #7，P1）：≥10MiB 队内消息磁盘保真入队（传输层腿见
  *   transport/mcpstdio.test.ts——大帧拒收不杀进程）。
  */
@@ -17,7 +17,8 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 import { payloadOf } from "./protocol.js";
-import { createToolCore, TaskReadShape, type ToolCore } from "./tools.js";
+import { createToolCore, type ToolCore } from "./core.js";
+import { ReadShape as TaskReadShape } from "./tools-read.js";
 import { writeSession } from "../core/registry.js";
 import { readMailbox } from "../core/mailbox.js";
 import { readTeam } from "../core/teamstate.js";
@@ -59,13 +60,13 @@ interface InboxPayload {
   batchBudgetChars?: number;
 }
 
-describe("SCALE-1: xc_check_inbox 批次窗口（批量消费接入注入预算）", () => {
+describe("SCALE-1: xc_read 批次窗口（批量消费接入注入预算）", () => {
   it("40 条积压 + 小批次预算：单次只消费窗口前缀、响应有界、三处指针、其余保持未读", async () => {
     const core = coreWith({ XC_INJECT_ITEM_CHARS: "400", XC_INJECT_TOTAL_CHARS: "1500" });
     await hookRegister(core, "conn-a", "a", "sess-a");
     await hookRegister(core, "conn-b", "b", "sess-b");
     for (let i = 0; i < 40; i += 1) {
-      await core.xc_message({ to: "b", content: `msg-${String(i).padStart(2, "0")}-${"x".repeat(40)}` }, "conn-a");
+      await core.xc_message({ to: "b", msg: `msg-${String(i).padStart(2, "0")}-${"x".repeat(40)}` }, "conn-a");
     }
 
     const res = await core.xc_check_inbox({}, "conn-b");
@@ -82,9 +83,9 @@ describe("SCALE-1: xc_check_inbox 批次窗口（批量消费接入注入预算�
     expect(textOf(res).length).toBeLessThan(budgetTotal + 600);
 
     // 三处分页指针：摘要行、JSON payload、信封块尾行
-    expect(res.content[0]?.text).toContain("xc_check_inbox");
+    expect(res.content[0]?.text).toContain("xc_read");
     expect(res.content[0]?.text).toContain("注入预算");
-    expect(textOf(res)).toContain("xc_check_inbox 继续消费");
+    expect(textOf(res)).toContain("继续消费");
 
     // 磁盘真源：40 行都在；窗口外消息保持未读（readAt 不盖章）
     const disk = await readMailbox(stateRoot, "default", "b");
@@ -118,7 +119,7 @@ describe("SCALE-1: xc_check_inbox 批次窗口（批量消费接入注入预算�
     await hookRegister(core, "conn-a", "a", "sess-a");
     await hookRegister(core, "conn-b", "b", "sess-b");
     for (let i = 0; i < 3; i += 1) {
-      await core.xc_message({ to: "b", content: `short-${i}` }, "conn-a");
+      await core.xc_message({ to: "b", msg: `short-${i}` }, "conn-a");
     }
     const res = await core.xc_check_inbox({}, "conn-b");
     const payload = payloadOf(res) as unknown as InboxPayload;
@@ -133,7 +134,7 @@ describe("SCALE-1: xc_check_inbox 批次窗口（批量消费接入注入预算�
     await hookRegister(core, "conn-a", "a", "sess-a");
     await hookRegister(core, "conn-b", "b", "sess-b");
     const bigText = "B".repeat(5000);
-    await core.xc_message({ to: "b", content: bigText }, "conn-a");
+    await core.xc_message({ to: "b", msg: bigText }, "conn-a");
 
     const res = await core.xc_check_inbox({}, "conn-b");
     const payload = payloadOf(res) as unknown as InboxPayload;
@@ -148,7 +149,7 @@ describe("SCALE-1: xc_check_inbox 批次窗口（批量消费接入注入预算�
   });
 });
 
-describe("SCALE-2: xc_claim 回显接入注入预算（prompt/acceptance 截断 + xc_task_read 指针）", () => {
+describe("SCALE-2: xc_claim 回显接入注入预算（prompt/acceptance 截断 + xc_read 指针）", () => {
   it("600KB prompt 认领：响应有界、promptTruncated{shown,total,sha256}、真源全文不动、分页可拼回", async () => {
     const core = coreWith();
     await hookRegister(core, "conn-a", "a", "sess-a");
@@ -177,14 +178,14 @@ describe("SCALE-2: xc_claim 回显接入注入预算（prompt/acceptance 截断 
       total: 600_000,
       sha256: sha256Of(prompt),
     });
-    expect(payload.promptPointer).toBe("xc_task_read");
+    expect(payload.promptPointer).toBe("xc_read");
 
     // 磁盘真源（team.json）全文不动（R-21）
     const team = await readTeam(stateRoot, "default");
     const task = team?.tasks.find((t) => t.id === taskId);
     expect(task?.prompt).toBe(prompt);
 
-    // 指针可走通：xc_task_read 分页拼回全文 sha256 相等
+    // 指针可走通：xc_read 分页拼回全文 sha256 相等
     let offset = 0;
     let joined = "";
     for (let guard = 0; guard < 200; guard += 1) {
@@ -224,7 +225,7 @@ describe("SCALE-2: xc_claim 回显接入注入预算（prompt/acceptance 截断 
     expect(payload.promptTruncated).toBeUndefined();
     expect(payload.acceptance.length).toBeLessThanOrEqual(500);
     expect(payload.acceptanceTruncated).toEqual({ shown: 499, total: 4000, sha256: sha256Of(acceptance) });
-    expect(payload.acceptancePointer).toBe("xc_task_read");
+    expect(payload.acceptancePointer).toBe("xc_read");
 
     // 新枚举值可分页取回 acceptance 全文
     const page = payloadOf(await core.xc_task_read({ taskId, field: "acceptance" }, "conn-b")) as {
@@ -237,9 +238,9 @@ describe("SCALE-2: xc_claim 回显接入注入预算（prompt/acceptance 截断 
     expect(page.hasMore).toBe(true);
   });
 
-  it("TaskReadShape 接受 acceptance 枚举值（schema 面回归锁定）", () => {
-    expect(z.object(TaskReadShape).safeParse({ taskId: "t1", field: "acceptance" }).success).toBe(true);
-    expect(z.object(TaskReadShape).safeParse({ taskId: "t1", field: "title" }).success).toBe(false);
+  it("v0.6（T5）：ReadShape 的 field 枚举接受 acceptance（schema 面回归锁定）", () => {
+    expect(z.object(TaskReadShape).safeParse({ scope: "task", id: "t1", field: "acceptance" }).success).toBe(true);
+    expect(z.object(TaskReadShape).safeParse({ scope: "task", id: "t1", field: "title" }).success).toBe(false);
   });
 });
 
@@ -250,7 +251,7 @@ describe("CONC-2 工具层腿：≥10MiB 队内消息磁盘保真入队（传输
     await hookRegister(core, "conn-b", "b", "sess-b");
     const big = "X".repeat(12 * 1024 * 1024) + "-END-MARKER";
 
-    const res = await core.xc_message({ to: "b", content: big }, "conn-a");
+    const res = await core.xc_message({ to: "b", msg: big }, "conn-a");
     expect(res.isError).toBeUndefined();
     expect(res.content[0]?.text).toContain("delivered via mailbox");
 

@@ -21,15 +21,23 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { payloadOf, type ToolResult } from "./protocol.js";
-import { createToolCore, type ToolCore } from "./tools.js";
+import { createToolCore, type ToolCore } from "./core.js";
 import { writeSession } from "../core/registry.js";
 import { readTeam, writeTeam } from "../core/teamstate.js";
 import { writePeerBaseRecord } from "../core/peerdir.js";
 import { PEER_MAX_QUEUE_DEPTH, PEER_RATE_LIMIT, PEER_RATE_WINDOW_MS, admitPeerMessage, createRateBuckets, peerMaxQueueDepthFromEnv } from "../core/peermsg.js";
-import { admissionDropDetail, createDefaultPeerServices, registerPeerTools, validateSendModeArgs } from "./peer-tools.js";
+import { admissionDropDetail, createDefaultPeerServices, validateSendModeArgs } from "./peer-services.js";
+import { registerReadTools } from "./tools-read.js";
+import { registerOverviewTools } from "./tools-overview.js";
+import { setPeerServicesForTests } from "./peer-services.js";
 import { appendPeerQueue, readPeerQueue } from "../core/peermsg.js";
 import { stopPeerEndpoint } from "../transport/pipe.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+/** v0.6：把假 PeerServices 装进 peer-services 进程单例（家族注册器经 getPeerServices 取；
+ *  等价旧 registerPeerTools(server, deps) 的 peer 注入字段）。 */
+function seedPeerServices(services: unknown): void {
+  setPeerServicesForTests(services as never);
+}
 
 let workDir: string;
 let stateRoot: string;
@@ -323,13 +331,15 @@ describe("SCALE-3: xc_peer_inbox 批次窗口（窗口外消息留在队列 + �
         this.tools.push({ name, handler });
       }
     })() as never;
-    registerPeerTools(server as unknown as McpServer, {
+    // v0.6（T5）：scope=peer 走 getPeerServices 单例——把已注册的 services 装进去
+    // （等价旧 registerPeerTools 的 peer 注入字段）。
+    setPeerServicesForTests(services);
+    registerReadTools(server as unknown as McpServer, {
       stateRoot: stateRoot2,
       workspace,
       env: { XC_MESSAGING_DIR: root, XC_INJECT_ITEM_CHARS: "3000", XC_INJECT_TOTAL_CHARS: "9600" } as NodeJS.ProcessEnv,
-      peer: services,
-    });
-    const inboxTool = server.tools.find((tool) => tool.name === "xc_peer_inbox");
+    }, createToolCore({ stateRoot: stateRoot2, workspace, env: { XC_MESSAGING_DIR: root, XC_INJECT_ITEM_CHARS: "3000", XC_INJECT_TOTAL_CHARS: "9600" } as NodeJS.ProcessEnv }), new Map());
+    const inboxTool = server.tools.find((tool) => tool.name === "xc_read");
     expect(inboxTool).toBeDefined();
     const all = new Set(first.items.map((entry) => entry.msgId));
     // 信封正文含「消息-NN-…」（信封 tag 不带 msgId）；按正文序号对账。
@@ -337,7 +347,7 @@ describe("SCALE-3: xc_peer_inbox 批次窗口（窗口外消息留在队列 + �
       [...envelope.matchAll(/消息-(\d{2})/g)].map((match) => `m-${match[1]}`);
     let pointerSeen = false;
     for (let guard = 0; guard < 20 && first.remaining > 0; guard += 1) {
-      const res = await inboxTool!.handler({});
+      const res = await inboxTool!.handler({ scope: "peer" });
       const payload = payloadOf(res) as { count: number; envelopes: string[]; remaining: number };
       expect(payload.count).toBeGreaterThanOrEqual(1);
       expect(payload.count).toBe(payload.envelopes.length);
@@ -350,7 +360,7 @@ describe("SCALE-3: xc_peer_inbox 批次窗口（窗口外消息留在队列 + �
       }
       if (payload.remaining > 0) {
         pointerSeen = true;
-        expect(String(res.content[0]?.text)).toContain("再调一次 xc_peer_inbox 继续拉取");
+        expect(String(res.content[0]?.text)).toContain("继续拉取");
       } else {
         expect(String(res.content[0]?.text)).not.toContain("再调一次");
         break;
@@ -378,14 +388,19 @@ describe("SCALE-3: xc_peer_inbox 批次窗口（窗口外消息留在队列 + �
         this.tools.push({ name, handler });
       }
     })() as never;
-    registerPeerTools(server as unknown as McpServer, {
+    // v0.6（T5）：scope=peer 走 getPeerServices 单例（已注册的 services 装进去）。
+    setPeerServicesForTests(services);
+    registerReadTools(server as unknown as McpServer, {
       stateRoot: stateRoot2,
       workspace,
       env: { XC_MESSAGING_DIR: root, XC_INJECT_ITEM_CHARS: "800", XC_INJECT_TOTAL_CHARS: "600" } as NodeJS.ProcessEnv,
-      peer: services,
-    });
-    const inboxTool = server.tools.find((tool) => tool.name === "xc_peer_inbox");
-    const res = await inboxTool!.handler({});
+    }, createToolCore({
+      stateRoot: stateRoot2,
+      workspace,
+      env: { XC_MESSAGING_DIR: root, XC_INJECT_ITEM_CHARS: "800", XC_INJECT_TOTAL_CHARS: "600" } as NodeJS.ProcessEnv,
+    }), new Map());
+    const inboxTool = server.tools.find((tool) => tool.name === "xc_read");
+    const res = await inboxTool!.handler({ scope: "peer" });
     const payload = payloadOf(res) as { count: number; envelopes: string[]; remaining: number; budgetTruncated?: boolean };
     expect(payload.count).toBe(1);
     expect(payload.remaining).toBe(0);
@@ -408,27 +423,29 @@ describe("本轮改动的接线冒烟", () => {
         this.tools.push({ name, handler });
       }
     })() as never;
-    registerPeerTools(server as unknown as McpServer, {
-      stateRoot: "<stateRoot>",
-      workspace: "<workspace>",
-      env: { XC_INJECT_TOTAL_CHARS: "7777" } as NodeJS.ProcessEnv,
-      peer: {
-        register: async () => { throw new Error("unused"); },
-        list: async () => [],
-        send: async () => { throw new Error("unused"); },
-        read: async () => { throw new Error("unused"); },
-        inbox: async (_limit, budget) => {
-          receivedBudget = budget;
-          return { items: [], rendered: [], remaining: 0 };
-        },
-        review: async () => { throw new Error("unused"); },
-        rename: async () => { throw new Error("unused"); },
-        agents: async () => { throw new Error("unused"); },
+    // v0.6（T5）：scope=peer 走 getPeerServices 单例——seed 后注册。
+    seedPeerServices({
+      register: async () => { throw new Error("unused"); },
+      list: async () => [],
+      send: async () => { throw new Error("unused"); },
+      read: async () => { throw new Error("unused"); },
+      inbox: async (_limit: number, budget: unknown) => {
+        receivedBudget = budget;
+        return { items: [], rendered: [], remaining: 0 };
       },
-    });
-    const inboxTool = server.tools.find((tool) => tool.name === "xc_peer_inbox");
+      review: async () => { throw new Error("unused"); },
+      rename: async () => { throw new Error("unused"); },
+      agents: async () => { throw new Error("unused"); },
+    } as never);
+    registerReadTools(
+      server as unknown as McpServer,
+      { stateRoot: "<stateRoot>", workspace: "<workspace>", env: { XC_INJECT_TOTAL_CHARS: "7777" } as NodeJS.ProcessEnv },
+      createToolCore({ stateRoot: "<stateRoot>", workspace: "<workspace>", env: { XC_INJECT_TOTAL_CHARS: "7777" } as NodeJS.ProcessEnv }),
+      new Map(),
+    );
+    const inboxTool = server.tools.find((tool) => tool.name === "xc_read");
     expect(inboxTool).toBeDefined();
-    const res = await inboxTool!.handler({});
+    const res = await inboxTool!.handler({ scope: "peer" });
     expect(res.isError).toBeUndefined();
     expect(receivedBudget).toMatchObject({ total: 7777 });
   });
@@ -440,26 +457,28 @@ describe("本轮改动的接线冒烟", () => {
         this.tools.push({ name, handler });
       }
     })() as never;
-    registerPeerTools(server as unknown as McpServer, {
-      stateRoot: "<stateRoot>",
-      workspace: "<workspace>",
-      env: {} as NodeJS.ProcessEnv,
-      peer: {
-        register: async () => { throw new Error("unused"); },
-        list: async () => [{
-          name: "bob", kind: "session" as const, identity: "bob@x", ref: "b1c2d3e4",
-          sessionId: "sess-bob", pid: 1, cwd: "D:\\ws-b", status: "idle", lastSeenMs: 1,
-        }],
-        send: async () => { throw new Error("unused"); },
-        read: async () => { throw new Error("unused"); },
-        inbox: async () => ({ items: [], rendered: [], remaining: 0 }),
-        review: async () => { throw new Error("unused"); },
-        rename: async () => { throw new Error("unused"); },
-        agents: async () => { throw new Error("unused"); },
-      },
-    });
-    const peersTool = server.tools.find((tool) => tool.name === "xc_peers");
-    const res = await peersTool!.handler({});
+    // v0.6（T7）：xc_peers → xc_overview view=peers（假服务经 seedPeerServices 注入）。
+    seedPeerServices({
+      register: async () => { throw new Error("unused"); },
+      list: async () => [{
+        name: "bob", kind: "session" as const, identity: "bob@x", ref: "b1c2d3e4",
+        sessionId: "sess-bob", pid: 1, cwd: "D:\\ws-b", status: "idle", lastSeenMs: 1,
+      }],
+      send: async () => { throw new Error("unused"); },
+      read: async () => { throw new Error("unused"); },
+      inbox: async () => ({ items: [], rendered: [], remaining: 0 }),
+      review: async () => { throw new Error("unused"); },
+      rename: async () => { throw new Error("unused"); },
+      agents: async () => { throw new Error("unused"); },
+    } as never);
+    registerOverviewTools(
+      server as unknown as McpServer,
+      { stateRoot: "<stateRoot>", workspace: "<workspace>", env: {} as NodeJS.ProcessEnv },
+      createToolCore({ stateRoot: "<stateRoot>", workspace: "<workspace>", env: {} as NodeJS.ProcessEnv }),
+      new Map(),
+    );
+    const peersTool = server.tools.find((tool) => tool.name === "xc_overview");
+    const res = await peersTool!.handler({ view: "peers" });
     const payload = payloadOf(res) as { count: number; total?: number; rowsTruncated?: unknown };
     expect(payload.count).toBe(1);
     expect(payload.total).toBe(1);

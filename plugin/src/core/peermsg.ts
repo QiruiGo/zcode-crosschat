@@ -42,6 +42,9 @@ import { mkdir, readdir, readFile, rename, rm, stat } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { writeFileAtomic, stripLeadingBom } from './atomic.js';
 import { appendJsonl } from './jsonl.js';
+// v0.6（C1，M3）：urgent-first 呈现序的唯一实现在 core/mailbox.ts（peermsg 与
+// hooks/shared、peer-drain 共用同一函数，规则不分叉）。
+import { urgentFirst } from './mailbox.js';
 import {
   peerHeldDir,
   peerHeldFile,
@@ -82,8 +85,19 @@ export interface PeerQueueItem {
   origin?: 'user' | 'agent';
   /** v0.5（R-11）：最初作者会话。 */
   originSessionId?: string;
-  /** v0.5（R-15-2）：接收路径盖的可疑信封标记。 */
-  forged?: boolean;
+  /**
+   * v0.6（C1，DESIGN-V0.6.md §3.1 数据面）：urgent 消息在一切读取面排最前
+   * （urgentFirst 排序键，peer 轴；core/mailbox.ts 同款规则）。absent=false。
+   *
+   * 载体边界（E1 §1.1 / DESIGN §2.2 行 5：transport/frames.ts 白名单冻结）：
+   * 管道 MsgFrame 不携带 urgent（封闭字段集不动，避免混合版本端点整帧拒收）；
+   * 发送侧构造的队列项（xc_relay 文件退化 fallbackItem）与暂存晋升
+   * （heldItemToQueueItem 透传）原样携带本字段。isPeerQueueItem 不校验本键——
+   * 旧队列行无此键照常解析（宽容读取）。
+   */
+  urgent?: boolean;
+  // v0.6（DESIGN-V0.6.md §2.2 行 3）：`forged` 可疑信封标记已随对抗检测砍除；
+  // 存量队列/held 行里的 forged 字段经 isPeerQueueItem 宽容读取（多余键不拒）。
 }
 
 // ---------------------------------------------------------------------------
@@ -242,9 +256,19 @@ export async function drainPeerFile(file: string, limit?: number): Promise<PeerD
 
   // Complete but malformed lines are dropped (they are garbage); the trailing
   // HALF line is written back below — only a half line can still be completed.
-  const take = limit === undefined ? validLines.length : Math.min(limit, validLines.length);
-  for (const entry of validLines.slice(0, take)) items.push(entry.item);
-  const leftoverLines = validLines.slice(take).map((entry) => entry.line);
+  // v0.6（C1，DESIGN-V0.6.md §3.1 排空面 urgent-first）：开窗**之前**先按 urgent
+  // 排序（core/mailbox.ts urgentFirst 同一实现，经 item↔line 引用映射）——
+  // urgent 队列项插队进入本批窗口，窗口外的普通件按原到达序写回（类内相对序
+  // 不变，数据零丢失）。无 urgent 项时排序为 stable 恒等，行为与 v0.5 逐字节
+  // 一致。面 A（钩子）/面 B（工具间隙）/面 C（xc_peer_inbox）三个排空面经
+  // drainPeerQueue/drainPeerInbox 统一生效；readPeerQueue（窥视）同序，保证
+  // 面 C「窥视→开窗→排空」三步口径一致。
+  const lineByItem = new Map(validLines.map((entry) => [entry.item, entry.line]));
+  const ordered = urgentFirst(validLines.map((entry) => entry.item))
+    .map((item) => ({ line: lineByItem.get(item)!, item }));
+  const take = limit === undefined ? ordered.length : Math.min(limit, ordered.length);
+  for (const entry of ordered.slice(0, take)) items.push(entry.item);
+  const leftoverLines = ordered.slice(take).map((entry) => entry.line);
   await writeBackLeftovers(file, leftoverLines, fragment);
   await rm(swapped, { force: true });
   return { items, malformed };
@@ -262,7 +286,9 @@ export async function drainPeerInbox(root: string, sessionId: string, limit?: nu
   return result.items;
 }
 
-/** Read the queue without consuming it (observation only). */
+/** Read the queue without consuming it (observation only).
+ *  v0.6（C1）：呈现序 urgent-first（与 drainPeerFile 排空口径一致，见其注释）；
+ *  深度计数（peerQueueDepth）不受顺序影响。 */
 export async function readPeerQueue(root: string, sessionId: string): Promise<PeerQueueItem[]> {
   const file = peerQueueFile(root, sessionId);
   let raw: string;
@@ -281,7 +307,7 @@ export async function readPeerQueue(root: string, sessionId: string): Promise<Pe
       // Malformed lines are ignored by the read-only view.
     }
   }
-  return items;
+  return urgentFirst(items);
 }
 
 /** Number of items currently queued for one session. */

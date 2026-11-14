@@ -246,6 +246,13 @@ export interface WakePromptInput {
   bodyText: string;
   /** 是否附加成员守则（dispatch 场景 true；report/message 唤醒省略以免噪声）。 */
   includeMemberRules?: boolean;
+  /**
+   * v0.6（C1，DESIGN-V0.6.md §3.1 读取序 3）：urgent 唤醒——正文携带段首位插
+   * URGENT 横幅（横幅计入正文预算；正文维持预算内全文/截断规则不变）。
+   * 横幅语义 = 「本条排在目标所有未读之首，先处理本条」——与邮箱读取面
+   * urgentFirst（M3）同一规则在 wake 携带段的投影。
+   */
+  urgent?: boolean;
 }
 
 /**
@@ -314,6 +321,13 @@ export function includeRulesForScene(reason: string): boolean {
 
 const TRUNCATE_MARKER = "…[truncated]";
 
+/**
+ * v0.6（C1）：urgent 唤醒横幅（DESIGN-V0.6.md §3.1 读取序 3）——置于正文携带段
+ * 首位；固定短行，计入正文预算（结构性部分回执行/身份行不截的纪律不变）。
+ */
+export const URGENT_WAKE_BANNER =
+  "[URGENT] 用户紧急介入：本条消息排在目标所有未读之首，先处理本条，再回到常规工作循环。";
+
 /** 截到 budget 内，超长加标记（scheduler.js:80-81 思想）。 */
 function truncateBody(body: string, budget: number): string {
   if (budget <= 0) return TRUNCATE_MARKER;
@@ -340,6 +354,13 @@ export function buildWakePrompt(input: WakePromptInput, maxChars: number = WAKE_
     `注册成功后调用 xc_check_inbox 读取回执对应的消息。`;
   const rules = input.includeMemberRules === true ? MEMBER_RULES_V2 : undefined;
 
+  // v0.6（C1）：urgent 唤醒 → 正文携带段首位插横幅（横幅 + 原正文合计受正文预算
+  // 约束；横幅固定短行，超长时先压正文再压横幅尾部——truncateBody 作用于合计文本，
+  // 保横幅与正文头部的可读顺序）。
+  const body = input.urgent === true
+    ? `${URGENT_WAKE_BANNER}\n${input.bodyText}`
+    : input.bodyText;
+
   // 分隔符开销：parts 以 "\n\n" 连接。
   const sepCount = (rules === undefined ? 2 : 3) * 2;
   const bodyBudget = Math.max(
@@ -347,8 +368,8 @@ export function buildWakePrompt(input: WakePromptInput, maxChars: number = WAKE_
     maxChars - receipt.length - identity.length - (rules?.length ?? 0) - sepCount,
   );
   const parts = rules === undefined
-    ? [receipt, identity, truncateBody(input.bodyText, bodyBudget)]
-    : [receipt, identity, truncateBody(input.bodyText, bodyBudget), rules];
+    ? [receipt, identity, truncateBody(body, bodyBudget)]
+    : [receipt, identity, truncateBody(body, bodyBudget), rules];
   let prompt = parts.join("\n\n");
   if (prompt.length > maxChars) {
     // 兜底硬切（结构性部分自身超限时才会走到这里）。
@@ -379,6 +400,12 @@ export interface WakeRequest {
   receiptIds: readonly string[];
   /** 正文文本（任务票/回执摘要/消息内容）；≤4000 截断在 M2。 */
   ticket: string;
+  /**
+   * v0.6（C1）：urgent 唤醒（xc_relay urgent/interrupt 写入侧）——true 时唤醒
+   * prompt 正文首位插 URGENT 横幅（buildWakePrompt）+ 审计行带 urgent 标记。
+   * 不改变三态决策（decideDelivery 三重条件对 urgent 不豁免，E1：忙→下一回合）。
+   */
+  urgent?: boolean;
   /** 进程 env；XC_WAKE_ENABLED 判定全在 M2（V7）。 */
   env: NodeJS.ProcessEnv;
   /**
@@ -530,6 +557,7 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
     claimMailboxDelivery(stateRoot, req.teamId, toKey, ids, now));
 
   // 5. prompt + spawn（fire-and-forget）。守则附加按场景白名单（v0.2 §9.1 白名单兼容）。
+  // v0.6（C1）：urgent 唤醒（xc_relay）→ 正文首位 URGENT 横幅。
   const prompt = buildWakePrompt({
     teamId: req.teamId,
     recipientKey: toKey,
@@ -538,6 +566,7 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
     receiptIds: ids,
     bodyText: req.ticket,
     includeMemberRules: includeRulesForScene(req.reason),
+    ...(req.urgent === true ? { urgent: true } : {}),
   });
   const logFile = wakeLogFile(stateRoot, toKey, now);
   const releaseOnFailure = async (where: string, err: unknown): Promise<void> => {
@@ -602,6 +631,7 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
   await logEngineEvent(stateRoot, {
     event: "wake", scene: req.reason, teamId: req.teamId, to: toKey, pid, nonce: token,
     wakeLog: logFile, receiptIds: ids,
+    ...(req.urgent === true ? { urgent: true } : {}),
   });
 
   // v0.5.1（FI-7/故障注-7）：spawn 成功只代表「唤醒已发起」，不代表送达——helper 孤儿化后

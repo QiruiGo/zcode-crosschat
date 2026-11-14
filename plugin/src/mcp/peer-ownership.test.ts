@@ -16,7 +16,9 @@
  * ③ identity_token_required：基记录 boundName 在册（该 sid 已被绑为队内身份，
  *    xc_register 盖章、跨工作区可见）时必须出示与基记录一致的锚定令牌。
  * 豁免：本进程幂等重认领自己的 sid（peer-1 语义）；基记录有 boundName 但无
- * regToken 的升级前旧锚 → 放行 + 审计 peer-ownership-unverified（不静默）。
+ * v0.6 改判（DESIGN-V0.6.md §2.2 行 2）：regToken 归属硬闸砍除——已绑定 sid 的
+ * peer 认领改为放行（软校验）；session_id_in_use（活冲突）/ session_not_anchored
+ * （锚定存在性）两道闸保留。原「令牌不符 → identity_token_required」断言移除。
  */
 import { spawn } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -27,10 +29,10 @@ import { writePeerBaseRecord, readPeerBaseRecord, localPidDomain } from "../core
 import { writePeerRecord, type PeerRecord } from "../core/peerregistry.js";
 import { writeSession } from "../core/registry.js";
 import { xcRegister } from "./identity.js";
-import { createDefaultPeerServices } from "./peer-tools.js";
+import { createDefaultPeerServices } from "./peer-services.js";
 import { stopPeerEndpoint } from "../transport/pipe.js";
 import { ToolError } from "./protocol.js";
-import type { ToolDeps } from "./tools.js";
+import type { ToolDeps } from "./core.js";
 
 let root = "";
 let workDir = "";
@@ -117,32 +119,27 @@ describe("A8-(b)：全伪造 sid（无锚定）→ session_not_anchored", () => 
   });
 });
 
-describe("A8-(a)：队内成员 sid 冒充 → identity_token_required", () => {
-  it("基记录 boundName 在册、无令牌 → identity_token_required（fakeboss 重放）", async () => {
+describe("A8-(a)：v0.6 改判——队内成员 sid 的 peer 认领一律放行（regToken 闸砍除）", () => {
+  it("基记录 boundName 在册 → 放行（旧版 identity_token_required 硬拒已砍）", async () => {
     await anchorBase("sess-victim", { regToken: "rt-victim", boundName: "victim" });
     const services = createDefaultPeerServices(deps);
 
-    const error = await services
-      .register({ name: "fakeboss", sessionId: "sess-victim" })
-      .catch((e: unknown) => e);
-    expect(error).toBeInstanceOf(ToolError);
-    expect((error as ToolError).payload).toMatchObject({
-      error: "identity_token_required",
-      sessionId: "sess-victim",
-      boundName: "victim",
-    });
+    // v0.6（§2.2 行 2）：regToken 归属硬闸砍除——认领已绑定 sid 放行（软校验）。
+    const result = await services.register({ name: "fakeboss", sessionId: "sess-victim" });
+    expect(result.name).toBe("fakeboss");
+    expect(result.sessionId).toBe("sess-victim");
+    // 活冲突（session_id_in_use）仍由另一道闸挡——见下方 describe。
   });
 
-  it("令牌错误 → identity_token_required；令牌正确 → 成功（victim 本会话的合法 peer 注册）", async () => {
+  it("v0.6：token 参数不再参与判定（认领一律放行，正确与否无差别）", async () => {
     await anchorBase("sess-victim", { regToken: "rt-victim", boundName: "victim" });
     const services = createDefaultPeerServices(deps);
 
-    const forged = await services
-      .register({ name: "fakeboss", sessionId: "sess-victim", regToken: "rt-forged" })
-      .catch((e: unknown) => e);
-    expect(forged).toBeInstanceOf(ToolError);
-
-    const legit = await services.register({ name: "vic-peer", sessionId: "sess-victim", regToken: "rt-victim" });
+    // 旧版：rt-forged → identity_token_required；rt-victim → 成功。
+    // v0.6：令牌不入 PeerRegisterInput——两次认领行为一致（先到者花名判定照旧）。
+    const first = await services.register({ name: "fakeboss", sessionId: "sess-victim" });
+    expect(first.sessionId).toBe("sess-victim");
+    const legit = await services.register({ name: "vic-peer", sessionId: "sess-victim" });
     expect(legit.sessionId).toBe("sess-victim");
   });
 
@@ -163,23 +160,16 @@ describe("A8-(a)：队内成员 sid 冒充 → identity_token_required", () => {
       lastSeen: Date.now(),
       regToken: "rt-vic",
     });
-    const out = await xcRegister(
-      stateRoot,
-      { name: "victim", sessionId: "sess-vic", regToken: "rt-vic" },
-      "conn-vic",
-      { peerRoot: root },
-    );
+    const out = await xcRegister(stateRoot, { name: "victim", sessionId: "sess-vic" }, "conn-vic", { peerRoot: root });
     expect(out.via).toBe("hook");
     expect((await readPeerBaseRecord(root, "sess-vic"))?.boundName).toBe("victim");
 
-    // 攻击者连接：用公开可读的 victim sid 注册 peer → 拒。
+    // v0.6 改判（a8 攻击链）：攻击者连接用公开可读的 victim sid 注册 peer →
+    // 不再被 regToken 闸挡（放行）。活冲突/锚定两道闸仍见下方 describe。
     const attackerDeps: ToolDeps = { stateRoot, workspace: workDir, env: { XC_MESSAGING_DIR: root } as NodeJS.ProcessEnv };
     const services = createDefaultPeerServices(attackerDeps);
-    const error = await services
-      .register({ name: "fakeboss", sessionId: "sess-vic" })
-      .catch((e: unknown) => e);
-    expect(error).toBeInstanceOf(ToolError);
-    expect((error as ToolError).payload.error).toBe("identity_token_required");
+    const result = await services.register({ name: "fakeboss", sessionId: "sess-vic" });
+    expect(result.sessionId).toBe("sess-vic");
   });
 });
 
@@ -199,22 +189,26 @@ describe("A8：闸序与豁免（v0.5.2 语义不回退）", () => {
     await anchorBase("sess-mine", { regToken: "rt-mine", boundName: "mine" });
     const services = createDefaultPeerServices(deps);
     // 首次注册（出示令牌，合法）。
-    const first = await services.register({ name: "mine", sessionId: "sess-mine", regToken: "rt-mine" });
+    const first = await services.register({ name: "mine", sessionId: "sess-mine" });
     expect(first.pid).toBe(process.pid);
     // 重试/重连：即使不带令牌也放行（同进程同 sid 豁免）。
     const second = await services.register({ name: "mine", sessionId: "sess-mine" });
     expect(second.pid).toBe(process.pid);
   });
 
-  it("升级前旧锚（boundName 在册但无 regToken）→ 放行 + 审计 peer-ownership-unverified", async () => {
+  it("v0.6：boundName 在册的 sid 认领一律放行（令牌闸砍除；旧锚差异不再存在）", async () => {
     await anchorBase("sess-legacy", { boundName: "legacy" }); // 无 regToken
     const services = createDefaultPeerServices(deps);
     const result = await services.register({ name: "legacy-peer", sessionId: "sess-legacy" });
     expect(result.sessionId).toBe("sess-legacy");
 
+    // v0.6（§2.2 行 2）：令牌归属闸整块砍除——连「旧锚未验证」的过渡审计也不复
+    // 存在（无闸即无留痕需求）；注册审计照常（peer-registered）。
     const { readFile } = await import("node:fs/promises");
     const { peerAuditLogFile } = await import("../core/peerdir.js");
     const log = await readFile(peerAuditLogFile(root), "utf8");
-    expect(log).toContain("peer-ownership-unverified");
+    expect(log).toContain("peer-registered");
+    expect(log).not.toContain("peer-ownership-unverified");
+    expect(log).not.toContain("peer-ownership-blocked");
   });
 });
