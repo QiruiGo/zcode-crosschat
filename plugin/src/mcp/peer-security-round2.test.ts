@@ -19,7 +19,7 @@ import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { localPidDomain, peerAuditLogFile } from "../core/peerdir.js";
+import { writePeerBaseRecord, localPidDomain, peerAuditLogFile } from "../core/peerdir.js";
 import { peerQueueDepth } from "../core/peermsg.js";
 import { storePeerMessageFull } from "../core/msgstore.js";
 import {
@@ -44,6 +44,14 @@ let sleepers: ReturnType<typeof spawn>[] = [];
 
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "xc-sec2-"));
+  // v0.5.3（a8）：给本文件用到的 sid 落钩子基记录（新锚定闸要求）。
+  await writePeerBaseRecord(root, { sessionId: "sess-alice", cwd: workspace, source: "startup", startedAt: Date.now(), lastSeen: Date.now() });
+  // v0.5.3（a8）：给本文件用到的 sid 落钩子基记录（新锚定闸要求）。
+  await writePeerBaseRecord(root, { sessionId: "sess-restart", cwd: workspace, source: "startup", startedAt: Date.now(), lastSeen: Date.now() });
+  // v0.5.3（a8）：给本文件用到的 sid 落钩子基记录（新锚定闸要求）。
+  await writePeerBaseRecord(root, { sessionId: "sess_attacker_own", cwd: workspace, source: "startup", startedAt: Date.now(), lastSeen: Date.now() });
+  // v0.5.3（a8）：给本文件用到的 sid 落钩子基记录（新锚定闸要求）。
+  await writePeerBaseRecord(root, { sessionId: "sess-shared-sid", cwd: workspace, source: "startup", startedAt: Date.now(), lastSeen: Date.now() });
   workspace = await mkdtemp(join(tmpdir(), "xc-sec2-ws-"));
   stateRoot = join(workspace, ".crosschat");
   servers = [];

@@ -102,6 +102,11 @@ export function inboxDir(root: string, teamId: string): string {
 export function inboxFile(root: string, teamId: string, agentKey: string): string {
   return join(root, 'teams', teamId, 'inbox', `${agentKey}.jsonl`);
 }
+/** v0.5.3（安全对-5 a10 修复）：邮箱完整性链 sidecar（`<agent>.jsonl.int`）。
+ *  后缀特意避开 `.jsonl`——teamstate 的邮箱残迹探测按 `*.jsonl` 计数（FI-5 回归）。 */
+export function inboxIntegrityFile(root: string, teamId: string, agentKey: string): string {
+  return join(root, 'teams', teamId, 'inbox', `${agentKey}.jsonl.int`);
+}
 export function snapshotFile(root: string, teamId: string): string {
   return join(root, 'teams', teamId, 'snapshot.json');
 }

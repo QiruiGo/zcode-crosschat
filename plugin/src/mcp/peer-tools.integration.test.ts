@@ -37,6 +37,10 @@ let received: string[] = [];
 
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "xc-peerint-"));
+  // v0.5.3（a8）：给本文件用到的 sid 落钩子基记录（新锚定闸要求）。
+  await writePeerBaseRecord(root, { sessionId: "sess-alice", cwd: workspace, source: "startup", startedAt: Date.now(), lastSeen: Date.now() });
+  // v0.5.3（a8）：给本文件用到的 sid 落钩子基记录（新锚定闸要求）。
+  await writePeerBaseRecord(root, { sessionId: "sess-sender", cwd: workspace, source: "startup", startedAt: Date.now(), lastSeen: Date.now() });
   workspace = await mkdtemp(join(tmpdir(), "xc-peerint-ws-"));
   stateRoot = join(workspace, ".crosschat");
   received = [];

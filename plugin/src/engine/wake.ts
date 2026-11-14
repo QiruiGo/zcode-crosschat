@@ -65,7 +65,7 @@ import {
 import { sanitizeKey } from "../core/sanitize";
 import type { TeamMessage, TeamState } from "../core/types";
 import { spawnResume, type WakeSpawnConfig } from "./resume-cli";
-import { resolveZcodeSpawnConfig, type ResolvedSpawnConfig } from "./zcode-locate";
+import { explicitSpawnConfigError, resolveZcodeSpawnConfig, type ResolvedSpawnConfig } from "./zcode-locate";
 
 /** v0.4（DESIGN-V0.4 §2.4）：req.cfg 测试注入（WakeSpawnConfig）与自动探测结果
  * （ResolvedSpawnConfig）的判别——`in` 收窄会给缺属性分支补 unknown（TS18046），
@@ -506,6 +506,21 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
     return { delivered: "mailbox", note: reason };
   }
 
+  // 3.7 v0.5.3（A5 修复）：显式 spawn 配置无效（XC_ZCODE_EXE/XC_ZCODE_CJS 配置了但路径
+  //     不存在/不可执行等）→ 唤醒通道必然不可用：不写 nonce/租约、**不回落自动探测**
+  //     （回落仅在未配置时），直接 mailbox 降级并把配置错误根因写进 note（回执可观测，
+  //     不再「静默换探测路径 + 回执只字不提」）。req.cfg 测试注入时跳过本闸（注入即信任）。
+  if (req.cfg === undefined) {
+    const cfgError = explicitSpawnConfigError(req.env);
+    if (cfgError !== undefined) {
+      const reason = `spawn-config-invalid: ${cfgError}`;
+      await logEngineEvent(stateRoot, {
+        event: "wake-skipped", reason, scene: req.reason, teamId: req.teamId, to: toKey,
+      });
+      return { delivered: "mailbox", note: reason };
+    }
+  }
+
   // 4. 写一次性 nonce（兼在途标记）+ 盖投递租约（尽力而为）。
   const { token } = await createWakeNonce(stateRoot, {
     teamId: req.teamId, agentKey: toKey, sid: req.toSessionId, now,
@@ -637,6 +652,9 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
  * 回落标注（纯函数，单测直测）。env 未配置 → 空串（v0.4 零必填配置的常规路径，无需标注）；
  * env 命中（source=user_config）→ 空串（没有回落这回事）；探测未命中 → 空串
  * （spawn 会同步抛错走 mailbox 降级，回落无从谈起）。
+ * v0.5.3（A5 修复）注：显式配置无效时 attemptWake 在 3.7 步直接 mailbox 降级（spawn 前闸），
+ * 「配置失效仍以探测路径发出唤醒」的形态已不可达——本函数保留为 FI-7 防御面（万一未来
+ * 重新出现回落路径，回执仍自动带标注），语义不变。
  */
 export function wakeFallbackNote(
   env: NodeJS.ProcessEnv,

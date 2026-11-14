@@ -8,6 +8,7 @@ import type { Task, TeamMessage } from "./types.js";
 import {
   collectDependencyOutputs,
   completedDependencyOutputs,
+  deadlockedDependents,
   downstreamReady,
   findTaskRecipient,
   revokeAttempt,
@@ -289,5 +290,69 @@ describe("findTaskRecipient（unblock-notice 投递目标定位）", () => {
     expect(findTaskRecipient([msg({ id: "m1", to: "m1", content: receipt, taskId: "t2" })], "t2")).toBeUndefined();
     // 自由文本（不可解析）→ 忽略
     expect(findTaskRecipient([msg({ id: "m2", to: "m3", content: "hello", taskId: "t2" })], "t2")).toBeUndefined();
+  });
+});
+
+// ─────────────────────────── v0.5.3（A3 修复）：deadlockedDependents ───────────────────────────
+
+describe("deadlockedDependents（A3：failed/cancelled 上游的死锁下游）", () => {
+  it("直依赖的 pending 下游被收集", () => {
+    const tasks = [
+      task({ id: "t1", status: "failed" }),
+      task({ id: "t2", status: "pending", dependsOn: ["t1"] }),
+    ];
+    expect(deadlockedDependents(tasks, "t1").map((t) => t.id)).toEqual(["t2"]);
+  });
+
+  it("传递闭包：深度 ≥2 的下游同样死锁（t3 依赖 t2、t2 依赖 t1）", () => {
+    const tasks = [
+      task({ id: "t1", status: "failed" }),
+      task({ id: "t2", status: "pending", dependsOn: ["t1"] }),
+      task({ id: "t3", status: "pending", dependsOn: ["t2"] }),
+    ];
+    expect(deadlockedDependents(tasks, "t1").map((t) => t.id)).toEqual(["t2", "t3"]);
+  });
+
+  it("幂等：已 cancelled 的下游不重复收集（跳过），pending 的仍收集", () => {
+    const tasks = [
+      task({ id: "t1", status: "cancelled" }),
+      task({ id: "t2", status: "cancelled", dependsOn: ["t1"] }),
+      task({ id: "t3", status: "pending", dependsOn: ["t1"] }),
+    ];
+    expect(deadlockedDependents(tasks, "t1").map((t) => t.id)).toEqual(["t3"]);
+  });
+
+  it("claimed/in_progress 下游不被触碰（防御：pending 过滤）", () => {
+    const tasks = [
+      task({ id: "t1", status: "failed" }),
+      task({ id: "t2", status: "claimed", dependsOn: ["t1"] }),
+      task({ id: "t3", status: "in_progress", dependsOn: ["t1"] }),
+    ];
+    expect(deadlockedDependents(tasks, "t1")).toEqual([]);
+  });
+
+  it("diamond：多路径依赖只收集一次（visited 去重）", () => {
+    const tasks = [
+      task({ id: "t1", status: "failed" }),
+      task({ id: "t2", status: "pending", dependsOn: ["t1"] }),
+      task({ id: "t3", status: "pending", dependsOn: ["t1"] }),
+      task({ id: "t4", status: "pending", dependsOn: ["t2", "t3"] }),
+    ];
+    const ids = deadlockedDependents(tasks, "t1").map((t) => t.id);
+    expect(ids.sort()).toEqual(["t2", "t3", "t4"]);
+  });
+
+  it("环安全：依赖环只断该支，不死循环", () => {
+    const tasks = [
+      task({ id: "t1", status: "failed" }),
+      task({ id: "t2", status: "pending", dependsOn: ["t1", "t3"] }),
+      task({ id: "t3", status: "pending", dependsOn: ["t2"] }),
+    ];
+    const ids = deadlockedDependents(tasks, "t1").map((t) => t.id).sort();
+    expect(ids).toEqual(["t2", "t3"]);
+  });
+
+  it("无下游 → 空数组（绝大多数 failed 任务零成本）", () => {
+    expect(deadlockedDependents([task({ id: "t1", status: "failed" })], "t1")).toEqual([]);
   });
 });

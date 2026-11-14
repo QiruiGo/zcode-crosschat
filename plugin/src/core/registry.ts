@@ -71,17 +71,25 @@ export async function writeSession(stateRoot: string, record: SessionRecord): Pr
  * Refresh one session's lastSeen, creating the record when the hook has not
  * written one yet (UserPromptSubmit path, DESIGN.md §2.3-1). Returns the
  * upserted record. Caller holds the registry lock when racing others.
+ *
+ * v0.5.3（安全对-1/a6 修复）：`ensureRegToken: true` 时（SessionStart 路径），
+ * 记录缺 `regToken` 就铸造一枚并落盘——锚定令牌是重绑 (name, sid) 对的属主凭据，
+ * 只注入到本会话上下文（见 hooks/session-start.ts）。已存在则原样保留（令牌在
+ * 会话生命周期内稳定，--resume 的新回合照常出示同一枚）。
  */
 export async function refreshSessionLastSeen(
   stateRoot: string,
   sessionId: string,
-  options: { cwd?: string; now?: number } = {},
+  options: { cwd?: string; now?: number; ensureRegToken?: boolean } = {},
 ): Promise<SessionRecord> {
   const now = options.now ?? Date.now();
   const existing = await readSession(stateRoot, sessionId);
   const record: SessionRecord = existing === undefined
     ? { sessionId, cwd: options.cwd ?? '', startedAt: now, lastSeen: now }
     : { ...existing, lastSeen: now, ...(options.cwd !== undefined && existing.cwd === '' ? { cwd: options.cwd } : {}) };
+  if (options.ensureRegToken === true && record.regToken === undefined) {
+    record.regToken = randomUUID();
+  }
   await writeSession(stateRoot, record);
   return record;
 }

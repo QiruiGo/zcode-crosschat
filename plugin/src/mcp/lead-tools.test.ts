@@ -25,7 +25,7 @@ import { readMailbox } from "../core/mailbox.js";
 import { engineLogFile } from "../core/paths.js";
 import { newTeamState, readTeam, writeTeam } from "../core/teamstate.js";
 import { MAX_LEAD_HISTORY, memberState } from "../core/types.js";
-import type { LeadHistoryEntry, TeamMember, TeamState } from "../core/types.js";
+import type { LeadHistoryEntry, Task, TeamMember, TeamState } from "../core/types.js";
 
 let workDir: string;
 let stateRoot: string;
@@ -304,5 +304,88 @@ describe("xc_team_init（v0.5 R-1 经 F-4 + P9 set 史）", () => {
     const team = (await readTeam(stateRoot, "default"))!;
     expect(team.leadSince).toBeUndefined(); // alreadyLead 分支不 touch
     expect(team.leadHistory ?? []).toHaveLength(0);
+  });
+});
+
+// ─────────────────────────── v0.5.3（A3 修复）：xc_cancel 的依赖死锁解除 ───────────────────────────
+
+/** graph.test.ts 同款任务工厂（本地最小副本，避免跨文件导入测试助手）。 */
+function seedTask(overrides: Partial<Task> & Pick<Task, "id" | "status">): Task {
+  return {
+    title: `T ${overrides.id}`,
+    prompt: "P",
+    dependsOn: [],
+    assignee: null,
+    attempt: 0,
+    attemptId: null,
+    createdBy: "a",
+    createdAt: 1_000,
+    updatedAt: 1_000,
+    result: null,
+    error: null,
+    evidence: [],
+    history: [],
+    ...overrides,
+  } as Task;
+}
+
+describe("xc_cancel 依赖死锁解除（v0.5.3 A3：cancelled 上游 → pending 下游自动 cancelled + 通知创建者）", () => {
+  it("取消 t1 → 依赖它的 t2（创建者 b）被引擎解除：cancelled + history=dependency-deadlock + b 收回执", async () => {
+    await seedTeam({ leadKey: "a", members: [member("a"), member("b")] });
+    identityStore.bind("conn-a", bindIdentity("a", "sess-a"));
+    const team = await readTeam(stateRoot, "default");
+    team!.tasks.push(
+      seedTask({ id: "t1", status: "pending", createdBy: "a" }),
+      seedTask({ id: "t2", status: "pending", dependsOn: ["t1"], createdBy: "b" }),
+    );
+    await writeTeam(stateRoot, team!);
+
+    const res = await core.xc_cancel({ taskId: "t1" }, "conn-a");
+    expect(res.isError).toBeUndefined();
+    const payload = payloadOf(res) as { deadlocked?: Array<{ taskId: string; createdBy: string; deadlockedBy: string }> };
+    expect(payload.deadlocked).toHaveLength(1);
+    expect(payload.deadlocked![0]).toMatchObject({ taskId: "t2", createdBy: "b", deadlockedBy: "t1" });
+
+    // 任务板：t2 cancelled，history 尾条 = dependency-deadlock（by=engine），error 写明根因。
+    const after = (await readTeam(stateRoot, "default"))!;
+    const t2 = after.tasks.find((x) => x.id === "t2")!;
+    expect(t2.status).toBe("cancelled");
+    expect(t2.error).toContain("dependency-deadlock");
+    expect(t2.history.at(-1)).toMatchObject({ event: "dependency-deadlock", by: "engine" });
+
+    // b 邮箱：cancelled 回执（cancelledBy=engine）；a 邮箱：自己取消的主回执照旧。
+    const bMail = await readMailbox(stateRoot, "default", "b");
+    const receipt = bMail.map((m) => JSON.parse(m.content) as Record<string, unknown>)
+      .find((c) => c["type"] === "task-receipt" && c["taskId"] === "t2");
+    expect(receipt).toMatchObject({ status: "cancelled", cancelledBy: "engine" });
+    const aMail = await readMailbox(stateRoot, "default", "a");
+    const mainReceipt = aMail.map((m) => JSON.parse(m.content) as Record<string, unknown>)
+      .find((c) => c["type"] === "task-receipt" && c["taskId"] === "t1");
+    expect(mainReceipt).toMatchObject({ status: "cancelled", cancelledBy: "a" });
+
+    // 审计：dependency-deadlock 事件带根因链。
+    const events = await engineEvents();
+    expect(events.find((e) => e["event"] === "dependency-deadlock")).toMatchObject({
+      taskId: "t2",
+      createdBy: "b",
+      deadlockedBy: "t1",
+      deadStatus: "cancelled",
+    });
+    // 解除后 team.json 落盘（writeTeam 时机：deadlocked 非空）。
+    expect(after.tasks.find((x) => x.id === "t1")!.status).toBe("cancelled");
+  });
+
+  it("幂等/无下游：取消无依赖的任务 → 响应无 deadlocked 字段（零成本路径）", async () => {
+    await seedTeam({ leadKey: "a" });
+    identityStore.bind("conn-a", bindIdentity("a", "sess-a"));
+    const team = await readTeam(stateRoot, "default");
+    team!.tasks.push(seedTask({ id: "t1", status: "pending", createdBy: "b" }));
+    await writeTeam(stateRoot, team!);
+
+    const res = await core.xc_cancel({ taskId: "t1" }, "conn-a");
+    expect(res.isError).toBeUndefined();
+    expect((payloadOf(res) as Record<string, unknown>)["deadlocked"]).toBeUndefined();
+    const events = await engineEvents();
+    expect(events.some((e) => e["event"] === "dependency-deadlock")).toBe(false);
   });
 });

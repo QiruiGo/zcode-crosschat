@@ -305,3 +305,41 @@ describe("identity: 保留名注册拒绝（BND-5，与 xc_member_add 规则统�
     expect(ok.roster.map((m) => m.key)).toEqual(["a"]);
   });
 });
+
+// ─────────────────────────── v0.5.3（A11 修复）：同形字花名注册闸 ───────────────────────────
+
+describe("identity: 同形字花名归一（v0.5.3 A11：西里尔同形字与真名撞同一把 name_taken 闸）", () => {
+  it("adj052 A11 攻击重放：victim 注册后，viсtim（с=U+0441）注册 → name_taken 指向同一绑定", async () => {
+    await writeSession(stateRoot, { sessionId: "sess-victim", cwd: workDir, startedAt: 1, lastSeen: Date.now() });
+    await writeSession(stateRoot, { sessionId: "sess-homoglyph", cwd: workDir, startedAt: 1, lastSeen: Date.now() });
+    await xcRegister(stateRoot, { name: "victim", sessionId: "sess-victim" }, nextConn());
+
+    const homoglyph = `vi${String.fromCodePoint(0x0441)}tim`; // viсtim
+    const taken = await errorPayload(() =>
+      xcRegister(stateRoot, { name: homoglyph, sessionId: "sess-homoglyph" }, nextConn()),
+    );
+    expect(taken.error).toBe("name_taken");
+    expect(taken.boundSessionId).toBe("sess-victim"); // 归一到真名的既有绑定
+
+    // 花名册里始终只有 victim 一个键（修复前 viсtim 以独立键并存）。
+    const team = (await readTeam(stateRoot, "default"))!;
+    expect(team.members.map((m) => m.key).sort()).toEqual(["victim"]);
+  });
+
+  it("全角同形（ｖｉｃｔｉｍ）同样撞闸；不同真名互不影响", async () => {
+    await writeSession(stateRoot, { sessionId: "sess-v", cwd: workDir, startedAt: 1, lastSeen: Date.now() });
+    await writeSession(stateRoot, { sessionId: "sess-f", cwd: workDir, startedAt: 1, lastSeen: Date.now() });
+    await writeSession(stateRoot, { sessionId: "sess-x", cwd: workDir, startedAt: 1, lastSeen: Date.now() });
+    await xcRegister(stateRoot, { name: "victim", sessionId: "sess-v" }, nextConn());
+
+    const fullwidth = String.fromCodePoint(0xff56, 0xff49, 0xff43, 0xff54, 0xff49, 0xff4d);
+    const taken = await errorPayload(() =>
+      xcRegister(stateRoot, { name: fullwidth, sessionId: "sess-f" }, nextConn()),
+    );
+    expect(taken.error).toBe("name_taken");
+
+    // 无关真名照常注册成功（归一只折叠形近字符，不扩大化）。
+    const ok = await xcRegister(stateRoot, { name: "小明", sessionId: "sess-x" }, nextConn());
+    expect(ok.sessionKey).toBe("xc:default:小明");
+  });
+});

@@ -1,6 +1,6 @@
 {
   "name": "zcode-crosschat",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "description": "Agent-team collaboration for independent ZCode sessions: a lead coordinates engine-provisioned teammate sessions, members self-start via prompt protocol, and a file mailbox remains the source of truth. v0.3 adds the cross-session peer axis: a machine-global peer registry, named-pipe transport, name-as-address addressing, and accept/hold/refuse inbound policy. v0.5 makes the lead a transferable metadata role, keeps user-spoken text verifiable end to end (origin=user), and bounds every injection surface by the receiver's declared context budget.",
   "description_i18n": {
     "en": "Lead-teammate collaboration across independent ZCode sessions plus a cross-session peer axis: machine-global peer registry, named-pipe transport, name-as-address addressing, accept/hold/refuse inbound policy, and structured attribution envelopes on every inbound peer message. v0.5: the lead is a transferable metadata role, user-spoken text stays verifiable end to end (origin=user), and every injection surface is bounded by the receiver's declared context budget.",
@@ -54,19 +54,19 @@
       "type": "file",
       "default": "",
       "title": "ZCode 可执行文件",
-      "description": "推送唤醒与成员供给用的 zcode 可执行文件绝对路径。留空时插件自动探测本机 zcode 安装（Windows；探测过程可在 xc_doctor 查看），仅探测失败时才需要手填（zcode 安装目录下的 ZCode.exe）。"
+      "description": "推送唤醒与成员供给用的 zcode 可执行文件绝对路径。留空时插件自动探测本机 zcode 安装（Windows；探测过程可在 xc_doctor 查看），仅探测失败时才需要手填（zcode 安装目录下的 ZCode.exe）。显式配置后即严格校验并按配置使用：路径不存在/不是 .exe 可执行文件时 xc_member_add 与推送唤醒显式报错（xc_doctor 出 WARNING），绝不静默回落自动探测、不建真实会话消耗额度（v0.5.3 起）。"
     },
     "zcode_cjs": {
       "type": "file",
       "default": "",
       "title": "zcode CLI 入口脚本",
-      "description": "与 zcode_exe 配套的 CLI 入口脚本绝对路径（通常为 zcode 安装目录下 resources\\<variant>\\zcode.cjs）。留空时随 zcode_exe 一并自动探测。"
+      "description": "与 zcode_exe 配套的 CLI 入口脚本绝对路径（通常为 zcode 安装目录下 resources\\<variant>\\zcode.cjs）。留空时从 zcode_exe 同目录推导（推导不到则显式报错要求手填）；与 zcode_exe 一并显式校验，无效即报错不回落（v0.5.3 起）。"
     },
     "max_members": {
       "type": "number",
       "default": 8,
       "title": "成员上限",
-      "description": "团队最大成员数（含 lead 之外的全部成员，removed 不计）。超限的 xc_member_add 被硬拒。对照 dsh-agent-teams maxMembers 默认 8。"
+      "description": "团队最大成员数（lead、供给失败(failed)与已停止(removed)的成员不计——上限只约束 provisioning/ready 的活成员；v0.5.3 起口径）。超限的 xc_member_add 被硬拒。对照 dsh-agent-teams maxMembers 默认 8。"
     },
     "member_model": {
       "type": "string",

@@ -5,7 +5,8 @@
  * - completed → 依赖解除：unblock-notice 入下游收件人邮箱 + 无开放任务时尝试唤醒
  *   （XC_WAKE_ENABLED=true 且未配 exe → spawn 同步失败 → engine.jsonl wake-failed 证明
  *   唤醒路径被走到；mailbox 兜底不丢消息）；
- * - failed → 不解除依赖；
+ * - v0.5.3（A3 修复）failed → 依赖死锁解除：闭包内 pending 下游自动置 cancelled
+ *   （history=dependency-deadlock）+ 创建者收 cancelled 回执 + 锁外唤醒；
  * - 清扫：超时且无在途 nonce 的开放任务被引擎重置 + 派发方收 stale-swept 回执；
  *   有在途 nonce 的成员被豁免；
  * - 永不抛出：基座错误信封原样透传、不触发边沿。
@@ -255,9 +256,9 @@ describe("withTaskEdges: xc_report completed → 依赖解除（E-b ②）", () 
     expect(wakeEvents).toHaveLength(0);
   });
 
-  it("failed 报告 → 下游保持阻塞（无 unblock-notice、无 edges 字段），快照仍刷新", async () => {
-    const core = makeCore();
-    const { t1 } = await seedChain(core);
+  it("v0.5.3（A3 修复）failed 报告 → 死锁下游自动解除：t2 置 cancelled + 创建者收回执 + edges.deadlocked", async () => {
+    const core = makeCore({ XC_WAKE_ENABLED: "true" }); // 未配 exe → spawn 失败 → wake-failed 证明走到唤醒
+    const { t1, t2 } = await seedChain(core);
     const attemptId = await claimAndStart(core, "conn-m1", t1);
     const res = unwrap(
       await core.xc_report(
@@ -265,10 +266,97 @@ describe("withTaskEdges: xc_report completed → 依赖解除（E-b ②）", () 
         "conn-m1",
       ),
     );
-    expect(res["edges"]).toBeUndefined();
+    // 无 unblock-notice（completed 专属）；有 deadlocked 边沿结果。
+    expect(res["edges"]).toBeDefined();
+    const deadlocked = ((res["edges"] as Record<string, unknown>)["deadlocked"] ?? []) as Array<Record<string, unknown>>;
+    expect(deadlocked).toHaveLength(1);
+    expect(deadlocked[0]).toMatchObject({ taskId: t2, createdBy: "a", deadlockedBy: t1 });
+
+    // 任务板：t2 = cancelled（history 记 dependency-deadlock，error 写明根因）。
+    const team = await mutateTeam(() => {});
+    const t2Task = team.tasks.find((x) => x.id === t2)!;
+    expect(t2Task.status).toBe("cancelled");
+    expect(t2Task.error).toContain("dependency-deadlock");
+    expect(t2Task.error).toContain(t1);
+    expect(t2Task.history.at(-1)).toMatchObject({ event: "dependency-deadlock", by: "engine" });
+
+    // 创建者（a）邮箱：cancelled 回执（cancelledBy=engine）。
+    const aBox = await readMailbox(stateRoot, "default", "a");
+    const receipts = aBox
+      .map((m) => JSON.parse(m.content) as Record<string, unknown>)
+      .filter((c) => c["type"] === "task-receipt" && c["taskId"] === t2);
+    expect(receipts).toHaveLength(1);
+    expect(receipts[0]).toMatchObject({ status: "cancelled", cancelledBy: "engine" });
+
+    // 唤醒路径被走到（scene=dependency-deadlock，to=创建者 a）。
+    const wakeFailed = readEngineEvents().filter((e) => e["event"] === "wake-failed");
+    expect(wakeFailed.some((e) => e["scene"] === "dependency-deadlock" && e["to"] === "a")).toBe(true);
+
+    // 解除审计 + 快照刷新。
+    expect(readEngineEvents().filter((e) => e["event"] === "dependency-deadlock" && e["taskId"] === t2)).toHaveLength(1);
+    expect(refreshCount()).toBeGreaterThanOrEqual(1);
+
+    // m2 邮箱里没有 unblock-notice（completed 专属），但派单还在（消息面不清理）。
     const box = await readMailbox(stateRoot, "default", "m2");
     expect(box.some((m) => m.content.includes('"unblock-notice"'))).toBe(false);
-    expect(refreshCount()).toBeGreaterThanOrEqual(1);
+  });
+
+  it("v0.5.3（A3 修复）传递闭包：t3 依赖 t2、t2 依赖 t1，t1 failed → t2/t3 一并解除", async () => {
+    const core = makeCore();
+    const { t1, t2 } = await seedChain(core);
+    const t3 = (unwrap(
+      await core.xc_dispatch({ to: "m2", title: "三级", prompt: "P", dependsOn: [t2] }, "conn-a"),
+    )["taskId"]) as string;
+    const attemptId = await claimAndStart(core, "conn-m1", t1);
+    const res = unwrap(
+      await core.xc_report({ taskId: t1, attemptId, status: "failed", error: "x" }, "conn-m1"),
+    );
+    const deadlocked = ((res["edges"] as Record<string, unknown>)["deadlocked"] ?? []) as Array<Record<string, unknown>>;
+    expect(deadlocked.map((d) => d["taskId"]).sort()).toEqual([t2, t3].sort());
+    const team = await mutateTeam(() => {});
+    expect(team.tasks.find((x) => x.id === t2)!.status).toBe("cancelled");
+    expect(team.tasks.find((x) => x.id === t3)!.status).toBe("cancelled");
+  });
+
+  it("v0.5.3（A3 修复）无下游的 failed → edges 无 deadlocked 字段（零成本路径）", async () => {
+    const core = makeCore();
+    await hookRegister(core, "conn-a", "a", "sess_a");
+    await hookRegister(core, "conn-m1", "m1", "sess_m1");
+    const t1 = (unwrap(await core.xc_dispatch({ to: "m1", title: "孤立单", prompt: "P" }, "conn-a"))["taskId"]) as string;
+    const attemptId = await claimAndStart(core, "conn-m1", t1);
+    const res = unwrap(
+      await core.xc_report({ taskId: t1, attemptId, status: "failed", error: "x" }, "conn-m1"),
+    );
+    expect(res["edges"]).toBeUndefined(); // swept/unblocked/deadlocked 全空 → 不追加 edges 块
+  });
+
+  it("v0.5.3（A3 修复）派发面：dependsOn 指向已 failed/cancelled 的任务 → invalid_params（生而死锁闸）", async () => {
+    const core = makeCore();
+    const { t1, t2 } = await seedChain(core);
+    // 先造一张 failed 上游：t1 failed（级联把 t2 也解除了）。
+    const attemptId = await claimAndStart(core, "conn-m1", t1);
+    unwrap(await core.xc_report({ taskId: t1, attemptId, status: "failed", error: "x" }, "conn-m1"));
+
+    const dead = await core.xc_dispatch({ to: "m2", title: "挂死上游", prompt: "P", dependsOn: [t1] }, "conn-a");
+    expect(dead.isError).toBe(true);
+    expect(payloadOf(dead)).toMatchObject({ error: "invalid_params" });
+    expect(JSON.stringify(payloadOf(dead))).toContain("dependency deadlock");
+
+    // cancelled 上游同闸：直接把一张单置 cancelled（xc_cancel 的级联解除在 lead-tools.test.ts），
+    // 再派依赖它的 → 派发面同样拒绝。
+    const t3 = (unwrap(await core.xc_dispatch({ to: "m1", title: "待取消", prompt: "P" }, "conn-a"))["taskId"]) as string;
+    await writeTeam(stateRoot, await mutateTeam((t) => {
+      const t3Task = t.tasks.find((x) => x.id === t3)!;
+      t3Task.status = "cancelled";
+    }));
+    const onCancelled = await core.xc_dispatch({ to: "m2", title: "挂取消上游", prompt: "P", dependsOn: [t3] }, "conn-a");
+    expect(onCancelled.isError).toBe(true);
+    expect(payloadOf(onCancelled)).toMatchObject({ error: "invalid_params" });
+
+    // 对照：pending/claimed 依赖照常放行（t2 已被级联取消，t3 也 cancelled —— 用新派的单）。
+    const t4 = (unwrap(await core.xc_dispatch({ to: "m1", title: "活上游", prompt: "P" }, "conn-a"))["taskId"]) as string;
+    const ok = await core.xc_dispatch({ to: "m2", title: "挂活上游", prompt: "P", dependsOn: [t4] }, "conn-a");
+    expect(ok.isError).toBeFalsy();
   });
 
   it("in_progress 心跳 → 无边沿动作但快照刷新（§7.3.1 机制 3「每单 report 至少一次」）", async () => {

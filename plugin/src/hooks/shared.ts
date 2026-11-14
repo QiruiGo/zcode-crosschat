@@ -35,9 +35,10 @@ import { readNames, namesBoundToSession, readSession, refreshSessionLastSeen } f
 import { readUnreadMailbox } from '../core/mailbox.js';
 import { withRegistryLock } from '../core/lock.js';
 import { logEngineEvent, type EngineEvent } from '../core/log.js';
-import { DEFAULT_TEAM_ID, type NameBindings, type TeamMessage } from '../core/types.js';
+import { DEFAULT_TEAM_ID, type NameBindings, type SessionRecord, type TeamMessage } from '../core/types.js';
 import {
   peerRootFromEnv as resolvePeerRoot,
+  readPeerBaseRecord,
   refreshPeerBaseRecord as refreshBase,
   writePeerBaseRecord as writeBase,
 } from '../core/peerdir.js';
@@ -149,17 +150,27 @@ export async function auditHookFailure(
  * SessionStart writes/refreshes; UserPromptSubmit refreshes lastSeen on every
  * prompt). Busy lock or missing session id -> skip silently: losing one
  * refresh is harmless, timing out the hook is not.
+ *
+ * v0.5.3（安全对-1/a6 修复）：SessionStart 路径（ensureRegToken=true）会在记录缺
+ * regToken 时铸造锚定令牌并随记录返回，调用方把它同步写进机器全局基记录并注入
+ * 本会话上下文。锁忙（超 2s）时返回 undefined——本回合拿不到令牌就不注入，
+ * 下次 SessionStart 再补，hook 永不因它失败。
  */
 export async function refreshSessionRegistration(
   stateRoot: string,
   sessionId: string,
   cwd: string,
-): Promise<void> {
+  options: { ensureRegToken?: boolean } = {},
+): Promise<SessionRecord | undefined> {
+  let upserted: SessionRecord | undefined;
   await withRegistryLock(
     stateRoot,
-    () => refreshSessionLastSeen(stateRoot, sessionId, { cwd }),
+    async () => {
+      upserted = await refreshSessionLastSeen(stateRoot, sessionId, { cwd, ensureRegToken: options.ensureRegToken });
+    },
     { waitMs: HOOK_LOCK_WAIT_MS },
   );
+  return upserted;
 }
 
 /**
@@ -224,13 +235,26 @@ export function readHookPermissionMode(stdin: HookStdin | undefined): 'bypass' |
   return 'prompting';
 }
 
-/** v0.3：写机器全局 peer 基记录（薄封装，落盘逻辑在 core/peerdir.ts）。 */
+/** v0.3：写机器全局 peer 基记录（薄封装，落盘逻辑在 core/peerdir.ts）。
+ *  v0.5.3（a6/a8）：记录形状放宽到含锚定令牌 regToken 与队内绑定标记 boundName。 */
 export async function writePeerBaseRecord(
   root: string,
-  record: { sessionId: string; cwd: string; permissionMode?: 'bypass' | 'prompting'; source: string | null; startedAt: number; lastSeen: number },
+  record: {
+    sessionId: string;
+    cwd: string;
+    permissionMode?: 'bypass' | 'prompting';
+    source: string | null;
+    startedAt: number;
+    lastSeen: number;
+    regToken?: string;
+    boundName?: string;
+  },
 ): Promise<void> {
   await writeBase(root, record);
 }
+
+/** v0.5.3（a6/a8）：读机器全局 peer 基记录（SessionStart 合并既有令牌/绑定标记用）。 */
+export { readPeerBaseRecord };
 
 /**
  * v0.3：刷新基记录的档类与 lastSeen（UserPromptSubmit 每次调用）。

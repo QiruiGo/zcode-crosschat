@@ -693,3 +693,102 @@ W3/W7 环节的记录（§8.4）提到「若同事最终导出的名字与签名
 - **红队二番战 19 项的端到端黑盒逐项复验未执行**（属复验环节职责，evidence/18-v052/reverify/ 监视区；本环节交付 = 跨组冲突检查 + 全量单测层自测 + v0.5.1 抽验 6+4 + R2-5 漏项补修 + 版本冻结 + README 核查 + 物化刷新）。
 - **发布环节未执行**（RELEASING §3-§6：pack-release、commit/tag/push、gh release；版本五处已对齐其断言口径）。
 - **安全对-1 残余边界**：受害者已死亡且与攻击者同工作区时锚定记录仍在，无法区分「复活的本人」与「小偷」——与 README 已知限制 12 威胁模型一致，修复组已如实声明，本环节未扩大。
+
+## 15. v0.5.3 安全组（a6/a8）修复交付（2026-11-14，安全一修复员）
+
+### 15.1 逐 bug 修复对照表（三番战 adj052 裁决编号 ↔ 修复 ↔ 防回归单测）
+
+| # | 裁决 id | 定级 | 缺陷 | 修复（文件） | 防回归单测 |
+|---|---|---|---|---|---|
+| 1 | 安全对-1（adj052 #6，a6） | P1 | (name, sessionId) 精确对重放冒充任意队内成员（xc_status 免注册读对 → 新连接 xc_register 命中幂等重绑 → 偷消费邮箱 / xc_lead_transfer 移走 lead / victim 零告警） | **注册身份锚定令牌 regToken**：SessionStart 钩子铸造（`core/registry.ts` refreshSessionLastSeen `ensureRegToken`，会话生命周期内稳定、--resume 回合延续）、注入本会话上下文并同步写两份锚定记录（workspace `registry/sessions/<sid>.json` + 机器全局 `peers/base/<sid>.json`，`hooks/session-start.ts` 合并保留 boundName）；`mcp/identity.ts` 重绑已绑定 (name,sid) 对必须出示与锚定记录一致的 regToken → `identity_token_required`。豁免三条：同连接幂等重试 / wakeToken 路径（一次性 nonce 即属主凭据）/ 升级前旧锚（放行 + warnings 披露，下次 SessionStart 即带令牌）；wake 代写与 xc_member_add 引擎预绑定（`mcp/member-tools.ts`）保留既有 regToken 不抹除。既有 name_taken / session_already_bound 闸先行触发、行为不变 | `mcp/identity-regtoken.test.ts`（新文件）12 例：精确对重放拒（含 a6 链路端到端：冒充者拒 → not_registered → 密信留在 victim 邮箱）、令牌错拒、令牌对成功（合法重连）、同连接幂等、旧锚放行+告警、wake 路径免令牌且令牌保留、name_taken/session_already_bound 不变、boundName 盖章（含基记录缺失补建）、不给 peerRoot 的向后兼容 |
+| 2 | 安全对-3（adj052 #8，a8） | P1 | xc_peer_register 不校验 sessionId 归属：(a) 任意花名 + 队内成员真 sid → 成功，from-session 可被 xc_status 交叉「验证」；(b) 全伪造 sid → 直接成功。README L267「peer 注册验 sessionId 归属」承诺落空 | **peer 轴归属三道闸**（`mcp/peer-tools.ts` register）：① session_id_in_use（活 peer 持有者，v0.5.2 语义先行不变）→ ② session_not_anchored（钩子基记录 `peers/base/<sid>.json` 缺失即拒——全伪造 sid 进不来）→ ③ identity_token_required（基记录 boundName 在册 = 该 sid 已被绑为队内身份（`mcp/identity.ts` 注册成功后盖章，跨工作区可见）⇒ 认领必须出示锚定令牌）。豁免：本进程幂等重认领（peer-1 语义）；基记录有 boundName 无 regToken 的升级前旧锚 → 放行 + 审计 `peer-ownership-unverified`（不静默）。未入队普通会话的 sid 不经任何工具面公开，不索令牌（兼容普通会话 peer 注册）。审计新事件：`peer-register-unanchored` / `peer-ownership-blocked` / `peer-ownership-unverified` | `mcp/peer-ownership.test.ts`（新文件）8 例：pghost 全伪造 sid 拒（a8-b 重放，注册表无残留）、普通锚定 sid 放行（档类来源 unknown 不变）、fakeboss 队内 sid 无令牌拒（a8-a 重放）、错令牌拒 / 对令牌成功、端到端（真实 xc_register 盖章 → peer 认领被拦）、活持有者仍 session_id_in_use（闸序不回退）、同进程幂等重认领不误伤、旧锚放行 + 审计留痕 |
+
+### 15.2 语义与承诺面同步
+
+- SessionStart 注入文案增补一行锚定令牌指引；`skills/crosschat/SKILL.md`（§1 身份与注册、工具表两行、§9 peer 注册）、`commands/xc-work.md`、README（xc_register / xc_peer_register 工具行、跨会话 quick-start 示例、v0.5.3 身份轴修复轮段落）与实现对齐。
+- 工具 schema：`xc_register` 与 `xc_peer_register` 各增可选 `regToken`（受保护路径必填，其余可不传——存量调用面零破坏）。
+- 残余边界（如实声明）：(a) 升级前旧锚在下次 SessionStart 前无令牌，重绑回落兼容路径（放行+告警），窗口自愈；(b) 威胁模型维持 README 已知限制 5/12——能读其他会话文件/上下文的同机进程超出纯 MCP API 防线（regToken 落锚定记录文件、注入会话上下文，均在「人/进程可直接读盘」边界内）。
+- adj052 原用例重放（v0.5.3 dist，2026-11-14）：a6 全链被闸（exact-pair-reregister → identity_token_required；impostor 邮箱/移 lead → not_registered；victim 密信保留、lead 未动）；a8 两形态被闸（fakeboss → identity_token_required、pghost → session_not_anchored、信封 0 条）；正向链（钩子铸令牌 → 新对注册 → 新连接带令牌重绑 → 队内 sid peer 注册带令牌成功/无令牌拒 → 普通 sid 免令牌）全绿。重放工作区：`_redteam-replay/adj052/`（harness 副本指向仓库 dist，evidence 原件未动）。
+
+## 16. v0.5.3 修复集成收口环节记录（2026-11-14，v0.5.3 集成工程师）
+
+红队三番战 13 项发现（`deepseek-crosschat/evidence/adversarial/adjudication/adj052/` + adj052 裁决段：**confirmed 12 / unconfirmed 1**——a1 stale 丢弃 3 轮按配方复现均未触发，保留观察；**P1×3 = a6/a7/a8，P2×3 = a2/a3/a12，P3×6 = a4/a5/a9/a10/a11/a13**）由四组修复员并行修复交付（43 个已跟踪文件修改 + 9 个新增源/测试文件）。本环节职责：跨组冲突检查、全量自测、v0.5.1+v0.5.2 防回退抽验（各 5 项）、版本递增、README/manifest 一致性核查、按物化规则刷新安装。
+
+### 16.1 逐 bug 修复对照表（三番战裁决编号 ↔ 修复 ↔ 防回归单测；a6/a8 详表见 §15.1）
+
+| # | 裁决 id | 定级 | 缺陷一句话 | 修复落点（文件） | 防回归单测 |
+|---|---|---|---|---|---|
+| a2 | 边界与-1 | P2 | 免注册 xc_status 对任意 teamId 无限刷出幽灵团队目录（写原语无清理路径） | `mcp/tools.ts` xc_status：团队不存在（team.json 未建）时不落 snapshot.json（查询零写副作用；有队后照常刷新） | `mcp/tools.test.ts`（新增快照零写断言） |
+| a3 | 边界与-3 | P2 | 上游 failed 后 dependsOn 下游 pending 永久死锁、零通知 | `core/graph.ts` `deadlockedDependents`（反向边 BFS）+ `mcp/task-edges.ts` `cascadeDependencyDeadlockLocked`（failed 边沿级联置 cancelled + 回执/唤醒）+ `mcp/lead-tools.ts` xc_cancel 同款级联 + `mcp/tools.ts` xc_dispatch 派发面拒绝终态依赖 | `core/graph.test.ts`、`mcp/task-edges.test.ts`、`mcp/lead-tools.test.ts` |
+| a4 | 并发与-1 | P3 | peer 活花名并发注册 4/4 全成功（无互斥、接管零留痕） | `mcp/peer-tools.ts` register/rename 全临界区纳入 `peerRegistryLockName` 文件锁（`XC_PEER_REGISTER_LOCK_WAIT_MS` 可配，默认 15s；锁内不做嵌套 touchPeerRecord——rename 改 read-merge-write） | `mcp/peer-round2.test.ts`（锁语义扩展） |
+| a5 | 故障注-1 | P3 | 显式 XC_ZCODE_EXE/CJS 无效时静默回落自动探测 → 真实 exe 建真会话烧额度 + 诊断误导 | `engine/zcode-locate.ts` `resolveExplicitSpawnPair`（任一非空即校验：存在性/普通文件/.exe 扩展名/成对配置/cjs 同目录推导；无效 → `configError`，绝不读缓存回落）+ `engine/provision.ts` spawn 前置硬拒 + `engine/wake.ts` 3.7 步 mailbox 降级带根因 + `mcp/doctor-tool.ts` WARNING | `engine/zcode-locate.test.ts`、`engine/provision-config-error.test.ts`（新）、`engine/wake.test.ts`、`mcp/doctor-tool.test.ts` |
+| a6 | 安全对-1 | **P1** | (name, sessionId) 精确对重放完全冒充任意队内成员 | 详表见 §15.1（regToken 锚定令牌） | `mcp/identity-regtoken.test.ts`（新，12 例） |
+| a7 | 安全对-2 | **P1** | U+200B 零宽字符嵌入信封标签绕过 forged 判定（伪造 lead+origin=user 透传） | `core/peerenvelope.ts`：`normalizeEnvelopeScan`（NFKC 归一 + 不可见格式字符剥离，只动扫描副本不改原文）+ 判定线补闭标签形态；队内域 `detectForgedTeamEnvelope` 同归一化 | `core/peerenvelope-zw.test.ts`（新：a7 攻击重放 + 变体 battery + 端到端 verified="false"） |
+| a8 | 安全对-3 | **P1** | peer 注册不校验 sessionId 归属（README L267 承诺落空） | 详表见 §15.1（peer 轴归属三道闸） | `mcp/peer-ownership.test.ts`（新，8 例） |
+| a9 | 安全对-4 | P3 | xc_idle completedTaskId 可引用他人任务/纯捏造 id，帧内状态任意填写 | `mcp/lead-tools.ts` xc_idle：unknown_task / not_task_owner 硬拒；自称状态与任务板矛盾（或 completed 无证据）→ 帧内 `integrityWarning` + 审计 | `mcp/idle-ownership.test.ts`（新） |
+| a10 | 安全对-5 | P3 | 磁盘篡改邮箱（手工编辑/陈旧备份回写）零告警原样消费 | `core/mailintegrity.ts`（新，哈希链 sidecar `<agent>.jsonl.int`，专用完整性锁）+ `core/mailbox.ts` appendMailbox 落链（fail-open：落链失败不阻断投递）+ `mcp/tools.ts` xc_check_inbox/xc_mail_read 双面对账：WARNING + `integrityViolations`/`integrity.status=tampered` 载荷 + 审计（检测+告警口径，不阻断；存量无链旧件 unverified 静默兼容） | `core/mailintegrity.test.ts`（新）+ `mcp/mail-integrity-face.test.ts`（新） |
+| a11 | 安全对-6 | P3 | 同形字名字（西里尔 с 混进 victim）绕过 name_taken 判重 | `core/sanitize.ts` `foldHomoglyphs`（TR39 混排混淆可反混淆子集 + 全角拉丁折回 ASCII；幂等，映射目标全 ASCII） | `core/sanitize.test.ts` |
+| a12 | 规模压-1 | P2 | max_members 计数把 lead 与 failed 成员计入（0 可用成员仍 team_at_member_cap） | `mcp/member-tools.ts` `countActiveMembers` 口径：仅 provisioning/ready 计入（lead/failed/removed 不计）+ plugin.json/README 配置行同步 | `mcp/member-cap-flow.test.ts`（新）+ `mcp/member-tools.test.ts` |
+| a13 | 规模压-2 | P3 | xc_status 摘要行 tasks= 显示窗口行数而非总数（运维误读规模） | `mcp/render.ts` `boardTotal`（摘要行恒为总数、窗口行数另列 shown=；固定面预算估算同步计入位数）+ `mcp/tools.ts` 两处传参 | `mcp/render.test.ts` + `mcp/tools.test.ts` |
+
+（a1 stale-drop 未复现保留观察：本轮无修复动作，监视区留待复验环节；`core/mailbox.ts` 的 stale 判定面本轮改动仅为 a10 落链包裹，判定语义未动。）
+
+### 16.2 跨组冲突检查
+
+四组改动按 `v0.5.3（<bug id> 修复）`注释标注归属，重叠公共面逐一审阅（git diff 逐文件）：
+
+- **`mcp/peer-tools.ts`（并发组 A4 × 安全组 a8 同函数重叠）**：注册临界区最终形态 = `withFileLock(peerRegistryLockName)` 包裹「单次扫描 → sid 归属三道闸 → 花名 claim → 端点起 → 记录/key 落盘 → 审计」全链（两闸与锁序语义相容：锁内只做无锁 IO）；rename 同锁、且规避了锁内嵌套 `touchPeerRecord` 自等死锁（改 read-merge-write，与 touch 合并语义同款）。**无语义矛盾**。
+- **`mcp/identity.ts`（a6 regToken × a8 盖章）**：注册成功后既做重绑属主校验又向 `peers/base/<sid>.json` 盖 boundName + regToken（令牌绝不凭空铸造——基记录缺令牌时保留既有值，防合法 peer 注册被锁死）。两改动在同一函数内顺序衔接、无冲突。
+- **`mcp/tools.ts`（a10 完整性 × A2 幽灵 × A3 依赖 × A13 摘要行）**：四处改动分布在不同工具实现内（xc_check_inbox/xc_mail_read/xc_status/xc_dispatch），互不触碰。
+- **`mcp/lead-tools.ts`（a9 idle × A3 cancel）**、**`engine/zcode-locate.ts`+`provision.ts`+`wake.ts`+`doctor-tool.ts`（A5 一致贯通）**、**`hooks/session-start.ts`+`shared.ts`（a6/a8 令牌铸造与基记录合并，boundName 保留防抹除）**：均为单组改动面，审阅无冲突。
+- typecheck 通过 + 952/952 全绿佐证装配层无机械冲突。
+
+### 16.3 全量自测（本环节亲跑，版本递增前后各跑一轮，结果一致）
+
+| # | 检查 | 命令 | 结果 |
+|---|---|---|---|
+| 1 | typecheck | `cd plugin && npm run typecheck` | **exit 0 零报错**（交付态与版本递增后各一轮） |
+| 2 | 全部单测 | `cd plugin && npm test` | **61 文件 / 952 例全绿**（版本递增后复跑同结果）。基线核对：v0.5.2 = 53 文件 / 824 例 → 交付态 +8 新文件 / +128 例 = 952，零删除 |
+| 3 | manifest 校验 | `ELECTRON_RUN_AS_NODE=1 ZCode.exe resources/glm/zcode.cjs plugins validate "<仓库路径>\plugin"` | `Plugin manifest is valid` |
+| 4 | 构建 | `cd plugin && npm run build` | `build ok`，5 产物齐；dist bundle `"0.5.3"` 命中 1 处、`"0.5.2"` 0 处 |
+
+### 16.4 版本递增（五处 + RELEASING「当前实例」，RELEASING §2；任务书口径「版本三处」按 pack-release.mjs 五处断言（L72-76）扩到五处齐改，沿 §14.4 先例）
+
+`plugin/.zcode-plugin/plugin.json` / `marketplace.json` / `plugin/package.json` / `plugin/package-lock.json`（根 + packages[""] 两处）/ `plugin/src/mcp/server.ts SERVER_VERSION` 全部 **0.5.2 → 0.5.3**（grep 复核五处均 0.5.3、manifest 残留 `"0.5.2"` 命中 0；`docs/RELEASING.md` 当前实例同步 `VER=v0.5.3`，前置基线行补 v0.5.3 当前值 61 文件/952 例）。README L24-25 的 Release 资产文件名（`zcode-crosschat-0.5.2-prebuilt-slim.tar.gz`）**保持不变**——它指向实际已发布的 0.5.2 资产，0.5.3 资产由发布环节（RELEASING §3-§6）打包时同步更新，此处提前改名会把用户指向不存在的资产。
+
+### 16.5 v0.5.1 + v0.5.2 防回退抽验（各 5 项重放，本环节对最终 dist 实跑）
+
+重放车：`deepseek-crosschat/evidence/18-v052/integration-replay/_lib` 原样复制到 `deepseek-crosschat/evidence/19-v053/integration-replay/_lib`（仅改 RV 根路径；原证据零覆写）；目标 = 仓库 `plugin/dist/mcp/server.mjs`（v0.5.3 构建）。抽验组合按任务书优先级（大帧/路径穿越/并发 busy/.bak 回滚/status 预算）+ 本轮改动高危面（peer-tools.ts register/rename 与 identity.ts 被 A4/a6/a8 重写，SEC-1/SEC-4/CONC-1 入选；mailbox.ts 被 a10 包裹，FI-1 入选）：
+
+| 抽验项 | 重放脚本 | 结果 |
+|---|---|---|
+| **v0.5.1-①** 路径穿越封堵（BND-1） | `case-01-bnd1.mjs` | **PASS**：6 个穿越载荷全部 `invalid_params`（`isError:true` ×6），磁盘零逃逸产物（ESCAPED-ARTIFACTS: []） |
+| **v0.5.1-②** 大帧自退出 + 超限显式拒（CONC-2） | `case-07-conc2.mjs` + `case-07b2-raw-capture.mjs` | **PASS**：9/10/12/24MiB 全部 delivered（inboxB 9,437,316/19,923,208/32,506,252/57,672,208 与 §14.5 逐位一致，alive exit=null）；34MiB → 显式 JSON-RPC `-32700`（33554432-byte 上限文案）2.24s 返回、同连接 doctor 自报 **0.5.3** 正常应答、stderr 0B（case-07 客户端对 id:null 拒帧显示 60s 超时为 harness 已知形态，§14.5 同款，权威口径以 raw-capture 为准） |
+| **v0.5.1-③** 并发 endpoint busy（CONC-3） | `case-08-conc3.mjs` N=9/N=7 | **PASS**：45/45 delivered 0 busy、35/35 delivered 0 busy；收方对账 45/45、35/35。**注（rig 适配非产品问题）**：v0.5.3 a8 锚定闸生效后，本脚本 8 个假 sid peer 首跑被 `session_not_anchored` 正确拒绝——这是新防线按设计工作；按裁决员「按钩子记录格式搭建状态」先例给 `_lib` 增补 `anchorPeerBase`（写 `peers/base/<sid>.json`，形状=钩子产物）后重跑即过 |
+| **v0.5.1-④** team.json 损坏自愈（FI-1，.bak last-known-good） | `case-09-12-faultinj.mjs` #9 段（+#10/#11/#12 附带） | **PASS**：.bak 存在 → 截断后自愈恢复 1740B、残损保全 665B、审计 ×3、恢复后 dispatch/claim 正常；无备份变体显式诊断。#10 孤儿披露+claim 拒 `orphan_task_reference`、#11 坏行 `1 unreadable line(s) skipped` 披露、#12 已读不重注入 全过 |
+| **v0.5.1-⑤** 批量消费窗口（SCALE-1'18，status 预算优先面） | `case-18-19-scale.mjs` #18 段 + `case-19b-scale2-paginate.mjs` | **PASS**：pull1 消费 27/300、17,500 字符、batchTruncated=true、三处指针；排空 300/300（13 轮，maxRespChars 17,574）；#19 分页拼回 600,016/600,016 shaMatch=true |
+| **v0.5.2-①** 陈旧 .bak 回滚硬拒（FI-1d） | `case-21-fi1d-stalebak.mjs`（本环节新写） | **PASS**：xc_status 披露 board/receipt contradiction + rolled back + 孤儿 t2；xc_claim 对回滚后 completed 任务 → `rollback_conflict`（message 含 "holds a completed receipt"）。首两轮 FAIL 为脚本自身场景缺陷（证据文件未创建被证据门拒 → t1 未 completed；跳过 in_progress 被 illegal_transition 拒），补齐后按裁决配方过——两处恰为 v0.5.1/v0.5.2 修复在正常工作的旁证 |
+| **v0.5.2-②** peer 注册 sessionId 归属（SEC-1/SEC-2） | `case-22-sec1-sidowner.mjs`（本环节新写） | **PASS**：受害者活进程注册后，攻击者携受害者 sid 注册 → `session_id_in_use` 显式拒（文案指引用自己的 hook 注入 sid）；名册无冒名行 |
+| **v0.5.2-③** 伪造信封判定线（SEC-4 三构造 + a7 零宽变体） | `case-23-sec4-envelope.mjs`（本环节新写） | **PASS**：完整闭对/带全属性闭对/裸开标签/10×U+200B 零宽嵌入 四构造全部 `verified="false"` + 强警告（载荷 envelopes=渲染块数组，判定面在块文本——首版断言误查 `forged` JSON 键修正后过） |
+| **v0.5.2-④** 规模 700 任务有界状态（SCALE-R2） | `case-24-scale-r2.mjs`（本环节新写） | **PASS**：700 任务 xc_status respChars=33,382（红队口径 285,273）、`boardTruncated{shown:54,total:700,offset:0,budgetChars:16000}`、摘要行 `tasks=700 shown=54`（v0.5.3 A13 真值化同屏可见） |
+| **v0.5.2-⑤** peer 改名扇出并行化（CONC-1） | 权威载体 `peer-round2.test.ts:350`（N=6 慢回应 peer ≈ 单次延迟，全量套件内跑过绿）+ `case-25-rename-sanity.mjs` 活检（本环节新写） | **PASS**：改名 10ms 完成、formerNames 留痕、外部 peer 经旧名寻址 delivered（活检首版自发自收被 `cannot_send_self` 正确拒绝，改外部寻址后过；10s 通知等待 = 单目标单次延迟，符合并行化不变量） |
+
+**抽验结论：10/10 全部通过，v0.5.1 与 v0.5.2 修复零回退。** 未抽验项的防回归由单测层承载（61 文件/952 例全绿）。重放脚本与日志落盘 `deepseek-crosschat/evidence/19-v053/integration-replay/`（scratch/logs；evidence 树其余部分零改动，`_lib` 的 `anchorPeerBase` 增补与 case-21~25 为本环节新增）。
+
+### 16.6 README/manifest 一致性核查（含集成补修三处，小错直接修纪律）
+
+- **manifest 一致性**：`plugin/.zcode-plugin/plugin.json`（version 0.5.3；zcode_exe/zcode_cjs/max_members/peer_max_queue_depth 等 userConfig 描述与实现逐条吻合——A5「显式配置严格校验不回落」、A12「lead/failed/removed 不计」均在插件描述声明）；`marketplace.json` version 0.5.3；`plugins validate` 通过（§16.3 #3）。
+- **README 工具行逐条对照实现**：xc_register（regToken + 同形字归一）/ xc_dispatch（终态依赖拒）/ xc_status（tasks=/shown= + 零写副作用）/ xc_claim（rollback_conflict）/ xc_peer_register（三道闸 + 注册表锁）/ xc_peer_rename（同锁）/ xc_cancel（死锁解除）/ zcode_exe/zcode_cjs（严格校验）/ max_members（新口径）——与 §16.1 修复逐条吻合。
+- **集成补修（README 承诺缺失三处，行为已在、文档未声明）**：①`xc_check_inbox` 行补邮箱哈希链完整性（a10）；②`xc_mail_read` 行补完整性复核与 `integrity.status=tampered`（a10）；③`xc_idle` 行补 completedTaskId 归属硬拒与 `integrityWarning`（a9）。**v0.5.3 修复轮段落由「身份轴 a6/a8」扩为 12 项全貌**（a1 保留观察如实注明；对照表引用指向 §16.1）。
+- **技能/命令面**：`SKILL.md`（§1 注册、工具表两行、§9 peer 注册三道闸）与 `commands/xc-work.md`（regToken 取钩子注入）由修复组更新，与本环节审阅一致；`xc_register` 对新对注册携带 regToken 无副作用（校验仅在重绑已绑定对时触发）。
+
+### 16.7 物化刷新（按 IMPLEMENTATION §9.3 物化规则，本环节实跑）
+
+`plugins marketplace update dev-zcode-crosschat`（快照刷新 → `Updated marketplace dev-zcode-crosschat (1 plugins)`）→ `plugins install zcode-crosschat@dev-zcode-crosschat` → **`Installed plugin zcode-crosschat@dev-zcode-crosschat (0.5.3) [enabled]`**（版本变化触发重新物化）→ `plugins list` 缓存路径 `…/cache/dev-zcode-crosschat/zcode-crosschat/0.5.3`（skills:1 commands:1 hooks:3 mcp:1）→ md5 比对：仓库 dist 5 产物（server.mjs `61cae680…` / wake-helper.mjs `45e14d27…` / hooks 3 件）与安装态**逐一相同**；缓存 `.zcode-plugin/plugin.json` md5 与仓库侧一致、version = **0.5.3**。未执行 `plugins uninstall`（v0.2 §2.4 事故先例：`--force` 清空 plugins.options 丢失 zcode_exe/zcode_cjs）。旧 0.5.2 缓存目录保留未动（多版本共存，宿主按安装版本取用）。
+
+### 16.8 本环节未执行项（如实声明）
+
+- **红队三番战 12 项的端到端黑盒逐项复验未执行**（属复验环节职责，evidence/19-v053/reverify/ 监视区；本环节交付 = 跨组冲突检查 + 全量单测层自测 + v0.5.1/v0.5.2 抽验各 5 + 版本递增 + README 核查 + 物化刷新）。三番战原用例的修复组自验重放已在各组交付记录（§15.2：a6/a8 全链绿 + `_redteam-replay/adj052/` 工作区）。
+- **发布环节未执行**（RELEASING §3-§6：pack-release、commit/tag/push、gh release、README 资产名定稿；版本五处已对齐其断言口径）。
+- **a1（stale-drop）保留观察**：裁决 3 轮未复现，本轮无修复动作；mailbox stale 判定语义未被本轮改动触及（仅 a10 落链包裹），回归风险由既有单测承载。
+- **对账残留说明**：任务书口径「48 文件」与实测「43 修改 + 9 新增 = 52」差异为口径统计时点不同（重放车等集成侧文件不计入修复组交付），不影响交付判定。

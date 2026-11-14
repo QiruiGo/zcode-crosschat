@@ -8,7 +8,7 @@
  * xc_member_add 流程（§6.1 七步）：
  *   1. lead 校验（not_lead）；2. 名校验（保留名 name_reserved / 重名 invalid_params，
  *      dsh tools.js:1206-1212 同序）；3. 名额（team_at_member_cap，dsh tools.js:1214-1215
- *      同文案同语义，removed 不计）；4. 锁内写 provisioning 记录（占名额防并发重复建）；
+ *      同语义；v0.5.3 A12 口径：lead/failed/removed 不计）；4. 锁内写 provisioning 记录（占名额防并发重复建）；
  *   5. 锁外供给（provision.ts 四步，失败 → state=failed+error + member_provision_failed，
  *      可同名重试）；6. registry→team 锁序内收尾（names.json 预绑定 issuedBy:"engine" +
  *      sessions/<sid>.json 代写 + roster state=ready）；7. 投产边沿 E-e：供给期间积压的
@@ -28,6 +28,7 @@
  * 邮箱作持久审计。
  */
 
+import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { attemptWake } from "../engine/wake.js";
@@ -35,7 +36,7 @@ import { bootstrapTimeoutFromEnv, provisionMember, ProvisionError } from "../eng
 import { LockBusyError, withRegistryThenTeamLocks, withTeamLock } from "../core/lock.js";
 import { logEngineEvent } from "../core/log.js";
 import { appendMailbox, createMessage, readUnreadMailbox } from "../core/mailbox.js";
-import { bindName, writeSession } from "../core/registry.js";
+import { bindName, readSession, writeSession } from "../core/registry.js";
 import { sanitizeKey } from "../core/sanitize.js";
 import { memberOpenTasks, readTeam, writeTeam } from "../core/teamstate.js";
 import {
@@ -94,9 +95,32 @@ export function maxMembersFromEnv(env: NodeJS.ProcessEnv, fallback = 8): number 
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
-/** 占名额的成员数：state!=="removed"（dsh tools.js:1214 同过滤；供给失败/provisioning 都占位）。 */
+/**
+ * 占名额的成员数（v0.5.3 A12 修复口径：**lead、failed、removed 均不计**）：
+ * 上限只约束真正占资源的活成员（provisioning/ready）——lead 是元数据角色、不占建员名额
+ * （plugin.json userConfig max_members「含 lead 之外的全部成员」的口径）；failed/removed
+ * 成员没有可用会话，占位会造成「0 个可用成员仍 team_at_member_cap」的运维死锁（红队 a12）。
+ */
 export function countActiveMembers(team: TeamState): number {
-  return team.members.filter((m) => memberState(m) !== "removed").length;
+  const lead = leadKeyOf(team);
+  return team.members.filter((m) => {
+    if (m.key === lead) return false;
+    const state = memberState(m);
+    return state !== "removed" && state !== "failed";
+  }).length;
+}
+
+/**
+ * 写入（新建/幂等重供给）后的占名额成员数（v0.5.3 A12 修复）：countActiveMembers
+ * 加上本次写入的净增量——新建、removed 重加、failed 重供给都是净 +1（failed 此前不计、
+ * 重供给后转 provisioning 占位）；停滞 provisioning 接管净 0（已在占位）。
+ */
+export function activeMembersAfterUpsert(team: TeamState, existing: TeamMember | undefined): number {
+  const stateBefore = existing !== undefined ? memberState(existing) : undefined;
+  return (
+    countActiveMembers(team)
+    + (stateBefore === undefined || stateBefore === "removed" || stateBefore === "failed" ? 1 : 0)
+  );
 }
 
 /** lead 判定（§6.1 step 1）：team.leadKey，未设置时 founder 视为 lead。 */
@@ -200,17 +224,18 @@ async function memberAdd(deps: ToolDeps, args: MemberAddArgs, me: BoundIdentity)
         message: `member "${key}" is being provisioned right now; retry after it turns ready/failed`,
       });
     }
-    // 名额：写入后的占名额成员数不得超上限（removed 重加/新建都净 +1；failed 重供给净 0）。
-    const activeAfter =
-      countActiveMembers(team)
-      + (existing !== undefined && memberState(existing) === "removed" ? 1 : 0)
-      + (existing === undefined ? 1 : 0);
+    // 名额：写入后的占名额成员数不得超上限。v0.5.3（A12 修复）口径：lead/failed/removed
+    // 不计（activeMembersAfterUpsert 同款）——新建、removed 重加、failed 幂等重供给都净 +1，
+    // 停滞 provisioning 接管净 0；此前 lead 与 failed 都被计入，max=2 时 0 个可用成员
+    // 仍 team_at_member_cap（运维死锁 + 与 manifest 口径矛盾）。
+    const activeAfter = activeMembersAfterUpsert(team, existing);
     if (activeAfter > maxMembers) {
       throw new ToolError({
         error: "team_at_member_cap",
         teamId: team.teamId,
         maxMembers,
-        message: `team "${team.teamId}" is at its member cap (${maxMembers}) (dsh tools.js:1214-1215 同文案同语义)`,
+        activeMembers: activeAfter,
+        message: `team "${team.teamId}" is at its member cap (${maxMembers}, active=${activeAfter}; lead/failed/removed 不计入) (dsh tools.js:1214-1215 同语义)`,
       });
     }
     const record: TeamMember = existing !== undefined
@@ -270,13 +295,19 @@ async function memberAdd(deps: ToolDeps, args: MemberAddArgs, me: BoundIdentity)
         registeredAt: readyAt,
         issuedBy: "engine",
       });
-      // sessions/<sid>.json 代写（identity.ts:162-163 wakeToken 路径同形态）。
+      // sessions/<sid>.json 代写（identity.ts wakeToken 路径同形态）。
+      // v0.5.3（a6）：代写不得抹掉钩子已写的锚定令牌——供给会话的 SessionStart 先于
+      // 欢迎回合运行（regToken 已在锚定记录里），这里全量重写必须保留它，否则该成员
+      // 的重绑属主校验退化为旧锚兼容路径。
+      const prebound = await readSession(stateRoot, result.sessionId);
       await writeSession(stateRoot, {
+        ...(prebound ?? {}),
         sessionId: result.sessionId,
         cwd: workspace,
-        startedAt: readyAt,
+        startedAt: prebound?.startedAt ?? readyAt,
         lastSeen: readyAt,
         boundName: plan.key,
+        regToken: prebound?.regToken ?? randomUUID(),
       });
       const team = await readTeam(stateRoot, me.teamId);
       if (team !== undefined) {

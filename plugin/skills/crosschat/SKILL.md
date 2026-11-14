@@ -18,7 +18,7 @@ description: 跨独立 zcode 会话的团队协作协议：队长（lead）拆�
 ## 1. 身份与注册
 
 - 每条 MCP 连接必须先 `xc_register` 绑定身份，之后所有需要身份的工具都**不需要也不能传 from/caller 参数**——身份一律取当前连接的绑定身份。
-- 交互会话的正常路径：SessionStart / UserPromptSubmit 钩子已把你的 sessionId 写入注册表并注入上下文。注册用 `xc_register({ "name": "<花名>", "sessionId": "<注入给你的 sid>" })`。
+- 交互会话的正常路径：SessionStart / UserPromptSubmit 钩子已把你的 sessionId 与**锚定令牌 regToken** 写入注册表并注入上下文。注册用 `xc_register({ "name": "<花名>", "sessionId": "<注入给你的 sid>", "regToken": "<注入给你的 regToken>" })`。重绑已绑定的 (name, sessionId) 对（换 MCP 连接重注册自己）时 `regToken` 必填——它只属于你的会话，不外传（v0.5.3）。
 - 花名用短小写英文（如 `a`、`b`、`builder`）；**`lead` 和 `default` 是保留名，不可使用**；同名或同 sid 已被绑定会被拒绝，换一个名字重试即可。
 - 被 `--resume` 无头唤醒的回合：唤醒 prompt 里会**显式给出你的 sid 与一次性 wakeToken**，注册时一并带上 `wakeToken`（每个被驱动的回合都要重新注册——这是正常现象，不是故障）。
 - `xc_status` 无需注册即可调用（只读观测）。
@@ -27,7 +27,7 @@ description: 跨独立 zcode 会话的团队协作协议：队长（lead）拆�
 
 | 工具 | 关键参数 | 说明 |
 |---|---|---|
-| `xc_register` | `name*`, `sessionId*`, `role?`(peer/worker), `wakeToken?` | 把当前连接绑定为一个协作身份并加入 default 队 |
+| `xc_register` | `name*`, `sessionId*`, `role?`(peer/worker), `wakeToken?`, `regToken?` | 把当前连接绑定为一个协作身份并加入 default 队；重绑已绑定对时 `regToken` 必填（v0.5.3） |
 | `xc_team_init` | `takeover?` | 使本会话成为队长（写 `team.leadKey`）；已有其他队长时返回 `lead_exists`，不得抢位；`{takeover:true}` 仅在用户明确指令时接管现任队长（旧队长被通知、全程审计） |
 | `xc_member_add` | `name*`, `model?`, `reasoningLevel?`, `note?` | （仅队长）由引擎程序化创建一个新成员会话并自动投产；受成员上限约束 |
 | `xc_member_stop` | `name*`, `reason?` | （仅队长）停止成员：不再被唤醒、开放任务收回待重派、花名保留可查 |
@@ -45,7 +45,7 @@ description: 跨独立 zcode 会话的团队协作协议：队长（lead）拆�
 
 | 工具 | 关键参数 | 说明 |
 |---|---|---|
-| `xc_peer_register` | `name*`, `sessionId*`, `displayName?`, `kind?`, `modeClass?` | 把本连接注册为跨会话 peer（名字即地址）；`modeClass` 仅在钩子基记录无档类时兜底 |
+| `xc_peer_register` | `name*`, `sessionId*`, `displayName?`, `kind?`, `modeClass?`, `regToken?` | 把本连接注册为跨会话 peer（名字即地址）；`modeClass` 仅在钩子基记录无档类时兜底；认领已绑定队内身份的 sid 时 `regToken` 必填（v0.5.3） |
 | `xc_peers` | `kind?` | 本机可寻址会话清单：`[self]` / `[member]` / `[session]` 三类行，带 cwd 与状态摘要 |
 | `xc_peer_send` | `to*`, `message*`, `summary?` | 给本机其他会话发信（`to` 可写 `名字 [ref]` 消歧）；回执六态 |
 | `xc_peer_inbox` | `limit?` | 拉取本会话待投递的 peer 消息（渲染成信封），拉取即消费 |
@@ -110,8 +110,8 @@ description: 跨独立 zcode 会话的团队协作协议：队长（lead）拆�
 队内协作（lead/成员）与跨会话 peer 是**两个独立机制**：队内邮箱在 `<workspace>/.crosschat/`，
 peer 通道在机器全局的 peer 注册表 + 命名管道里；两边的帧与回执互不通。
 
-1. **注册**：`xc_peer_register({ "name": "<短小写英文名>", "sessionId": "<注入给你的 sid>" })`。
-   名字就是地址（对齐 CC 的 "Names are the address"）；同名会被拒（先到者为准），换名重试。
+1. **注册**：`xc_peer_register({ "name": "<短小写英文名>", "sessionId": "<注入给你的 sid>", "regToken": "<注入给你的 regToken>" })`。
+   名字就是地址（对齐 CC 的 "Names are the address"）；同名会被拒（先到者为准），换名重试。sessionId 归属受三道闸校验（活冲突 / 无锚定 / 队内绑定 sid 验令牌，v0.5.3）——始终携带钩子注入的 regToken 可一闸不落。
 2. **发现**：`xc_peers` 列出本机所有可寻址会话（`[self]` / `[member]` / `[session]` 三类行），
    每行带 cwd 与状态摘要；**出现同名行时两行都带 `[ref]`**，发信要写完整的 `名字 [ref]`。
 3. **发信**：`xc_peer_send({ "to": "<名字>", "message": "<正文>", "summary": "<可选摘要>" })`。

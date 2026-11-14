@@ -115,8 +115,8 @@ npm install && npm run build
 本机上**互相独立**的会话（不必同工作区、不必同团队）直接互发消息，名字即地址：
 
 ```text
-（会话 A）xc_peer_register(name="alice", sessionId=<钩子注入的会话 id>)
-（会话 B）xc_peer_register(name="bob",   sessionId=<钩子注入的会话 id>)
+（会话 A）xc_peer_register(name="alice", sessionId=<钩子注入的会话 id>, regToken=<钩子注入的锚定令牌>)
+（会话 B）xc_peer_register(name="bob",   sessionId=<钩子注入的会话 id>, regToken=<钩子注入的锚定令牌>)
 
 （会话 A）xc_peers                    → 可寻址清单里有 alice / bob
 （会话 A）xc_peer_send(to="bob", message="……")
@@ -170,30 +170,30 @@ npm install && npm run build
 
 | 工具 | 作用 |
 |---|---|
-| `xc_register` | 把当前连接绑定为协作身份（支持无头唤醒回合的一次性令牌路径） |
-| `xc_dispatch` | 派发新任务（可带依赖 `dependsOn`） |
-| `xc_check_inbox` | 读取并消费自己邮箱的未读消息（单条与**批次**都按预算截断：单次只消费批次窗口内消息，其余保持未读并给「再调一次」指针；超大单条按预算截断并给分页指针） |
+| `xc_register` | 把当前连接绑定为协作身份（支持无头唤醒回合的一次性令牌路径）；重绑已绑定的 (name, sessionId) 对必须出示锚定令牌 `regToken`（v0.5.3 起，`identity_token_required`）——精确对可经 `xc_status` 公开读到，本身不是凭据；名字经同形字归一（v0.5.3 起）：西里尔/希腊字母中与拉丁形近的字符（с→c、ο→o 等）与全角拉丁折到对应拉丁字符后再判重——`viсtim` 与 `victim` 撞同一把 `name_taken` 闸；非形近字母（б г д ж、γ δ 等）原样保留，数学字母数字等其余混淆源不在归一范围 |
+| `xc_dispatch` | 派发新任务（可带依赖 `dependsOn`）；`dependsOn` 指向已 failed/cancelled 的任务时显式拒绝 `invalid_params`（v0.5.3 起——终态依赖永远无法满足，挂在其下的任务只会生而死锁） |
+| `xc_check_inbox` | 读取并消费自己邮箱的未读消息（单条与**批次**都按预算截断：单次只消费批次窗口内消息，其余保持未读并给「再调一次」指针；超大单条按预算截断并给分页指针）；投递时落邮箱哈希链（sidecar `<agent>.jsonl.int`，v0.5.3 起），消费面对链记录/正文哈希复核——磁盘篡改件照常返回但带显著 WARNING + `integrityViolations` 载荷并审计（不阻断消费） |
 | `xc_claim` | 原子认领 pending 任务，返回一次性 attemptId 凭证（prompt/acceptance 超预算时截断回显并给 `xc_task_read` 分页指针，真源全文不动）；任务看着 pending 但派发方邮箱已有其 completed 回执（真源被陈旧备份回滚/手工改坏）时硬拒 `rollback_conflict`（v0.5.2 起，防止已完成工作被静默重复执行） |
 | `xc_report` | 汇报 in_progress / completed（必须带证据）/ failed；每条证据文件必须真实存在、**位于工作区内**且 sha256 由工具现算复核（越界 → `evidence_path_outside_workspace`（v0.5.2 起），缺失 → `evidence_file_missing`，声称值不符 → `evidence_checksum_mismatch`，整单拒绝；缺省/显式 null 落现算值） |
 | `xc_message` | 成员间对等自由消息（可关联任务上下文；v0.5 支持 `forwardOf` 原文转发并保留作者溯源） |
-| `xc_status` | 任务板快照（免注册；任务 result/error 超预算截断并给 `resultTruncated`；任务板本身也按接收方声明预算开窗口（v0.5.2 起）——装不下时只呈现窗口前缀并给 `boardTruncated{shown,total,offset,budgetChars}`，用 `xc_status({offset})` 分页续读，`snapshot.json` 落盘仍全量；`history:true` 附 lead 变更史，超预算同样窗口化并给 `leadHistoryTruncated`；真源被陈旧备份回滚时在此强制披露 `staleCompletedReceipts`/`stateRecovery` 与 WARNING 行（v0.5.2 起）——`xc_claim` 对矛盾任务回 `rollback_conflict`） |
-| `xc_mail_read` | 只读分页器：读自己邮箱历史件全文（含已消费），单次 ≤64k 字符 |
+| `xc_status` | 任务板快照（免注册；任务 result/error 超预算截断并给 `resultTruncated`；任务板本身也按接收方声明预算开窗口（v0.5.2 起）——装不下时只呈现窗口前缀并给 `boardTruncated{shown,total,offset,budgetChars}`，用 `xc_status({offset})` 分页续读，`snapshot.json` 落盘仍全量；摘要行 `tasks=` 恒为任务总数、窗口行数另列 `shown=`（v0.5.3 起）；`history:true` 附 lead 变更史，超预算同样窗口化并给 `leadHistoryTruncated`；真源被陈旧备份回滚时在此强制披露 `staleCompletedReceipts`/`stateRecovery` 与 WARNING 行（v0.5.2 起）——`xc_claim` 对矛盾任务回 `rollback_conflict`；查询零写副作用（v0.5.3 起）：团队不存在时只回 `phase:none` 不落盘，不建目录） |
+| `xc_mail_read` | 只读分页器：读自己邮箱历史件全文（含已消费），单次 ≤64k 字符；读取面对邮箱哈希链复核（v0.5.3 起）——篡改件带 WARNING 且载荷 `integrity.status=tampered`（附原因），存量无链记录旧件静默兼容（`unverified`） |
 | `xc_task_read` | 只读分页器：读 team.json 任务 result/error/prompt 字段全文 |
 | `xc_team_init` | 立队为 lead；已有其他队长时返回 `lead_exists`（载荷附现任 lead 的 sessionId）；`{takeover:true}` 仅限用户明确指令时接管 |
 | `xc_lead_transfer` | （现任 lead）把 lead 角色移交给另一在册成员——元数据角色，任务/邮箱/注册不动 |
 | `xc_lead_release` | （现任 lead）卸任：团队回到无显式 lead 的对等态，派发/认领/消息照常 |
 | `xc_member_add` | （队长）程序化建成员：建会话→设模型→欢迎回合自注册→投产（可带 `context` 声明该成员上下文字符数） |
 | `xc_member_stop` | （队长）停止成员：开放任务收回池 + 回执 + 停机通知 |
-| `xc_idle` | 成员无活可领时通知队长（无显式 lead 时回落 founder） |
-| `xc_cancel` | （队长/任务创建者）取消任务并回执 |
+| `xc_idle` | 成员无活可领时通知队长（无显式 lead 时回落 founder）；`completedTaskId` 必须引用**存在且属于调用者**的任务（未知 → `unknown_task`、他人任务 → `not_task_owner`，v0.5.3 起硬拒）——帧自称完成状态与任务板矛盾（状态不符或自称 completed 而板上无证据）时帧内附 `integrityWarning` 供 lead 核对 |
+| `xc_cancel` | （队长/任务创建者）取消任务并回执；取消后其依赖闭包内的 pending 下游自动解除（置 cancelled，v0.5.3 起）——引擎回执/唤醒各下游创建者，依赖死锁不再无声永久阻塞；`xc_report` failed 同款自动解除 |
 | `xc_inbound_review` | 审查队内 hold 隔离箱：accept / discard |
-| `xc_peer_register` | 把本连接注册为跨会话 peer（可带 `contextChars` 声明上下文字符数） |
+| `xc_peer_register` | 把本连接注册为跨会话 peer（可带 `contextChars` 声明上下文字符数）；sessionId 归属三道闸（v0.5.3 起完整落地）：活冲突 `session_id_in_use`、无锚定 `session_not_anchored`（钩子基记录缺失即拒，全伪造 sid 进不来）、已绑定队内身份的 sid 必须出示锚定令牌 `regToken`（`identity_token_required`）；花名 claim→落盘在机器全局注册表锁内串行（v0.5.3 起）——并发注册同名时恰好一个成功、其余显式 `name_taken`（拒名带 `peer-name-taken-refused` 审计；锁超时给结构化 `busy`），不再出现同名多持有 |
 | `xc_peers` | 本机可寻址会话清单（免注册；清单行按接收方声明预算开窗口（v0.5.2 起），装不下时给 `rowsTruncated{shown,total,offset,budgetChars}` 并用 `xc_peers({offset})` 分页续读） |
 | `xc_peer_send` | 给本机其他会话发信（用户亲述经盖章链可携带 origin=user 权威标记；`forwardOf` 原文转发保留溯源）；回执 delivered/held/refused 等——`dropped` 等非送达终态时摘要行如实改口为「未投递」并附原因与恢复动作（v0.5.2 起，不再自称「已投递」） |
 | `xc_peer_inbox` | 拉取本会话待投递的 peer 消息（信封按接收方注入预算排布），**只消费预算窗口内的到达序前缀**（v0.5.2 起）：窗口外消息保持待投递（留在队列），`remaining` 字段与摘要行「再调一次 xc_peer_inbox 继续拉取」指针照常；单条超预算时保底消费一条并做单条截断 + `xc_peer_read` 指针，响应内不再出现「已省略（超注入预算）」占位符 |
 | `xc_peer_read` | 只读分页器：读某条收到的跨会话消息全文（截断指针的取回通道） |
 | `xc_peer_review` | 跨会话 hold 隔离区审阅（list / accept / discard；操作**本会话**的隔离区——需先 `xc_peer_register`，注册是连接与 sessionId 的绑定方式；未注册调用显式 `not_registered`）；暂存件损坏（不可解析）时摘要行披露 `corrupted N 条`（v0.5.2 起，不再静默当空暂存区） |
-| `xc_peer_rename` | 改名：旧名仍是可寻址别名 |
+| `xc_peer_rename` | 改名：旧名仍是可寻址别名；与注册同一互斥临界区（v0.5.3 起）——并发改名到同一活名恰好一个成功，其余 `name_taken`（同款拒名审计） |
 | `xc_agents` | 只读观测面板数据源：peers + 成员 + 任务概览 + 入站策略（peers 行按接收方声明预算开窗口（v0.5.2 起），装不下时给 `peersTruncated{shown,total,budgetChars}`，完整清单用 `xc_peers` 续读） |
 | `xc_doctor` | 只读体检：插件版本、运行时、自动探测到的 zcode 路径与探测尝试线索；探测失败时它会告诉你该填什么 |
 
@@ -204,9 +204,9 @@ npm install && npm run build
 | 配置 | 默认 | 说明 |
 |---|---|---|
 | `wake_enabled` | `false` | 推送唤醒总开关。开启后，派发/回传在目标**无人值守**时用无头回合唤醒目标会话（fire-and-forget，失败自动回落邮箱投递）。团队自动开工必须开启；默认关闭以保护正被桌面持有的会话。 |
-| `zcode_exe` | 空 | 推送唤醒与成员供给用的 zcode 可执行文件绝对路径。**留空 = 自动探测本机安装**（Windows）；探测失败时才需要手填（zcode 安装目录下的 `ZCode.exe`），`xc_doctor` 可查看探测线索。 |
-| `zcode_cjs` | 空 | 与 `zcode_exe` 配套的 CLI 入口脚本绝对路径（通常为 zcode 安装目录下 `resources\<variant>\zcode.cjs`）。留空时随 `zcode_exe` 一并自动探测。 |
-| `max_members` | `8` | 团队最大成员数（已停止的成员不计）。超限的 `xc_member_add` 被硬拒。 |
+| `zcode_exe` | 空 | 推送唤醒与成员供给用的 zcode 可执行文件绝对路径。**留空 = 自动探测本机安装**（Windows）；探测失败时才需要手填（zcode 安装目录下的 `ZCode.exe`），`xc_doctor` 可查看探测线索。**显式配置后即严格校验并按配置使用**（v0.5.3 起）：路径不存在/不是 `.exe` 可执行文件时 `xc_member_add` 与推送唤醒显式报错（`xc_doctor` 出 WARNING），绝不静默回落自动探测、不建真实会话消耗额度。 |
+| `zcode_cjs` | 空 | 与 `zcode_exe` 配套的 CLI 入口脚本绝对路径（通常为 zcode 安装目录下 `resources\<variant>\zcode.cjs`）。留空时从 `zcode_exe` 同目录推导（推导不到则显式报错要求手填）；与 `zcode_exe` 一并显式校验，无效即报错不回落（v0.5.3 起）。 |
+| `max_members` | `8` | 团队最大成员数（**lead、供给失败(failed)与已停止(removed)的成员不计**——上限只约束 provisioning/ready 的活成员；v0.5.3 起口径）。超限的 `xc_member_add` 被硬拒。 |
 | `member_model` | 空 | 新建成员会话的模型 id（如 `glm-5.3-flash`）。留空 = 引擎从可用模型表自动选第一个——它可能是当前账号不可用的模型；若建员因模型失败，失败回执会给出可选模型与填写指引，届时再填本项即可。 |
 | `member_provider` | 空 | 成员模型的 providerId。留空时按枚举表自动匹配。 |
 | `member_reasoning` | `max` | 成员会话的推理档位。 |
@@ -265,6 +265,8 @@ Release 资产下载失败可换时间重试；或用实测更稳的源码压缩
 **v0.5.1 修复轮**（2026-11-13；红队对抗裁决与逐项复现证据：`deepseek-crosschat/evidence/adversarial/adjudication.md`）：红队 19 项中 18 项 confirmed 缺陷全部修复，每项配防回归单测（裁决编号 ↔ 修复 ↔ 单测对照表见 [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md) §12.1）。要点：`xc_status.teamId` 路径穿越封堵；peer 轴 hold→accept 放行修复（假成功黑洞）；completed 证据门硬化（文件存在性 + sha256 现算复核）；team.json 损坏自愈（.bak 镜像）与重置告警 + 任务 id 纪元前缀；坏行/已读重注入治理；不可解析残留锁自愈；僵尸任务周期清扫兑现（`stale_task_minutes`）；大帧守卫（stdio 32 MiB 显式拒收不杀进程）；批次注入预算接入 `xc_check_inbox` 与 `xc_claim`；peer 端点并发上限提到 128（fan-in 突发不再 busy）；保留名注册与 `xc_member_add` 统一。基线 48 文件 / 758 例全绿。
 
 **v0.5.2 修复轮**（2026-11-14；红队二轮对抗裁决与逐项复现证据：`deepseek-crosschat/evidence/adversarial/adjudication/adj051-round2.md`）：二轮 21 项中 19 项 confirmed（去重后）缺陷全部修复，每项配防回归单测（裁决编号 ↔ 修复 ↔ 单测对照表见 [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md) §14.1）。要点：**快照/观测面接入注入预算**（`xc_status` 任务板与 lead 史、`xc_peers` 清单行、`xc_agents` peers 行分页指针 `boardTruncated`/`rowsTruncated`/`peersTruncated`）；**peer 队列上限 64→1024** 并可配（`peer_max_queue_depth`），非送达回执摘要行如实改口并附恢复动作；**`xc_peer_inbox` 只消费预算窗口**（窗口外留在队列，不再「消费即省略」）；peer 重复注册幂等重认领、死花名接管留痕（`peer-name-reclaimed`）、保留名与自发禁令对齐队内轴、改名通知并行化（不再随在线数线性恶化）；**peer 注册验 sessionId 归属**（冒充与 sid 碰撞黑洞同一道闸）+ 盖章前活性/锚定双验证；伪造信封判定线前移（夹带信封标签即 `forged`）、`forwardOf` 所有权硬校验；陈旧 .bak 回滚的双重披露与 `xc_claim` 回滚矛盾硬拒、锁路径被目录占用自愈、审计不可写降级披露、暂存件损坏披露、高并发锁打开冲突重试吸收（EPERM 不再抛 internal）；completed 证据路径工作区遏制（v0.5.2 起，`evidence_path_outside_workspace`）。1 项未复现（并发注册争抢 registry 锁 EPERM）按同族失败模式顺带加固（registry 锁与 team 锁同路径重试吸收）。基线 53 文件 / 824 例全绿。
+
+**v0.5.3 修复轮（身份轴 + 状态机/观测面收尾）**（2026-11-14；红队三番战 12 项 confirmed 裁决与逐项复现证据：`deepseek-crosschat/evidence/adversarial/adjudication/adj052/`，a1 stale 丢弃 3 轮未复现保留观察）：**注册身份锚定令牌（regToken）**——(name, sessionId) 对可经 `xc_status` 免注册读到，本身不是凭据；SessionStart 钩子现铸造每会话锚定令牌并只注入本会话上下文（两份锚定记录 `registry/sessions/<sid>.json` 与机器全局 `peers/base/<sid>.json` 各存一份）。队内轴：重绑已绑定的 (name, sid) 精确对必须出示令牌（`identity_token_required`），精确对重放冒充（偷消费邮箱 / `xc_lead_transfer` 移走 lead / 零告警，a6）就此堵死；同连接幂等重试、wakeToken 路径（一次性 nonce 即属主凭据）与升级前旧锚（放行 + 告警披露，下次 SessionStart 即带令牌）豁免。peer 轴：sessionId 归属三道闸完整落地（活冲突 `session_id_in_use` → 无锚定 `session_not_anchored`（全伪造 sid 拒绝）→ 已绑定队内身份的 sid 须验令牌 `identity_token_required`（a8 的 (name, sid) 冒充与交叉「验证」堵死））；队内注册成功后自动在基记录盖 `boundName` 队内绑定标记（跨工作区可见），未入队的普通会话 sid 不受令牌闸影响。**同轮其余修复**：伪造信封判定线升级到 NFKC 归一 + 不可见格式字符剥离副本上扫描（U+200B 零宽嵌入标签不再致盲判定，a7；补闭标签形态，fail-closed 声明见工具注释）；`xc_idle` completedTaskId 归属/存在硬拒 + 帧板矛盾 `integrityWarning`（a9）；邮箱哈希链完整性（`<agent>.jsonl.int` sidecar）——`xc_check_inbox`/`xc_mail_read` 对篡改件 WARNING + 载荷披露 + 审计（a10，检测+告警口径）；名字同形字归一（a11，见 `xc_register` 行）；无效显式 zcode_exe/zcode_cjs 配置显式报错不回落不建真会话（a5）；xc_status 幽灵团队目录（免注册无限刷目录写原语）封堵——查询零写副作用（a2）；终态依赖死锁引擎自动解除（`xc_dispatch` 派发面拒绝 + failed/cancelled 边沿级联置 cancelled + 回执/唤醒，a3）；peer 花名并发注册/改名注册表锁互斥（a4）；`max_members` 计数口径 lead/failed/removed 不计（a12）；xc_status 摘要行 `tasks=` 真值化（a13）。每项修复配防回归单测（含 a6/a8 攻击重放用例：`src/mcp/identity-regtoken.test.ts`、`src/mcp/peer-ownership.test.ts`；a7 用例 `src/core/peerenvelope-zw.test.ts`；a10 用例 `src/core/mailintegrity.test.ts` + `src/mcp/mail-integrity-face.test.ts`；其余见 [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md) §16.1）。基线 61 文件 / 952 例全绿。
 
 更长的工程细节（平台边界、验收期缺陷修复记录、未确认项）见 [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md) 与 [docs/DESIGN-V0.2.md](docs/DESIGN-V0.2.md) / [docs/DESIGN-V0.3.md](docs/DESIGN-V0.3.md) / [docs/DESIGN-V0.5.md](docs/DESIGN-V0.5.md)。
 

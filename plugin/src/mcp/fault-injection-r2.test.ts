@@ -30,6 +30,7 @@ import { readTeam, teamRecoveryWarning, writeTeam } from "../core/teamstate.js";
 import { engineLogFile, lockFile, teamBackupFile, teamFile } from "../core/paths.js";
 import { acquireFileLock } from "../core/lock.js";
 import { auditDegradation, auditDegradationWarning, logEngineEvent } from "../core/log.js";
+import { writePeerBaseRecord } from "../core/peerdir.js";
 import { renderReviewSummary } from "./peer-tools.js";
 import {
   holdPeerMessage,
@@ -324,6 +325,8 @@ describe("故障注-4 held 暂存件损坏披露（FI-4 二番战）", () => {
         } as NodeJS.ProcessEnv,
       };
       const services = createDefaultPeerServices(deps);
+      // v0.5.3（a8）：peer 注册新锚定闸——先落钩子基记录。
+      await writePeerBaseRecord(root, { sessionId: "sess-r2", cwd: join(root, "ws"), source: "startup", startedAt: Date.now(), lastSeen: Date.now() });
       const registered = await services.register({ name: "r2review", sessionId: "sess-r2" });
       const heldDir = join(root, "held", registered.sessionId);
       await holdPeerMessage(root, registered.sessionId, { msgId: "m-corrupt", from: "bob", text: "hi", ts: 1 }, "repo-setting");

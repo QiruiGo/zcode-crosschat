@@ -216,3 +216,46 @@ describe("render: renderStatusTable 双形态（v0.1.0 回归锁定 + v2 升级�
     expect(text).toContain("Engine: wake=on maxMembers=8 inbound=accept");
   });
 });
+
+// ---------------------------------------------------------------------------
+// v0.5.3（A13 修复）：摘要行 tasks= 恒为任务总数，窗口行数另列 shown=
+// （红队 a13：201 单派发后摘要行 tasks=53 —— 显示的是注入窗口行数而非总数，
+//   真值只能从 JSON boardTruncated.total 挖；修复后 tasks=201 shown=53。）
+// ---------------------------------------------------------------------------
+
+describe("render: 摘要行 tasks=总数 shown=窗口行数（A13 修复）", () => {
+  it("boardTotal > tasks.length（窗口化）→ 摘要行 tasks=<total> shown=<窗口行数>", () => {
+    const text = renderStatusTable({ ...snapshot(), boardTotal: 201 });
+    const first = text.split("\n")[0]!;
+    expect(first).toContain("tasks=201");
+    expect(first).toContain("shown=2");
+    expect(first).not.toContain("tasks=2 "); // 不得再显示窗口行数当任务规模
+  });
+
+  it("v2 全景形状同样生效（xc_status 实际路径）", () => {
+    const text = renderPanorama({ ...panoramaSnapshot(), boardTotal: 1001, tasks: panoramaSnapshot().tasks.slice(0, 1) });
+    const first = text.split("\n")[0]!;
+    expect(first).toContain("tasks=1001");
+    expect(first).toContain("shown=1");
+    expect(first).toContain("members=5");
+  });
+
+  it("未窗口化（无 boardTotal）→ 输出与旧形态逐字符一致（回归锁定）", () => {
+    const before = renderStatusTable(snapshot());
+    const text = renderStatusTable(snapshot());
+    expect(text).toBe(before);
+    expect(text.split("\n")[0]).toContain("tasks=2");
+    expect(text).not.toContain("shown=");
+  });
+
+  it("boardTotal === tasks.length → 不出现 shown=（无窗口化语义）", () => {
+    const text = renderStatusTable({ ...snapshot(), boardTotal: 2 });
+    expect(text.split("\n")[0]).toContain("tasks=2");
+    expect(text).not.toContain("shown=");
+  });
+
+  it("offset>0 的中段页（窗口行数<总数）→ tasks=总数 shown=本页行数", () => {
+    const text = renderStatusTable({ ...snapshot(), boardTotal: 150 });
+    expect(text.split("\n")[0]).toContain("tasks=150 shown=2");
+  });
+});

@@ -45,6 +45,7 @@ import { sanitizeKey } from "../core/sanitize.js";
 import { DEFAULT_TEAM_ID, MAX_LEAD_HISTORY, TERMINAL_TASK_STATUSES, memberState } from "../core/types.js";
 import type { LeadHistoryEntry, MemberState } from "../core/types.js";
 import { getTask, newTeamState, readTeam, transitionTask, writeTeam } from "../core/teamstate.js";
+import { cascadeDependencyDeadlockLocked } from "./task-edges.js";
 import { attemptWake } from "../engine/wake.js";
 
 /** v1 单队固定 default（DESIGN §2.2）。 */
@@ -282,6 +283,9 @@ export function createLeadToolCore(deps: ToolDepsLike): LeadToolCore {
      * xc_idle（E-c 空闲边沿，§5.1/§5.3）：写 idle-notification 帧入 lead 邮箱 +
      * 唤醒 lead。唤醒门控（R1 修复）：调用者自身 roster state ∈ {provisioning,
      * failed} → 只入箱不唤醒。欢迎回合不发 idle 是守则纪律（§6.2 ③），工具不拦。
+     * v0.5.3（安全对-4 a9 修复）：completedTaskId 必须存在且属于调用者
+     * （unknown_task / not_task_owner 硬拒）；帧自称的完成状态与任务板矛盾或
+     * completed 无证据时帧内附 integrityWarning（lead 侧机器可读告警+审计）。
      */
     async xc_idle(args, connectionKey) {
       return runLeadTool(async () => {
@@ -310,6 +314,45 @@ export function createLeadToolCore(deps: ToolDepsLike): LeadToolCore {
           // memberState = W2 访问器，v0.1.0 旧花名缺 state → "ready"，§6.5）。
           const mine = team.members.find((m) => m.key === me.agentKey);
           const mailboxOnly = mine !== undefined && blocksWake(memberState(mine));
+          // v0.5.3（安全对-4 三番战 a9 修复）：completedTaskId 任务归属校验。
+          // adj052 实测：任意成员可携他人任务 id 或纯捏造 id 发 idle 帧，帧内
+          // completedStatus/result 全为调用者任意填写、无任何校验直投 lead 邮箱
+          // （误导 lead 模型）。堵法（保持帧协议可用）：
+          //   ① completedTaskId 非空 → 任务必须存在（unknown_task 硬拒）；
+          //   ② 且必须属于发送者（assignee === 调用者，not_task_owner 硬拒）——
+          //     idle 语义是「我刚做完自己的活」，引用他人任务即冒认他人成果；
+          //   ③ 帧自称 completedStatus 但任务板对不上（状态不符，或自称 completed
+          //     而板上无证据）→ 帧内附 integrityWarning + 审计（不硬拒：状态串
+          //     自由文本、板/帧时序有合法窗口，但 lead 拿到机器可读的矛盾提示，
+          //     不再只靠守约自觉核对）。
+          let integrityWarning: string | undefined;
+          const claimedTaskId = args.completedTaskId !== undefined && args.completedTaskId.trim() !== ""
+            ? args.completedTaskId
+            : undefined;
+          if (claimedTaskId !== undefined) {
+            const task = getTask(team, claimedTaskId);
+            if (task === undefined) {
+              throw new ToolError({
+                error: "unknown_task",
+                taskId: claimedTaskId,
+                message: `idle frame references unknown task "${claimedTaskId}"; completedTaskId must be an existing task on the team board`,
+              });
+            }
+            if (task.assignee !== me.agentKey) {
+              throw new ToolError({
+                error: "not_task_owner",
+                taskId: task.id,
+                assignee: task.assignee,
+                message: `task ${task.id} is not yours (assignee=${task.assignee ?? "null"}); idle completedTaskId must reference a task assigned to you`,
+              });
+            }
+            if (args.completedStatus !== undefined && args.completedStatus.trim() !== ""
+              && (task.status !== args.completedStatus
+                || (args.completedStatus === "completed" && task.evidence.length === 0))) {
+              integrityWarning =
+                `task ${task.id} board status="${task.status}" with ${task.evidence.length} evidence item(s) does not back the idle frame's claimed status "${args.completedStatus}" — verify with xc_status/xc_task_read before trusting`;
+            }
+          }
           // idle-notification 帧（§5.3 契约，字段逐一对应 CC idle_notification 结构）。
           const frame = JSON.stringify({
             type: "idle-notification",
@@ -317,10 +360,11 @@ export function createLeadToolCore(deps: ToolDepsLike): LeadToolCore {
             from: me.agentKey,
             idleReason: args.idleReason ?? "no-claimable-task",
             summary,
-            completedTaskId: args.completedTaskId ?? null,
+            completedTaskId: claimedTaskId ?? null,
             completedStatus: args.completedStatus ?? null,
             failureReason: args.failureReason ?? null,
             result: args.result ?? null,
+            ...(integrityWarning !== undefined ? { integrityWarning } : {}),
           });
           const message = createMessage(me.agentKey, to, frame, { deliveryClaimedAt: Date.now() });
           await appendMailbox(stateRoot, me.teamId, to, message);
@@ -329,6 +373,7 @@ export function createLeadToolCore(deps: ToolDepsLike): LeadToolCore {
             messageId: message.id,
             mailboxOnly,
             toSessionId: team.members.find((m) => m.key === to)?.sessionId ?? null,
+            integrityWarning,
           };
         });
 
@@ -360,12 +405,14 @@ export function createLeadToolCore(deps: ToolDepsLike): LeadToolCore {
           delivered,
           mailboxOnly: prepared.mailboxOnly,
           messageId: prepared.messageId,
+          ...(prepared.integrityWarning !== undefined ? { integrityWarning: true } : {}),
         });
         return okResult(renderIdle(me.agentKey, prepared.to, delivered), {
           to: prepared.to,
           delivered,
           ...(prepared.mailboxOnly ? { mailboxOnly: true } : {}),
           ...(note !== undefined ? { note } : {}),
+          ...(prepared.integrityWarning !== undefined ? { integrityWarning: prepared.integrityWarning } : {}),
         });
       });
     },
@@ -440,11 +487,18 @@ export function createLeadToolCore(deps: ToolDepsLike): LeadToolCore {
             deliveryClaimedAt: Date.now(),
           });
           await appendMailbox(stateRoot, me.teamId, task.createdBy, message);
+          // v0.5.3（A3 修复）：cancelled 上游的依赖死锁解除——与 xc_report(failed)
+          // 边沿共用同一条 cascadeDependencyDeadlockLocked 路径。人工取消上游后其
+          // pending 下游同样永远无法满足依赖（adj052 A3 同款死锁的 cancelled 入口）：
+          // 自动置 cancelled + 回执/唤醒各任务创建者，死锁不再无声。
+          const deadlock = await cascadeDependencyDeadlockLocked(stateRoot, team, task.id, "cancelled", Date.now());
+          if (deadlock.deadlocked.length > 0) await writeTeam(stateRoot, team);
           return {
             taskId: task.id,
             createdBy: task.createdBy,
             messageId: message.id,
             createdBySessionId: team.members.find((m) => m.key === task.createdBy)?.sessionId ?? null,
+            deadlock,
           };
         });
 
@@ -466,6 +520,27 @@ export function createLeadToolCore(deps: ToolDepsLike): LeadToolCore {
           delivered = sent.delivered;
           note = sent.note;
         }
+        // v0.5.3（A3 修复）：锁外执行依赖死锁解除的唤醒计划（§2.7-4——attemptWake
+        // 不准持团队锁调用）。创建者 = 取消者本人时不自唤醒（与主回执同纪律）。
+        for (const item of prepared.deadlock?.wakePlan ?? []) {
+          if (item.to === me.agentKey || item.sessionId === null) continue;
+          try {
+            await attemptWake({
+              stateRoot,
+              teamId: me.teamId,
+              toAgentKey: item.to,
+              toSessionId: item.sessionId,
+              workspace,
+              reason: "dependency-deadlock",
+              receiptIds: item.receiptIds,
+              ticket: `收到 CrossChat 回执：task 依赖的上游 ${prepared.taskId} = cancelled，其 pending 下游已被引擎解除（cancelled）`,
+              env: deps.env,
+            });
+          } catch {
+            // 唤醒失败不影响工具结果：邮箱回执兜底（attemptWake 自身降级语义同款）。
+          }
+        }
+        const deadlockedCount = prepared.deadlock?.deadlocked.length ?? 0;
         await refreshSnapshotBestEffort(stateRoot, me.teamId); // 任务图变化 → 落一版快照（§7.3.1 机制 1）
         await logEngineEvent(stateRoot, {
           event: "cancel",
@@ -474,6 +549,7 @@ export function createLeadToolCore(deps: ToolDepsLike): LeadToolCore {
           by: me.agentKey,
           receiptTo: prepared.createdBy,
           delivered,
+          ...(deadlockedCount > 0 ? { deadlocked: deadlockedCount } : {}),
         });
         return okResult(renderCancel(prepared.taskId, me.agentKey, prepared.createdBy, delivered), {
           taskId: prepared.taskId,
@@ -481,6 +557,9 @@ export function createLeadToolCore(deps: ToolDepsLike): LeadToolCore {
           cancelledBy: me.agentKey,
           receiptTo: prepared.createdBy,
           delivered,
+          ...(deadlockedCount > 0
+            ? { deadlocked: prepared.deadlock?.deadlocked.map((d) => ({ taskId: d.taskId, createdBy: d.createdBy, deadlockedBy: d.deadlockedBy, woken: d.woken })) }
+            : {}),
           ...(note !== undefined ? { note } : {}),
         });
       });
@@ -670,7 +749,7 @@ export function registerLeadTools(server: McpServer, deps: ToolDepsLike): void {
   );
   server.tool(
     "xc_idle",
-    "Send an idle-notification frame to the lead (recipient = team.leadKey, else founderKey) and wake it. Callers that are still provisioning/failed mailbox-only (R1 gate).",
+    "Send an idle-notification frame to the lead (recipient = team.leadKey, else founderKey) and wake it. Callers that are still provisioning/failed mailbox-only (R1 gate). completedTaskId must reference an existing task assigned to you (unknown_task/not_task_owner hard-reject); a frame claiming completedStatus that the task board does not back (wrong status, or completed with no evidence) is delivered with an integrityWarning for the lead.",
     IdleShape,
     async (args, extra) => core.xc_idle(args, connectionKeyOf(extra)),
   );

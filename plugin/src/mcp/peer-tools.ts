@@ -35,8 +35,10 @@ import {
 } from "../core/peerdir.js";
 import {
   logPeerEvent,
+  peerRegistryLockName,
   PEER_FORMER_NAMES_MAX,
   readPeerKeyFile,
+  readPeerRecord,
   scanPeers,
   touchPeerRecord,
   writePeerKeyFile,
@@ -46,6 +48,7 @@ import {
   type PeerRecord,
   type PeerScanResult,
 } from "../core/peerregistry.js";
+import { LockBusyError, withFileLock } from "../core/lock.js";
 import {
   formatPeerRows,
   peerRowsFromRecord,
@@ -111,6 +114,25 @@ import type { ToolDeps } from "./tools.js";
 // 数据形状
 // ---------------------------------------------------------------------------
 
+/**
+ * v0.5.3（A4 修复）：花名 claim→写盘临界区的注册表锁等待预算（毫秒）。
+ * 注册/改名是 MCP 工具调用（非 10s 钩子预算内），与 W1 心跳共用
+ * `peerRegistryLockName` 同一把机器全局锁；竞争窗口 = 单次注册的
+ * 扫描+端点起+记录落盘（实测 <1s），15s 与队内变更工具 LOCK_WAIT_MS 同级，
+ * 超时给结构化 busy（可重试），绝不静默并存第二条同名活记录。
+ */
+export const PEER_REGISTER_LOCK_WAIT_MS = 15_000;
+
+/**
+ * v0.5.3（A4 修复）：XC_PEER_REGISTER_LOCK_WAIT_MS → 毫秒；非有限正数取缺省 15s。
+ * 覆盖口供单测注入短预算（持锁竞争 → 快速 busy，不必等满 15s）。
+ */
+export function peerRegisterLockWaitMsFromEnv(env: NodeJS.ProcessEnv): number {
+  const raw = env["XC_PEER_REGISTER_LOCK_WAIT_MS"];
+  const n = typeof raw === "string" && raw.trim() !== "" ? Number(raw) : Number.NaN;
+  return Number.isFinite(n) && n > 0 ? n : PEER_REGISTER_LOCK_WAIT_MS;
+}
+
 /** 一行 peer（W3 的 PeerRow + 发送路径需要的注册记录指针）。 */
 export interface PeerRow extends AddressRow {
   /** 注册记录（发送路径要拿 socket 路径与 pid）。 */
@@ -129,6 +151,13 @@ export interface PeerRegisterInput {
   kind?: 'interactive' | 'bg';
   /** 档类兜底：仅当钩子基记录里没有档类时才用（DESIGN §8.1）。 */
   modeClass?: 'bypass' | 'prompting';
+  /**
+   * v0.5.3（安全对-3/a8 修复）：锚定令牌——认领「已绑定队内身份」的 sid（基记录
+   * boundName 在册）时必填，须与基记录 regToken 一致。sessionId 是自述数据且可经
+   * xc_status/xc_peers 交叉读到，不验令牌就能冒充；未绑定队内身份的 sid 不要求
+   * （其 sid 不经任何工具面公开）。
+   */
+  regToken?: string;
   /** v0.5（R-18）：本会话上下文字符数声明（接收方注入预算刻度；声明值，非探测值）。 */
   contextChars?: number;
 }
@@ -379,18 +408,27 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
       // 角色语义、缺省 teamId 撞名，是一条注册旁路。
       assertPeerNameNotReserved(name);
 
-      // v0.5.2（二番战 SEC-1 / SEC-2 修复）：sessionId 归属硬校验——该 sid 已被
-      // 一个**别的活进程**注册时拒绝（session_id_in_use）。旧实现完全不查，攻击者
-      // 用公开 MCP API 冒充受害者 sid 即可三重得手（rtsec C2）：fromSessionId/
-      // originSessionId 归因到受害者、命中受害者的 uservoice 偷走 origin=user
-      // 权威标记、同一 sid 两条注册记录并存；sid 碰撞还会造成投递黑洞（rtsec C3：
-      // 发送方注册 sid=目标 sid 时回执 delivered 但消息永不到达）——两者共用同一
-      // 根因（注册不验归属），同一道闸封堵。校验对象是**活**记录：pid 已死的旧
-      // 记录不在活集（scanPeers 惰性清扫），会话重启/续跑（--resume 同 sid）照常
-      // 注册；本进程自己的记录豁免（幂等重注册，peer-1 修复语义）。
-      // v0.5.2（竞态修复）：这里只做**一次**扫描，归属校验与花名 claim 共享——
-      // scanPeers 会惰性删除死记录文件，两次独立扫描时第一次就把死花名的前任
-      // 证据删掉了，peer-name-reclaimed 接管留痕失明（peer-round2 单测锁定）。
+      // v0.5.3（A4 修复）：花名 claim→写盘临界区加机器全局注册表锁。adj052 A4：
+      // 此前 scanPeers 与 writePeerRecord 之间无互斥，同一毫秒并发注册同一活名
+      // 4/4 全成功——名字即地址的机制下同名多持有污染名册（裸名投递 fail-closed
+      // 为 ambiguous_target，但接管零审计、地址换人不可观测）。临界区 = 单次扫描
+      // → sid 归属校验 → 花名 claim → 端点起 → 记录/key 落盘 → 注册审计，全部
+      // 在 `peerRegistryLockName` 文件锁内串行（与 W1 心跳 touchPeerRecord 同锁；
+      // 锁内不嵌套取同一把锁——临界区里只做无锁 IO）。竞争败者显式 name_taken
+      // （fail-closed）；锁超时给结构化 busy（PEER_REGISTER_LOCK_WAIT_MS）。
+      return await withFileLock(r, peerRegistryLockName(r), async (): Promise<PeerRegisterResult> => {
+        // v0.5.2（二番战 SEC-1 / SEC-2 修复）：sessionId 归属硬校验——该 sid 已被
+        // 一个**别的活进程**注册时拒绝（session_id_in_use）。旧实现完全不查，攻击者
+        // 用公开 MCP API 冒充受害者 sid 即可三重得手（rtsec C2）：fromSessionId/
+        // originSessionId 归因到受害者、命中受害者的 uservoice 偷走 origin=user
+        // 权威标记、同一 sid 两条注册记录并存；sid 碰撞还会造成投递黑洞（rtsec C3：
+        // 发送方注册 sid=目标 sid 时回执 delivered 但消息永不到达）——两者共用同一
+        // 根因（注册不验归属），同一道闸封堵。校验对象是**活**记录：pid 已死的旧
+        // 记录不在活集（scanPeers 惰性清扫），会话重启/续跑（--resume 同 sid）照常
+        // 注册；本进程自己的记录豁免（幂等重注册，peer-1 修复语义）。
+        // v0.5.2（竞态修复）：这里只做**一次**扫描，归属校验与花名 claim 共享——
+        // scanPeers 会惰性删除死记录文件，两次独立扫描时第一次就把死花名的前任
+        // 证据删掉了，peer-name-reclaimed 接管留痕失明（peer-round2 单测锁定）。
       const scannedOnce = await scanPeers(r);
       const sidHolder = await findLiveSessionIdHolder(r, input.sessionId, scannedOnce);
       if (sidHolder !== undefined) {
@@ -408,119 +446,192 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
         );
       }
 
-      // v0.5.2（二番战 peer-1 / peer-5 修复）：一次扫描同时办三件事——
-      // ① 花名占用判定：占用者就是本进程 ⇒ 同一连接的重复注册（agent 重试 /
-      //    重连），幂等重认领自己的记录，不再 name_taken 硬拒；
-      // ② 占用者是别的**活**会话 ⇒ 仍 name_taken（名字即地址，冲突必须显式）；
-      // ③ 占用者已死（pid 亡 / lastSeen 陈旧，惰性清扫已摘除）⇒ 接管留痕：
-      //    审计 peer-name-reclaimed 带上任身份，否则「活人顶替死花名」在观测面
-      //    上完全静默（旧名既不进任何 formerNames，也没有任何事件）。
-      const reclaimedFrom = await claimPeerName(r, name, input.sessionId, scannedOnce);
+      // v0.5.3（二番战 peer-1 幂等豁免的同类面）：本进程已注册同一 sid ⇒ 同一连接的
+      // 幂等重认领（agent 重试/重连），跳过下面的锚定/属主校验（首次注册时已验过）。
+      const sameProcessReclaim = scannedOnce.active.some(
+        (record) => record.pid === process.pid && record.sessionId === input.sessionId,
+      );
 
-      const tokens = mintPeerTokens();
-      const explicit = deps.env["XC_MESSAGING_SOCKET_PATH"];
-      let socketPath: string;
-      if (explicit !== undefined && explicit.trim() !== "") {
-        const validated = validatePeerSocketPath(explicit);
-        if (!validated.ok || validated.path === undefined) {
+      // v0.5.3（安全对-3/a8 修复 ①锚定校验）：claimed sid 必须有钩子写的会话基记录
+      //（peers/base/<sid>.json，机器全局）——全伪造 sid（无任何锚定记录）此前直接
+      // 放行，from-session 归因可随意捏造。唯一豁免：本进程幂等重认领自己的 sid。
+      // v0.5.2 README L267「peer 注册验 sessionId 归属」承诺自此完整落地：
+      // session_id_in_use（活冲突）→ session_not_anchored（无锚定）→
+      // identity_token_required（有锚定但已被绑为队内身份且令牌不符）三道闸。
+      let anchoredBase: Awaited<ReturnType<typeof readPeerBaseRecord>> | undefined;
+      if (!sameProcessReclaim) {
+        anchoredBase = await readPeerBaseRecord(r, input.sessionId);
+        if (anchoredBase === undefined) {
+          await logPeerEvent(r, {
+            event: "peer-register-unanchored",
+            sessionId: input.sessionId,
+            name,
+          });
           throw new ToolError(
-            { error: "invalid_params", reason: validated.reason ?? "bad socket path" },
-            `refusing socket path — ${validated.reason ?? "unknown reason"}`,
+            {
+              error: "session_not_anchored",
+              sessionId: input.sessionId,
+              message: `no session base record for "${input.sessionId}" (the SessionStart hook writes ` +
+                "peers/base/<sessionId>.json on this machine); a sessionId that no hook ever anchored " +
+                "cannot be claimed — use this session's own hook-injected sessionId",
+            },
+            `sessionId "${input.sessionId}" has no anchor record; peer registration refused`,
           );
         }
-        socketPath = validated.path;
-      } else {
-        socketPath = defaultPeerSocketPath();
-      }
 
-      const now = Date.now();
-      // v0.5.2（peer-1 修复的伴生防线）：重复注册不得把既有身份痕迹抹掉。
-      // 同名重认领 ⇒ 保留既有 formerNames（改名攒下的别名不因一次重试蒸发）；
-      // 换名重注册（本进程旧记录当前名 ≠ 新名）⇒ 旧名进 formerNames（与 rename
-      // 同语义，旧名保持可寻址，而不是静默消失）。
-      const mineBefore = (await scanPeers(r)).active.find((record) => record.pid === process.pid);
-      const formerNames = [...(mineBefore?.formerNames ?? [])];
-      if (mineBefore?.name !== undefined && mineBefore.name !== name
-        && !formerNames.some((entry) => entry.name === mineBefore.name)) {
-        formerNames.push({ name: mineBefore.name, releasedAt: now });
-        while (formerNames.length > PEER_FORMER_NAMES_MAX) formerNames.shift();
-      }
-      const record: PeerRecord = {
-        pid: process.pid,
-        sessionId: input.sessionId,
-        messagingSocketPath: socketPath,
-        pidDomain: localPidDomain(),
-        peerProtocol: 1,
-        peerFeatures: [],
-        kind: input.kind ?? "interactive",
-        name,
-        ...(input.displayName !== undefined ? { displayName: input.displayName } : {}),
-        ...(input.contextChars !== undefined ? { contextChars: input.contextChars } : {}),
-        ...(reclaimedFrom !== undefined ? { reclaimedFrom } : {}),
-        formerNames,
-        workspace: deps.workspace,
-        cwd: deps.workspace,
-        startedAt: now,
-        lastSeen: now,
-        updatedAt: now,
-      };
-
-      // 端点先起：注册记录里的 socket 路径必须是活的（CC 的 pid 文件注册表语义）。
-      await startPeerEndpoint({
-        root: r,
-        record,
-        token: tokens.peerToken,
-        socketPath,
-        handlers: {
-          onMessage: async (frame) => receivePeerMessage(deps, frame),
-          onControl: async (frame) => {
+        // v0.5.3（安全对-3/a8 修复 ②归属校验）：基记录 boundName 在册 ⇒ 该 sid 已是
+        // 某队成员身份（xc_register 盖章，跨工作区可见）⇒ 认领它必须出示锚定令牌。
+        // (name, sid) 对经 xc_status 公开可读，令牌只注入本会话上下文——攻击者拿不到。
+        // 豁免：本进程幂等重认领。基记录有 boundName 但缺 regToken（升级前旧锚）⇒
+        // 放行 + 审计 peer-ownership-unverified（过渡窗口如实留痕，不静默）。
+        if (anchoredBase.boundName !== undefined) {
+          if (anchoredBase.regToken !== undefined) {
+            if (input.regToken?.trim() !== anchoredBase.regToken) {
+              await logPeerEvent(r, {
+                event: "peer-ownership-blocked",
+                sessionId: input.sessionId,
+                name,
+                boundName: anchoredBase.boundName,
+                tokenPresented: input.regToken !== undefined,
+              });
+              throw new ToolError(
+                {
+                  error: "identity_token_required",
+                  sessionId: input.sessionId,
+                  boundName: anchoredBase.boundName,
+                  message: `sessionId "${input.sessionId}" is bound to team member "${anchoredBase.boundName}" ` +
+                    "on this machine; claiming it as a peer identity requires the session's regToken " +
+                    "(injected by the SessionStart hook into that session's own context). " +
+                    "A sessionId readable via xc_status/xc_peers is not a credential.",
+                },
+                `sessionId "${input.sessionId}" belongs to a bound team member; regToken required`,
+              );
+            }
+          } else {
             await logPeerEvent(r, {
-              event: "peer-control-rename",
+              event: "peer-ownership-unverified",
               sessionId: input.sessionId,
-              newName: frame.name,
+              name,
+              boundName: anchoredBase.boundName,
             });
+          }
+        }
+      }
+
+        // v0.5.2（二番战 peer-1 / peer-5 修复）：一次扫描同时办三件事——
+        // ① 花名占用判定：占用者就是本进程 ⇒ 同一连接的重复注册（agent 重试 /
+        //    重连），幂等重认领自己的记录，不再 name_taken 硬拒；
+        // ② 占用者是别的**活**会话 ⇒ 仍 name_taken（名字即地址，冲突必须显式）；
+        // ③ 占用者已死（pid 亡 / lastSeen 陈旧，惰性清扫已摘除）⇒ 接管留痕：
+        //    审计 peer-name-reclaimed 带上任身份，否则「活人顶替死花名」在观测面
+        //    上完全静默（旧名既不进任何 formerNames，也没有任何事件）。
+        const reclaimedFrom = await claimPeerName(r, name, input.sessionId, scannedOnce);
+
+        const tokens = mintPeerTokens();
+        const explicit = deps.env["XC_MESSAGING_SOCKET_PATH"];
+        let socketPath: string;
+        if (explicit !== undefined && explicit.trim() !== "") {
+          const validated = validatePeerSocketPath(explicit);
+          if (!validated.ok || validated.path === undefined) {
+            throw new ToolError(
+              { error: "invalid_params", reason: validated.reason ?? "bad socket path" },
+              `refusing socket path — ${validated.reason ?? "unknown reason"}`,
+            );
+          }
+          socketPath = validated.path;
+        } else {
+          socketPath = defaultPeerSocketPath();
+        }
+
+        const now = Date.now();
+        // v0.5.2（peer-1 修复的伴生防线）：重复注册不得把既有身份痕迹抹掉。
+        // 同名重认领 ⇒ 保留既有 formerNames（改名攒下的别名不因一次重试蒸发）；
+        // 换名重注册（本进程旧记录当前名 ≠ 新名）⇒ 旧名进 formerNames（与 rename
+        // 同语义，旧名保持可寻址，而不是静默消失）。
+        const mineBefore = scannedOnce.active.find((record) => record.pid === process.pid);
+        const formerNames = [...(mineBefore?.formerNames ?? [])];
+        if (mineBefore?.name !== undefined && mineBefore.name !== name
+          && !formerNames.some((entry) => entry.name === mineBefore.name)) {
+          formerNames.push({ name: mineBefore.name, releasedAt: now });
+          while (formerNames.length > PEER_FORMER_NAMES_MAX) formerNames.shift();
+        }
+        const record: PeerRecord = {
+          pid: process.pid,
+          sessionId: input.sessionId,
+          messagingSocketPath: socketPath,
+          pidDomain: localPidDomain(),
+          peerProtocol: 1,
+          peerFeatures: [],
+          kind: input.kind ?? "interactive",
+          name,
+          ...(input.displayName !== undefined ? { displayName: input.displayName } : {}),
+          ...(input.contextChars !== undefined ? { contextChars: input.contextChars } : {}),
+          ...(reclaimedFrom !== undefined ? { reclaimedFrom } : {}),
+          formerNames,
+          workspace: deps.workspace,
+          cwd: deps.workspace,
+          startedAt: now,
+          lastSeen: now,
+          updatedAt: now,
+        };
+
+        // 端点先起：注册记录里的 socket 路径必须是活的（CC 的 pid 文件注册表语义）。
+        await startPeerEndpoint({
+          root: r,
+          record,
+          token: tokens.peerToken,
+          socketPath,
+          handlers: {
+            onMessage: async (frame) => receivePeerMessage(deps, frame),
+            onControl: async (frame) => {
+              await logPeerEvent(r, {
+                event: "peer-control-rename",
+                sessionId: input.sessionId,
+                newName: frame.name,
+              });
+            },
+            onUnauthenticated: (info) => {
+              void logPeerEvent(r, { event: "peer-unauthenticated", reason: info.reason });
+            },
           },
-          onUnauthenticated: (info) => {
-            void logPeerEvent(r, { event: "peer-unauthenticated", reason: info.reason });
-          },
-        },
-      });
+        });
 
-      await writePeerRecord(r, record);
-      await writePeerKeyFile(r, process.pid, socketPath, {
-        peerToken: tokens.peerToken,
-        pidDomain: localPidDomain(),
-      });
+        await writePeerRecord(r, record);
+        await writePeerKeyFile(r, process.pid, socketPath, {
+          peerToken: tokens.peerToken,
+          pidDomain: localPidDomain(),
+        });
 
-      self = { sessionId: input.sessionId, name, socketPath, pid: process.pid };
-      setPeerSessionContext({ sessionId: input.sessionId, name, socketPath, pid: process.pid, root: r });
+        self = { sessionId: input.sessionId, name, socketPath, pid: process.pid };
+        setPeerSessionContext({ sessionId: input.sessionId, name, socketPath, pid: process.pid, root: r });
 
-      // 档类真源 = 钩子写的基记录；基记录里没有时才用显式兜底（DESIGN §8.1）。
-      const modeClassSource = await resolveModeClass(deps, r, input);
-      await logPeerEvent(r, {
-        event: "peer-registered",
-        sessionId: input.sessionId,
-        name,
-        socketPath,
-        modeClassSource,
-      });
-      await logEngineEvent(deps.stateRoot, {
-        event: "peer-registered",
-        sessionId: input.sessionId,
-        name,
-        socketPath,
-        modeClassSource,
-      });
+        // 档类真源 = 钩子写的基记录；基记录里没有时才用显式兜底（DESIGN §8.1）。
+        const modeClassSource = await resolveModeClass(deps, r, input);
+        await logPeerEvent(r, {
+          event: "peer-registered",
+          sessionId: input.sessionId,
+          name,
+          socketPath,
+          modeClassSource,
+        });
+        await logEngineEvent(deps.stateRoot, {
+          event: "peer-registered",
+          sessionId: input.sessionId,
+          name,
+          socketPath,
+          modeClassSource,
+        });
 
-      return {
-        name,
-        sessionId: input.sessionId,
-        pid: process.pid,
-        socketPath,
-        keyFile: peerKeyFile(r, process.pid, socketPath),
-        tokenHint: tokens.peerToken.slice(0, 8),
-        modeClassSource,
-      };
+        return {
+          name,
+          sessionId: input.sessionId,
+          pid: process.pid,
+          socketPath,
+          keyFile: peerKeyFile(r, process.pid, socketPath),
+          tokenHint: tokens.peerToken.slice(0, 8),
+          modeClassSource,
+        };
+      }, { waitMs: peerRegisterLockWaitMsFromEnv(deps.env) });
     },
 
     async list(kind?: 'self' | 'member' | 'session'): Promise<PeerRow[]> {
@@ -983,23 +1094,59 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
           `already named "${next}"`,
         );
       }
+      // 闭包内引用收窄后的非空 self（async 回调会丢失对可变外层变量的收窄）。
+      const me = self;
       // v0.5.2（二番战 peer-1 / peer-5 修复）：与注册共用一个花名claim助手
       // （占用判定 + 死名接管审计）。本进程持有 previous 而非 next，故「占用者是
       // 本进程」这条豁免对改名不成立——冲突仍然显式 name_taken。
-      const reclaimedFrom = await claimPeerName(r, next, self.sessionId);
-
+      // v0.5.3（A4 修复）：改名与注册同一临界区纪律——花名 claim→记录落盘在
+      // `peerRegistryLockName` 锁内串行（并发的「改名到同一活名」此前同样 4/4 全过）。
+      // touchPeerRecord 内部取**同一把**注册表锁，锁内嵌套只会自等超时静默失败，
+      // 故在外锁内直接 read-merge-write（合并语义与 touchPeerRecord 同款）。
       const now = Date.now();
-      const scanned = await scanPeers(r);
-      const mine = scanned.active.find((record) => record.pid === process.pid);
-      const formerNames = [...(mine?.formerNames ?? [])];
-      if (previous !== undefined) formerNames.push({ name: previous, releasedAt: now });
-      while (formerNames.length > 32) formerNames.shift();
+      const claimed = await withFileLock(r, peerRegistryLockName(r), async () => {
+        const reclaimedFrom = await claimPeerName(r, next, me.sessionId);
+        const scanned = await scanPeers(r);
+        const mine = scanned.active.find((record) => record.pid === process.pid);
+        const formerNames = [...(mine?.formerNames ?? [])];
+        if (previous !== undefined) formerNames.push({ name: previous, releasedAt: now });
+        while (formerNames.length > PEER_FORMER_NAMES_MAX) formerNames.shift();
+        const current = await readPeerRecord(r, process.pid);
+        if (current !== undefined) {
+          await writePeerRecord(r, {
+            ...current,
+            name: next,
+            formerNames,
+            ...(reclaimedFrom !== undefined ? { reclaimedFrom } : {}),
+            lastSeen: now,
+            updatedAt: now,
+          });
+        } else {
+          // 防御分支（self 在册而记录被外部清扫判死的罕见残景）：按 register 同款
+          // 形状重建（外锁已保证互斥）。
+          await writePeerRecord(r, {
+            pid: process.pid,
+            sessionId: me.sessionId,
+            messagingSocketPath: me.socketPath ?? defaultPeerSocketPath(),
+            pidDomain: localPidDomain(),
+            peerProtocol: 1,
+            peerFeatures: [],
+            kind: "interactive",
+            name: next,
+            formerNames,
+            ...(reclaimedFrom !== undefined ? { reclaimedFrom } : {}),
+            workspace: deps.workspace,
+            cwd: deps.workspace,
+            startedAt: now,
+            lastSeen: now,
+            updatedAt: now,
+          });
+        }
+        return { reclaimedFrom, scanned };
+      }, { waitMs: peerRegisterLockWaitMsFromEnv(deps.env) });
+      const reclaimedFrom = claimed.reclaimedFrom;
+      const scanned = claimed.scanned;
 
-      await touchPeerRecord(r, process.pid, {
-        name: next,
-        formerNames,
-        ...(reclaimedFrom !== undefined ? { reclaimedFrom } : {}),
-      });
       self = { ...self, name: next };
       setPeerSessionContext({
         sessionId: self.sessionId,
@@ -1181,6 +1328,14 @@ async function claimPeerName(
   const holders = result.active.filter((record) => record.name === name);
   if (holders.length > 0 && !holders.some((record) => record.pid === process.pid)) {
     const reason = `peer name "${name}" is already registered on this machine`;
+    // v0.5.3（A4 修复）：占名拒绝也留痕。锁互斥后并发同名注册的败者在此显式
+    // 失败——没有这行审计，「谁在何时试图接管谁的花名」在观测面完全不可见
+    // （adj052 A4：4/4 全成功且零接管审计）。带上任持有者身份（sessionId/pid）。
+    await logPeerEvent(root, {
+      event: "peer-name-taken-refused",
+      name,
+      holders: holders.map((record) => ({ sessionId: record.sessionId, pid: record.pid })),
+    });
     throw new ToolError({ error: "name_taken", name, message: reason }, reason);
   }
   const previous = result.dead.find((row) => row.record.name === name);
@@ -1531,6 +1686,9 @@ export const PeerRegisterShape = {
     .enum(["bypass", "prompting"])
     .optional()
     .describe("权限档类兜底：仅当钩子基记录里没有档类时生效"),
+  regToken: z.string().optional().describe(
+    "锚定令牌（v0.5.3）：认领已绑定队内身份的 sid 时必填（基记录 boundName 在册），取 SessionStart 钩子注入到本会话上下文的 regToken；未绑定队内身份的 sid 可不传",
+  ),
   contextChars: z
     .number()
     .int()
@@ -1616,7 +1774,11 @@ export function registerPeerTools(server: McpServer, deps: PeerToolDeps): void {
       result = await fn();
     } catch (error) {
       if (error instanceof ToolError) result = errorResult(error.payload);
-      else {
+      else if (error instanceof LockBusyError) {
+        // v0.5.3（A4 修复）：注册/改名的注册表锁超时给结构化 busy（可重试），与
+        // 队内工具 runCore 同口径——不再把锁竞争洗成 internal。
+        result = errorResult(error.toStructured());
+      } else {
         const message = error instanceof Error ? error.message : String(error);
         await logEngineEvent(deps.stateRoot, { event: "peer-tool-error", message });
         result = errorResult({ error: "internal", message });
@@ -1648,6 +1810,7 @@ export function registerPeerTools(server: McpServer, deps: PeerToolDeps): void {
           ...(args.displayName !== undefined ? { displayName: args.displayName } : {}),
           ...(args.kind !== undefined ? { kind: args.kind } : {}),
           ...(args.modeClass !== undefined ? { modeClass: args.modeClass } : {}),
+          ...(args.regToken !== undefined ? { regToken: args.regToken } : {}),
           ...(args.contextChars !== undefined ? { contextChars: args.contextChars } : {}),
         });
         return okResult(

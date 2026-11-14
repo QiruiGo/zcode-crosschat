@@ -31,6 +31,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import { appendJsonl, readJsonl, rewriteJsonl, type MalformedLine } from './jsonl.js';
+import { appendMailIntegrityRecord } from './mailintegrity.js';
 import { sanitizeKey } from './sanitize.js';
 import { isRecord, isTeamMessage, normalizeMessage, TERMINAL_TASK_STATUSES, type TeamMessage, type TeamState } from './types.js';
 import { logEngineEvent } from './log.js';
@@ -290,14 +291,22 @@ export async function readPendingMailbox(
         || now - message.deliveryClaimedAt >= MAILBOX_DELIVERY_LEASE_MS));
 }
 
-/** Append one message as the next JSONL line (cross-process O_APPEND write). */
+/**
+ * Append one message as the next JSONL line (cross-process O_APPEND write).
+ * v0.5.3（安全对-5 a10 修复）：落信同步写完整性链记录（sidecar
+ * `<agent>.jsonl.int`，{@link appendMailIntegrityRecord}）——链头读取+
+ * 邮箱行+链记录三步在专用完整性锁内原子完成；校验面（xc_mail_read /
+ * xc_check_inbox）据此检测磁盘篡改并告警。链记录追加失败不阻断投递
+ * （fail-open：该件落为 unverified，与存量旧件同待遇）。
+ */
 export async function appendMailbox(
   stateRoot: string,
   teamId: string,
   agentKey: string,
   message: TeamMessage,
 ): Promise<void> {
-  await appendJsonl(mailboxPath(stateRoot, teamId, agentKey), [JSON.stringify(message)]);
+  await appendMailIntegrityRecord(stateRoot, teamId, agentKey, message, () =>
+    appendJsonl(mailboxPath(stateRoot, teamId, agentKey), [JSON.stringify(message)]));
 }
 
 /**

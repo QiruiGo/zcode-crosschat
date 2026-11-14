@@ -5,6 +5,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
+  activeMembersAfterUpsert,
   countActiveMembers,
   leadKeyOf,
   maxMembersFromEnv,
@@ -54,20 +55,81 @@ describe('maxMembersFromEnv (V18 防御 + dsh index.js:100 默认 8)', () => {
   });
 });
 
-describe('countActiveMembers (dsh tools.js:1214 同过滤：removed 不计)', () => {
-  it('counts provisioning/ready/failed, excludes removed', () => {
+describe('countActiveMembers (v0.5.3 A12 口径：lead/failed/removed 均不计)', () => {
+  it('counts provisioning/ready only; excludes lead, failed and removed', () => {
+    const team = teamWith(
+      [
+        member({ key: 'a', state: 'ready', identity: 'engine' }), // founder 记录（leadKey 未设 → a 是 lead）
+        member({ key: 'b', state: 'provisioning' }),
+        member({ key: 'c', state: 'failed' }),
+        member({ key: 'd', state: 'removed' }),
+        member({ key: 'e' }), // legacy record: memberState → ready
+      ],
+      'a',
+    );
+    // 红队 a12：旧实现计 lead(a)+failed(c)=5，max=2 时 0 个可用成员仍 team_at_member_cap。
+    expect(countActiveMembers(team)).toBe(2); // b(provisioning) + e(legacy→ready)
+  });
+
+  it('explicit leadKey excludes the lead record even with role worker', () => {
+    const team = teamWith(
+      [
+        member({ key: 'boss', state: 'ready', identity: 'self' }),
+        member({ key: 'w1', state: 'ready', identity: 'engine' }),
+        member({ key: 'w2', state: 'ready', identity: 'engine' }),
+      ],
+      'boss',
+    );
+    expect(countActiveMembers(team)).toBe(2);
+  });
+
+  it('no leadKey set → founder 视为 lead（leadKeyOf 同源），其记录不计', () => {
     const team = teamWith([
-      member({ key: 'a', state: 'ready', identity: 'engine' }),
-      member({ key: 'b', state: 'provisioning' }),
-      member({ key: 'c', state: 'failed' }),
-      member({ key: 'd', state: 'removed' }),
-      member({ key: 'e' }), // legacy record: memberState → ready
+      member({ key: 'a', state: 'ready' }), // founder 记录
+      member({ key: 'w', state: 'ready', identity: 'engine' }),
     ]);
-    expect(countActiveMembers(team)).toBe(4);
+    expect(countActiveMembers(team)).toBe(1);
+  });
+
+  it('all-failed roster counts 0（0 个可用成员不再占满名额）', () => {
+    const team = teamWith(
+      [member({ key: 'x', state: 'failed' }), member({ key: 'y', state: 'failed' })],
+      'a',
+    );
+    expect(countActiveMembers(team)).toBe(0);
   });
 
   it('empty roster counts 0', () => {
     expect(countActiveMembers(teamWith([]))).toBe(0);
+  });
+});
+
+describe('activeMembersAfterUpsert (v0.5.3 A12：写入后的名额数与净增量)', () => {
+  const base = () =>
+    teamWith(
+      [
+        member({ key: 'a', state: 'ready' }), // founder = lead，不计
+        member({ key: 'w1', state: 'ready', identity: 'engine' }),
+      ],
+      'a',
+    );
+
+  it('新建（无记录）→ 净 +1', () => {
+    expect(activeMembersAfterUpsert(base(), undefined)).toBe(2);
+  });
+
+  it('removed 重加 → 净 +1（removed 不计 → 重加后 provisioning 占位）', () => {
+    expect(activeMembersAfterUpsert(base(), member({ key: 'w2', state: 'removed' }))).toBe(2);
+  });
+
+  it('failed 重供给 → 净 +1（failed 此前不计，重供给转 provisioning 占位）', () => {
+    expect(activeMembersAfterUpsert(base(), member({ key: 'w2', state: 'failed' }))).toBe(2);
+  });
+
+  it('停滞 provisioning 接管 → 净 0（已在占位）', () => {
+    expect(
+      activeMembersAfterUpsert(base(), member({ key: 'w2', state: 'provisioning', provisionedAt: 1 })),
+    ).toBe(1);
   });
 });
 

@@ -79,6 +79,13 @@ export interface PanoramaExtras {
   dag?: Record<string, string[]>;
   /** 引擎/配置面信息（§7.3.1 "engine"）。 */
   engine?: { wakeEnabled?: boolean; maxMembers?: number; inboundMode?: string };
+  /**
+   * v0.5.3（A13 修复）：任务板窗口化时的任务总数。摘要行 `tasks=` 恒显示该总数，
+   * 窗口行数另列 `shown=`——此前 tasks=N 显示的是注入窗口行数（201 单显示 tasks=53），
+   * 运维一眼误读任务规模；真值只能从 JSON boardTruncated.total 挖。缺省（未窗口化）
+   * 时回落 tasks.length，v0.1.0 形态输出逐字符不变。
+   */
+  boardTotal?: number;
 }
 
 /** 成员记录的 v2 增量字段（W2 落盘的可选字段；宽容读取，缺省 = §6.5 ready/peer 语义）。 */
@@ -104,6 +111,15 @@ function hasPanoramaFields(snapshot: StatusSnapshot & PanoramaExtras): boolean {
 }
 
 /**
+ * 摘要行 tasks= 片段（v0.5.3 A13 修复）：带 boardTotal 时显示任务总数，窗口行数
+ * 另列 shown=；未带（未窗口化）时与旧行为逐字符一致。
+ */
+function summaryTasksPart(snapshot: StatusSnapshot & PanoramaExtras): string {
+  const total = snapshot.boardTotal ?? snapshot.tasks.length;
+  return total !== snapshot.tasks.length ? `tasks=${total} shown=${snapshot.tasks.length}` : `tasks=${total}`;
+}
+
+/**
  * v2 全景渲染（§7.3.1）：成员状态表（working/idle/provisioning/failed/removed，
  * lead 有 ★ 标注）+ 任务板（v0.1.0 列不变）+ DAG 一行图（`t1 ─▶ t2`）。
  * 依据只来自快照本身，不触盘。
@@ -113,7 +129,7 @@ export function renderPanorama(snapshot: StatusSnapshot & PanoramaExtras): strin
   const lead = snapshot.leadKey ?? snapshot.founderKey;
   lines.push(
     `Team "${snapshot.teamId}" phase=${snapshot.phase} lead=${lead} founder=${snapshot.founderKey} `
-      + `tasks=${snapshot.tasks.length} members=${snapshot.members.length}`,
+      + `${summaryTasksPart(snapshot)} members=${snapshot.members.length}`,
   );
   if (snapshot.engine !== undefined) {
     const e = snapshot.engine;
@@ -222,7 +238,7 @@ export const BOARD_TRUNCATION_NOTE_MAX_CHARS = 220;
 export function renderStatusTable(snapshot: StatusSnapshot & PanoramaExtras): string {
   if (hasPanoramaFields(snapshot)) return renderPanorama(snapshot);
   const lines: string[] = [];
-  lines.push(`Team "${snapshot.teamId}" phase=${snapshot.phase} founder=${snapshot.founderKey} tasks=${snapshot.tasks.length}`);
+  lines.push(`Team "${snapshot.teamId}" phase=${snapshot.phase} founder=${snapshot.founderKey} ${summaryTasksPart(snapshot)}`);
   const memberCols = snapshot.members.map((m) => unreadText(snapshot, m.key)).join(" ");
   lines.push(`Members: ${memberCols || "(none)"}`);
   // v0.5.1（故障注-2 修复）：孤儿任务引用告警行——邮箱信封指向不存在的任务，

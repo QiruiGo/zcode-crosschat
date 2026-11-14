@@ -75,6 +75,52 @@ export function downstreamReady(tasks: readonly Task[], completedTaskId: string)
   return ready;
 }
 
+/**
+ * v0.5.3（A3 修复）：依赖死锁下游（failed/cancelled 上游专属）。
+ *
+ * deadTaskId 进入 failed/cancelled 后，其传递闭包内的 pending 下游永远无法满足
+ * 依赖——依赖解除（E-b ②）只认 completed，而终态任务无出边，任何重试都造不出
+ * 「同一条任务完成」的事实（重试 = 新任务）。不主动解除 = 下游 pending 死锁
+ * （adj052 A3：无解除、无通知，唯一出路是创建者手工 xc_cancel）。
+ *
+ * 本函数沿反向边 BFS（downstreamReady 同款环安全纪律）收集「可达 ∧
+ * status === "pending"」的任务。claimed/in_progress 不可能出现在 failed 任务的
+ * 依赖闭包里（认领要求全部依赖 completed）；已 cancelled 的下游是上次解除的
+ * 遗迹，天然被状态过滤跳过（幂等）。
+ *
+ * @returns 依赖已死锁的 pending 任务（BFS 序：离 deadTaskId 近者在前）。
+ */
+export function deadlockedDependents(tasks: readonly Task[], deadTaskId: string): Task[] {
+  const byId = new Map(tasks.map((task) => [task.id, task]));
+  // 反向边：taskId → 依赖它的任务 id 列表（downstreamReady 同构）。
+  const dependents = new Map<string, string[]>();
+  for (const task of tasks) {
+    for (const dep of task.dependsOn) {
+      const list = dependents.get(dep);
+      if (list === undefined) dependents.set(dep, [task.id]);
+      else list.push(task.id);
+    }
+  }
+  const visited = new Set<string>([deadTaskId]);
+  const queue: string[] = [deadTaskId];
+  const deadlocked: Task[] = [];
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    for (const dependentId of dependents.get(current) ?? []) {
+      if (visited.has(dependentId)) continue;
+      // 入队即标记：diamond（t2→t4 且 t3→t4）会在 t4 出队前沿两条边各探到一次，
+      // 只在出队时标记会双重收集（downstreamReady 无此问题——它的收集条件含
+      // dependsOn.includes(completedTaskId)，非直接依赖的下游不满足）。
+      visited.add(dependentId);
+      const dependent = byId.get(dependentId);
+      if (dependent === undefined) continue; // 依赖引用了不存在的任务：不可达，跳过
+      queue.push(dependentId); // 闭包继续下探（深度 ≥2 的下游同样死锁）
+      if (dependent.status === "pending") deadlocked.push(dependent);
+    }
+  }
+  return deadlocked;
+}
+
 // ---------------------------------------------------------------------------
 // 依赖输出注入（§12-O11 的 v0.2 半边：2000/12000 截断预算）
 // ---------------------------------------------------------------------------

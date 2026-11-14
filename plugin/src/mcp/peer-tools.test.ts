@@ -38,6 +38,7 @@ import {
 import type { PeerQueueItem } from "../core/peermsg.js";
 import { payloadOf, ToolError, type ToolResult } from "./protocol.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { LockBusyError } from "../core/lock.js";
 import type { ToolDeps } from "./tools.js";
 
 type Handler = (args: Record<string, unknown>, extra: unknown) => Promise<ToolResult>;
@@ -642,5 +643,31 @@ describe("renderReviewSummary（BND-2 修复：摘要行不再虚报「影响 N 
       {},
     ]);
     expect(counts).toEqual({ delivered: 1, dropped: 1, refused: 1, "still-held": 1, other: 2 });
+  });
+});
+
+// ─────────────────────────── v0.5.3（A4 修复）：注册表锁 busy 的结构化映射 ───────────────────────────
+
+describe("A4 修复：注册/改名锁超时给结构化 busy（不洗成 internal）", () => {
+  it("xc_peer_register 的服务实现抛 LockBusyError → {error:'busy', lock}（与队内工具同口径）", async () => {
+    const server = setup(fakeServices({
+      register: async () => {
+        throw new LockBusyError("peer-registry-<digest>");
+      },
+    }));
+    const res = await server.find("xc_peer_register").handler({ name: "alice", sessionId: "sess-alice" }, undefined);
+    expect(res.isError).toBe(true);
+    expect(payloadOf(res)).toMatchObject({ error: "busy", lock: "peer-registry-<digest>" });
+  });
+
+  it("xc_peer_rename 的服务实现抛 LockBusyError → 同款结构化 busy", async () => {
+    const server = setup(fakeServices({
+      rename: async () => {
+        throw new LockBusyError("peer-registry-<digest>");
+      },
+    }));
+    const res = await server.find("xc_peer_rename").handler({ name: "trixie" }, undefined);
+    expect(res.isError).toBe(true);
+    expect(payloadOf(res)).toMatchObject({ error: "busy" });
   });
 });

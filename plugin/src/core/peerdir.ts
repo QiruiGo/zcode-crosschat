@@ -235,6 +235,19 @@ export interface PeerBaseRecord {
   source: string | null;
   startedAt: number;
   lastSeen: number;
+  /**
+   * v0.5.3（安全对-3/a8 修复）：锚定令牌——与 workspace 侧 sessions/<sid>.json 的
+   * regToken 同值（SessionStart 同步写）。机器全局可见（跨工作区），xc_peer_register
+   * 认领已绑定队内身份的 sid 时必须出示它。
+   */
+  regToken?: string;
+  /**
+   * v0.5.3（a8）：队内绑定标记——xc_register 成功后由 MCP server 盖章（机器全局，
+   * 跨工作区可见）。非空 ⇒ 该 sid 已是某队的成员身份，peer 轴认领该 sid 属受保护
+   * 注册，必须出示 regToken。缺省 = 未绑定队内身份（peer 注册不要求令牌，兼容
+   * 未入队的普通会话）。
+   */
+  boundName?: string;
 }
 
 function isPeerBaseRecord(value: unknown): value is PeerBaseRecord {

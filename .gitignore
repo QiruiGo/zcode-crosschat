@@ -7,6 +7,12 @@
 # 本地验证证据（唤醒日志、会话转录等，同样含本机路径与会话 id）
 evidence/
 
+# 红队对抗工作区（三番战 adj052 等用例脚本、日志、scratch ws，含本机路径与会话 id，不入库）
+_redteam-replay/
+
+# 复验插桩副本（验证 scratch，如 ws/instr 插桩 server，不入库）
+plugin/ws/
+
 # 依赖与构建产物（plugin/ 内另有 .gitignore，此处兜底）
 node_modules/
 dist/

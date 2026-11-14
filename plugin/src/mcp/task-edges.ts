@@ -17,7 +17,12 @@
  *      findTaskRecipient 定位派发对象 → unblock-notice 帧（携 collectDependencyOutputs
  *      的 2000/12000 预算上游输出摘要）入其邮箱；收件人无开放任务且非
  *      provisioning/failed/removed → 锁外逃逸唤醒（scene "unblock"）。
- *      failed/cancelled 不解除依赖（下游保持阻塞，lead 决定重派，§5.1 E-b ③）；
+ *   ②' 依赖死锁解除（v0.5.3 A3 修复，status=failed 专属）：failed/cancelled 不再
+ *      让下游永久阻塞（adj052 A3：下游 pending 死锁、零通知，唯一出路是创建者
+ *      手工 xc_cancel）——failed 上游的依赖闭包内 pending 下游**确定死锁**，自动
+ *      置 cancelled（合法边，by=engine、history=dependency-deadlock）+ 回执/唤醒
+ *      各任务创建者；cancelled 上游的同款解除由 xc_cancel 边沿（lead-tools）复用
+ *      cascadeDependencyDeadlockLocked 完成；
  *   ③ 边沿后刷新 snapshot.json（§7.3.1「任务图每次真实变化都落盘一版快照」；
  *      in_progress 心跳更新 updatedAt，同样刷新——满足 §7.3.1 机制 3「每单 report
  *      至少触发一次边沿刷新」）。
@@ -42,9 +47,10 @@ import { findInflightWakeNonce } from "../core/registry.js";
 import { appendMailbox, createMessage, readMailbox } from "../core/mailbox.js";
 import { logEngineEvent } from "../core/log.js";
 import { withTeamLock } from "../core/lock.js";
-import { memberOpenTasks, readTeam, writeTeam } from "../core/teamstate.js";
+import { appendTaskHistory, memberOpenTasks, readTeam, writeTeam } from "../core/teamstate.js";
 import {
   collectDependencyOutputs,
+  deadlockedDependents,
   downstreamReady,
   findTaskRecipient,
   revokeAttempt,
@@ -117,9 +123,26 @@ export interface UnblockedTaskInfo {
   woken: boolean;
 }
 
+/**
+ * v0.5.3（A3 修复）：依赖死锁被引擎解除的下游任务。
+ * 上游 failed/cancelled 后其 pending 下游永远无法满足依赖——自动置 cancelled
+ * 并回执/唤醒各任务创建者，死锁从「无声永久阻塞」变为「显式终态 + 可行动通知」。
+ */
+export interface DeadlockedTaskInfo {
+  taskId: string;
+  createdBy: string;
+  messageId: string;
+  /** 死锁根因的上游任务 id（状态 failed/cancelled）。 */
+  deadlockedBy: string;
+  /** 已对该创建者发起逃逸唤醒（false = 有开放任务/供给中/failed/removed → 只入箱）。 */
+  woken: boolean;
+}
+
 export interface TaskEdgeOutcome {
   swept: SweptTaskInfo[];
   unblocked: UnblockedTaskInfo[];
+  /** v0.5.3（A3 修复）：随终态报告被解除的死锁下游。 */
+  deadlocked: DeadlockedTaskInfo[];
 }
 
 /** 锁内收集、锁外执行的唤醒计划项。 */
@@ -298,6 +321,100 @@ async function unblockDependentsLocked(
   return { unblocked, wakePlan };
 }
 
+// ─────────────────────────── ②' 依赖死锁解除（A3 修复，failed/cancelled 专属） ───────────────────────────
+
+/**
+ * v0.5.3（A3 修复）：deadTaskId 进入 failed/cancelled 后，解除其全部死锁下游
+ * （调用方持团队锁）。
+ *
+ * 旧约（§5.1 E-b ③）「failed/cancelled 不解除依赖，lead 决定重派」造成 adj052
+ * A3 死锁：下游 pending 永久阻塞、零通知，唯一出路是创建者碰巧知道去手工
+ * xc_cancel。新约：终态非 completed 的上游 = 其依赖闭包内的 pending 下游**确定
+ * 死锁**（依赖解除只认 completed，终态无出边）——引擎自动把它们置 cancelled
+ * （pending→cancelled 是 types.ts TASK_TRANSITIONS 的合法边；by="engine"、
+ * history 记 `dependency-deadlock`，与人工 xc_cancel 的 "cancelled" 事件区分），
+ * `task.error` 写明根因（观测面可见），回执（status:"cancelled"）入各任务
+ * createdBy 邮箱并收集创建者唤醒计划（锁外执行，§2.7-4）。
+ *
+ * 幂等：deadlockedDependents 只收 pending，已解除/终态的下游天然跳过；无下游
+ * （绝大多数 failed 任务）零成本返回。
+ *
+ * @param deadStatus 上游终态（回执与审计里写明根因链）。
+ */
+async function cascadeDependencyDeadlockLocked(
+  stateRoot: string,
+  team: TeamState,
+  deadTaskId: string,
+  deadStatus: "failed" | "cancelled",
+  now: number,
+): Promise<{ deadlocked: DeadlockedTaskInfo[]; wakePlan: WakePlanItem[] }> {
+  const teamId = team.teamId;
+  const tasks = deadlockedDependents(team.tasks, deadTaskId);
+  if (tasks.length === 0) return { deadlocked: [], wakePlan: [] };
+
+  const deadlocked: DeadlockedTaskInfo[] = [];
+  const perCreator = new Map<string, { sessionId: string | null; ids: string[]; ticket: string; woken: boolean }>();
+  for (const task of tasks) {
+    // 引擎特权解除：走合法边 pending→cancelled，但根因是依赖死锁而非人工取消——
+    // history 记 dependency-deadlock（区别于 xc_cancel 的 "cancelled" 事件）。
+    task.status = "cancelled";
+    task.error = `dependency-deadlock: upstream task ${deadTaskId} ${deadStatus} — this task can never start`;
+    appendTaskHistory(task, "dependency-deadlock", "engine", undefined, now);
+    // 回执（与 xc_cancel 的 cancelled 回执同构；cancelledBy=engine 表明自动解除）。
+    const receipt = JSON.stringify({
+      type: "task-receipt",
+      teamId,
+      taskId: task.id,
+      attemptId: task.attemptId ?? "",
+      status: "cancelled",
+      result: null,
+      error: task.error,
+      evidence: [],
+      cancelledBy: "engine",
+    });
+    const msg = createMessage("engine", task.createdBy, receipt, {
+      taskId: task.id,
+      sourceTaskId: deadTaskId,
+      sourceTaskStatus: deadStatus,
+      deliveryClaimedAt: now,
+    });
+    await appendMailbox(stateRoot, teamId, task.createdBy, msg);
+    deadlocked.push({ taskId: task.id, createdBy: task.createdBy, messageId: msg.id, deadlockedBy: deadTaskId, woken: false });
+    const memberRecord = team.members.find((m) => m.key === task.createdBy);
+    const woken =
+      memberOpenTasks(team.tasks, task.createdBy).length === 0
+      && !blocksWake(memberProvisionState(memberRecord));
+    const entry = perCreator.get(task.createdBy) ?? {
+      sessionId: memberRecord?.sessionId ?? null,
+      ids: [],
+      ticket: receipt,
+      woken: false,
+    };
+    entry.ids.push(msg.id);
+    entry.woken = entry.woken || woken;
+    perCreator.set(task.createdBy, entry);
+    await logEngineEvent(stateRoot, {
+      event: "dependency-deadlock",
+      teamId,
+      taskId: task.id,
+      createdBy: task.createdBy,
+      deadlockedBy: deadTaskId,
+      deadStatus,
+    });
+  }
+
+  const wakePlan: WakePlanItem[] = [];
+  for (const [to, entry] of perCreator) {
+    if (!entry.woken) continue;
+    wakePlan.push({ to, sessionId: entry.sessionId, reason: "dependency-deadlock", receiptIds: entry.ids, ticket: entry.ticket });
+  }
+  // woken 结果回填进 deadlocked（唤醒判定在收集后统一完成）。
+  for (const info of deadlocked) {
+    info.woken = perCreator.get(info.createdBy)?.woken ?? false;
+  }
+  return { deadlocked, wakePlan };
+}
+
 // ─────────────────────────── 模块级边沿助手（E-b 边沿与周期清扫共用） ───────────────────────────
 
 /** 边沿/清扫后的快照刷新：best-effort，失败审计（观测面失败永不影响工具结果，§7.3.1）。 */
@@ -443,20 +560,32 @@ export function withTaskEdges(core: ToolCore, deps: ToolDeps): ToolCore {
 
       const teamId = DEFAULT_TEAM_ID;
       const now = Date.now();
-      const outcome: TaskEdgeOutcome = { swept: [], unblocked: [] };
+      const outcome: TaskEdgeOutcome = { swept: [], unblocked: [], deadlocked: [] };
       try {
         if (TERMINAL_TASK_STATUSES.includes(status as (typeof TERMINAL_TASK_STATUSES)[number])) {
-          // E-b 边沿：① 清扫 → ② 依赖解除（顺序按 §5.1 E-b）；唤醒统一锁外。
+          // E-b 边沿：① 清扫 → ② 依赖解除（completed）→ ②' 依赖死锁解除（failed）
+          // （v0.5.3 A3 修复）；唤醒统一锁外。
           const plan = await withTeamLock(stateRoot, teamId, async () => {
             const team = await readTeam(stateRoot, teamId);
             if (team === undefined) return [] as WakePlanItem[];
             const sweep = await sweepStaleTasksLocked(stateRoot, team, staleThresholdMsFromEnv(env), now);
             outcome.swept = sweep.swept;
             if (sweep.swept.length > 0) await writeTeam(stateRoot, team);
-            if (status !== "completed") return sweep.wakePlan;
-            const unblock = await unblockDependentsLocked(stateRoot, team, taskId, now);
-            outcome.unblocked = unblock.unblocked;
-            return [...sweep.wakePlan, ...unblock.wakePlan];
+            if (status === "completed") {
+              const unblock = await unblockDependentsLocked(stateRoot, team, taskId, now);
+              outcome.unblocked = unblock.unblocked;
+              return [...sweep.wakePlan, ...unblock.wakePlan];
+            }
+            if (status === "failed") {
+              // v0.5.3（A3 修复）：failed 上游的 pending 下游确定死锁——自动解除
+              // （置 cancelled）+ 回执/唤醒各任务创建者。cancelled 不经 xc_report
+              // 产生（transitionTable 无此入边），此分支不处理。
+              const deadlock = await cascadeDependencyDeadlockLocked(stateRoot, team, taskId, "failed", now);
+              outcome.deadlocked = deadlock.deadlocked;
+              if (deadlock.deadlocked.length > 0) await writeTeam(stateRoot, team);
+              return [...sweep.wakePlan, ...deadlock.wakePlan];
+            }
+            return sweep.wakePlan;
           });
           await runWakePlan(deps, plan);
         }
@@ -477,6 +606,7 @@ export function withTaskEdges(core: ToolCore, deps: ToolDeps): ToolCore {
       const edges: Record<string, unknown> = {};
       if (outcome.swept.length > 0) edges["swept"] = outcome.swept;
       if (outcome.unblocked.length > 0) edges["unblocked"] = outcome.unblocked;
+      if (outcome.deadlocked.length > 0) edges["deadlocked"] = outcome.deadlocked;
       if (Object.keys(edges).length === 0) return result;
       return {
         ...result,
@@ -492,8 +622,13 @@ export function withTaskEdges(core: ToolCore, deps: ToolDeps): ToolCore {
 // §9.2 对外接口：W3 的图计算件经本模块再出口（W2/W4 也可直接 import core/graph.js）。
 export {
   collectDependencyOutputs,
+  deadlockedDependents,
   downstreamReady,
   findTaskRecipient,
   revokeAttempt,
   staleTasks,
 } from "../core/graph.js";
+
+// v0.5.3（A3 修复）：依赖死锁解除的锁内实现——xc_report(failed) 边沿（本模块）
+// 与 xc_cancel 边沿（lead-tools.ts）共用同一条解除路径。
+export { cascadeDependencyDeadlockLocked };

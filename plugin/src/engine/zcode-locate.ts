@@ -20,10 +20,13 @@
  * 测试用假 probe 模拟全败/命中顺序——本机 ZCode 在装，真全败不可构造。
  * 不变式（复核轮 F4）：env 判定先于缓存返回，env 命中不读不写缓存——
  * 「env 永远可覆盖探测结果」不依赖调用时序。
+ * v0.5.3（A5 修复）：显式配置（XC_ZCODE_EXE/XC_ZCODE_CJS 任一非空）一律校验，
+ * 无效即显式报错（outcome.configError）——不再「已配置但文件不存在 → 继续自动探测」
+ * 的静默回落；自动探测仅两项都未配置时可达。
  */
 import { spawnSync } from "node:child_process";
-import { existsSync, readdirSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { existsSync, readdirSync, statSync } from "node:fs";
+import { basename, dirname, extname, join } from "node:path";
 
 export interface ZcodePair {
   /** ZCode.exe 绝对路径。 */
@@ -50,6 +53,13 @@ export interface LocateOutcome {
   attempts: LocateAttempt[];
   /** found=false 时的用户指引（工具回执 / doctor / 错误文案共用一份）。 */
   guidance: string;
+  /**
+   * v0.5.3（A5 修复）：显式配置（XC_ZCODE_EXE/XC_ZCODE_CJS 任一非空）无效时的根因文案
+   * （含修复指引）。未配置（走自动探测）或配置有效时 absent。配置无效时 found=false、
+   * **绝不回落自动探测**（回落仅在未配置时）——provision/ wake/doctor 依此显式报错，
+   * 不再「配置路径被静默弃用 + 建真会话烧额度 + 失败回执误导到 member_model」。
+   */
+  configError?: string;
 }
 
 /** 探测失败时的统一指引（DESIGN-V0.4 §2.7：明确指引而非静默不可用）。 */
@@ -61,6 +71,81 @@ export const LOCATE_GUIDANCE =
   "② 在会话里运行 xc_doctor 查看已尝试的探测线索。";
 
 const PROBE_TIMEOUT_MS = 4000;
+
+// ─────────────────────────── 显式配置校验（v0.5.3 A5 修复） ───────────────────────────
+
+/** 显式配置无效时的统一修复指引（与 LOCATE_GUIDANCE 同风格：给明确出路而非静默）。 */
+export const SPAWN_CONFIG_GUIDANCE =
+  "请在插件设置里修正 zcode_exe（zcode 安装目录下的 ZCode.exe）与 zcode_cjs" +
+  "（同目录 resources\\<variant>\\zcode.cjs），或清空两项走自动探测；" +
+  "确认配置有效之前推送唤醒与成员供给不可用（不会回落自动探测），两会话 pull 协作不受影响，" +
+  "可运行 xc_doctor 查看校验详情。";
+
+/** 单个配置文件的有效性校验；无效返回根因短语，有效返回 undefined（只做同步 fs 检查）。 */
+function invalidFileReason(path: string, kind: "exe" | "cjs"): string | undefined {
+  let isFile = false;
+  try {
+    isFile = statSync(path).isFile();
+  } catch {
+    return "文件不存在";
+  }
+  if (!isFile) return "存在但不是普通文件（目录或其他）";
+  // exe 在 Windows 上要求 .exe 扩展名（plugin.json userConfig zcode_exe 描述的交付形态）；
+  // 「存在但不可执行文件」（红队 a5 对照组：.txt）在此显式拦截，不再静默换探测路径。
+  if (kind === "exe" && process.platform === "win32" && extname(path).toLowerCase() !== ".exe") {
+    return "存在但不是 Windows 可执行文件（扩展名非 .exe）";
+  }
+  return undefined;
+}
+
+/**
+ * v0.5.3（A5 修复）：显式 spawn 配置解析（唯一入口）。
+ * XC_ZCODE_EXE/XC_ZCODE_CJS 任一非空即视为「显式配置」——校验并原样采用，绝不静默回落
+ * 自动探测（回落仅在两项都未配置时）：
+ * - exe 配置无效（不存在/非文件/非 .exe）→ 显式报错（含根因与 SPAWN_CONFIG_GUIDANCE）；
+ * - cjs 留空（plugin.json userConfig「留空时随 zcode_exe 一并自动探测」）→ 从配置的
+ *   exe 同目录推导（锚定配置的 exe，绝不换用探测到的其他安装）；推导不到 → 显式报错；
+ * - exe 未配置但 cjs 已配置 → 显式报错（成对配置或清空走自动探测，不再半配置半探测）。
+ * 纯同步 fs 检查，零子进程探测（校验失败连 PowerShell 都不起——快速失败不烧额度）。
+ */
+export function resolveExplicitSpawnPair(
+  env: NodeJS.ProcessEnv = process.env,
+): { error?: string; pair?: ZcodePair } {
+  const exeEnv = (env["XC_ZCODE_EXE"] ?? "").trim();
+  const cjsEnv = (env["XC_ZCODE_CJS"] ?? "").trim();
+  if (exeEnv === "" && cjsEnv === "") return {}; // 未配置：唯一允许自动探测的入口
+
+  const problems: string[] = [];
+  let derivedCjs: string | undefined;
+  if (exeEnv === "") {
+    problems.push(`已配置 zcode_cjs="${cjsEnv}" 但 zcode_exe 未配置（请成对配置，或清空 zcode_cjs 走自动探测）`);
+  } else {
+    const exeProblem = invalidFileReason(exeEnv, "exe");
+    if (exeProblem !== undefined) {
+      problems.push(`配置的 zcode_exe="${exeEnv}" 无效: ${exeProblem}`);
+    } else if (cjsEnv === "") {
+      derivedCjs = deriveCjsCandidates(dirname(exeEnv))[0];
+      if (derivedCjs === undefined) {
+        problems.push(`zcode_cjs 留空且无法从 zcode_exe 同目录推导出 resources\\<variant>\\zcode.cjs（请手填 zcode_cjs）`);
+      }
+    }
+  }
+  if (exeEnv !== "" && cjsEnv !== "") {
+    const cjsProblem = invalidFileReason(cjsEnv, "cjs");
+    if (cjsProblem !== undefined) problems.push(`配置的 zcode_cjs="${cjsEnv}" 无效: ${cjsProblem}`);
+  }
+  if (problems.length > 0) {
+    return { error: `XC_ZCODE_EXE/XC_ZCODE_CJS 显式配置无效（${problems.join("；")}）。${SPAWN_CONFIG_GUIDANCE}` };
+  }
+  // cjs 留空时此处必已推导成功（推导失败已归入 problems）。
+  const cjs = cjsEnv !== "" ? cjsEnv : derivedCjs!;
+  return { pair: { exe: exeEnv, cjs } };
+}
+
+/** 只取显式配置的校验结论（唤醒路径的零成本前置闸用；未配置/配置有效 → undefined）。 */
+export function explicitSpawnConfigError(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  return resolveExplicitSpawnPair(env).error;
+}
 
 /** 探测函数类型：单步只读探测的注入缝（测试用假 probe 模拟全败/命中顺序，§5-S2c-②）。 */
 export type ZcodeProbe = (script: string) => string;
@@ -122,23 +207,28 @@ export function locateZcodePair(
   // ① env（userConfig 经 plugin.json env 注入；探测事实基线 F3：缺省场景确实为空）。
   //    判定先于缓存（复核轮 F4）：env 命中直接返回——不读缓存、不写缓存，
   //    不同 env 参数的调用（生产进程内 env 恒定；测试/doctor 传不同 env）互不污染。
+  //    v0.5.3（A5 修复）：显式配置存在 → 校验并显式报错，绝不静默回落自动探测
+  //    （回落仅在两项都未配置时）。校验失败也不读成功缓存——缓存是自动探测的结果，
+  //    读它就等于静默换用另一个 exe（a5 形态：配置路径被弃用 + 真会话烧额度）。
   const exeEnv = (env["XC_ZCODE_EXE"] ?? "").trim();
   const cjsEnv = (env["XC_ZCODE_CJS"] ?? "").trim();
-  if (exeEnv !== "" && cjsEnv !== "") {
-    if (existsSync(exeEnv) && existsSync(cjsEnv)) {
-      attempts.push({ step: "env", hit: true, detail: "XC_ZCODE_EXE/XC_ZCODE_CJS 已配置且文件存在" });
-      return { found: true, source: "user_config", pair: { exe: exeEnv, cjs: cjsEnv }, attempts, guidance: "" };
+  if (exeEnv !== "" || cjsEnv !== "") {
+    const explicit = resolveExplicitSpawnPair(env);
+    if (explicit.error !== undefined) {
+      attempts.push({ step: "env", hit: false, detail: `显式配置无效（不回落自动探测）: ${explicit.error}` });
+      return {
+        found: false, source: "user_config", pair: null, attempts,
+        guidance: explicit.error, configError: explicit.error,
+      };
     }
     attempts.push({
-      step: "env", hit: false,
-      detail: `已配置但文件不存在（继续自动探测）: exe=${exeEnv} cjs=${cjsEnv}`,
+      step: "env", hit: true,
+      detail: `XC_ZCODE_EXE/XC_ZCODE_CJS 已配置且校验通过`
+        + (cjsEnv === "" ? "（zcode_cjs 留空，已从 zcode_exe 同目录推导）" : ""),
     });
-  } else {
-    attempts.push({
-      step: "env", hit: false,
-      detail: `未配置（exe=${exeEnv === "" ? "empty" : "set"} cjs=${cjsEnv === "" ? "empty" : "set"}）`,
-    });
+    return { found: true, source: "user_config", pair: explicit.pair!, attempts, guidance: "" };
   }
+  attempts.push({ step: "env", hit: false, detail: "未配置（exe=empty cjs=empty）→ 自动探测" });
 
   // 自动探测成功缓存（env 已在上面分流；命中缓存时并入本次 attempts，doctor 展示的留痕仍是本次调用链）。
   if (cache) return { ...cache, attempts };
@@ -235,8 +325,9 @@ export interface ResolvedSpawnConfig {
 
 /**
  * spawn 配置解析的唯一入口（wake.ts / provision.ts 调用）：
- * env 已配置且文件存在 → 原样使用（现行为不变，最快路径，不触发任何子进程探测）；
- * 否则自动探测兜底（含「已配置但文件不存在」的回落）。返回 outcome 供审计与指引。
+ * 显式配置（XC_ZCODE_EXE/XC_ZCODE_CJS 任一非空）→ 校验后原样使用（最快路径，不触发任何
+ * 子进程探测）；校验失败 → outcome.configError 携带根因、pair 为空，调用方必须显式失败
+ * （v0.5.3 A5：不静默回落、不建真会话）；两项都未配置 → 自动探测兜底。返回 outcome 供审计与指引。
  */
 export function resolveZcodeSpawnConfig(
   env: NodeJS.ProcessEnv = process.env,

@@ -94,6 +94,51 @@ describe("buildDoctorReport（report 构造，env 命中场景）", () => {
   });
 });
 
+describe("buildDoctorReport：显式配置无效 → configError WARNING（v0.5.3 A5 修复）", () => {
+  // 红队 a5 形态：doctor 此前显示 env(set=true) 却给出探测到的 exe（source=process_table），
+  // 配置被静默弃用且无任何警告。修复后：locate(found=false, source=user_config) + WARNING 行。
+  it("report：found=false、source=user_config、configError 携带无效路径根因", () => {
+    const badExe = "E:\\nonexistent-dir-9999\\ZCode.exe";
+    const report = buildDoctorReport({
+      ...envHitInput(),
+      env: { XC_ZCODE_EXE: badExe, XC_MEMBER_MODEL: "" } as NodeJS.ProcessEnv,
+    });
+    expect(report.spawnPaths.zcode_exe_env_set).toBe(true);
+    expect(report.spawnPaths.locate.found).toBe(false);
+    expect(report.spawnPaths.locate.source).toBe("user_config");
+    expect(report.spawnPaths.locate.exe).toBe(""); // 不再给出探测到的 exe
+    expect(report.spawnPaths.locate.configError).toContain(badExe);
+    expect(report.spawnPaths.locate.configError).toContain("文件不存在");
+    expect(report.guidance).toBe(report.spawnPaths.locate.configError);
+  });
+
+  it("协议面：可读文本含 WARNING 行与 locate(found=false)，JSON 载体同步 configError", async () => {
+    const server = new McpServer({ name: "doctor-test-server", version: "0.0.0" });
+    registerDoctorTool(server, {
+      ...envHitInput(),
+      env: { XC_ZCODE_EXE: "E:\\nonexistent-dir-9999\\ZCode.exe" } as NodeJS.ProcessEnv,
+    });
+    const [serverT, clientT] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "doctor-test-client", version: "0.0.0" });
+    await Promise.all([server.connect(serverT), client.connect(clientT)]);
+    try {
+      const result = (await client.callTool({ name: "xc_doctor", arguments: {} })) as unknown as {
+        content: Array<{ type: string; text: string }>;
+      };
+      const readable = result.content[0]!.text;
+      expect(readable).toContain("locate(found=false, source=user_config)");
+      expect(readable).toContain("WARNING: XC_ZCODE_EXE/XC_ZCODE_CJS 显式配置无效");
+      expect(readable).toContain("nonexistent-dir-9999");
+      expect(readable).toContain("指引: ");
+      const parsed = JSON.parse(result.content[1]!.text) as DoctorReport;
+      expect(parsed.spawnPaths.locate.configError).toContain("nonexistent-dir-9999");
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+});
+
 describe("registerDoctorTool（注册 smoke：真实 MCP 协议面）", () => {
   it("listTools 暴露 xc_doctor，空参数 shape", async () => {
     const server = new McpServer({ name: "doctor-test-server", version: "0.0.0" });

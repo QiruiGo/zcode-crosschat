@@ -591,3 +591,30 @@ describe("tools: xc_status.teamId 路径穿越闸（BND-1）", () => {
     expect(teamDirs).toEqual(["default"]);
   });
 });
+
+// ─────────────────────────── v0.5.3（A2 修复）：xc_status 查询零写副作用 ───────────────────────────
+
+describe("tools: xc_status 零写副作用（v0.5.3 A2：幽灵团队目录）", () => {
+  it("adj052 A2 攻击重放：未注册连接对任意 teamId 反复查询不创建幽灵团队目录", async () => {
+    for (const teamId of ["no-such-team", "ghost-a", "ghost-b", "a.b-c_d"]) {
+      const res = await core.xc_status({ teamId }, "ghost");
+      expect(res.isError).toBeUndefined(); // 查询面照常豁免注册（§2.8）
+      const payload = payloadOf(res) as { teamId: string; phase: string };
+      expect(payload.teamId).toBe(teamId);
+      expect(payload.phase).toBe("none"); // 无队快照只进响应负载
+    }
+    // 一个团队目录都没建（旧实现每查一次 mkdir+写 snapshot.json，无限刷无清理）。
+    expect(existsSync(join(stateRoot, "teams"))).toBe(false);
+  });
+
+  it("已存在团队照常刷新 snapshot.json（§2.8 观测面不回归）", async () => {
+    await hookRegister("conn-a", "a", "sess-a");
+    const res = await core.xc_status({ teamId: "default" }, "ghost");
+    expect(res.isError).toBeUndefined();
+    const snap = join(stateRoot, "teams", "default", "snapshot.json");
+    expect(existsSync(snap)).toBe(true);
+    const parsed = JSON.parse(await readFile(snap, "utf8")) as { members: Array<{ key: string }> };
+    expect(parsed.members).toHaveLength(1);
+    expect(parsed.members[0]!.key).toBe("a");
+  });
+});

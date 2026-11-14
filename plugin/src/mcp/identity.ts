@@ -8,10 +8,17 @@
  *   都成立；Map 结构为未来 HTTP 形态预留 per-session 键）。
  * - 路径 1（hook 锚定）：registry/sessions/<sid>.json 存在（任意年龄；lastSeen
  *   超 10 分钟仅告警不拒绝）∧ 名字未被其他 sid 绑定 ∧ sid 未被其他名字绑定。
+ *   v0.5.3（安全对-1/a6 修复）：**重绑已绑定的 (name, sid) 精确对**还须出示锚定
+ *   令牌 regToken（SessionStart 铸造、只注入本会话上下文；同连接幂等重试与旧锚
+ *   免除外）——(name, sid) 对可经 xc_status 免注册读到，本身不是凭据，不验令牌
+ *   即可精确重放冒充任意成员（偷邮箱/移 lead/零告警）。
  * - 路径 2（wakeToken 回退）：registry/wake/<nonce>.json 命中未过期未使用且
  *   {teamId, agentKey, sid} 匹配 → 直接绑定（允许覆盖同名旧绑定：无头回合身份以
- *   nonce 为准），并由服务端代写 sessions/<sid>.json（消除对钩子落盘的依赖），
- *   nonce 标记 used（M1 consumeWakeNonce）。
+ *   nonce 为准），并由服务端代写 sessions/<sid>.json（消除对钩子落盘的依赖；
+ *   v0.5.3 起代写保留/补铸 regToken），nonce 标记 used（M1 consumeWakeNonce）。
+ * - v0.5.3（安全对-3/a8 修复）：注册成功后把 boundName 盖到机器全局基记录
+ *   peers/base/<sid>.json（options.peerRoot 给出时）——peer 轴据此对「已绑定
+ *   队内身份的 sid」强制验 regToken。
  * - 锁序全局固定：registry → team（§2.7-3）。xc_register 是唯一同时持两把锁的
  *   路径，直接用 M1 的 withRegistryThenTeamLocks（先 registry 绑名、后 team 入队；
  *   join 失败经 unbindName 回滚绑名——M1 专门为回滚设计的条件删除）。
@@ -20,7 +27,7 @@
  * tools.ts 的 runCore 统一映射成结构化错误信封。
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { invalidParamsError, notRegisteredError, ToolError } from "./protocol.js";
 import { withRegistryThenTeamLocks } from "../core/lock.js";
 import { sanitizeKey } from "../core/sanitize.js";
@@ -34,10 +41,11 @@ import {
   unbindName,
   writeSession,
 } from "../core/registry.js";
+import { readPeerBaseRecord, writePeerBaseRecord } from "../core/peerdir.js";
 import { newTeamState, noteTeamReset, readTeam, writeTeam } from "../core/teamstate.js";
 import { logEngineEvent } from "../core/log.js";
 import { DEFAULT_TEAM_ID, memberState, RESERVED_MEMBER_KEYS } from "../core/types.js";
-import type { MemberRole, TeamMember, TeamState } from "../core/types.js";
+import type { MemberRole, SessionRecord, TeamMember, TeamState } from "../core/types.js";
 
 export { DEFAULT_TEAM_ID };
 
@@ -104,6 +112,14 @@ export interface RegisterArgs {
   sessionId: string;
   role?: MemberRole;
   wakeToken?: string;
+  /**
+   * v0.5.3（安全对-1/a6 修复）：锚定令牌——SessionStart 钩子铸造并只注入到本会话
+   * 上下文的凭据。(name, sessionId) 对可经 xc_status 公开读到，不构成凭据；重绑
+   * 已绑定的 (name, sid) 对时必须出示与锚定记录一致的 regToken，否则精确对重放
+   * 冒充（偷邮箱/移 lead/零告警）成立。wakeToken 路径不需要它（一次性 nonce 即
+   * 属主凭据）。
+   */
+  regToken?: string;
 }
 
 export interface RegisterOutcome {
@@ -119,11 +135,17 @@ export interface RegisterOutcome {
  * xc_register 主体（双路径校验 + join default team）。
  * 成功后由本函数把身份绑定到 connectionKey（§2.3-2：校验通过即绑定）。
  * 抛出的 LockBusyError 由 tools.ts runCore 映射为 {error:"busy"} 信封。
+ *
+ * v0.5.3（安全对-1/a6 修复）：`options.peerRoot` 缺省 undefined——给出时（生产装配
+ * 由 tools.ts 传 `peerRootFromEnv(deps.env)`），注册成功后会在机器全局基记录
+ * `peers/base/<sid>.json` 上盖 `boundName` 队内绑定标记；peer 轴（xc_peer_register）
+ * 据此识别「该 sid 已是队内成员身份」并强制验 regToken（跨工作区也可见）。
  */
 export async function xcRegister(
   stateRoot: string,
   args: RegisterArgs,
   connectionKey: string,
+  options: { peerRoot?: string } = {},
 ): Promise<RegisterOutcome> {
   const name = args.name.trim();
   if (!name) throw invalidParamsError("name is required");
@@ -152,6 +174,9 @@ export async function xcRegister(
     const now = Date.now();
     const warnings: string[] = [];
     let via: "hook" | "wake";
+    // v0.5.3（a6）：锚定记录（hook 路径读取；wake 路径为代写后的记录）——重绑属主
+    // 校验要读它的 regToken，故提升到双路径分支之外声明。
+    let sess: SessionRecord | undefined;
 
     // ---- v0.2（DESIGN-V0.2 §7.4-I5/§7.3.3）：removed 成员的注册一律拒绝 ----
     // xc_member_stop 后花名不释放（roster 记录保留）；重新启用必须由 lead 走
@@ -190,12 +215,24 @@ export async function xcRegister(
       const consumed = await consumeWakeNonce(stateRoot, nonce, { teamId, agentKey, sid: sessionId }, now);
       if (consumed === undefined) throw invalidParamsError(`wakeToken "${nonce}" is no longer usable`);
       // 服务端代写 sessions/<sid>.json：wakeToken 路径不依赖钩子落盘（§2.3-4 ②）。
-      const record = { sessionId, cwd: process.cwd(), startedAt: now, lastSeen: now, boundName: agentKey };
+      // v0.5.3（a6）：代写不得抹掉钩子已写的锚定令牌（保留既有 regToken；缺失则
+      // 补铸一枚，令牌与后续 SessionStart 的延续逻辑同源）。
+      const existingRecord = await readSession(stateRoot, sessionId);
+      const record: SessionRecord = {
+        ...(existingRecord ?? {}),
+        sessionId,
+        cwd: process.cwd(),
+        startedAt: existingRecord?.startedAt ?? now,
+        lastSeen: now,
+        boundName: agentKey,
+        regToken: existingRecord?.regToken ?? randomUUID(),
+      };
       await writeSession(stateRoot, record);
+      sess = record;
     } else {
       // ---- 路径 1：hook 锚定（§2.3-1/3）----
       via = "hook";
-      const sess = await readSession(stateRoot, sessionId);
+      sess = await readSession(stateRoot, sessionId);
       if (sess === undefined) {
         throw new ToolError({
           error: "session_not_anchored",
@@ -235,6 +272,48 @@ export async function xcRegister(
       });
     }
 
+    // ---- v0.5.3（安全对-1/a6 修复）：重绑属主校验 ----
+    // (name, sid) 精确对可经 xc_status 免注册读到，本身不构成凭据：已绑定对的再次
+    // 出示必须附带锚定令牌（SessionStart 铸造、只注入本会话上下文），否则精确对
+    // 重放可完全冒充任意成员（偷消费邮箱 / xc_lead_transfer 移走 lead / 零告警）。
+    // 豁免三条：
+    // ① 本连接已绑定同一身份 ⇒ 同一连接的幂等重试（agent 重试语义），不再索要；
+    // ② wakeToken 路径 ⇒ 一次性 nonce 即属主凭据（via === "wake"）；
+    // ③ 锚定记录缺 regToken（v0.5.3 之前铸的旧锚）⇒ 放行 + 告警（不静默：该会话
+    //    下次 SessionStart 即携带令牌，过渡窗口在响应 warnings 与审计里如实披露）。
+    // 错误码 identity_token_required：与 name_taken/session_already_bound（仍先行
+    // 触发，行为不变）区分开——那里挡「对不上」，这里挡「对得上但不是你」。
+    const pairAlreadyBound = existingBinding !== undefined && existingBinding.sessionId === sessionId;
+    const connBound = identityStore.get(connectionKey);
+    const sameConnectionRetry = connBound !== undefined
+      && connBound.agentKey === agentKey
+      && connBound.sessionId === sessionId;
+    if (pairAlreadyBound && via === "hook" && !sameConnectionRetry) {
+      if (sess?.regToken !== undefined) {
+        if (args.regToken?.trim() !== sess.regToken) {
+          await logEngineEvent(stateRoot, {
+            event: "register-replay-blocked",
+            teamId,
+            agentKey,
+            sessionId,
+            tokenPresented: args.regToken !== undefined,
+          });
+          throw new ToolError({
+            error: "identity_token_required",
+            name: agentKey,
+            sessionId,
+            message: `pair (name "${agentKey}", session "${sessionId}") is already bound; re-binding it from a new connection ` +
+              "requires the session's regToken (injected by the SessionStart hook into this session's own context). " +
+              "A (name, sessionId) pair readable via xc_status is not a credential — presenting it alone is rejected.",
+          });
+        }
+      } else {
+        warnings.push(
+          "anchor predates regToken protection (v0.5.3): exact-pair replay protection inactive for this session until its next SessionStart",
+        );
+      }
+    }
+
     // 先绑名（registry），后 team 入队；入队失败经 unbindName 回滚（§2.7-3 原顺序）。
     await bindName(stateRoot, agentKey, { sessionId, role, registeredAt: now });
     let team: TeamState;
@@ -243,6 +322,48 @@ export async function xcRegister(
     } catch (err) {
       await unbindName(stateRoot, agentKey, sessionId); // 条件回滚：仍指向本 sid 才删
       throw err;
+    }
+
+    // ---- v0.5.3（安全对-3/a8 修复）：队内绑定标记盖章 ----
+    // 注册成功 ⇒ 该 sid 已是队内成员身份。把 boundName 盖到机器全局基记录
+    //（peers/base/<sid>.json，跨工作区可见）上，peer 轴 xc_peer_register 据此识别
+    //「受保护 sid」并强制验锚定令牌——堵住「任意花名 + 队内成员真 sid」的 peer
+    // 冒充。基记录缺失时按注册事实补建（cwd=进程工作区；regToken 与 workspace 侧
+    // 锚定记录同值）；盖章失败只审计不回滚注册（保护是尽力面，注册本身已验证）。
+    if (options.peerRoot !== undefined) {
+      try {
+        const base = await readPeerBaseRecord(options.peerRoot, sessionId);
+        // 令牌取值：workspace 侧锚定记录的 regToken 优先；它缺（旧锚）时保留基记录
+        // 既有值。**绝不凭空铸造**——模型只见过 SessionStart 注入的那一枚，写一枚
+        // 它没见过的令牌会把合法的 peer 注册锁死。
+        const stampToken = sess?.regToken ?? base?.regToken;
+        await writePeerBaseRecord(options.peerRoot, {
+          sessionId,
+          cwd: base?.cwd ?? process.cwd(),
+          source: base?.source ?? null,
+          startedAt: base?.startedAt ?? now,
+          lastSeen: base?.lastSeen ?? now,
+          ...(base?.permissionMode !== undefined ? { permissionMode: base.permissionMode } : {}),
+          ...(stampToken !== undefined ? { regToken: stampToken } : {}),
+          boundName: agentKey,
+        });
+        if (base === undefined) {
+          await logEngineEvent(stateRoot, {
+            event: "bound-name-stamp-created-base",
+            teamId,
+            agentKey,
+            sessionId,
+          });
+        }
+      } catch (error) {
+        await logEngineEvent(stateRoot, {
+          event: "bound-name-stamp-failed",
+          teamId,
+          agentKey,
+          sessionId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
     }
 
     const sessionKey = `xc:${teamId}:${agentKey}`;

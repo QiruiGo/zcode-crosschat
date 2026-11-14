@@ -14,7 +14,11 @@ export interface DoctorReport {
     zcode_exe_env_set: boolean;
     zcode_cjs_env_set: boolean;
     member_model_env_value: string;
-    locate: { found: boolean; source: string; exe: string; cjs: string; attempts: LocateAttempt[] };
+    locate: {
+      found: boolean; source: string; exe: string; cjs: string; attempts: LocateAttempt[];
+      /** v0.5.3（A5 修复）：显式配置无效的根因文案（人可读面另出 WARNING 行）；否则 absent。 */
+      configError?: string;
+    };
   };
   guidance: string;
 }
@@ -41,6 +45,7 @@ export function buildDoctorReport(input: {
         found: outcome.found, source: outcome.source,
         exe: outcome.pair?.exe ?? "", cjs: outcome.pair?.cjs ?? "",
         attempts: outcome.attempts,
+        ...(outcome.configError !== undefined ? { configError: outcome.configError } : {}),
       },
     },
     guidance: outcome.guidance,
@@ -67,6 +72,11 @@ export function registerDoctorTool(server: McpServer, input: {
         `exe: ${report.spawnPaths.locate.exe || "(未定)"}`,
         `cjs: ${report.spawnPaths.locate.cjs || "(未定)"}`,
         `member_model(XC_MEMBER_MODEL): ${report.spawnPaths.member_model_env_value || "(空=枚举表自动选第一个)"}`,
+        // v0.5.3（A5 修复）：显式配置无效 → WARNING 显式报错（红队 a5：此前 doctor
+        // env(set=true) 却显示探测路径、配置被静默弃用且无任何警告）。
+        ...(report.spawnPaths.locate.configError !== undefined
+          ? [`WARNING: ${report.spawnPaths.locate.configError}`]
+          : []),
         ...report.spawnPaths.locate.attempts.map((a) => `- [${a.hit ? "命中" : "未中"}] ${a.step}: ${a.detail}`),
         ...(report.guidance !== "" ? [`指引: ${report.guidance}`] : []),
       ];

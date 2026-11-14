@@ -7,7 +7,9 @@
  * - S2c-② 真全败：八步全败 → guidance===LOCATE_GUIDANCE、attempts 全步留痕；
  * - 命中顺序：process_table → parent_process → registry → common_paths 逐步命中与配对失败回落；
  * - 缓存：成功结果缓存命中零探测、resetLocateCache 复位、失败不缓存；
- * - F4 不变式：env 合法命中不读缓存、不写缓存；env 误配置（文件不存在）被缓存/自动探测救回；
+ * - F4 不变式：env 合法命中不读缓存、不写缓存；
+ * - A5 修复（v0.5.3）：显式配置（XC_ZCODE_EXE/XC_ZCODE_CJS 任一非空）无效 → configError
+ *   显式报错、零探测、绝不回落自动探测（红队 a5 攻击重放：不存在路径 + 不可执行文件）；
  * - deriveCjsCandidates / pairFromExe / resolveZcodeSpawnConfig 契约。
  */
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
@@ -16,10 +18,13 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
   LOCATE_GUIDANCE,
+  SPAWN_CONFIG_GUIDANCE,
   deriveCjsCandidates,
+  explicitSpawnConfigError,
   locateZcodePair,
   pairFromExe,
   resetLocateCache,
+  resolveExplicitSpawnPair,
   resolveZcodeSpawnConfig,
   type ZcodeProbe,
 } from "./zcode-locate";
@@ -166,16 +171,155 @@ describe("locateZcodePair：env 判定先于缓存（F4：env 永远可覆盖探
     expect(got.guidance).toBe(LOCATE_GUIDANCE);
     expect(next.calls.length).toBeGreaterThan(0); // 确实走了全步探测
   });
-  it("env 误配置（文件不存在）→ 留痕后继续自动探测，无缓存时真探测（S2c-① 的单元层）", () => {
+});
+
+// ─────────────────────────── A5 修复：显式配置校验，绝不静默回落（v0.5.3） ───────────────────────────
+
+describe("locateZcodePair：显式配置无效 → configError 显式报错（A5 攻击重放）", () => {
+  it("红队 a5 探针①（配置不存在的 exe 路径，仅 zcode_exe 非空）→ 显式报错，零探测零回落", () => {
+    const badExe = "E:\\nonexistent-dir-9999\\ZCode.exe";
+    const { probe, calls } = failAll(); // 本机桌面 zcode 存活时旧实现必经 process_table 静默回落
+    const got = locateZcodePair({ XC_ZCODE_EXE: badExe }, probe);
+    expect(got.found).toBe(false);
+    expect(got.source).toBe("user_config");
+    expect(got.pair).toBeNull();
+    expect(got.configError).toContain(badExe);
+    expect(got.configError).toContain("文件不存在");
+    expect(got.configError).toContain("不会回落自动探测");
+    expect(got.guidance).toBe(got.configError);
+    expect(calls).toHaveLength(0); // 关键判别：旧实现此处 ≥2 次 PowerShell 探测并命中 process_table
+    expect(got.attempts.some((a) => a.step === "process_table")).toBe(false); // 探测步根本不可达
+  });
+
+  it("红队 a5 探针②（配置存在但不可执行的 .txt，win32）→ 显式报错「扩展名非 .exe」，零回落", () => {
+    const root = freshDir();
+    const notExec = join(root, "notexec.txt");
+    writeFileSync(notExec, "plain text\n", "utf8");
+    const { probe, calls } = scriptedProbe([{ test: isTableScript, out: join(root, "ZCode.exe") }]);
+    const got = locateZcodePair({ XC_ZCODE_EXE: notExec }, probe);
+    if (process.platform === "win32") {
+      expect(got.found).toBe(false);
+      expect(got.configError).toContain(notExec);
+      expect(got.configError).toContain("不是 Windows 可执行文件");
+      expect(got.configError).toContain(".exe");
+      expect(calls).toHaveLength(0); // 旧实现：静默弃用配置并 provision 成功（masking）
+    } else {
+      // 非 Windows 无扩展名闸：文件存在且是普通文件 → 按 user_config 采用（spawn 语义平台自决）
+      expect(got.found).toBe(true);
+      expect(got.pair?.exe).toBe(notExec);
+    }
+  });
+
+  it("exe 有效但 cjs 指向不存在的文件 → 显式报错且指向 zcode_cjs", () => {
+    const root = freshDir();
+    const exe = join(root, "ZCode.exe");
+    writeFileSync(exe, "exe-bytes", "utf8");
+    const { probe, calls } = failAll();
+    const got = locateZcodePair({ XC_ZCODE_EXE: exe, XC_ZCODE_CJS: join(root, "nope.cjs") }, probe);
+    expect(got.found).toBe(false);
+    expect(got.configError).toContain("zcode_cjs");
+    expect(got.configError).toContain("文件不存在");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("只配 zcode_cjs 不配 zcode_exe → 显式报错（成对配置或清空走自动探测，不再半配置半探测）", () => {
+    const { probe, calls } = scriptedProbe([{ test: isTableScript, out: join(freshDir(), "ZCode.exe") }]);
+    const got = locateZcodePair({ XC_ZCODE_CJS: join(freshDir(), "zcode.cjs") }, probe);
+    expect(got.found).toBe(false);
+    expect(got.configError).toContain("zcode_exe 未配置");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("exe 有效 + cjs 留空 + exe 同目录推导得到 cjs → user_config 命中且 cjs 锚定配置的 exe（探测永不参与）", () => {
+    const treeRoot = freshDir();
+    const otherRoot = freshDir();
+    const tree = makeZcodeTree(treeRoot);
+    makeZcodeTree(otherRoot, "elsewhere"); // 诱饵：探测若参与必然给出另一套安装
+    const { probe, calls } = scriptedProbe([{ test: isTableScript, out: join(otherRoot, "ZCode.exe") }]);
+    const got = locateZcodePair({ XC_ZCODE_EXE: tree.exe }, probe);
+    expect(got.found).toBe(true);
+    expect(got.source).toBe("user_config");
+    expect(got.pair).toEqual({ exe: tree.exe, cjs: tree.cjs }); // cjs 从配置的 exe 同目录推导
+    expect(calls).toHaveLength(0);
+  });
+
+  it("exe 有效 + cjs 留空 + 同目录推导不到 → 显式报错要求手填 zcode_cjs（不换探测路径）", () => {
+    const root = freshDir();
+    const exe = join(root, "ZCode.exe");
+    writeFileSync(exe, "exe-bytes", "utf8"); // 无 resources/<variant>/zcode.cjs
+    const decoyRoot = freshDir();
+    makeZcodeTree(decoyRoot); // 诱饵：探测若参与即可配对成功
+    const { probe, calls } = scriptedProbe([{ test: isTableScript, out: join(decoyRoot, "ZCode.exe") }]);
+    const got = locateZcodePair({ XC_ZCODE_EXE: exe }, probe);
+    expect(got.found).toBe(false);
+    expect(got.configError).toContain("zcode_cjs");
+    expect(got.configError).toContain("推导");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("配置无效不读成功缓存：先建立探测缓存，再传无效 env → 仍是 configError 而非缓存命中", () => {
+    const treeRoot = freshDir();
+    const tree = makeZcodeTree(treeRoot);
+    const first = scriptedProbe([{ test: isTableScript, out: tree.exe }]);
+    expect(locateZcodePair({}, first.probe).found).toBe(true); // 缓存建立
+    const got = locateZcodePair({ XC_ZCODE_EXE: "E:\\nope-9999\\ZCode.exe" }, failAll().probe);
+    expect(got.found).toBe(false);
+    expect(got.configError).toBeDefined();
+    expect(got.source).toBe("user_config"); // 不是缓存的 process_table（读缓存=静默换 exe）
+  });
+
+  it("配置错误不写缓存：无效 env 调用后，无 env 全败 probe → 真正全败（错误结果不缓存）", () => {
+    expect(locateZcodePair({ XC_ZCODE_EXE: "E:\\nope-9999\\ZCode.exe" }, failAll().probe).found).toBe(false);
+    const next = failAll();
+    const got = locateZcodePair({}, next.probe);
+    expect(got.found).toBe(false);
+    expect(got.configError).toBeUndefined(); // 无 env → 自动探测路径无 configError
+    expect(got.guidance).toBe(LOCATE_GUIDANCE);
+    expect(next.calls.length).toBeGreaterThan(0);
+  });
+
+  it("SPAWN_CONFIG_GUIDANCE 给修复出路（改配置/清空走探测/xc_doctor/pull 不受影响）", () => {
+    expect(SPAWN_CONFIG_GUIDANCE).toContain("zcode_exe");
+    expect(SPAWN_CONFIG_GUIDANCE).toContain("zcode_cjs");
+    expect(SPAWN_CONFIG_GUIDANCE).toContain("自动探测");
+    expect(SPAWN_CONFIG_GUIDANCE).toContain("xc_doctor");
+    expect(SPAWN_CONFIG_GUIDANCE).toContain("pull");
+  });
+
+  it("双误配置（exe 与 cjs 都指向不存在文件）→ 显式报错、零探测（S2c-① 单元层的 A5 修复版）", () => {
     const { probe, calls } = failAll();
     const got = locateZcodePair(
       { XC_ZCODE_EXE: join(freshDir(), "nope.exe"), XC_ZCODE_CJS: join(freshDir(), "nope.cjs") },
       probe,
     );
     expect(got.attempts[0]).toMatchObject({ step: "env", hit: false });
-    expect(got.attempts[0]!.detail).toContain("已配置但文件不存在（继续自动探测）");
+    expect(got.attempts[0]!.detail).toContain("显式配置无效（不回落自动探测）");
     expect(got.found).toBe(false);
-    expect(calls.length).toBeGreaterThanOrEqual(2); // 至少走了进程表+父链两步真探测
+    expect(got.configError).toContain("文件不存在");
+    expect(got.guidance).toBe(got.configError);
+    expect(calls).toHaveLength(0); // 校验短路：连 PowerShell 探测都不发起（快速失败不烧额度）
+  });
+});
+
+describe("resolveExplicitSpawnPair / explicitSpawnConfigError（A5 校验唯一入口）", () => {
+  it("两项都未配置 → 无 error（唯一允许自动探测的入口）", () => {
+    expect(resolveExplicitSpawnPair({})).toEqual({});
+    expect(explicitSpawnConfigError({})).toBeUndefined();
+  });
+  it("配置有效（含 cjs 留空推导）→ pair 返回；cjs 显式配置 → 原样返回", () => {
+    const root = freshDir();
+    const tree = makeZcodeTree(root);
+    const derived = resolveExplicitSpawnPair({ XC_ZCODE_EXE: tree.exe });
+    expect(derived.error).toBeUndefined();
+    expect(derived.pair).toEqual({ exe: tree.exe, cjs: tree.cjs });
+    const explicit = resolveExplicitSpawnPair({ XC_ZCODE_EXE: tree.exe, XC_ZCODE_CJS: tree.cjs });
+    expect(explicit.pair).toEqual({ exe: tree.exe, cjs: tree.cjs });
+  });
+  it("错误文案含根因（无效路径原文）与修复指引（provision/wake 回执直接引用）", () => {
+    const err = explicitSpawnConfigError({ XC_ZCODE_EXE: "E:\\nx\\ZCode.exe" });
+    expect(err).toContain("XC_ZCODE_EXE/XC_ZCODE_CJS 显式配置无效");
+    expect(err).toContain("E:\\nx\\ZCode.exe");
+    expect(err).toContain(SPAWN_CONFIG_GUIDANCE);
   });
 });
 

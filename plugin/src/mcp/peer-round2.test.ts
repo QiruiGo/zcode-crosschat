@@ -29,7 +29,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { formatPeerRows } from "../core/peeraddr.js";
-import { localPidDomain, peerAuditLogFile } from "../core/peerdir.js";
+import { writePeerBaseRecord, localPidDomain, peerAuditLogFile } from "../core/peerdir.js";
 import { peerQueueDepth } from "../core/peermsg.js";
 import {
   writePeerKeyFile,
@@ -39,6 +39,8 @@ import {
 import { stopPeerEndpoint } from "../transport/pipe.js";
 import { createDefaultPeerServices } from "./peer-tools.js";
 import { ToolError } from "./protocol.js";
+import { acquireFileLock, LockBusyError } from "../core/lock.js";
+import { peerRegistryLockName, scanPeers } from "../core/peerregistry.js";
 import type { ToolDeps } from "./tools.js";
 
 let root = "";
@@ -50,6 +52,10 @@ let children: ReturnType<typeof spawn>[] = [];
 
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "xc-peerint2-"));
+  // v0.5.3（a8）：给本文件用到的 sid 落钩子基记录（新锚定闸要求）。
+  await writePeerBaseRecord(root, { sessionId: "sess-alice", cwd: workspace, source: "startup", startedAt: Date.now(), lastSeen: Date.now() });
+  // v0.5.3（a8）：给本文件用到的 sid 落钩子基记录（新锚定闸要求）。
+  await writePeerBaseRecord(root, { sessionId: "sess-sender", cwd: workspace, source: "startup", startedAt: Date.now(), lastSeen: Date.now() });
   workspace = await mkdtemp(join(tmpdir(), "xc-peerint2-ws-"));
   stateRoot = join(workspace, ".crosschat");
   servers = [];
@@ -437,5 +443,114 @@ describe("peer-5 修复：接管死会话占用的花名必须留痕（审计 + 
     const rows = await services.list("self");
     expect(rows[0]?.reclaimedFrom).toBeUndefined();
     expect(formatPeerRows(rows).join("\n")).not.toContain("接管自已离会会话");
+  });
+});
+
+// ─────────────────────────── v0.5.3（A4 修复）：注册/改名互斥 + 拒名审计 ───────────────────────────
+
+describe("A4 修复（adj052 A4 攻击重放）：花名 claim→写盘临界区互斥", () => {
+  it("注册表锁被持有时注册 → LockBusyError（临界区真在机器全局锁内，TOCTOU 关闭）；释放后照常成功", async () => {
+    deps.env = { ...deps.env, XC_PEER_REGISTER_LOCK_WAIT_MS: "150" } as NodeJS.ProcessEnv;
+    const services = createDefaultPeerServices(deps);
+    const lockName = peerRegistryLockName(root);
+    const held = await acquireFileLock(root, lockName); // 测试进程持锁 = 模拟另一注册者正在临界区
+    try {
+      const busy = await services
+        .register({ name: "alice", sessionId: "sess-alice" })
+        .catch((error: unknown) => error);
+      expect(busy).toBeInstanceOf(LockBusyError);
+      expect((busy as LockBusyError).lock).toBe(lockName);
+      // 锁未被绕过：注册表里没有写出任何记录（修复前此场景直接写盘成功）。
+      const scan = await scanPeers(root);
+      expect(scan.active).toHaveLength(0);
+    } finally {
+      await held.release();
+    }
+    // 锁释放后注册照常成功（busy 可重试，fail-closed 不留残迹）。
+    const ok = await services.register({ name: "alice", sessionId: "sess-alice" });
+    expect(ok.name).toBe("alice");
+    expect((await services.list("self")).map((row) => row.name)).toEqual(["alice"]);
+  });
+
+  it("注册到别的活会话占用的花名 → name_taken + 审计 peer-name-taken-refused（带上任身份）", async () => {
+    await registerOtherPeer("bob", "sess-bob");
+    const services = createDefaultPeerServices(deps);
+    const refused = await services
+      .register({ name: "bob", sessionId: "sess-alice" })
+      .catch((error: unknown) => error);
+    expect(refused).toBeInstanceOf(ToolError);
+    expect((refused as ToolError).payload).toMatchObject({ error: "name_taken", name: "bob" });
+
+    const events = await auditEvents();
+    const refusedEvents = events.filter((e) => e["event"] === "peer-name-taken-refused");
+    expect(refusedEvents).toHaveLength(1);
+    expect(refusedEvents[0]).toMatchObject({
+      name: "bob",
+      holders: [{ sessionId: "sess-bob" }],
+    });
+  });
+
+  it("改名到别的活会话占用的花名 → name_taken + 同款拒名审计（与注册同一临界区纪律）", async () => {
+    await registerOtherPeer("bob", "sess-bob");
+    const services = createDefaultPeerServices(deps);
+    await services.register({ name: "alice", sessionId: "sess-alice" });
+
+    const refused = await services.rename("bob").catch((error: unknown) => error);
+    expect(refused).toBeInstanceOf(ToolError);
+    expect((refused as ToolError).payload).toMatchObject({ error: "name_taken", name: "bob" });
+    // 改名被拒后本进程记录的名字未变（没有写盘副作用）。
+    expect((await services.list("self")).map((row) => row.name)).toEqual(["alice"]);
+    const events = await auditEvents();
+    expect(events.some((e) => e["event"] === "peer-name-taken-refused" && e["name"] === "bob")).toBe(true);
+  });
+
+  it("改名临界区也在注册表锁内：锁被持有时改名 → LockBusyError（不写盘）", async () => {
+    const services = createDefaultPeerServices(deps);
+    await services.register({ name: "alice", sessionId: "sess-alice" });
+    deps.env = { ...deps.env, XC_PEER_REGISTER_LOCK_WAIT_MS: "150" } as NodeJS.ProcessEnv;
+    const held = await acquireFileLock(root, peerRegistryLockName(root));
+    try {
+      const busy = await services.rename("trixie").catch((error: unknown) => error);
+      expect(busy).toBeInstanceOf(LockBusyError);
+      // 名字未变。
+      expect((await services.list("self")).map((row) => row.name)).toEqual(["alice"]);
+    } finally {
+      await held.release();
+    }
+  });
+});
+
+describe("A4 回归锁：同名多持有 = 显式歧义状态（裸名 fail-closed + 行标记）", () => {
+  it("手工污染两条同名活记录（模拟历史名册）：裸名投递 ambiguous_target，xc_peers 行带 ref 标记", async () => {
+    const services = createDefaultPeerServices(deps);
+    await services.register({ name: "alice", sessionId: "sess-alice" });
+    // 两条同名活记录（不同 sleeper pid = 两个活会话；历史版本互斥缺失的遗留形态）。
+    const pid1 = await startSleeper();
+    const socket1 = await startFakePeerEndpoint();
+    await writePeerRecord(root, peerRecord(pid1, "dupname", "sess-dup-1", socket1));
+    await writePeerKeyFile(root, pid1, socket1, { peerToken: "d".repeat(32), pidDomain: localPidDomain() });
+    const pid2 = await startSleeper();
+    const socket2 = await startFakePeerEndpoint();
+    await writePeerRecord(root, peerRecord(pid2, "dupname", "sess-dup-2", socket2));
+    await writePeerKeyFile(root, pid2, socket2, { peerToken: "d".repeat(32), pidDomain: localPidDomain() });
+
+    // 裸名投递 fail-closed：ambiguous_target 带两个候选。
+    const sent = await services.send({ to: "dupname", message: "hello whoever you are" }).catch((e: unknown) => e);
+    expect(sent).toBeInstanceOf(ToolError);
+    const payload = (sent as ToolError).payload as { error: string; candidates: unknown[] };
+    expect(payload.error).toBe("ambiguous_target");
+    expect(payload.candidates).toHaveLength(2);
+
+    // 观测面显式歧义：同名行渲染带 [ref] 消歧后缀（ambiguousNames）。
+    const rows = await services.list();
+    const dupRows = rows.filter((r) => r.name === "dupname");
+    expect(dupRows).toHaveLength(2);
+    const lines = formatPeerRows(dupRows);
+    for (const line of lines) {
+      expect(line).toMatch(/\[[\w-]{8}\]/); // 歧义行的 ref 后缀（sessionId 尾 8 位，如 [ss-dup-1]）
+    }
+    // ref 定向投递仍可精确寻址（歧义不阻断精确路由）。
+    const targeted = await services.send({ to: `dupname [${dupRows[0]!.ref}]`, message: "exact" });
+    expect(targeted.receipt).toBe("delivered");
   });
 });

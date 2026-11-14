@@ -248,6 +248,13 @@ export async function provisionMember(deps: ToolDeps, spec: ProvisionSpec): Prom
 
   // v0.4（DESIGN-V0.4 §2.4）：spawn 配置解析改为「env → 自动探测」。
   const spawnCfg = resolveZcodeSpawnConfig(deps.env);
+  // v0.5.3（A5 修复）：显式配置（XC_ZCODE_EXE/XC_ZCODE_CJS）无效 → 立即失败，绝不
+  // 经自动探测回落建真会话（红队 a5：静默回落烧账号额度）；ProvisionError 的 message
+  // 即配置错误根因（含无效路径），member_provision_failed 回执 detail 原样携带——
+  // 失败诊断不再误导用户去查 member_model。
+  if (spawnCfg.outcome.configError !== undefined) {
+    throw new ProvisionError("spawn", spawnCfg.outcome.configError);
+  }
   let keeper: AppServerKeeper;
   try {
     keeper = AppServerKeeper.start({

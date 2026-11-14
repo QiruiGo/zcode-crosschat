@@ -24,6 +24,7 @@ import { payloadOf, type ToolResult } from "./protocol.js";
 import { createToolCore, type ToolCore } from "./tools.js";
 import { writeSession } from "../core/registry.js";
 import { readTeam, writeTeam } from "../core/teamstate.js";
+import { writePeerBaseRecord } from "../core/peerdir.js";
 import { PEER_MAX_QUEUE_DEPTH, PEER_RATE_LIMIT, PEER_RATE_WINDOW_MS, admitPeerMessage, createRateBuckets, peerMaxQueueDepthFromEnv } from "../core/peermsg.js";
 import { admissionDropDetail, createDefaultPeerServices, registerPeerTools, validateSendModeArgs } from "./peer-tools.js";
 import { appendPeerQueue, readPeerQueue } from "../core/peermsg.js";
@@ -265,11 +266,15 @@ describe("SCALE-3: xc_peer_inbox 批次窗口（窗口外消息留在队列 + �
   let workspace: string;
   let stateRoot2: string;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     root = mkdtempSync(join(tmpdir(), "xc-scale-r2-peers-"));
     workspace = mkdtempSync(join(tmpdir(), "xc-scale-r2-ws-"));
     stateRoot2 = join(workspace, ".crosschat");
     mkdirSync(stateRoot2, { recursive: true });
+    // v0.5.3（a8）：给 peer 注册用到的 sid 落钩子基记录（新锚定闸要求）。
+    for (const sid of ["sess-alice", "sess-alice2"]) {
+      await writePeerBaseRecord(root, { sessionId: sid, cwd: workspace, source: "startup", startedAt: Date.now(), lastSeen: Date.now() });
+    }
   });
 
   afterEach(async () => {

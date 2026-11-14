@@ -709,3 +709,58 @@ describe("attemptWake 失败侦听（FI-7：spawn 成功 ≠ 送达；回执须�
     expect(readEngineEvents().some((e) => e["event"] === "wake-failed")).toBe(false);
   });
 });
+
+// ─────────────────────────── v0.5.3（A5 修复）：显式 spawn 配置无效 → 唤醒前闸 mailbox 降级 ───────────────────────────
+
+describe("attemptWake: 显式 spawn 配置无效（A5 修复——不回落探测、不写 nonce、回执带根因）", () => {
+  it("XC_ZCODE_EXE 配置不存在路径（cfg 未注入）→ mailbox 降级 + note 携带配置根因，零 spawn 零 nonce", async () => {
+    const message = await seedMailbox();
+    const captured: CapturedSpawn[] = [];
+    const res = await attemptWake(baseReq({
+      receiptIds: [message.id],
+      now: 2_000_000,
+      cfg: undefined, // 未注入配置 → 走 env 校验（红队 a5 形态：显式配置了坏路径）
+      env: { XC_WAKE_ENABLED: "true", XC_ZCODE_EXE: "E:/nonexistent-dir-9999/ZCode.exe" },
+      spawn: fakeSpawn(9999, captured),
+    }));
+
+    expect(res.delivered).toBe("mailbox");
+    expect(res.note).toContain("spawn-config-invalid");
+    expect(res.note).toContain("nonexistent-dir-9999");
+    expect(res.note).toContain("不会回落自动探测");
+    expect(res.nonce).toBeUndefined(); // 前置闸在 nonce 写入之前：无 15min 在途标记
+    expect(captured).toHaveLength(0); // 绝不经探测路径发出唤醒
+
+    // 磁盘：无 nonce 落盘；无 wake/zcode-locate/spawn-failed 事件，只有 wake-skipped 根因行
+    const wakeDir = join(root, "registry", "wake");
+    expect(existsSync(wakeDir) ? readdirSync(wakeDir).filter((f) => f.endsWith(".json")) : []).toEqual([]);
+    const skipped = readEngineEvents().filter((e) => e["event"] === "wake-skipped");
+    expect(skipped.some((e) => String(e["reason"]).includes("spawn-config-invalid"))).toBe(true);
+    expect(readEngineEvents().some((e) => e["event"] === "wake")).toBe(false);
+    expect(readEngineEvents().some((e) => e["event"] === "zcode-locate")).toBe(false);
+
+    // 消息留邮箱可 pull（投递租约未被 markDelivered 盖章）
+    const after = (await readMailbox(root, "default", "b")).find((m) => m.id === message.id);
+    expect(after?.readAt ?? null).toBeNull();
+  });
+
+  it("cfg 测试注入时跳过配置闸（注入即信任，既有 wake 测试路径不变）", async () => {
+    await seedMailbox();
+    const captured: CapturedSpawn[] = [];
+    const res = await attemptWake(baseReq({
+      receiptIds: [message0Id()],
+      now: 2_100_000,
+      env: { XC_WAKE_ENABLED: "true", XC_ZCODE_EXE: "E:/nonexistent-dir-9999/ZCode.exe" },
+      spawn: fakeSpawn(8888, captured),
+    }));
+    expect(res.delivered).toBe("wake");
+    expect(captured).toHaveLength(1); // 注入 cfg 直接使用，env 坏配置不参与判定
+  });
+});
+
+function message0Id(): string {
+  // 本 describe 内的 seedMailbox 每次落一条新消息；此处读取最新一条的 id（时序上一一对应）。
+  const file = join(root, "teams", "default", "inbox", "b.jsonl");
+  const lines = readFileSync(file, "utf8").split("\n").filter((l) => l.trim() !== "");
+  return (JSON.parse(lines[lines.length - 1]!) as { id: string }).id;
+}

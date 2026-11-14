@@ -252,6 +252,13 @@ export interface SessionRecord {
   lastSeen: number;
   /** Set once the session has bound a name via xc_register. */
   boundName?: string;
+  /**
+   * v0.5.3（安全对-1/a6 修复）：锚定令牌——SessionStart 钩子铸造、仅注入到**本会话**
+   * 上下文的随机凭据。(name, sessionId) 对可经 xc_status 公开读到，本身不是凭据；
+   * 重绑已绑定 (name, sid) 对时必须出示本令牌，才能把「精确对重放冒充」从
+   * 纯 MCP API 层堵死（令牌不出现在任何工具输出/注册表外的公开面上）。
+   */
+  regToken?: string;
 }
 
 /**
@@ -664,6 +671,8 @@ export function coerceSessionRecord(value: unknown, expectedSessionId: string): 
     return { ok: false, defect: 'fields "startedAt"/"lastSeen" missing or not numbers' };
   }
   const boundName = optionalString(value['boundName']);
+  // v0.5.3（a6）：regToken 可选透传——旧格式记录（升级前锚定）缺该字段照常解析。
+  const regToken = optionalString(value['regToken']);
   return {
     ok: true,
     record: {
@@ -672,6 +681,7 @@ export function coerceSessionRecord(value: unknown, expectedSessionId: string): 
       startedAt,
       lastSeen,
       ...(boundName === undefined ? {} : { boundName }),
+      ...(regToken === undefined ? {} : { regToken }),
     },
   };
 }
