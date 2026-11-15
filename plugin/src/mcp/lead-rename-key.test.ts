@@ -18,7 +18,7 @@
  * 改名走 handleIdentify 真路径（peer 轴无会话上下文 → 只改队内轴），角色操作走
  * createLeadToolCore 真路径；XC_MESSAGING_DIR 钉临时目录。
  */
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -251,5 +251,61 @@ describe("红队四番战 边界-1（P1）：lead/founder 改名 key 随动", ()
     const renamed2 = (await engineEvents()).filter((e) => e["event"] === "register-renamed").at(-1);
     expect(renamed2!["leadKeyFollowed"]).toBeUndefined();
     expect(renamed2!["founderKeyFollowed"]).toBeUndefined();
+  });
+});
+
+// ─────────── v0.7.2 红队五番战 CB-01：改名后 names.json 写新绑定 ───────────
+
+/** 直接种一版 names.json（改名路径只消费它：unbind 旧键 + bind 新键）。 */
+async function seedNames(bindings: Record<string, { sessionId: string; role: "peer" | "worker"; registeredAt: number }>): Promise<void> {
+  await mkdir(join(stateRoot, "registry"), { recursive: true });
+  await writeFile(join(stateRoot, "registry", "names.json"), JSON.stringify(bindings, null, 2));
+}
+
+async function readNamesFile(): Promise<Record<string, { sessionId: string }>> {
+  return JSON.parse(await readFile(join(stateRoot, "registry", "names.json"), "utf8")) as Record<string, { sessionId: string }>;
+}
+
+describe("v0.7.2 CB-01：改名后 names.json 的新键绑定（钩子误报修复）", () => {
+  it("改名成功 → names.json 新键绑定本 sid、旧键移除（SessionStart 钩子可识别）", async () => {
+    await seedTeam({ members: [member("b")] });
+    await seedNames({ a: { sessionId: "sess-a", role: "peer", registeredAt: 1 } });
+    const connA = bind("a");
+
+    const res = await rename(connA, "a", "a2");
+    expect(res.isError).toBeFalsy();
+
+    // 修复前：旧键被解绑、新键从不写入 → names.json 对该 sid 零绑定，钩子注入
+    // 「尚未注册跨会话花名」（红队 capbug1 实测）。修复后：索引与事实一致。
+    const after = await readNamesFile();
+    expect(after["a2"]?.sessionId).toBe("sess-a");
+    expect(after["a"]).toBeUndefined();
+  });
+
+  it("改名被板面守卫阻止（team_rename_blocked）→ names.json 两键都不动", async () => {
+    await seedTeam({ members: [member("b")], withTaskFromA: true });
+    await seedNames({ a: { sessionId: "sess-a", role: "peer", registeredAt: 1 } });
+    const connA = bind("a");
+
+    const blocked = await rename(connA, "a", "a2");
+    expect(blocked.isError).toBe(true);
+    const names = await readNamesFile();
+    expect(names["a"]?.sessionId).toBe("sess-a");
+    expect(names["a2"]).toBeUndefined();
+  });
+
+  it("新键已被别的 sid 占用（陈旧死绑定）→ 不覆盖别人的索引行", async () => {
+    await seedTeam({ members: [member("b")] });
+    await seedNames({
+      a: { sessionId: "sess-a", role: "peer", registeredAt: 1 },
+      a2: { sessionId: "sess-someone-else", role: "peer", registeredAt: 1 },
+    });
+    const connA = bind("a");
+
+    const res = await rename(connA, "a", "a2");
+    expect(res.isError).toBeFalsy(); // 改名本身成功（队内轴换键）
+    const after = await readNamesFile();
+    expect(after["a2"]?.sessionId).toBe("sess-someone-else"); // 未被覆盖
+    expect(after["a"]).toBeUndefined();
   });
 });

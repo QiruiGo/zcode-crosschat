@@ -24,6 +24,7 @@ import {
   listPendingToolRequests,
   listToolRequests,
   readToolRequest,
+  transitionToolRequest,
   updateToolRequest,
   type ToolRequestLedger,
 } from './toolledger.js';
@@ -168,5 +169,42 @@ describe('toolledger v0.7: 终态清理（7 天）', () => {
   it('无目录时零成本（readdir 失败 → 空）', async () => {
     expect(await cleanupToolArtifacts(stateRoot, Date.now())).toEqual({ ledgers: [], approvals: [] });
     expect(await listToolRequests(stateRoot)).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.7.2 复验（P3 修复）：B-02 多进程 sweeper 竞态致过期回投重复
+// ---------------------------------------------------------------------------
+
+describe('toolledger v0.7.2 (B-02): 过期迁移只有一个赢家', () => {
+  it('transitionToolRequest：闸命中才写才返回；未命中不写不返回', async () => {
+    await createToolRequest(stateRoot, ledger());
+    const first = await transitionToolRequest(stateRoot, 'r-001', ['pending'], (l) => ({ ...l, state: 'expired', decidedAt: 2_000_000 }));
+    expect(first?.state).toBe('expired');
+    // 竞态输家：状态已是 expired，闸（pending）不再命中 → undefined，调用方据此不回投。
+    const second = await transitionToolRequest(stateRoot, 'r-001', ['pending'], (l) => ({ ...l, state: 'expired', decidedAt: 3_000_000 }));
+    expect(second).toBeUndefined();
+    // 落盘的 decidedAt 仍是赢家的值（输家没有覆盖写）。
+    expect((await readToolRequest(stateRoot, 'r-001'))?.decidedAt).toBe(2_000_000);
+  });
+
+  it('transitionToolRequest：台账缺失 → undefined（不建文件）', async () => {
+    expect(await transitionToolRequest(stateRoot, 'r-ghost', ['pending'], (l) => ({ ...l, state: 'expired' }))).toBeUndefined();
+    expect(existsSync(toolRequestFile(stateRoot, 'r-ghost'))).toBe(false);
+  });
+
+  it('expireToolRequests：重复调用（sweeper 节拍重入）只第一次返回赢家', async () => {
+    await createToolRequest(stateRoot, ledger());
+    const now = 4_600_001; // > expiresAt（1_000_000 + 3_600_000）
+    expect((await expireToolRequests(stateRoot, now)).map((l) => l.requestId)).toEqual(['r-001']);
+    // 第二次（下一节拍/另一进程）：读到已 expired，闸不命中 → 空列表 → 不回投。
+    expect(await expireToolRequests(stateRoot, now)).toEqual([]);
+    expect((await readToolRequest(stateRoot, 'r-001'))?.state).toBe('expired');
+  });
+
+  it('updateToolRequest 旧契约不变（mutate 放弃 → 返回当前台账）', async () => {
+    await createToolRequest(stateRoot, ledger());
+    const same = await updateToolRequest(stateRoot, 'r-001', () => undefined);
+    expect(same?.state).toBe('pending');
   });
 });

@@ -21,8 +21,11 @@
  * 未读索引：stop 时把该成员邮箱未读消息的 id/from/ts/预览抄进 meta（preview 截
  * 200 字符）——只抄索引不搬运原文，邮箱 JSONL 真源不动。
  *
- * 捡起三步（E3 §④ 16s 实证；longtask skill §2）：①xc_identify({name}) ②
- * xc_read(scope:"journal", id:"archive:<name>") ③按 journal 指针 xc_read(scope:"task")。
+ * 捡起三步（E3 §④ 16s 实证；longtask skill §2）：v0.7.2（C9-B5 修复）起第①条
+ * 按真实可达路径书写——member-stop 后同名 identify 被 `member_removed` 硬拒
+ * （DEMO 明示的重注册硬拒语义），恢复 = lead 的 `xc_team member-add` 幂等重供给
+ * （或换名接手）→ ②xc_read(scope:"journal", id:"archive:<name>") 读档 →
+ * ③按 journal 指针 xc_read(scope:"task")。
  * 同名重加是全新生命周期（provision.ts:54），archive 读档是唯一续上下文路径。
  *
  * @module core/archive
@@ -114,12 +117,31 @@ export interface JournalSectionSource {
   handoff?: string;
 }
 
-/** 缺省交接注意 = 恢复模板（捡起三步；E3 §④ + longtask skill §2）。 */
+/**
+ * 缺省交接注意 = 恢复模板（捡起三步；E3 §④ + longtask skill §2）。
+ *
+ * v0.7.2（红队五番战 C9-B5 修复）：第①条改写。旧模板写
+ * 「①xc_identify({name:<name>})（原成员已 stop，须新会话重绑定；旧会话崩溃场景加
+ * takeover:true）」——而 member-stop 后同名 identify 会被 `member_removed` 硬拒
+ * （v0.2 起的生命周期纪律：花名不释放、roster 记录保留；DEMO 明示「removed 且
+ * 重注册被硬拒」），takeover 同样过不了 removed 门（它只接管**已崩溃但未停机**
+ * 的持有者）。插件生成的交接指令于是指向一条走不通的路（红队 c9b5 实测）。
+ * 新模板按**真实可达**的恢复路径写：
+ *   ① 重新启用该花名 = lead 的 `xc_team member-add`（幂等重供给，§6.4；这是
+ *      removed 成员唯一的重启用入口），新会话再 xc_identify 绑定该名；
+ *      或直接用**新花名** identify 接手（不占用旧名，立即可用）；
+ *   ② 读档（xc_read journal archive:<name>）——两条路都靠它续上下文；
+ *   ③ 按任务清单取原文、以新 attempt 认领续作。
+ * 「同名重加是全新生命周期（不继承上下文）」的告警保留——它正是 member-add
+ * 重供给的语义。
+ */
 export function defaultHandoff(name: string, tasks: readonly ArchiveTaskRef[]): string {
-  const lines = [
-    '- 接手三步：①xc_identify({ "name": "' + name + '" })（原成员已 stop，须新会话重绑定；旧会话崩溃场景加 takeover:true）',
-    '- ②xc_read({ "scope": "journal", "id": "archive:' + name + '" }) 读本留档（当前进度/交接注意）',
-  ];
+  const step1 =
+    '- 接手三步（member-stop 后的恢复路径）：'
+    + `①重新启用花名「${name}」：lead 运行 xc_team({ action: "member-add", name: "${name}" })（幂等重供给，removed 成员的唯一重启用入口），`
+    + '新会话再 xc_identify 绑定该名；或直接用新花名 xc_identify 接手（不占用旧名，立即可用）';
+  const step2 = `- ②xc_read({ "scope": "journal", "id": "archive:${name}" }) 读本留档（当前进度/交接注意）`;
+  const lines = [step1, step2];
   if (tasks.length > 0) {
     lines.push(
       '- ③按下方任务清单逐个 xc_read({ "scope": "task", "id": "<taskId>", "field": "prompt" }) 取任务原文，'

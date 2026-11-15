@@ -113,6 +113,11 @@ interface OfflineMount {
   lines: string[];
   /** XC_OFFLINE_MINUTES 低于 stale 阈值被钳制（挂载面附 WARNING）。 */
   clamped: boolean;
+  /**
+   * v0.7.2（C8-B4 修复）：XC_OFFLINE_MINUTES 设了非法值（0/负数/非数字）——
+   * 已按内置缺省 240min 回落，挂载面附 WARNING 披露（不再静默）。
+   */
+  fellBack: boolean;
 }
 
 async function offlineMembersMount(deps: ToolDeps, team: TeamState, now: number): Promise<OfflineMount | null> {
@@ -122,8 +127,8 @@ async function offlineMembersMount(deps: ToolDeps, team: TeamState, now: number)
     // 只读扫描（sweep:false）：查询路径不得有清扫副作用（peerregistry.ts 的 hazard 自载）。
     const scan = await scanPeers(peerRootFromEnv(deps.env), now, { sweep: false });
     const members = offlineMembers(team, scan, now, threshold.ms);
-    if (members.length === 0 && !threshold.clamped) return null;
-    return { members, lines: members.map(offlineMemberLine), clamped: threshold.clamped };
+    if (members.length === 0 && !threshold.clamped && !threshold.fellBack) return null;
+    return { members, lines: members.map(offlineMemberLine), clamped: threshold.clamped, fellBack: threshold.fellBack };
   } catch {
     return null;
   }
@@ -313,10 +318,11 @@ export function createTeamOverviewCore(deps: ToolDeps): TeamOverviewCore {
           // C3 挂载（M6）：capacity 块（采样失败则不挂载，任务板不受影响）。
           ...(capacity !== null ? capacity.payload : {}),
           // v0.7（C8，M4）挂载点：offlineMembers 块（离线成员 + 名下待转交任务 + 证据）。
-          ...(offlineMount !== null && (offlineMount.members.length > 0 || offlineMount.clamped)
+          ...(offlineMount !== null && (offlineMount.members.length > 0 || offlineMount.clamped || offlineMount.fellBack)
             ? {
                 offlineMembers: offlineMount.members,
                 ...(offlineMount.clamped ? { offlineThresholdClamped: true } : {}),
+                ...(offlineMount.fellBack ? { offlineThresholdFallback: true } : {}),
               }
             : {}),
         };
@@ -338,6 +344,12 @@ export function createTeamOverviewCore(deps: ToolDeps): TeamOverviewCore {
         if (offlineMount !== null && offlineMount.clamped) {
           rollbackWarnings.push(
             "WARNING XC_OFFLINE_MINUTES 低于僵尸清扫阈值（XC_STALE_TASK_MINUTES）——离线阈值已按 stale 阈值钳制（无进展任务会先被 stale 回收，idle-timeout 分支轮不到展示）",
+          );
+        }
+        // v0.7.2（C8-B4 修复）：非法值（0/负数/非数字）不再静默回落——明示已按缺省 240min 接管。
+        if (offlineMount !== null && offlineMount.fellBack) {
+          rollbackWarnings.push(
+            "WARNING XC_OFFLINE_MINUTES 非法（须为有限正数；0/负数/非数字不被接受）——已回落内置缺省 240min（安全方向：取最保守的离线阈值）；如只想用缺省值请取消该 env 设置",
           );
         }
         const text = renderStatusTable({

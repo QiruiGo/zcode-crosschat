@@ -80,7 +80,14 @@ import {
   type OfflineTaskInfo,
 } from "../core/offline.js";
 // v0.7（C6/C7，DESIGN-V0.7.md §2.5/§3.3）：转办台账过期节拍 + 终态清理。
-import { cleanupToolArtifacts, expireToolRequests, TOOL_APPROVAL_KEEP_MS } from "../core/toolledger.js";
+import {
+  cleanupToolArtifacts,
+  expireToolRequests,
+  listToolRequests,
+  transitionToolRequest,
+  TOOL_APPROVAL_KEEP_MS,
+  type ToolRequestLedger,
+} from "../core/toolledger.js";
 import { buildApprovalResult, buildRefusedToolResult } from "../core/toolrelay.js";
 
 // ─────────────────────────── 配置解析（V18 同款防御） ───────────────────────────
@@ -697,9 +704,18 @@ export async function sweepStaleTasksOnce(deps: ToolDeps, now: number = Date.now
  *    回投请求方 `tool_result{status:"refused", reason:"request expired"}`（A 不在线
  *    躺箱的场景由本节拍收口——队内轴无活性闸，E4 §6.4）；lead 收过 approval_request
  *    通知的，补一条 `approval_result{decision:"expired"}` 收尾（§3.3）。
- * 2. **清理**（§3.3）：终态（executed/error/refused/denied/expired）台账与审批文件
+ * 2. **通知收尾**（§11.4，v0.7.2 C7-B5 修复）：lead 收过待批通知、但请求停在
+ *    refused/denied（门拒后始终无人批准）且窗口已关闭的，补一条
+ *    `approval_result{decision:"expired"}`——只通知不改台账（拒绝态已有结论）。
+ *    旧实现只有第 1 步的收尾，而「被通知⇒已读⇒门拒⇒永不被扫」使该分支不可达
+ *    （裁决日志 c7b5b.jsonl：lead 邮箱只有 approval_request、无任何过期回执）。
+ * 3. **清理**（§3.3）：终态（executed/error/refused/denied/expired）台账与审批文件
  *    保留 TOOL_APPROVAL_KEEP_MS（7 天，常量不新增 env）后删除；邮箱帧不预清理
  *    （JSONL 追加真源纪律，v0.6 起不做 TTL）。
+ *
+ * 多进程幂等（v0.7.2 B-02 修复）：过期迁移在**团队锁内**完成，且
+ * {@link expireToolRequests} 只把「本调用真正落盘」的台账算进 expired 列表——
+ * 同相位竞态的其它进程读到已 expired（闸不命中）→ 不进列表 → 不回投。
  *
  * 永不抛出：任何 IO 失败吞掉返回零计数（与 sweepStaleTasksOnce 同纪律）。
  */
@@ -707,7 +723,8 @@ export async function sweepToolRequestsOnce(deps: ToolDeps, now: number = Date.n
   const { stateRoot } = deps;
   const empty = { expired: 0, cleanedLedgers: 0, cleanedApprovals: 0 };
   try {
-    const expiredList = await expireToolRequests(stateRoot, now);
+    // 锁内过期：跨进程只有一个赢家能迁移并拿到回投清单（B-02）。
+    const expiredList = await withTeamLock(stateRoot, DEFAULT_TEAM_ID, () => expireToolRequests(stateRoot, now));
     for (const ledger of expiredList) {
       const frame = buildRefusedToolResult(ledger.requestId, ledger.tool, ledger.to, "request expired", now);
       const msg = createMessage(ledger.to, ledger.from, JSON.stringify(frame), { deliveryClaimedAt: now });
@@ -724,22 +741,19 @@ export async function sweepToolRequestsOnce(deps: ToolDeps, now: number = Date.n
       });
       // §3.3：lead 收过待批通知 → approval_result{expired} 收尾。
       if (ledger.approvalNotifiedAt !== undefined) {
-        const team = await readTeam(stateRoot, DEFAULT_TEAM_ID);
-        const leadKey = team !== undefined ? leadKeyOf(team) : null;
-        if (leadKey !== null && leadKey !== "") {
-          const closeFrame = buildApprovalResult(ledger.requestId, "expired", "engine", now);
-          const closeMsg = createMessage("engine", leadKey, JSON.stringify(closeFrame), { deliveryClaimedAt: now });
-          await appendMailbox(stateRoot, DEFAULT_TEAM_ID, leadKey, closeMsg);
-          await logEngineEvent(stateRoot, {
-            event: "tool-approval-request",
-            teamId: DEFAULT_TEAM_ID,
-            requestId: ledger.requestId,
-            to: leadKey,
-            closedAs: "expired",
-            messageId: closeMsg.id,
-          });
-        }
+        await closeLeadApprovalRequest(stateRoot, ledger, now, "expired");
       }
+    }
+    // §11.4（C7-B5）：通知过但停在拒绝态、窗口已关闭 → 收尾（不迁移台账）。
+    for (const ledger of await listToolRequests(stateRoot)) {
+      if (ledger.approvalNotifiedAt === undefined || ledger.approvalClosedAt !== undefined) continue;
+      if (ledger.state !== "refused" && ledger.state !== "denied") continue;
+      if (now < ledger.expiresAt) continue;
+      const closed = await transitionToolRequest(stateRoot, ledger.requestId, ["refused", "denied"], (l) => ({
+        ...l,
+        approvalClosedAt: now,
+      }));
+      if (closed !== undefined) await closeLeadApprovalRequest(stateRoot, closed, now, "expired");
     }
     const cleaned = await cleanupToolArtifacts(stateRoot, now);
     if (cleaned.ledgers.length > 0 || cleaned.approvals.length > 0) {
@@ -756,6 +770,28 @@ export async function sweepToolRequestsOnce(deps: ToolDeps, now: number = Date.n
     // 永不抛出（清扫面纪律）：下轮节拍重算。
     return empty;
   }
+}
+
+/**
+ * 向现任 lead 补一条 `approval_result` 收尾帧（§3.3/§11.4）：lead 收过待批通知的
+ * 请求走到窗口关闭时，给通知方一个终态信号。只发通知，不带授权语义；无 lead 时
+ * 静默跳过（审计已由 tool-expired / tool-approval-request 留痕）。
+ */
+async function closeLeadApprovalRequest(stateRoot: string, ledger: ToolRequestLedger, now: number, decision: "expired"): Promise<void> {
+  const team = await readTeam(stateRoot, DEFAULT_TEAM_ID);
+  const leadKey = team !== undefined ? leadKeyOf(team) : null;
+  if (leadKey === null || leadKey === "") return;
+  const closeFrame = buildApprovalResult(ledger.requestId, decision, "engine", now);
+  const closeMsg = createMessage("engine", leadKey, JSON.stringify(closeFrame), { deliveryClaimedAt: now });
+  await appendMailbox(stateRoot, DEFAULT_TEAM_ID, leadKey, closeMsg);
+  await logEngineEvent(stateRoot, {
+    event: "tool-approval-request",
+    teamId: DEFAULT_TEAM_ID,
+    requestId: ledger.requestId,
+    to: leadKey,
+    closedAs: decision,
+    messageId: closeMsg.id,
+  });
 }
 
 /**

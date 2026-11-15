@@ -20,13 +20,38 @@ export interface StallFlag {
 }
 
 /**
- * 最后进展时刻 = max(createdAt, history 末条 ts)。
- * teamstate.appendTaskHistory 已逐转移落 ts（v0.6 无需新埋点）；history 为空的
- * 旧记录退回 createdAt。
+ * 最后进展时刻（epoch ms）——停滞检测（本模块）与 C8 离线 idle-timeout 判据
+ * （core/offline.ts offlineVerdict）共用的单一事实源。
+ *
+ * v0.7.2（红队五番战 C8-B2 修复）：口径修正 + 落盘镜像。
+ *
+ * 1. **落盘镜像**：v0.7.2 起任务记录带 `lastProgressTs` 字段（PROTOCOL §12.1
+ *    的 `task.lastProgressTs`），由 teamstate.appendTaskHistory（全部状态转移的
+ *    唯一收口点）随 history 末条同步刷新——观测面（xc_read/板面）可直读，不必
+ *    回溯 history。此前该字段不存在：离线判定的空闲源在磁盘上不可见，协议字面
+ *    （§12.1 `now - task.lastProgressTs > XC_OFFLINE_MINUTES`）与实现脱节。
+ * 2. **口径修正**：旧实现 = `max(createdAt, history 末条 ts)`。对自洽记录两者
+ *    恒等（history 条目必然晚于建单），但按「回拨 updatedAt + 末条 history.ts」
+ *    的既定时间加速手段（红队/验收模拟「N 分钟无进展」的标准做法）构造记录时，
+ *    createdAt 下限会把回拨吞掉——黑盒复现里 idle-timeout 分支因此从未命中
+ *    （C8-B2：判据看似死分支）。新口径 = 两个进展 Marker（history 末条 ts 与
+ *    落盘 lastProgressTs）中**较旧**的一个；两者由同一收口点维护、正常记录恒等，
+ *    取值分歧只可能是外部改写（时间加速/损坏），此时采纳较旧者——停滞/空闲是
+ *    「宁可提示、不可漏报」的观测信号，保守方向正确。history 为空（从未有进展）
+ *    时再退回 createdAt（含 makeTask 落盘的初值）。
+ *
+ * 兼容：v0.7.2 之前的存量记录无 `lastProgressTs` 字段 → 按 history 末条推导，
+ * 自洽记录与旧口径结果一致（旧口径的 createdAt 下限只对外部改写记录生效）。
  */
 export function lastProgressTs(task: Task): number {
+  const markers: number[] = [];
   const last = task.history.length > 0 ? task.history[task.history.length - 1]!.ts : 0;
-  return Math.max(task.createdAt, last);
+  if (Number.isFinite(last) && last > 0) markers.push(last);
+  if (typeof task.lastProgressTs === 'number' && Number.isFinite(task.lastProgressTs) && task.lastProgressTs > 0) {
+    markers.push(task.lastProgressTs);
+  }
+  if (markers.length > 0) return Math.min(...markers);
+  return task.createdAt;
 }
 
 /**

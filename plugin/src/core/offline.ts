@@ -171,17 +171,31 @@ export function offlineMembers(
  * `clamped`——离线阈值若低于 stale，无进展任务会先被 stale 收走，idle-timeout 分支
  * 永远轮不到，钳制保住「30 < 240 ⇒ stale 先动、C8 永不抢先」的边界（§4.2）。
  * 挂载面据此附 WARNING（同 stall 钳制告警）。
+ *
+ * v0.7.2（红队五番战 C8-B4 修复）：**0/负数/非数字不再静默回落**。
+ * 红队实测：`XC_OFFLINE_MINUTES=0`（及 `-5`）时 overview 无
+ * `offlineThresholdClamped`、无 WARNING——env 明明设了却被当「未设」处理，
+ * 运维无法分辨「我没配」与「我配了但值被拒」。现在显式分辨三态：
+ * - `clamped`：有效正值但低于 stale → 按 stale 钳制（原有披露）；
+ * - `fellBack`：env 有值但非法（非有限/≤0/不可解析）→ 回落**内置缺省** 240min
+ *   （安全方向：离线判定取最保守阈值），并由挂载面附 WARNING 披露；
+ * - 两者皆 false = 未设置（或缺省空串）→ 就是缺省 240min，无需披露。
  */
 export function offlineThresholdMsFromEnv(
   env: NodeJS.ProcessEnv,
   staleThresholdMs: number,
-): { ms: number; clamped: boolean } {
+): { ms: number; clamped: boolean; fellBack: boolean } {
   const raw = env['XC_OFFLINE_MINUTES'];
-  const n = typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : Number.NaN;
-  const minutes = Number.isFinite(n) && n > 0 ? n : DEFAULT_OFFLINE_MINUTES;
+  const provided = typeof raw === 'string' && raw.trim() !== '';
+  const n = provided ? Number(raw) : Number.NaN;
+  const valid = Number.isFinite(n) && n > 0;
+  const minutes = valid ? n : DEFAULT_OFFLINE_MINUTES;
+  const fellBack = provided && !valid;
   const staleMinutes = Math.round(staleThresholdMs / 60_000);
-  if (minutes < staleMinutes) return { ms: staleThresholdMs, clamped: true };
-  return { ms: minutes * 60_000, clamped: false };
+  // 两态可并存：非法值回落 240 后仍可能低于 stale（超大 stale 阈值）——钳制与
+  // 回落各自披露，挂载面两条 WARNING 都出。
+  if (minutes < staleMinutes) return { ms: staleThresholdMs, clamped: true, fellBack };
+  return { ms: minutes * 60_000, clamped: false, fellBack };
 }
 
 /**

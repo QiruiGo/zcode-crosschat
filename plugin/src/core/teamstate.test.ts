@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   allowedTransitions,
+  appendTaskHistory,
   applyReport,
   beginTaskAttempt,
   bootstrapTimeoutFromEnv,
@@ -475,5 +476,60 @@ describe('v0.7.1 provisioning deadline 清扫（红队四番战 故障注-1）',
     expect(text.length).toBeLessThanOrEqual(500);
     expect(text).toMatch(/member-add/);
     expect(text).toMatch(/idempotent reprovision/);
+  });
+});
+
+// ─────────────────── v0.7.2 C8-B2 修复：lastProgressTs 落盘与刷新 ───────────────────
+
+describe('v0.7.2 C8-B2：lastProgressTs 落盘与更新点', () => {
+  let dir: string;
+  let root: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'xc-teamstate-lpt-'));
+    root = join(dir, '.crosschat');
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('makeTask 建单即落 lastProgressTs（= createdAt/updatedAt）', () => {
+    const team = newTeamState({ teamId: 'default', name: 'default', founderKey: 'lead', now: 5_000 });
+    const t = makeTask(team, { title: 'x', prompt: 'p', createdBy: 'lead' }, 5_000);
+    expect(t.lastProgressTs).toBe(5_000);
+    expect(t.lastProgressTs).toBe(t.createdAt);
+  });
+
+  it('appendTaskHistory（唯一收口点）逐转移刷新 lastProgressTs，与 history 末条同值', () => {
+    const team = newTeamState({ teamId: 'default', name: 'default', founderKey: 'lead', now: 5_000 });
+    const t = makeTask(team, { title: 'x', prompt: 'p', createdBy: 'lead' }, 5_000);
+    appendTaskHistory(t, 'created', 'lead', undefined, 6_000);
+    expect(t.lastProgressTs).toBe(6_000);
+    const attemptId = beginTaskAttempt(t, 'm1', 7_000);
+    expect(t.lastProgressTs).toBe(7_000);
+    expect(t.lastProgressTs).toBe(t.history[t.history.length - 1]!.ts);
+    expect(attemptId).toBeTruthy();
+    applyReport(t, { status: 'in_progress', attemptId }, 'm1', 8_000);
+    expect(t.lastProgressTs).toBe(8_000);
+    applyReport(t, { status: 'blocked', error: 'waiting', attemptId }, 'm1', 9_000);
+    expect(t.lastProgressTs).toBe(9_000);
+    expect(unblockTask(t, 10_000)).toBeUndefined();
+    expect(t.lastProgressTs).toBe(10_000);
+  });
+
+  it('落盘 roundtrip：字段经 coerceTeamState 保留；非法值被宽容丢弃（不整文件拒绝）', async () => {
+    const team = newTeamState({ teamId: 'default', name: 'default', founderKey: 'lead', now: 5_000 });
+    const t = makeTask(team, { title: 'x', prompt: 'p', createdBy: 'lead' }, 5_000);
+    appendTaskHistory(t, 'created', 'lead', undefined, 6_000);
+    await writeTeam(root, team);
+    const back = await readTeam(root, 'default');
+    expect(back?.tasks[0]?.lastProgressTs).toBe(6_000);
+    // 非法值（字符串/0/负数）→ 字段丢弃，记录仍可读（§11.1 宽容纪律）。
+    const raw = JSON.parse(readFileSync(teamFile(root, 'default'), 'utf8'));
+    raw.tasks[0].lastProgressTs = 'nope';
+    writeFileSync(teamFile(root, 'default'), JSON.stringify(raw));
+    const coerced = await readTeam(root, 'default');
+    expect(coerced?.tasks[0]?.lastProgressTs).toBeUndefined();
+    expect(coerced?.tasks[0]?.id).toBe(t.id);
   });
 });

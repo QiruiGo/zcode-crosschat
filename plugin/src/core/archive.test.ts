@@ -216,12 +216,24 @@ describe('buildJournalSections（三节聚合）', () => {
 
   it('缺省恢复模板含三步与全新生命周期警告', () => {
     const h = defaultHandoff('w1', [{ taskId: 't1', title: 'x', status: 'in_progress' }]);
-    expect(h).toContain('xc_identify({ "name": "w1" })');
     expect(h).toContain('archive:w1');
     expect(h).toContain('"scope": "task"');
     expect(h).toContain('全新生命周期');
     const hEmpty = defaultHandoff('w2', []);
     expect(hEmpty).toContain('无负责任务');
+  });
+
+  // v0.7.2（红队五番战 C9-B5 修复）：接手三步第①条不得再指向被 member_removed
+  // 硬拒的同名 identify（插件生成的交接指令曾指向走不通的路）——改为真实可达的
+  // 两条恢复路径：lead 的 member-add 幂等重供给，或换名 identify 接手。
+  it('接手三步第①条指向可达路径（member-add 重供给 / 换名接手），不再教同名 identify', () => {
+    const h = defaultHandoff('w1', [{ taskId: 't1', title: 'x', status: 'in_progress' }]);
+    expect(h).toContain('member-add');
+    expect(h).toContain('name: "w1"'); // member-add 的重供给参数仍用旧名
+    expect(h).toContain('新花名');
+    // 旧的走不通指令（member-stop 后同名 identify / takeover 提示）不再出现
+    expect(h).not.toContain('xc_identify({ "name": "w1" })');
+    expect(h).not.toContain('takeover:true');
   });
 
   it('超长 journal body 尾部空白被收拢；taskJournals 与 tasks 不匹配也安全', () => {

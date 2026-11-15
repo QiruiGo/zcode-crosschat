@@ -218,6 +218,118 @@ describe("render: renderStatusTable 双形态（v0.1.0 回归锁定 + v2 升级�
 });
 
 // ---------------------------------------------------------------------------
+// v0.7.2（C9-B1/C9-B2 修复，25-能力反向检验）：板面文本面必须让人「定位」——
+// ID 列呈现 `<8hex>-t<N>` 全形（同一波派发的区分后缀不再被切），
+// RESULT/ERROR 列不截断（C9 承诺的「看到板面指针即算落盘」的 journal 路径要可见）。
+// 行宽由 xc_overview 的注入预算窗口兜底（boardCosts 含人可读行长度），JSON 面本就全量。
+// ---------------------------------------------------------------------------
+
+describe("render: 任务板列宽（C9-B1/C9-B2 修复）", () => {
+  /** 同一波派发的三个任务：共享 8hex 时间前缀，区分全靠 `-t<N>` 后缀。 */
+  function batchSnapshot(result: string | null): StatusSnapshot {
+    const base = snapshot();
+    return {
+      ...base,
+      tasks: [
+        {
+          id: "755d9697-t1",
+          title: "C9 batch task 1",
+          status: "in_progress" as const,
+          assignee: "b",
+          attempt: 1,
+          attemptId: "564ad2d5-f7cb-4878-a119-6909b1ff7334",
+          dependsOn: [],
+          createdBy: "a",
+          result,
+          error: null,
+          evidenceCount: 0,
+          updatedAt: 1762660001000,
+        },
+        {
+          id: "755d9697-t2",
+          title: "C9 batch task 2",
+          status: "pending" as const,
+          assignee: null,
+          attempt: 0,
+          attemptId: null,
+          dependsOn: [],
+          createdBy: "a",
+          result: null,
+          error: null,
+          evidenceCount: 0,
+          updatedAt: 1762660002000,
+        },
+        {
+          id: "755d9697-t3",
+          title: "C9 batch task 3",
+          status: "pending" as const,
+          assignee: null,
+          attempt: 0,
+          attemptId: null,
+          dependsOn: [],
+          createdBy: "a",
+          result: null,
+          error: null,
+          evidenceCount: 0,
+          updatedAt: 1762660003000,
+        },
+      ],
+    };
+  }
+
+  it("C9-B2：同一波派发的三个 taskId 在文本面逐行可辨（全形呈现，不再同为 755d9…）", () => {
+    const text = renderStatusTable(batchSnapshot(null));
+    for (const id of ["755d9697-t1", "755d9697-t2", "755d9697-t3"]) {
+      expect(text).toContain(id);
+    }
+    const rows = text.split("\n").filter((l) => l.includes("755d9697-t"));
+    expect(rows).toHaveLength(3);
+    // 三行的 ID 列互不相同（定位 taskId 的前提）
+    const idCols = rows.map((r) => r.slice(0, 14).trim());
+    expect(new Set(idCols).size).toBe(3);
+  });
+
+  it("C9-B2：超宽 id 保尾截断（区分后缀 -t<N> 永远可见，被省的是时间前缀）", () => {
+    const text = renderStatusTable({
+      ...batchSnapshot(null),
+      tasks: [{ ...batchSnapshot(null).tasks[0]!, id: "755d9697abcdef-t123456" }],
+    });
+    // COL.id=14 → 「…」+ 末尾 13 字符：-t123456 完整可见，被省的是时间前缀
+    expect(text).toContain("…bcdef-t123456");
+    expect(text).not.toContain("755d9697abcdef-t123456 "); // 全形放不下，确实截断
+  });
+
+  it("C9-B1：RESULT 列的 journal 指针在文本面完整可见（不再切成 …；journal…）", () => {
+    const journalPath = ".crosschat/tasks/755d9697-t1/journal.md";
+    const result = `进展：已算完 1..10 平方；journal 已落盘：${journalPath}（产物 result.txt 指针在其中）`;
+    const text = renderStatusTable(batchSnapshot(result));
+    expect(text).toContain(journalPath);
+    expect(text).not.toContain("journal…"); // 旧的 24 字符列截断形态不得复现
+  });
+
+  it("C9-B1：error 列同样不截断，且多行 result 仍折叠为单行（一行一任务形态不变）", () => {
+    const text = renderStatusTable({
+      ...batchSnapshot(null),
+      tasks: [{ ...batchSnapshot(null).tasks[0]!, error: "ERR: 很长的失败原因 ".repeat(20) }],
+    });
+    expect(text).toContain("ERR: 很长的失败原因 ".repeat(20).trim());
+    const multi = renderStatusTable({
+      ...batchSnapshot("第一行\n第二行\n第三行"),
+    });
+    const row = multi.split("\n").find((l) => l.includes("755d9697-t1"))!;
+    expect(row.includes("\n")).toBe(false);
+    expect(row).toContain("第一行 第二行 第三行");
+  });
+
+  it("C9-B1：空 result 的行仍保持列形态（不塌成一行）", () => {
+    const text = renderStatusTable(batchSnapshot(null));
+    const row = text.split("\n").find((l) => l.includes("755d9697-t2"))!;
+    expect(row).toContain("pending");
+    expect(row.trimEnd().endsWith("C9 batch task 2")).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // v0.5.3（A13 修复）：摘要行 tasks= 恒为任务总数，窗口行数另列 shown=
 // （红队 a13：201 单派发后摘要行 tasks=53 —— 显示的是注入窗口行数而非总数，
 //   真值只能从 JSON boardTruncated.total 挖；修复后 tasks=201 shown=53。）

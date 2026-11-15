@@ -354,6 +354,9 @@ export function makeTask(team: TeamState, input: NewTaskInput, now: number = Dat
     createdBy: input.createdBy,
     createdAt: now,
     updatedAt: now,
+    // v0.7.2（C8-B2 修复）：最后进展时刻落盘（建单即首个进展点；此后每次
+    // appendTaskHistory 同步刷新——与 history 末条 ts 保持同值的冗余镜像）。
+    lastProgressTs: now,
     result: null,
     error: null,
     evidence: [],
@@ -392,11 +395,23 @@ export function leadKeyOf(team: TeamState): string {
   return team.leadKey ?? team.founderKey;
 }
 
-/** Append one history entry and bump updatedAt. */
+/**
+ * Append one history entry and bump updatedAt.
+ *
+ * v0.7.2（红队五番战 C8-B2 修复）：同时刷新**落盘**的 `lastProgressTs`
+ * （PROTOCOL §12.1 的 `task.lastProgressTs`）。C8 的 idle-timeout 判据
+ * （`now - task.lastProgressTs > XC_OFFLINE_MINUTES`）此前只存在于纯函数
+ * 推导里、任务记录无该字段——离线判定的空闲源在观测面不可见，且按「回拨
+ * updatedAt + 末条 history.ts」的既定时间加速手段模拟时被 createdAt 下限
+ * 吞掉（见 core/stall.ts lastProgressTs 的口径修正）。本函数是全部状态
+ * 转移的唯一收口点（claim/report/blocked/unblock/revoke/deadlock 都经它），
+ * 在此刷新即覆盖所有进展点。
+ */
 export function appendTaskHistory(task: Task, event: string, by: string, attemptId?: string, now: number = Date.now()): void {
   const entry: TaskHistoryEntry = { ts: now, event, by, ...(attemptId === undefined ? {} : { attemptId }) };
   task.history.push(entry);
   task.updatedAt = now;
+  task.lastProgressTs = now;
 }
 
 /**

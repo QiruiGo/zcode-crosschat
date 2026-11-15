@@ -190,6 +190,15 @@ export interface Task {
   createdBy: string;
   createdAt: number;
   updatedAt: number;
+  /**
+   * v0.7.2（红队五番战 C8-B2 修复）：**落盘**的最后进展时刻（epoch ms）——
+   * PROTOCOL §12.1 的 `task.lastProgressTs`。每个进展点（建单/认领/状态转移/
+   * blocked/unblock/引擎回池）随 appendTaskHistory 同步刷新，与 history 末条
+   * ts 同值（冗余镜像，供观测面直读，不必走 history 回溯）。
+   * absent = v0.7.2 之前的存量记录：读取方按 history 末条推导（stall.ts
+   * lastProgressTs 的兜底口径），行为不变。
+   */
+  lastProgressTs?: number;
   result: string | null;
   error: string | null;
   evidence: EvidenceItem[];
@@ -586,6 +595,12 @@ function coerceTask(value: unknown): Task | undefined {
   // v0.6.1（安全对-3 修复）：受领人字段宽容读取——非法值丢弃（absent=无受领人
   // 信息，认领面兼容开放），绝不整文件拒绝（§11.1 纪律）。
   const to = optionalString(value['to']);
+  // v0.7.2（C8-B2 修复）：lastProgressTs 宽容读取——非有限数/非安全整数即丢弃
+  // （absent=存量记录，读取方按 history 末条推导兜底），不整文件拒绝。
+  const lastProgressTsRaw = value['lastProgressTs'];
+  const lastProgressTs = isFiniteNumber(lastProgressTsRaw) && Number.isSafeInteger(lastProgressTsRaw) && lastProgressTsRaw >= 0
+    ? lastProgressTsRaw
+    : undefined;
   return {
     id,
     title,
@@ -599,6 +614,7 @@ function coerceTask(value: unknown): Task | undefined {
     createdBy,
     createdAt,
     updatedAt,
+    ...(lastProgressTs === undefined ? {} : { lastProgressTs }),
     result,
     error,
     evidence,

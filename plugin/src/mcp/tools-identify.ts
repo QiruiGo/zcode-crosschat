@@ -408,10 +408,27 @@ export async function handleIdentify(deps: ToolDeps, rawArgs: IdentifyArgs, conn
       }
       {
         // 队内花名换绑（registry 锁内：unbind 旧名 → member key 换绑）。
-        // 注意：v0.7.0 起队内改名只解绑旧名、不为新名写 names.json 绑定（既有
-        // 语义，本版不改）；undoTeamRename 与之严格互逆（解绑新名 + 重绑旧名）。
+        // v0.7.2（红队五番战 CB-01 修复）：换绑后**写新花名的 names.json 绑定**。
+        // v0.7.0~v0.7.1 这里只解绑旧名、不为新名写绑定（「既有语义」）——names.json
+        // 于是既无旧键也无新键，而 SessionStart 钩子的「已注册花名」判定就读
+        // names.json（hooks/shared.ts boundNamesForSession）：改名成功的会话下一轮
+        // 钩子注入误报「尚未注册跨会话花名」（红队 capbug1 实测；功能路由不受影响、
+        // 无冒名窗口，但观测面自相矛盾）。names.json 是 name→{sessionId,role,
+        // registeredAt} 的索引——本会话确实已绑到新名，写进去才与事实一致；
+        // undoTeamRename 的「解绑新名 + 重绑旧名」也从此与正操作严格互逆。
+        // 冲突保护：新键已被**别的 sid** 绑定（陈旧死绑定）时不覆盖——那属于
+        // 接管语义（takeover/claim 路径），改名面不越权改别人的索引行。
         await withRegistryThenTeamLocks(deps.stateRoot, existing.teamId, async () => {
+          const namesNow = await readNames(deps.stateRoot);
           await unbindName(deps.stateRoot, existing.agentKey, existing.sessionId);
+          const foreign = namesNow[newKey];
+          if (foreign === undefined || foreign.sessionId === existing.sessionId) {
+            await bindName(deps.stateRoot, newKey, {
+              sessionId: existing.sessionId,
+              role: existing.role,
+              registeredAt: now,
+            });
+          }
           const team = await readTeam(deps.stateRoot, existing.teamId);
           if (team !== undefined) {
             const idx = team.members.findIndex((m) => m.key === existing.agentKey);

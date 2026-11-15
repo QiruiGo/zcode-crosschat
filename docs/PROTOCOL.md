@@ -133,12 +133,20 @@ duplicateKey = (to 成员键, 任务票文本) ∧ 该派发信封未被读过(r
 - 回执披露 `duplicateKey`（`to=<收方>|ticket=<票面 sha256 前 16 hex>`）与 `originalCreatedBy`（首派方，命中他人派单时据此看出「这一单已经有人派过」）。
 - 收方已读走旧票、或票面（标题/内容/验收标准）不同 → 建新单。
 
+### 4.3 派单目标生命周期闸（v0.7.2 C8-B3 修复）
+
+`xc_dispatch` 的 `to` 除会籍存在性（`not_a_member`）外，还过一道**生命周期**闸：目标成员 `state === 'removed'`（`xc_team member-stop` 已留档 + 回池其开放任务）→ 显式拒绝 `member_removed`（**不建单、不投递**），payload/文案指引两条恢复动作（改派活成员 / lead 的 `xc_team member-add` 幂等重供给），并落 engine.jsonl `dispatch-refused` 审计。理由：removed 成员的 pending 派单会永久搁浅——他人 claim 得 `not_assignee`、停机成员自身无法认领、pending 不在 `SWEEPABLE` 清扫域、创建者无任何回执（红队 c8b3 实测）。`provisioning`/`failed`/`ready` 目标不受本闸影响（fail-closed 只针对已停机）。
+
 ## 5. 停滞检测（C5）与容量水位（C3）
 
 - 停滞：`lastProgress` 超 `XC_STALL_MINUTES`（缺省 120 分钟）的任务在 `xc_overview` 标 `stalled` 并附建议（催/转交/取消）。
 - 容量采样（无定时器，仅在 `xc_overview`/`xc_doctor` 调用时惰性采样，缓存 `capacity/sample.json`，最小间隔 `XC_MEM_SAMPLE_MIN_MS` 缺省 60s）：
-  设备水位 `os.totalmem/freemem` + ZCode 进程树 working set（CIM 采样）。
-- 预警规则：可用内存 < `XC_MEM_WARN_WATERMARK`（缺省 0.15）或单会话 working set > `XC_MEM_SESSION_LIMIT_BYTES`（缺省 800MB）时 overview 标红并给出 violated 规则明细；CIM 不可用时降级为只报 os 水位 + `degraded:"cim-unavailable"`，进程类数据不虚报。
+  设备水位 `os.totalmem/freemem` + ZCode 进程树 working set（CIM 采样）。窗口期内回缓存，但缓存样本的**设备水位字段与 `os.freemem()` 实时交叉复核**（一次系统调用）——缓存只省进程树（CIM）采样成本，不为伪造/陈新缓存制造最长一个窗口（缺省 60s）的虚假读数（v0.7.2 修复）。
+- 预警规则（三条，任一命中即标红，`violated` 逐条给出明细）：
+  1. `watermark`：可用内存 < `XC_MEM_WARN_WATERMARK`（缺省 0.15）；
+  2. `session-limit`：headless 回合树单进程 working set > `XC_MEM_SESSION_LIMIT_BYTES`（缺省 800MB）；
+  3. `turn-concurrency`：并发 headless 回合数 × `XC_TURN_ESTIMATE_BYTES`（单回合瞬时占用预估，缺省 1.5GB）> 当前可用内存（建议减少并发回合或让成员休眠）。
+  CIM 不可用时降级为只报 os 水位 + `degraded:"cim-unavailable"`，进程类规则（2/3）无数据不评、不虚报。
 - 压缩联动（C9，**建议级非拦截级**）：verdict 标红时 `formatCapacityLines` 追加固定 `compress-advice` 建议行——先按 longtask checklist 落 journal（`.crosschat/tasks/<taskId>/journal.md`）再接受压缩；lead 可 `xc_relay` 要求目标先 `xc_report(status:"in_progress")` 附 journal 路径。平台无宿主压缩钩子接口，插件**不能拦截或触发压缩**，只做「预警 + 建议 + 落盘副本」最小闭环；team/panel 两视图都经 `capacityMount`，改一处两处生效。
 
 ### 5.1 建员 provisioning 超时（v0.7.1，故障注-1 修复）
@@ -216,7 +224,7 @@ total = clamp(16000 × scale, 4000, 64000)，且 total ≥ item  # 批次基准�
 | `XC_INJECT_TOTAL_CHARS` | `inject_total_chars` | 空 | 批次预算覆盖（0/非法=自动） |
 | `XC_USERVOICE_TTL_MS` | `uservoice_ttl_ms` | `600000`（10min） | 盖章链匹配窗口；每条原话 ≤3 次 |
 
-仅代码读取、无用户设置项的演练 env：`XC_STALL_MINUTES`（停滞阈值，缺省 120）、`XC_MEM_WARN_WATERMARK`（缺省 0.15）、`XC_MEM_SESSION_LIMIT_BYTES`（缺省 800MB）、`XC_MEM_SAMPLE_MIN_MS`（缺省 60000）、`XC_TOOL_REQUEST_TTL_MS`（v0.7 C6 转办请求缺省有效期，缺省 3600000=1h，硬上限 86400000=24h）、`XC_OFFLINE_MINUTES`（v0.7 C8 离线判定空闲阈值，缺省 240min；低于 `XC_STALE_TASK_MINUTES` 时按 stale 钳制并附 WARNING——见 §12）。均为高级 env，不进插件设置面。
+仅代码读取、无用户设置项的演练 env：`XC_STALL_MINUTES`（停滞阈值，缺省 120）、`XC_MEM_WARN_WATERMARK`（缺省 0.15）、`XC_MEM_SESSION_LIMIT_BYTES`（缺省 800MB）、`XC_TURN_ESTIMATE_BYTES`（并发 headless 回合单回合瞬时占用预估，缺省 1.5GB=1610612736 字节；>0 合法，非法/未设回落缺省——见 §5 预警规则 3）、`XC_MEM_SAMPLE_MIN_MS`（缺省 60000）、`XC_TOOL_REQUEST_TTL_MS`（v0.7 C6 转办请求缺省有效期，缺省 3600000=1h，硬上限 86400000=24h）、`XC_OFFLINE_MINUTES`（v0.7 C8 离线判定空闲阈值，缺省 240min；低于 `XC_STALE_TASK_MINUTES` 时按 stale 钳制并附 WARNING；v0.7.2 起 0/负数/非数字同样**不静默**——回落内置缺省 240min 并附 WARNING + payload `offlineThresholdFallback:true`，见 §12）。均为高级 env，不进插件设置面。
 
 ## 10. 身份与安全底线（v0.6 口径）
 
@@ -229,6 +237,7 @@ total = clamp(16000 × scale, 4000, 64000)，且 total ≥ item  # 批次基准�
 - **两轴操作的原子性**（v0.7.1 边界-4/边界-6）：`xc_identify` 的注册与改名都是「队内轴 + peer 轴」一次调用办两件事，任一轴失败都不留半边状态——
   - 注册：peer 轴失败（`name_taken` / `session_not_anchored` / 锁忙等）→ **队内轴回滚**（names.json 绑定、team.json 成员行、连接绑定全部撤销；本次新建的队伍连 team.json 一起撤），错误信封 `peer_axis_failed` 带 `teamAxis:{registered:false, rolledBack:true}`。调用方可以把错误当「无副作用」直接重试（精确对重绑幂等）。回滚自身失败时如实写 `registered:true, rolledBack:false` + `rollbackError`。
   - 改名：队内轴被「板面不干净」守卫阻止（名下任务引用/邮箱非空）→ **两轴都不改**，显式 `team_rename_blocked`（payload `renamed:{peer:false,team:false}`）；peer 轴改名失败（`name_taken`）→ 队内轴改名回滚到原键，同样不给「队内新名 + peer 旧名」的半个改名。
+- **改名后 names.json 写新绑定**（v0.7.2 CB-01 修复）：队内花名换绑在 registry 锁内「解绑旧键 + **写新键绑定**（`{sessionId, role, registeredAt}`）」一次完成——v0.7.0~v0.7.1 只解绑旧名、新键从不写入，names.json 对该 sid 零绑定，而 SessionStart 钩子的「已注册花名」判定（`hooks/shared.ts boundNamesForSession`）就读 names.json，于是改名成功的会话下一轮钩子注入误报「尚未注册跨会话花名」（红队 capbug1 实测；功能路由不受影响、无冒名窗口，但观测面自相矛盾）。**冲突保护**：新键已被**别的 sid** 绑定（陈旧死绑定）时不覆盖——那属于接管语义（takeover/claim 路径），改名面不越权改别人的索引行；改名被守卫整体阻止时两键都不动。
 - **同 sid 冲突的文案**（v0.7.1 并发与-1）：`session_id_in_use` 的 payload 增 `sameSessionId`。冲突对象持有**同一个** sessionId（同一会话被两个活进程重复拉起）时文案说清「两个活进程在争一个会话，停掉重复的那个」，不再误述 "another live session … use your own id"（败者用的正是自己的 id）；**异** sid 才是冒用场景，沿用 v0.5.2 起的原文案。
 - 底线三不：不崩（大帧守卫/截断有界 + **畸形帧显式 -32700**，见 §13）、不丢（磁盘真源全文 + 原子写 + .bak 自愈）、不串号（身份锚 = 连接 extra 的 connectionKey，别名路径透传不变）。
 
@@ -280,11 +289,28 @@ payload 标注 `wake:"suppressed (approval-gate bypass guard)"`）。理由：wa
   不设全局禁用品清单（逐请求审批 + reason 必填 + 反洗白纪律承担 R3 缓解）。
 - 台账 `.crosschat/toolrequests/<requestId>.json`：状态机
   `pending → approved｜denied｜refused → executed｜error｜expired`（`refused`=门自动拒，
-  `denied`=审批文件显式拒绝；显式批准可从 refused/denied 转入——后者写者胜）。
-- 失败路径全表（§2.6）：A 不在线→入箱异步等 + sweeper 过期回投；A 不存在→`target_not_found`；
+  `denied`=审批文件显式拒绝；`refused` 亦含执行方回投 `status:"refused"` 的辞谢——一请求一结果，
+  辞谢同样是终态；显式批准可从 refused/denied 转入——后者写者胜）。
+- **写者胜（v0.7.2 修复 B-01 ≡ C7-B1）**：门在**任意台账状态**下都重读磁盘审批文件
+  （`core/toolgate.ts`）。拒绝态（refused/denied）台账 + 合法批准文件 → 门放行并把台账迁回
+  approved；文件轨与工具轨（`xc_review` 代写同格式）自此完全等价。两处不重读：请求窗已关闭
+  （`now > expiresAt`——安全边界，批准窗不可能同时满足「> now」与「≤ 请求 expiresAt」）与已终态
+  executed/error（回投已发生，请求帧照常带头全文）。
+- **工具轨审批动作的边界**（v0.7.2 修复 C7-B6/C7-B7）：`xc_review({action:"approve"|"deny", axis:"approval"})`
+  对**已终态**（executed/error/expired）台账显式拒绝 `request_already_finalized`——不写审批文件、不发
+  `approval_result` 回执、不改台账（旧实现静默放弃台账迁移却照写文件照发回执并回报 ok）；可审批的
+  台账态 = pending/approved/refused/denied（后者写者胜）。`xc_review({axis:"approval", action:"list"})`
+  的**可批清单**只含「pending ∧ 无审批文件 ∧ 未过 `expiresAt`」的请求；已过 `expiresAt`、尚未被
+  sweeper 标记 expired 的 pending **不进清单**（旧实现照列并附 `approveHow`，按建议 approve 只得到
+  `approval_window_closed`——观测面误导），另以 `lapsedWindowClosed` 计数 + 说明行披露「批准窗已关，
+  需请求方重发」。
+- 失败路径全表（§2.6）：A 不在线→入箱异步等 + sweeper 过期回投；A 不存在→双轴解析未命中
+  `target_not_found`（显式 `名字 [team]` 后缀指向非花名册成员则是队内闸的 `not_a_member`，
+  两者都 fail-closed；v0.7.2 按实际行为校正本表文案）；
   工具不存在→平台错误原样回投 `status:"error"`；审批缺失/过期/畸形/denied/工具不符/自批→
   门拒 + 对应 reason（`approval missing` / `approval expired` /
-  `approval file malformed (unparseable JSON)` / `approval denied` / `approval tool mismatch` /
+  `approval file malformed (unparseable JSON | not a JSON object | invalid fields: <清单> | requestId mismatch)` /
+  `approval denied` / `approval tool mismatch` /
   `self-approval refused`）；args 超限→`args_too_large`；result 超限→`result_too_large`；
   伪造回投→`tool-result-rejected`。
 
@@ -302,12 +328,18 @@ v0.7 修掉该原文旁路：
   inbox 路的请求帧标记 discarded（不进注入面）。
 - **放**（approved/executed/error）：输出 `[CrossChat APPROVAL VERIFIED …]` 头 + 全文；
   pending 态持有效审批文件的，门放行时把台账记 approved（门放行≥1 次）。
+- **写者胜（v0.7.2）**：拒绝态（denied/refused/expired）复读前也重读磁盘审批文件——持有效
+  批准文件即放行并把台账迁回 approved（审计 `tool-decision approved` 附 `revivedFrom`）；
+  无文件或文件非法则沿用历史理由继续遮蔽（fail-closed 不变）。自批守卫按成员键归一化
+  （`approvedBy:"REQB"` 与 `reqb` 同等拒绝，`core/sanitize.ts` 同一条清洗链）。
 - 门只对 `type:"tool_request"` 生效；其他帧/chat 早返回原路径（零影响）。
 
 ### 11.4 预算、审计与清理
 
-- args ≤ 64KB；result ≤ 请求 `maxResultChars`（A 侧主动截断时在帧内标 `resultTruncated{shown,total}`，
-  模型改投摘要+文件指针）；协议硬顶 MCP stdio 单帧 32MiB（-32700 显式拒收）不改。
+- args ≤ 64KB；result ≤ 请求 `maxResultChars`（**按有效载荷计**：字符串取自身长度、非字符串取
+  序列化长度——v0.7.2 修复 B-03，不再把 JSON 引号算进载荷；A 侧主动截断时在帧内标
+  `resultTruncated{shown,total}`，模型改投摘要+文件指针）；协议硬顶 MCP stdio 单帧 32MiB
+  （-32700 显式拒收）不改。
 - 注入面复用现有预算（item 4000/total 16000 基准，§8）：获批全文超限时截断 + 尾注指针，
   `xc_read({scope:"mail"})` 分页取回（每页 64K）——mail 取回的是获批请求的执行通道，故同受门。
 - 引擎审计（engine.jsonl，邮箱原文 + 审计双轨）：`tool-request`（发送）、
@@ -317,7 +349,13 @@ v0.7 修掉该原文旁路：
   `tool-artifacts-cleaned`（终态清理）。
 - 过期：`expiresAt = createdAt + ttlMs`；A 消费时过期即拒（`request expired`）；A 不在线躺箱 →
   sweeper 节拍（与 stale 任务清扫同一 setInterval，无新定时器）标 expired + 回投请求方；
-  lead 收过通知的补 `approval_result{decision:"expired"}`。
+  lead 收过通知的补 `approval_result{decision:"expired"}`。**多进程幂等（v0.7.2 修复 B-02）**：
+  过期迁移在团队锁内完成，且只有真正落盘的那一次进回投列表——同相位竞态的其它进程读到已
+  expired 即跳过，不会重复回投/重复审计。
+- **lead 收尾可达性（v0.7.2 修复 C7-B5）**：lead 收过待批通知的请求，无论走哪条路径关闭窗口
+  都能收到 `approval_result{decision:"expired"}`——①被 sweeper 扫为 expired（pending/approved
+  超期，§3.3 原路径）；②停在 refused/denied（门拒后始终无人批准）且窗口已关闭时，由 sweeper
+  补发收尾帧（只通知、不改台账，`approvalClosedAt` 记档防重复）。
 - 清理：终态台账与审批文件保留 `TOOL_APPROVAL_KEEP_MS`（7 天，常量）后删除；邮箱帧不预清理。
 
 ### 11.5 威胁模型口径（v0.7 增量）
@@ -352,11 +390,21 @@ crosschat 的 MCP server 是宿主外独立 stdio 进程，不持有其他 MCP �
 - `heartbeat-stale` / `no-record` / `live` 在阈值内 → `{offline:false, evidence:null}`（**活着但空闲不判离线**）；
 - `member.state === 'removed'` → 直接 `{offline:false, evidence:null}`（已停机成员不参与离线判定）。
 
+`task.lastProgressTs`（v0.7.2 C8-B2 修复起**落盘字段**，epoch ms）：每个进展点（建单 / 认领 / 状态转移 / blocked / unblock / 引擎回池）由 `teamstate.appendTaskHistory`（全部转移的唯一收口点）随 history 末条同步刷新，与 history 末条 ts 同值（冗余镜像，观测面可直读）。读取口径（`core/stall.ts lastProgressTs`，停滞检测与本判据共用）：history 末条 ts 与落盘字段中**较旧**的一个（二者正常恒等；仅外部改写才会分歧，取较旧者是「宁可提示、不漏报」的保守方向）；history 为空时退回 `createdAt`。v0.7.2 之前的存量记录无该字段 → 按 history 末条推导，自洽记录结果不变。
+
 ### 12.2 可达性如实声明
 
 - **优雅退出与空闲在注册表上同形**（pipe.ts 优雅退出摘记录）——「用户主动关闭的会话」检不出离线，
   可检出的进程死只有崩溃残留。故 C8 的 lead 通知实际覆盖「成员崩溃」而非「成员主动离开」；
   主动离开靠 stale 回池 + createdBy 回执既有链路兜底。
+- **崩溃残留的保留与回收（v0.7.2 F-02/C8-B1 修复）**：`pid-dead` 注册记录是进程死判据的唯一硬证据，
+  因此**注册/改名路径（xc_identify）的 peer 扫描一律只读**（`scanPeers(..., {sweep:false})`）——此前默认
+  惰性清扫会把**全部**死记录一并删掉，而 README 快速开始的第一动作就是 identify：「成员崩溃 →
+  无人值守 → 任意会话重启后第一动作 identify」必然抹掉残留，紧接的首轮 stale 清扫只能看到
+  `no-record`，task-offline 审计 / lead 转交通知 / overview offlineMembers 三样静默丢失（红队 c8b1
+  实测：对照组四件套齐全、故障组全失）。死记录的回收改走**定向 GC**：认领（或改到）某花名时，只删
+  该花名的死前任（其身份已被 `peer-name-reclaimed` 审计 + 新记录 `reclaimedFrom` 消费完毕），
+  其余会话的崩溃残留保留给队内 sweeper 的离线判据消费（`sweepStaleTasksOnce` 的只读扫描）。
 - **idle-timeout 分支窄可达**：`updatedAt ≥ lastProgressTs`，满足 240min 空闲的任务必已被 30min stale
   先回收（sweeper 常驻）——idle-timeout 只在「全员静默 ≥240min 后某会话重启触发首轮清扫」时命中，
   是兜底而非常规路径。**升级信号实际由 process-dead 证据产生。**
@@ -369,7 +417,8 @@ crosschat 的 MCP server 是宿主外独立 stdio 进程，不持有其他 MCP �
    现有能力组合，不新增工具/动作）；
 2. `TaskEdgeOutcome` 增 `offline: OfflineMember[]`（进 `xc_report` 工具 payload 与 `task-offline` 审计事件）；
 3. `xc_overview` team 视图挂 `offlineMembers` 块 + 文本行（`offline: <名>(证据, 名下任务 n 个 → 建议 xc_dispatch 重派)`）；
-   阈值被钳制时挂 `offlineThresholdClamped` + WARNING。
+   阈值被钳制时挂 `offlineThresholdClamped` + WARNING；`XC_OFFLINE_MINUTES` 为 0/负数/非数字（回落内置缺省）时挂
+   `offlineThresholdFallback` + WARNING（v0.7.2 C8-B4 修复，不再静默）。
 4. 并发安全：全部裁决在 `withTeamLock` 内；peer 扫描在锁外只读做。
 
 ## 13. MCP stdio 传输层帧级拒收（v0.7.1 边界-5）

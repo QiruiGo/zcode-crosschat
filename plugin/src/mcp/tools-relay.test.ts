@@ -261,6 +261,18 @@ describe('xc_relay 双轴路由', () => {
     expect(payload['error']).toBe('target_not_found');
   });
 
+  it('v0.7.2（B-05）：A 不存在的两个错误码按 PROTOCOL §11.2 文案锁定', async () => {
+    // 红队裁决 b05.jsonl：显式 `[team]` 后缀指向非花名册成员 → not_a_member；
+    // 裸名双轴都未命中 → target_not_found。两者都 fail-closed，仅代码不同——
+    // PROTOCOL §11.2 失败表据此分列（不再只写 target_not_found）。
+    await seedTeam();
+    bindIdentity();
+    const explicitTeam = await xcRelay(relayDeps(), core(), { to: 'ghostmember [team]', msg: 'x' }, 'conn-a', false);
+    expect(payloadOf_(explicitTeam)).toMatchObject({ error: 'not_a_member', agentKey: 'ghostmember' });
+    const bareMiss = await xcRelay(relayDeps(), core(), { to: 'ghostmember', msg: 'x' }, 'conn-a', false);
+    expect(payloadOf_(bareMiss)['error']).toBe('target_not_found');
+  });
+
   it('编排层 removed 硬拒：成员被移除后 relay → member_removed', async () => {
     await seedTeam();
     bindIdentity();

@@ -39,10 +39,37 @@ describe('lastProgressTs（最后进展时刻）', () => {
     expect(lastProgressTs(task({ id: 't1', status: 'claimed' }))).toBe(NOW - 10 * MIN);
   });
 
-  it('history 末条早于 createdAt（异常数据）→ 仍取 max（createdAt）', () => {
+  it('history 为空但落盘 lastProgressTs 在场 → 取落盘字段', () => {
+    const t = task({ id: 't1', status: 'claimed' });
+    t.lastProgressTs = NOW - 4 * MIN;
+    expect(lastProgressTs(t)).toBe(NOW - 4 * MIN);
+  });
+
+  // v0.7.2（红队五番战 C8-B2 修复）：口径从 max(createdAt, history 末条) 改为
+  // 「两个进展 Marker 较旧者」——自洽记录恒等；外部改写（回拨 history.ts 模拟
+  // 「N 分钟无进展」）时不再被 createdAt 下限吞掉，idle-timeout 判据才可达。
+  it('history 末条早于 createdAt（回拨模拟无进展）→ 取较旧的 history 末条（不再被 createdAt 下限吞掉）', () => {
     const t = task({ id: 't1', status: 'pending', createdAt: NOW - 2 * MIN });
     t.history.push({ ts: NOW - 9 * MIN, event: 'weird', by: 'b' });
-    expect(lastProgressTs(t)).toBe(NOW - 2 * MIN);
+    expect(lastProgressTs(t)).toBe(NOW - 9 * MIN);
+  });
+
+  it('落盘字段与 history 末条分歧（外部改写）→ 取较旧者（宁可提示、不漏报）', () => {
+    const t = task({ id: 't1', status: 'in_progress' });
+    t.history.push({ ts: NOW - 5 * MIN, event: 'in_progress', by: 'b' });
+    t.lastProgressTs = NOW - 8 * MIN; // 字段更旧（回拨只改了字段）
+    expect(lastProgressTs(t)).toBe(NOW - 8 * MIN);
+    t.lastProgressTs = NOW - 1 * MIN; // 字段更新（history 更旧）
+    expect(lastProgressTs(t)).toBe(NOW - 5 * MIN);
+  });
+
+  it('非法落盘值（非数/0）被忽略，按 history 推导', () => {
+    const t = task({ id: 't1', status: 'in_progress' });
+    t.history.push({ ts: NOW - 3 * MIN, event: 'in_progress', by: 'b' });
+    (t as { lastProgressTs?: unknown }).lastProgressTs = 'nope';
+    expect(lastProgressTs(t)).toBe(NOW - 3 * MIN);
+    t.lastProgressTs = 0;
+    expect(lastProgressTs(t)).toBe(NOW - 3 * MIN);
   });
 });
 

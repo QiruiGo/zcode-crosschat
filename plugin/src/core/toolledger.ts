@@ -9,10 +9,13 @@
  * 状态机（§2.5/§3.1 同一套枚举，不设第二套词表）：
  *   pending → approved（门放行≥1 次或工具轨批准）
  *           → denied（审批文件 decision=denied）
- *           → refused（门拒：缺失/畸形/过期/工具不符/自批）
+ *           → refused（门拒：缺失/畸形/过期/工具不符/自批；v0.7.2 起亦含执行方
+ *             回投 status:"refused" 的辞谢——一请求一结果，辞谢同样是终态）
  *           → executed（收到 ok 回投）/ error（收到 error 回投）
  *           → expired（sweeper 判 ttl 超期）
  * approved 亦可由 refused/denied 经显式批准动作转入（后者写者胜，§10.3-4）。
+ * v0.7.2（F-01 修复）：写者胜对**两条轨**都成立——门在任意台账状态下都重读磁盘
+ * 审批文件，refused/denied 台账 + 合法批准文件 → 门放行并迁回 approved。
  *
  * 锁纪律：写路径的调用方（relay 核心/xc_review/门/sweeper）各自持团队锁或接受
  * 无锁读改写（O_APPEND/原子 rename 的单文件语义；单人内部场景竞态有界）。
@@ -70,6 +73,12 @@ export interface ToolRequestLedger {
   decisionReason?: string;
   /** lead 待批通知（approval_request 帧）已发送时刻——防每次读箱重复通知。 */
   approvalNotifiedAt?: number;
+  /**
+   * v0.7.2（C7-B5 修复）：lead 待批通知的**收尾回执**（approval_result{expired}）已发送
+   * 时刻——防 sweeper 每节拍重复补发。只对「通知过但始终无人批准」的请求置位
+   * （门拒后停在 refused/denied，不在 expireToolRequests 的 pending/approved 域内）。
+   */
+  approvalClosedAt?: number;
   /** 回投结果字符数（tool-executed 审计同值）。 */
   resultChars?: number;
   /** 回投帧落箱后的 messageId（可按 id 检索）。 */
@@ -166,6 +175,31 @@ export async function updateToolRequest(
   return next;
 }
 
+/**
+ * v0.7.2（B-02 修复）：带状态闸的台账迁移——**只有真正发生写入**才返回新台账。
+ *
+ * 与 `updateToolRequest` 的差别就在返回值语义：后者在 mutate 放弃时返回**当前**
+ * 台账（读改写探针的既有契约），调用方无法区分「我迁移的」与「别人已经迁移好了」。
+ * sweeper 的过期迁移正是踩了这个坑：多进程同相位各读一次 pending、各自写一次
+ * expired、各自都拿到 `state==='expired'` 的返回值 → 各自回投一条
+ * `tool_result{refused,"request expired"}`（裁决日志 b02-b02c.jsonl：3 条审计 +
+ * 3 条同内容回执）。本函数把「闸命中即写、未命中不写也不返回」显式化，跨进程
+ * （与跨调用）都只有一个赢家能拿到返回值。
+ */
+export async function transitionToolRequest(
+  stateRoot: string,
+  requestId: string,
+  from: readonly ToolRequestState[],
+  patch: (ledger: ToolRequestLedger) => ToolRequestLedger,
+): Promise<ToolRequestLedger | undefined> {
+  const current = await readToolRequest(stateRoot, requestId);
+  if (current === undefined) return undefined;
+  if (!from.includes(current.state)) return undefined;
+  const next = patch(current);
+  await writeFileAtomic(toolRequestFile(stateRoot, requestId), JSON.stringify(next, null, 2));
+  return next;
+}
+
 /** 待批清单（§3.2 list axis:"approval" 的数据源；审批文件存在性由调用面判）。 */
 export async function listPendingToolRequests(stateRoot: string): Promise<ToolRequestLedger[]> {
   return (await listToolRequests(stateRoot)).filter((l) => l.state === 'pending');
@@ -174,19 +208,25 @@ export async function listPendingToolRequests(stateRoot: string): Promise<ToolRe
 /**
  * 过期节拍（§2.5/§2.6：sweeper 扫台账标 expired）。
  * 只动 pending（approved 未执行的请求也允许过期——执行窗随请求窗关闭）。
- * 返回本次被标 expired 的台账（调用方负责回投请求方）。
+ * 返回本次**由本调用**迁移的台账（调用方负责回投请求方）。
+ *
+ * v0.7.2（B-02 修复）：迁移走 {@link transitionToolRequest}——只有闸命中（读到
+ * pending/approved）并真正落盘的那一次才进返回列表，因此多进程同相位竞态下
+ * 只有一个进程拿到「该回投」的台账（另一个读到已 expired → 闸不命中 → 不进列表）。
  */
 export async function expireToolRequests(stateRoot: string, now: number): Promise<ToolRequestLedger[]> {
   const expired: ToolRequestLedger[] = [];
   for (const ledger of await listToolRequests(stateRoot)) {
     if (ledger.state !== 'pending' && ledger.state !== 'approved') continue;
     if (now < ledger.expiresAt) continue;
-    const next = await updateToolRequest(stateRoot, ledger.requestId, (l) =>
-      l.state === 'pending' || l.state === 'approved'
-        ? { ...l, state: 'expired', decidedAt: now, decidedBy: 'engine', decisionReason: 'request expired' }
-        : undefined,
-    );
-    if (next !== undefined && next.state === 'expired') expired.push(next);
+    const next = await transitionToolRequest(stateRoot, ledger.requestId, ['pending', 'approved'], (l) => ({
+      ...l,
+      state: 'expired',
+      decidedAt: now,
+      decidedBy: 'engine',
+      decisionReason: 'request expired',
+    }));
+    if (next !== undefined) expired.push(next);
   }
   return expired;
 }

@@ -35,7 +35,7 @@ import { withTeamLock } from "../core/lock.js";
 import { attemptWake } from "../engine/wake.js";
 import { identityStore } from "./identity.js";
 import { sanitizeKey } from "../core/sanitize.js";
-import { DEFAULT_TEAM_ID, TERMINAL_TASK_STATUSES, TASK_PRIORITIES } from "../core/types.js";
+import { DEFAULT_TEAM_ID, memberState, TERMINAL_TASK_STATUSES, TASK_PRIORITIES } from "../core/types.js";
 import type { EvidenceItem, TeamMessage, TeamState } from "../core/types.js";
 import {
   appendTaskHistory,
@@ -210,6 +210,45 @@ function requireMember(team: TeamState, agentKey: string): void {
   }
 }
 
+/**
+ * v0.7.2（红队五番战 C8-B3 修复）：派单目标的**生命周期**闸。
+ *
+ * 红队实测（c8b3）：`xc_team member-stop` 后成员 state=removed（花名不释放、
+ * roster 记录保留），`xc_dispatch({to:"m1"})` 仍返回「dispatched to m1 via
+ * mailbox.」——任务建单成功但永久搁浅：他人 claim 得 `not_assignee`、removed
+ * 成员自身无法认领、pending 不在 SWEEPABLE 清扫域、创建者收不到任何回执。
+ * 与 §5.4「member-stop 对在途（claimed/in_progress）任务回池」相邻，但
+ * pending 派单从未被任何既有闸覆盖。
+ *
+ * 修法 = 派发面显式拒绝 + 指引（不静默建单）：removed 成员的重新启用只有
+ * lead 的 `xc_team member-add`（幂等重供给，§6.4）或改派活成员两条路。
+ * 会籍存在性校验（requireMember）之后做——错误码区分「不在册」与「已停机」。
+ */
+async function requireDispatchTarget(stateRoot: string, team: TeamState, agentKey: string): Promise<void> {
+  const member = team.members.find((m) => m.key === agentKey);
+  if (member !== undefined && memberState(member) === "removed") {
+    // 观测面留痕：谁在何时试图给已停机成员派单（与 peer-name-taken-refused 同族）。
+    await logEngineEvent(stateRoot, {
+      event: "dispatch-refused",
+      teamId: team.teamId,
+      to: agentKey,
+      reason: "member_removed",
+    });
+    throw new ToolError({
+      error: "member_removed",
+      agentKey,
+      teamId: team.teamId,
+      message:
+        `member "${agentKey}" was removed from team "${team.teamId}" (xc_team member-stop); dispatch refused — ` +
+        `dispatching to a stopped member would strand the task forever (nobody can claim it: others get ` +
+        `not_assignee, the stopped member cannot claim, and pending tasks are outside the stale-sweep domain). ` +
+        `Re-dispatch to an active member, or ask the lead to re-enable "${agentKey}" via xc_team ` +
+        `{action:"member-add"} (idempotent reprovision; the archive under .crosschat/archive/${agentKey}/ ` +
+        `holds its handover context)`,
+    });
+  }
+}
+
 export interface TaskCore {
   xc_dispatch(args: DispatchArgs, connectionKey: string): Promise<ToolResult>;
   xc_claim(args: ClaimArgs, connectionKey: string): Promise<ToolResult>;
@@ -238,6 +277,8 @@ export function createTaskCore(deps: ToolDeps): TaskCore {
             team = newTeamState({ teamId: me.teamId, name: me.teamId, founderKey: me.agentKey, now });
           }
           requireMember(team, toKey); // §2.6：to 必须是已注册成员
+          // v0.7.2（C8-B3 修复）：已停机（removed）成员不接受派单（显式拒绝，不建单）。
+          await requireDispatchTarget(stateRoot, team, toKey);
           for (const dep of args.dependsOn ?? []) {
             const depTask = getTask(team, dep);
             if (depTask === undefined) {

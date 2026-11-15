@@ -18,6 +18,9 @@
  *
  * 侧效应纪律（§2.7）：首次门拒（状态迁移发生）才回投请求方 + 通知 lead + 审计；
  * 已处于拒绝态的复读只出遮蔽占位（mail 路可重复触发门，防回投风暴）。
+ * v0.7.2（F-01）：拒绝态复读前先重读审批文件——合法批准文件使台账迁回 approved
+ * （写者胜），这也是一次状态迁移，同样只审计不回投（请求方已收到过首拒回执，
+ * 执行结果会照常回投）。
  *
  * @module core/toolgate
  */
@@ -26,6 +29,7 @@ import { logEngineEvent } from './log.js';
 import { leadKeyOf, readTeam } from './teamstate.js';
 import {
   readToolRequest,
+  transitionToolRequest,
   updateToolRequest,
   type ToolRequestLedger,
   type ToolRequestState,
@@ -157,9 +161,19 @@ async function notifyLeadApprovalRequest(
  *
  * - 非 tool_request 帧（chat/其他协议帧）→ 原样透传（gate:"pass", text=content）；
  * - tool_request → 按台账 state 裁决（§2.7 七步：台账缺失 → 目标不符 → 请求方
- *   不符 → 请求过期 → denied/refused/expired → 已终态放行 → 审批文件校验）；
+ *   不符 → 请求过期 → 已终态放行 → 审批文件校验）；
  * - 首次拒绝发生状态迁移时回投请求方 +（无审批时）通知 lead + 审计 tool-decision；
  * - 放行：pending 且有有效审批文件 → 台账记 approved（门放行≥1 次，§2.5）。
+ *
+ * v0.7.2（F-01 修复，写者胜）：**审批文件校验不再被台账的拒绝态短路**。旧实现
+ * 在 `denied/refused/expired` 分支直接渲染-only 返回，磁盘上已变为合法批准的
+ * 文件永不被重读——README「用户/lead 落盘 ≡ xc_review 代写同格式」与 PROTOCOL
+ * §11.2「显式批准可从 refused/denied 转入——后者写者胜」在文件轨静默失效
+ * （裁决日志 b01.jsonl/b01b.jsonl：门连已变成 decision:"approved" 的文件都不看）。
+ * 现在除「请求窗已关闭」（③，安全边界）与「已终态 executed/error / 执行方辞谢」
+ * （④/④b，回投已发生）外，任何台账状态都重读审批文件：有效 → 放行并按需迁回
+ * approved（refused/denied 复活）；无效 → 沿用该状态的历史理由渲染-only 遮蔽
+ * （无文件时的 fail-closed 行为不变）。
  */
 export async function gateToolRequestRender(message: TeamMessage, ctx: ToolGateContext): Promise<ToolGateRenderResult> {
   if (parseToolFrameType(message.content) !== 'tool_request') {
@@ -242,16 +256,21 @@ export async function gateToolRequestRender(message: TeamMessage, ctx: ToolGateC
   }
 
   // ③ 请求过期（ttl 超期；sweeper 亦会标 expired——同一迁移，幂等）。
+  //    安全边界优先于审批文件：请求窗关闭后任何批准窗都不可能同时满足
+  //    「> now」与「≤ 请求 expiresAt」（checkApproval 的两条判据），故此处
+  //    拒绝即终局，不存在「过期请求被审批文件复活」的合法路径。
   if (ctx.now > ledger.expiresAt) {
     const reason = 'request expired';
     let transitioned = false;
     if (ledger.state === 'pending' || ledger.state === 'approved') {
-      const next = await updateToolRequest(ctx.stateRoot, ledger.requestId, (l) =>
-        l.state === 'pending' || l.state === 'approved'
-          ? { ...l, state: 'expired', decidedAt: ctx.now, decidedBy: 'engine', decisionReason: reason }
-          : undefined,
-      );
-      transitioned = next?.state === 'expired';
+      const next = await transitionToolRequest(ctx.stateRoot, ledger.requestId, ['pending', 'approved'], (l) => ({
+        ...l,
+        state: 'expired',
+        decidedAt: ctx.now,
+        decidedBy: 'engine',
+        decisionReason: reason,
+      }));
+      transitioned = next !== undefined;
       if (transitioned) {
         const receiptId = await replyRefusal(ctx, next!, reason);
         await logEngineEvent(ctx.stateRoot, {
@@ -271,27 +290,7 @@ export async function gateToolRequestRender(message: TeamMessage, ctx: ToolGateC
     return { gate: 'refuse', requestId: ledger.requestId, state, reason, text: maskedToolRequestText(ledger.requestId, state, reason), transitioned };
   }
 
-  // ④ 显式拒绝 / 既往门拒 / 已过期：渲染-only（B 已在动作当时收到通知）。
-  if (ledger.state === 'denied' || ledger.state === 'refused' || ledger.state === 'expired') {
-    const reason: string = ledger.state === 'denied'
-      ? 'approval denied'
-      : ledger.state === 'expired'
-        ? 'request expired'
-        : ledger.decisionReason ?? 'approval refused';
-    await logEngineEvent(ctx.stateRoot, {
-      event: 'tool-decision',
-      teamId: ctx.teamId,
-      requestId: ledger.requestId,
-      decision: 'refused',
-      reason,
-      from: ledger.from,
-      to: ledger.to,
-      tool: ledger.tool,
-    });
-    return { gate: 'refuse', requestId: ledger.requestId, state: ledger.state, reason, text: maskedToolRequestText(ledger.requestId, ledger.state, reason), transitioned: false };
-  }
-
-  // ⑤ 已终态（executed/error）：回投已发生，请求帧保持可见（带头全文）。
+  // ④ 已终态（executed/error）：回投已发生，请求帧保持可见（带头全文）。
   if (ledger.state === 'executed' || ledger.state === 'error') {
     return {
       gate: 'pass',
@@ -302,7 +301,27 @@ export async function gateToolRequestRender(message: TeamMessage, ctx: ToolGateC
     };
   }
 
-  // ⑥⑦ 审批文件校验（state ∈ pending/approved；授权只认文件，§2.3）。
+  // ④b 执行方辞谢终态（B-04）：`refused` + 已有 tool_result 落箱（resultMessageId）=
+  //     「请求已被回答」，与门自动拒的 refused 同形不同义——**不**被审批文件复活
+  //     （一请求一结果：否则辞谢后重读即可复活、再回投一次 ok = 双结果）。
+  if (ledger.state === 'refused' && ledger.resultMessageId !== undefined) {
+    const reason = ledger.decisionReason ?? 'approval refused';
+    await logEngineEvent(ctx.stateRoot, {
+      event: 'tool-decision',
+      teamId: ctx.teamId,
+      requestId: ledger.requestId,
+      decision: 'refused',
+      reason,
+      from: ledger.from,
+      to: ledger.to,
+      tool: ledger.tool,
+      answered: true,
+    });
+    return { gate: 'refuse', requestId: ledger.requestId, state: 'refused', reason, text: maskedToolRequestText(ledger.requestId, 'refused', reason), transitioned: false };
+  }
+
+  // ⑤⑥ 审批文件校验（**任意台账状态**都重读：pending/approved/denied/refused/expired
+  //     ——写者胜，§11.2）。授权只认文件，§2.3。
   const read = await readApprovalFile(ctx.stateRoot, ledger.requestId, ledger.approvalFile);
   const verdict = checkApproval(
     read,
@@ -310,22 +329,29 @@ export async function gateToolRequestRender(message: TeamMessage, ctx: ToolGateC
     ctx.now,
   );
   if (verdict.ok) {
-    // 放行：pending → approved（门放行≥1 次，§2.5）；approved 保持。
+    // 放行：pending → approved（门放行≥1 次，§2.5）；approved 保持；
+    //      refused/denied → approved（F-01 写者胜：合法批准文件复活拒绝态台账）。
     let transitioned = false;
-    if (ledger.state === 'pending') {
+    let current = ledger;
+    if (ledger.state !== 'approved') {
       const decidedBy = read.status === 'ok' ? read.approval.approvedBy : undefined;
       const decidedAt = read.status === 'ok' ? read.approval.decidedAt : undefined;
-      const next = await updateToolRequest(ctx.stateRoot, ledger.requestId, (l) =>
-        l.state === 'pending'
-          ? {
-              ...l,
-              state: 'approved',
-              decidedAt: decidedAt ?? ctx.now,
-              decidedBy: decidedBy ?? '(file-track approval)',
-            }
-          : undefined,
+      const next = await transitionToolRequest(
+        ctx.stateRoot,
+        ledger.requestId,
+        ['pending', 'approved', 'denied', 'refused', 'expired'],
+        (l) => ({
+          ...l,
+          state: 'approved',
+          decidedAt: decidedAt ?? ctx.now,
+          decidedBy: decidedBy ?? '(file-track approval)',
+          decisionReason: `approved via approval file (revived from ${l.state})`,
+        }),
       );
-      transitioned = next?.state === 'approved';
+      if (next !== undefined) {
+        current = next;
+        transitioned = true;
+      }
     }
     await logEngineEvent(ctx.stateRoot, {
       event: 'tool-decision',
@@ -335,9 +361,9 @@ export async function gateToolRequestRender(message: TeamMessage, ctx: ToolGateC
       from: ledger.from,
       to: ledger.to,
       tool: ledger.tool,
-      ...(transitioned ? { firstPass: true } : {}),
+      ...(transitioned ? { firstPass: true, revivedFrom: ledger.state } : {}),
     });
-    const approvedBy = ledger.decidedBy ?? (read.status === 'ok' ? read.approval.approvedBy : undefined);
+    const approvedBy = current.decidedBy ?? (read.status === 'ok' ? read.approval.approvedBy : undefined);
     return {
       gate: 'pass',
       requestId: ledger.requestId,
@@ -351,18 +377,14 @@ export async function gateToolRequestRender(message: TeamMessage, ctx: ToolGateC
   const reason = verdict.reason;
   if (ledger.state === 'pending') {
     const notifyLead = reason === 'approval missing' && ledger.approvalNotifiedAt === undefined;
-    const next = await updateToolRequest(ctx.stateRoot, ledger.requestId, (l) =>
-      l.state === 'pending'
-        ? {
-            ...l,
-            state: 'refused',
-            decidedAt: ctx.now,
-            decidedBy: 'gate',
-            decisionReason: reason,
-          }
-        : undefined,
-    );
-    if (next !== undefined && next.state === 'refused') {
+    const next = await transitionToolRequest(ctx.stateRoot, ledger.requestId, ['pending'], (l) => ({
+      ...l,
+      state: 'refused',
+      decidedAt: ctx.now,
+      decidedBy: 'gate',
+      decisionReason: reason,
+    }));
+    if (next !== undefined) {
       const receiptId = await replyRefusal(ctx, next, reason);
       let notified: string | undefined;
       if (notifyLead) {
@@ -389,13 +411,23 @@ export async function gateToolRequestRender(message: TeamMessage, ctx: ToolGateC
     }
   }
 
-  // 渲染-only 拒绝（approved 后审批失效/复读）：只审计不出新回执。
+  // 渲染-only 拒绝（非 pending 态：拒绝态台账复读 / approved 后审批失效）。
+  // 拒绝态台账用历史理由（denied→approval denied；refused→首拒理由；expired→request
+  // expired），避免把「用户还没落文件」误报成首拒当时的具体缺陷；审批文件在场但
+  // 非法时用本次校验理由（更有信息量）。
+  const renderReason = ledger.state === 'denied'
+    ? 'approval denied'
+    : ledger.state === 'expired'
+      ? 'request expired'
+      : ledger.state === 'refused' && read.status === 'missing'
+        ? (ledger.decisionReason ?? 'approval refused')
+        : reason;
   await logEngineEvent(ctx.stateRoot, {
     event: 'tool-decision',
     teamId: ctx.teamId,
     requestId: ledger.requestId,
     decision: 'refused',
-    reason,
+    reason: renderReason,
     from: ledger.from,
     to: ledger.to,
     tool: ledger.tool,
@@ -404,8 +436,8 @@ export async function gateToolRequestRender(message: TeamMessage, ctx: ToolGateC
     gate: 'refuse',
     requestId: ledger.requestId,
     state: ledger.state,
-    reason,
-    text: maskedToolRequestText(ledger.requestId, ledger.state, reason),
+    reason: renderReason,
+    text: maskedToolRequestText(ledger.requestId, ledger.state, renderReason),
     transitioned: false,
   };
 }

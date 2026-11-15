@@ -21,7 +21,9 @@
  *
  * 无定时器纪律：只在 xc_overview/xc_doctor 调用时惰性采样，缓存文件
  * `.crosschat/capacity/sample.json` 最小间隔 XC_MEM_SAMPLE_MIN_MS（缺省 60s），
- * 窗口期内直接回缓存（sampledAt 标注真实采样时刻）。
+ * 窗口期内回缓存——但设备水位字段（totalBytes/freeBytes/watermark）会与
+ * `os.freemem()` 实时交叉复核（C9-B3 修复）：缓存只省进程树采样成本，不为
+ * 伪造/陈新缓存制造最长一个窗口的虚假读数（sampledAt 仍标注进程树真采样时刻）。
  *
  * 判定纯函数 judgeCapacity 只吃样本（不触 os）——detail 给出具体 violated 规则与
  * 数字，供 panel 文本与测试断言。CIM 失败降级：只报 os 水位 + degraded:
@@ -372,22 +374,51 @@ export function capacityCacheFile(stateRoot: string): string {
   return join(stateRoot, 'capacity', 'sample.json');
 }
 
+/** 实时设备水位读数（os.totalmem/os.freemem；单测经 osReader 缝注入，保持纯度）。 */
+export interface OsWatermark {
+  totalBytes: number;
+  freeBytes: number;
+}
+
+export function readOsWatermark(): OsWatermark {
+  return { totalBytes: os.totalmem(), freeBytes: os.freemem() };
+}
+
+function watermarkOf(totalBytes: number, freeBytes: number): number {
+  return totalBytes > 0 ? freeBytes / totalBytes : 1;
+}
+
 /** 惰性采样入口（DESIGN §3.3）：窗口期内回缓存，否则真采样并尽力写缓存。 */
 export async function sampleCapacity(env: NodeJS.ProcessEnv, cacheFile: string, now: number): Promise<CapacitySample> {
   return sampleCapacityWithSampler(env, cacheFile, now, () => takeFreshSample(now));
 }
 
-/** 可注入采样器的内部形态（单测用；生产行为=sampleCapacity）。 */
+/**
+ * 可注入采样器的内部形态（单测用；生产行为=sampleCapacity）。
+ *
+ * v0.7.2（C9-B3 修复，25-能力反向检验）：窗口期内缓存命中时，样本的**设备水位字段**
+ * （totalBytes/freeBytes/watermark）与 `os.freemem()` 实时交叉复核后刷新——缓存只省
+ * 进程树（CIM/PowerShell）采样成本，绝不被逐字信任到能制造虚假读数的地步。此前一条
+ * 伪造/陈新的缓存可在整个 `XC_MEM_SAMPLE_MIN_MS`（缺省 60s）窗口内把面板钉成假 GREEN
+ * （漏报）或假 RED（误报），而采样器自己本来就会调 `os.freemem()`，成本仅一次系统调用。
+ * 进程树字段仍取缓存值（CIM 才是缓存要省的那 ~1s），`sampledAt` 保持首次真采样时刻。
+ */
 export async function sampleCapacityWithSampler(
   env: NodeJS.ProcessEnv,
   cacheFile: string,
   now: number,
   sampler: (now: number) => CapacitySample | Promise<CapacitySample>,
+  osReader: () => OsWatermark = readOsWatermark,
 ): Promise<CapacitySample> {
   const minMs = memSampleMinMsFromEnv(env);
   if (minMs > 0) {
     const cached = await readSampleCache(cacheFile, now, minMs);
-    if (cached !== null) return cached;
+    if (cached !== null) {
+      const live = osReader();
+      const totalBytes = Number.isFinite(live.totalBytes) && live.totalBytes > 0 ? live.totalBytes : cached.totalBytes;
+      const freeBytes = Number.isFinite(live.freeBytes) && live.freeBytes >= 0 ? live.freeBytes : cached.freeBytes;
+      return { ...cached, totalBytes, freeBytes, watermark: watermarkOf(totalBytes, freeBytes) };
+    }
   }
   const fresh = await sampler(now);
   await writeSampleCache(cacheFile, fresh).catch(() => undefined); // 缓存尽力而为，失败不影响返回
@@ -396,9 +427,8 @@ export async function sampleCapacityWithSampler(
 
 /** 一次真采样（os 水位 + CIM 分类；now 注入保持纯度）。 */
 export async function takeFreshSample(now: number = Date.now()): Promise<CapacitySample> {
-  const totalBytes = os.totalmem();
-  const freeBytes = os.freemem();
-  const watermark = totalBytes > 0 ? freeBytes / totalBytes : 1;
+  const { totalBytes, freeBytes } = readOsWatermark();
+  const watermark = watermarkOf(totalBytes, freeBytes);
   const rows = await sampleZcodeTree();
   if (rows === null) {
     return {

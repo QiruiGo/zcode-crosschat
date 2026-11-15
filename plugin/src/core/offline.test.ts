@@ -176,6 +176,23 @@ describe('offlineVerdict（离线判据，§4.1 判定规则）', () => {
     expect(offlineVerdict(t, m, 'no-record', NOW, OFFLINE_MS).offline).toBe(false);
   });
 
+  // v0.7.2（红队五番战 C8-B2 修复）：按「回拨 updatedAt + 末条 history.ts」的
+  // 标准时间加速手段构造 300min 无进展记录时，idle-timeout 必须可达——旧口径
+  // max(createdAt, history 末条) 让新建任务的 createdAt 下限把回拨吞掉，分支
+  // 黑盒下从未命中（红队 c8b2 原用例）；full-backdate 对照组在修复前即可命中。
+  it('回拨 history 末条（createdAt 不动）→ idle-timeout 可达（C8-B2 修复判据）', () => {
+    const t = task({ id: 't1', status: 'in_progress', assignee: 'm1', createdAt: NOW - MIN, updatedAt: NOW - 300 * MIN });
+    t.history.push({ ts: NOW - 300 * MIN, event: 'in_progress', by: 'm1' });
+    expect(offlineVerdict(t, m, 'live', NOW, OFFLINE_MS)).toEqual({ offline: true, evidence: 'idle-timeout' });
+  });
+
+  it('落盘 lastProgressTs 在场且与 history 一致 → 同判（正常记录两 Marker 恒等）', () => {
+    const t = task({ id: 't1', status: 'in_progress', assignee: 'm1', createdAt: NOW - 300 * MIN, updatedAt: NOW - 300 * MIN });
+    t.history.push({ ts: NOW - 300 * MIN, event: 'in_progress', by: 'm1' });
+    t.lastProgressTs = NOW - 300 * MIN;
+    expect(offlineVerdict(t, m, 'no-record', NOW, OFFLINE_MS)).toEqual({ offline: true, evidence: 'idle-timeout' });
+  });
+
   it('removed 成员（xc_member_stop 已回池留档）→ 永不判离线（「不在册」不是「离线」）', () => {
     const t = task({ id: 't1', status: 'in_progress', assignee: 'm1', createdAt: NOW - 600 * MIN, updatedAt: NOW - 600 * MIN });
     const removed = member({ key: 'm1', sessionId: 'sess_m1', state: 'removed' });
@@ -246,28 +263,44 @@ describe('offlineMembers（离线成员清单，§4.2 转交面）', () => {
 
 describe('offlineThresholdMsFromEnv（阈值可配且保守，AC7）', () => {
   it('缺省 240min（长于 stall 120 与 stale 30）', () => {
-    expect(offlineThresholdMsFromEnv({}, STALE_MS)).toEqual({ ms: 240 * MIN, clamped: false });
+    expect(offlineThresholdMsFromEnv({}, STALE_MS)).toEqual({ ms: 240 * MIN, clamped: false, fellBack: false });
     expect(DEFAULT_OFFLINE_MINUTES).toBe(240);
   });
 
   it('XC_OFFLINE_MINUTES 合法正值 → 采用', () => {
-    expect(offlineThresholdMsFromEnv({ XC_OFFLINE_MINUTES: '360' }, STALE_MS)).toEqual({ ms: 360 * MIN, clamped: false });
+    expect(offlineThresholdMsFromEnv({ XC_OFFLINE_MINUTES: '360' }, STALE_MS)).toEqual({ ms: 360 * MIN, clamped: false, fellBack: false });
   });
 
-  it('非有限/非正/空白值 → 缺省 240min', () => {
+  it('非有限/非正/空白值 → 缺省 240min（非法值另见 fellBack 披露用例）', () => {
     for (const raw of ['abc', '0', '-5', '   ', '']) {
-      expect(offlineThresholdMsFromEnv({ XC_OFFLINE_MINUTES: raw }, STALE_MS)).toEqual({ ms: 240 * MIN, clamped: false });
+      expect(offlineThresholdMsFromEnv({ XC_OFFLINE_MINUTES: raw }, STALE_MS).ms).toBe(240 * MIN);
+      expect(offlineThresholdMsFromEnv({ XC_OFFLINE_MINUTES: raw }, STALE_MS).clamped).toBe(false);
     }
   });
 
+  // v0.7.2（红队五番战 C8-B4 修复）：env **有值但非法**（0/负数/非数字）不再与
+  // 「未设置」同形——回落内置缺省的同时 fellBack:true，挂载面附 WARNING +
+  // payload offlineThresholdFallback（空串/未设仍是 fellBack:false）。
+  it('非法值（0/负数/非数字）→ 回落缺省且 fellBack:true（披露，不静默）', () => {
+    for (const raw of ['0', '-5', 'abc', 'NaN']) {
+      expect(offlineThresholdMsFromEnv({ XC_OFFLINE_MINUTES: raw }, STALE_MS)).toEqual({ ms: 240 * MIN, clamped: false, fellBack: true });
+    }
+    expect(offlineThresholdMsFromEnv({ XC_OFFLINE_MINUTES: '   ' }, STALE_MS)).toEqual({ ms: 240 * MIN, clamped: false, fellBack: false });
+  });
+
   it('低于 stale 阈值 → 按 stale 钳制并返回 clamped（挂载面附 WARNING）', () => {
-    expect(offlineThresholdMsFromEnv({ XC_OFFLINE_MINUTES: '5' }, STALE_MS)).toEqual({ ms: STALE_MS, clamped: true });
-    expect(offlineThresholdMsFromEnv({ XC_OFFLINE_MINUTES: '30' }, STALE_MS)).toEqual({ ms: STALE_MS, clamped: false });
+    expect(offlineThresholdMsFromEnv({ XC_OFFLINE_MINUTES: '5' }, STALE_MS)).toEqual({ ms: STALE_MS, clamped: true, fellBack: false });
+    expect(offlineThresholdMsFromEnv({ XC_OFFLINE_MINUTES: '30' }, STALE_MS)).toEqual({ ms: STALE_MS, clamped: false, fellBack: false });
   });
 
   it('自定义大 stale 阈值（200min）+ 离线阈值 100min → 钳到 200min（30 < 阈值边界不被破坏）', () => {
     const bigStale = 200 * MIN;
-    expect(offlineThresholdMsFromEnv({ XC_OFFLINE_MINUTES: '100' }, bigStale)).toEqual({ ms: bigStale, clamped: true });
+    expect(offlineThresholdMsFromEnv({ XC_OFFLINE_MINUTES: '100' }, bigStale)).toEqual({ ms: bigStale, clamped: true, fellBack: false });
+  });
+
+  it('非法值回落 240 后仍低于超大 stale → clamped 与 fellBack 并存（两条 WARNING 都出）', () => {
+    const hugeStale = 300 * MIN;
+    expect(offlineThresholdMsFromEnv({ XC_OFFLINE_MINUTES: '0' }, hugeStale)).toEqual({ ms: hugeStale, clamped: true, fellBack: true });
   });
 });
 

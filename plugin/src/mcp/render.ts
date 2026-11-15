@@ -172,20 +172,36 @@ function dagEdges(snapshot: StatusSnapshot & PanoramaExtras): string[] {
 }
 
 // ---------------------------------------------------------------------------
-// 任务板（v0.1.0 列形态原样保留；renderStatusTable/renderPanorama 共用）
+// 任务板（列布局自 v0.1.0 演进：STATUS/ASSIGNEE/ATT/TITLE 沿用原列序与宽度；
+//   ID 与 RESULT/ERROR 两列按 v0.7.2 C9-B1/C9-B2 修复调整——25-能力反向检验）：
+// - **ID 列加宽到 14**（`<8hex>-t<N>` 全形，如 `755d9697-t12`）。此前固定 6 字符，
+//   同一波派发的任务共享 8hex 时间前缀、区分用的 `-t<N>` 后缀正好被切掉——文本面
+//   三行全同形，而 journal 路径 / xc_read(journal) / xc_claim 都要用被切掉的 taskId。
+//   超宽（seq 位数很多）时按**保尾**截断（`…<尾部>`），区分后缀永远可见。
+// - **RESULT/ERROR 列取消固定 24 字符截断**：C9 承诺「看到板面指针即算落盘」，
+//   journal 路径（`.crosschat/tasks/<taskId>/journal.md`）此前在文本面被切成
+//   `…；journal…`，路径本体不可见。行宽改由注入预算窗口统一兜底（xc_overview 的
+//   boardCosts 已按人可读行长度记账，超预算自然分页 + boardTruncated 指针），
+//   JSON 面本就全量、不受影响。
 // ---------------------------------------------------------------------------
 
-const COL = { id: 6, status: 11, assignee: 10, att: 11, result: 24 };
+const COL = { id: 14, status: 11, assignee: 10, att: 11 };
 
 function pad(text: string, width: number): string {
   const oneLine = text.replace(/\s+/g, " ").trim();
   return oneLine.length <= width ? oneLine.padEnd(width, " ") : `${oneLine.slice(0, width - 1)}…`;
 }
 
+/** ID 列专用：超宽时保尾截断（`…<尾部>`）——时间前缀可省，`-t<N>` 区分后缀不可省。 */
+function padId(text: string, width: number): string {
+  const oneLine = text.replace(/\s+/g, " ").trim();
+  return oneLine.length <= width ? oneLine.padEnd(width, " ") : `…${oneLine.slice(oneLine.length - (width - 1))}`;
+}
+
 /** 任务板表头行（renderTaskTable 用；预算窗口的固定面记账同款，避免两处字面量漂移）。 */
 export const STATUS_TASK_TABLE_HEADER =
   `${"ID".padEnd(COL.id)}  ${"STATUS".padEnd(COL.status)}  ${"ASSIGNEE".padEnd(COL.assignee)}  `
-  + `${"ATT".padEnd(COL.att)}  ${"RESULT/ERROR".padEnd(COL.result)}  TITLE`;
+  + `${"ATT".padEnd(COL.att)}  RESULT/ERROR  TITLE`;
 
 /**
  * 单条任务的人可读板面行（renderTaskTable 逐行同款）。
@@ -196,9 +212,12 @@ export const STATUS_TASK_TABLE_HEADER =
 export function statusTaskRowText(task: StatusSnapshotTask): string {
   const att = `${task.attempt}@${task.attemptId ? shortId(task.attemptId) : "-"}`;
   const outcome = task.error ? `ERR: ${task.error}` : (task.result ?? "");
+  // v0.7.2（C9-B1）：RESULT/ERROR 不截断——journal 指针必须在文本面可定位；
+  // 仍折叠为单行（多行 result 不破坏板面一行一任务的形态）。
+  const outcomeOneLine = outcome.replace(/\s+/g, " ").trim();
   return (
-    `${pad(task.id, COL.id)}  ${pad(task.status, COL.status)}  ${pad(task.assignee ?? "-", COL.assignee)}  `
-    + `${pad(att, COL.att)}  ${pad(outcome, COL.result)}  ${task.title}`
+    `${padId(task.id, COL.id)}  ${pad(task.status, COL.status)}  ${pad(task.assignee ?? "-", COL.assignee)}  `
+    + `${pad(att, COL.att)}  ${outcomeOneLine}  ${task.title}`
   );
 }
 

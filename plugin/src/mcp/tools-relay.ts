@@ -42,7 +42,8 @@
  *   正文由 ticket 原样携带，urgent 旁路同理挡不住，§2.2）+ uservoice 盖章豁免
  *   （机器帧不应有用户亲述语义，E4 §7.3）；
  * - tool_result：帧校验（requestId 在台账且已放行/from=执行方/tool 逐字节/结果
- *   ≤ maxResultChars）→ 落箱 + 台账终填(executed/error) + 审计 tool-executed；
+ *   ≤ maxResultChars）→ 落箱 + 台账终填(executed/error/**refused**——v0.7.2 B-04
+ *   修复：执行方辞谢同样是终态，一请求一结果) + 审计 tool-executed；
  *   伪造回投 tool-result-rejected（不落箱不终填）；
  * - C6/C7 帧免入站策略（PROTOCOL §9「协议帧不受影响」；转办的控制点是审批门）；
  * - peer 轴不收 C6/C7 帧（E4 §9.3：peer 轴转办未验，最小链路=队内轴+文件邮箱）。
@@ -74,6 +75,7 @@ import {
   checkToolResultFrame,
   parseToolFrameType,
   toolRequestTtlMsFromEnv,
+  toolResultPayloadChars,
   TOOL_REQUEST_WAKE_SUPPRESSION_NOTE,
   type ToolRequestCheck,
 } from "../core/toolrelay.js";
@@ -523,27 +525,31 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
           });
           await appendMailbox(stateRoot, me.teamId, toKey, msg);
 
-          // v0.7（C6，§2.5）：tool_result 回投终填台账（ok→executed / error→error；
-          // refused 不迁移——门拒路径由插件侧拥有该状态）。
+          // v0.7（C6，§2.5）：tool_result 回投终填台账（ok→executed / error→error /
+          // refused→refused——B-04 修复：辞谢也是终态，落账后不再接受第二次回投，
+          // 也不会被 TTL 清扫改写；门侧对 refused 台账继续遮蔽，全文不外泄）。
           if (toolFrameType === "tool_result") {
             const frame: unknown = JSON.parse(content);
             const status = (frame as { status?: unknown }).status;
             const requestId = (frame as { requestId?: unknown }).requestId;
-            if (typeof requestId === "string" && (status === "ok" || status === "error")) {
+            if (typeof requestId === "string" && (status === "ok" || status === "error" || status === "refused")) {
+              const nextState = status === "ok" ? "executed" : status === "error" ? "error" : "refused";
               const next = await updateToolRequest(stateRoot, requestId, (l) =>
                 l.state === "approved"
                   ? {
                       ...l,
-                      state: status === "ok" ? "executed" : "error",
+                      state: nextState,
                       decidedAt: now,
                       decidedBy: l.to,
                       decisionReason: `tool_result:${status}`,
-                      resultChars: JSON.stringify((frame as { result?: unknown }).result ?? null).length,
+                      ...(status === "ok"
+                        ? { resultChars: toolResultPayloadChars((frame as { result?: unknown }).result ?? null) }
+                        : {}),
                       resultMessageId: msg.id,
                     }
                   : undefined,
               );
-              if (next === undefined || (next.state !== "executed" && next.state !== "error")) {
+              if (next === undefined || next.state !== nextState) {
                 // 并发下台账已被迁移（双重回投/门已拒）——消息已落箱，审计留痕。
                 await logEngineEvent(stateRoot, {
                   event: "tool-result-rejected",
@@ -630,7 +636,9 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
             to: toKey,
             tool: (frame as { tool?: unknown }).tool ?? null,
             status: (frame as { status?: unknown }).status ?? null,
-            resultChars: JSON.stringify((frame as { result?: unknown }).result ?? null).length,
+            ...((frame as { status?: unknown }).status === "ok"
+              ? { resultChars: toolResultPayloadChars((frame as { result?: unknown }).result ?? null) }
+              : {}),
             messageId: out.messageId,
             delivered,
           });

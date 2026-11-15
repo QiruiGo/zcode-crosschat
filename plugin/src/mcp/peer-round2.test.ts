@@ -556,3 +556,57 @@ describe("A4 回归锁：同名多持有 = 显式歧义状态（裸名 fail-clos
     expect(targeted.receipt).toBe("delivered");
   });
 });
+
+// ─────────── v0.7.2 红队五番战 F-02（C8-B1）：注册/改名不得抹崩溃残留 ───────────
+
+describe("v0.7.2 F-02（C8-B1）：identify 路径保留他人崩溃残留，只定向回收所认领花名的死前任", () => {
+  it("注册新花名 → 别的会话的 pid-dead 残留原样保留（C8 离线判据的进程死硬证据）", async () => {
+    // 崩溃残留：另一个成员（m2）的进程已亡、记录未优雅摘除。
+    await writePeerRecord(root, peerRecord(999_999, "m2", "sess-m2", "\\.\pipe\LOCAL\xcc-m2"));
+    // 新会话的钩子锚定（注册闸要求 claimed sid 有基记录）。
+    await writePeerBaseRecord(root, { sessionId: "sess-obs1", cwd: workspace, source: "startup", startedAt: Date.now(), lastSeen: Date.now() });
+
+    const services = createDefaultPeerServices(deps);
+    const result = await services.register({ name: "obs1", sessionId: "sess-obs1" });
+    expect(result.name).toBe("obs1");
+
+    // 修复前：register 的 scanPeers 默认惰性清扫把全部死记录一并删掉——红队
+    // c8b1 实测「任一会话 identify 后仅剩存活者记录」，C8 四件套（task-offline
+    // 审计 / lead 转交通知 / overview offlineMembers）在「重启后查看」流程全失。
+    const scanned = await scanPeers(root, Date.now(), { sweep: false });
+    const residue = scanned.dead.find((row) => row.record.name === "m2");
+    expect(residue).toBeDefined();
+    expect(residue!.record.sessionId).toBe("sess-m2");
+    expect(residue!.reason).toBe("pid-dead");
+    // 别人的死名不产生接管痕迹（只对本次认领的花名 claim）。
+    expect((await auditEvents()).some((e) => e["event"] === "peer-name-reclaimed")).toBe(false);
+  });
+
+  it("认领死花名 → 该花名的死前任被定向回收（证据已被 reclaimed 审计消费）", async () => {
+    await writePeerRecord(root, peerRecord(999_998, "alice", "sess-dead", "\\.\pipe\LOCAL\xcc-dead2"));
+
+    const services = createDefaultPeerServices(deps);
+    const result = await services.register({ name: "alice", sessionId: "sess-alice" });
+    expect(result.name).toBe("alice");
+
+    // 接管留痕照旧（审计 + reclaimedFrom），且死前任文件被收掉——注册表不无限堆积。
+    const reclaimed = (await auditEvents()).find((e) => e["event"] === "peer-name-reclaimed");
+    expect(reclaimed).toMatchObject({ name: "alice", previous: { sessionId: "sess-dead", pid: 999_998 } });
+    const rows = await services.list("self");
+    expect(rows[0]?.reclaimedFrom).toMatchObject({ sessionId: "sess-dead", pid: 999_998 });
+    const after = await scanPeers(root, Date.now(), { sweep: false });
+    expect(after.dead.some((row) => row.record.name === "alice")).toBe(false);
+  });
+
+  it("改名到新花名 → 别的会话的 pid-dead 残留同样保留", async () => {
+    await writePeerRecord(root, peerRecord(999_997, "m3", "sess-m3", "\\.\pipe\LOCAL\xcc-m3"));
+    const services = createDefaultPeerServices(deps);
+    await services.register({ name: "alice", sessionId: "sess-alice" });
+
+    const renamed = await services.rename("alice2");
+    expect(renamed.name).toBe("alice2");
+
+    const scanned = await scanPeers(root, Date.now(), { sweep: false });
+    expect(scanned.dead.some((row) => row.record.name === "m3" && row.reason === "pid-dead")).toBe(true);
+  });
+});

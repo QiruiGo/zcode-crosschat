@@ -24,6 +24,7 @@ import {
   checkToolResultFrame,
   isToolFrameType,
   parseToolFrameType,
+  toolResultPayloadChars,
   toolRequestTtlMsFromEnv,
   type ToolRequestFrame,
   type ToolResultLedgerView,
@@ -219,6 +220,76 @@ describe('toolrelay v0.7: tool_result 发送侧校验', () => {
   it('refused/error 回投也要求状态已放行且载荷键正确', () => {
     expect(checkToolResultFrame(resultFrame({ status: 'refused', result: undefined, reason: 'approval missing' }), 'aye', ledger).ok).toBe(true);
     expect(checkToolResultFrame(resultFrame({ status: 'error', result: undefined, error: 'No such tool available: x' }), 'aye', ledger).ok).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.7.2 复验（P3 修复）：B-03 result 限额按有效载荷口径（不再把 JSON 引号计入）
+// ---------------------------------------------------------------------------
+
+describe('toolrelay v0.7.2 (B-03): result 限额按有效载荷计', () => {
+  const cappedLedger: ToolResultLedgerView = {
+    requestId: '11111111-2222-4333-8444-555555555555',
+    from: 'bee',
+    to: 'aye',
+    tool: 'mcp__plugin_zcx-probe_zcxprobe__probe_ping',
+    state: 'approved',
+    maxResultChars: 64_000,
+  };
+
+  function frame(result: unknown, maxResultChars = 64_000): string {
+    return JSON.stringify({
+      type: 'tool_result',
+      requestId: cappedLedger.requestId,
+      from: 'aye',
+      status: 'ok',
+      tool: cappedLedger.tool,
+      result,
+      ts: 1794681345958,
+    });
+  }
+
+  const capped = (maxResultChars: number): ToolResultLedgerView => ({ ...cappedLedger, maxResultChars });
+
+  it('toolResultPayloadChars：字符串取自身长度；对象/数组/数字取序列化长度', () => {
+    expect(toolResultPayloadChars('x'.repeat(1000))).toBe(1000);
+    expect(toolResultPayloadChars('')).toBe(0);
+    expect(toolResultPayloadChars({ pid: 1 })).toBe(JSON.stringify({ pid: 1 }).length);
+    expect(toolResultPayloadChars([1, 2])).toBe(5);
+    expect(toolResultPayloadChars(null)).toBe(4);
+    expect(toolResultPayloadChars(42)).toBe(2);
+    // 循环引用 → Infinity（调用方按超限处理，不抛）。
+    const cyclic: Record<string, unknown> = {};
+    cyclic['self'] = cyclic;
+    expect(toolResultPayloadChars(cyclic)).toBe(Number.POSITIVE_INFINITY);
+  });
+
+  it('字符串结果恰好等于限值 → 放行（旧实现按序列化长度 = 限值+2 拒）', () => {
+    // 红队裁决 b03.jsonl：1000 字符 result vs 限 1000 → result_too_large
+    // 「serializes to 1002 chars (limit 1000)」。
+    const limit = capped(1000);
+    const check = checkToolResultFrame(frame('x'.repeat(1000)), 'aye', limit);
+    expect(check.ok).toBe(true);
+    const over = checkToolResultFrame(frame('x'.repeat(1001)), 'aye', limit);
+    expect(over.ok).toBe(false);
+    if (!over.ok) {
+      expect(over.error).toBe('result_too_large');
+      expect(over.message).toContain('payload is 1001 chars (limit 1000)');
+    }
+  });
+
+  it('非字符串结果仍按序列化长度计（语义不变）', () => {
+    const limit = capped(100);
+    const ok = checkToolResultFrame(frame({ blob: 'z'.repeat(89) }), 'aye', limit);
+    expect(ok.ok).toBe(true); // {"blob":"z"×89} = 100 字符（9 + 89 + 2）
+    const over = checkToolResultFrame(frame({ blob: 'z'.repeat(90) }), 'aye', limit);
+    expect(over.ok).toBe(false); // 101 字符
+    expect(over.ok).toBe(false);
+  });
+
+  it('缺省上限 64000：64000 字符字符串结果恰好等于限值 → 放行', () => {
+    const check = checkToolResultFrame(frame('y'.repeat(64_000)), 'aye', cappedLedger);
+    expect(check.ok).toBe(true);
   });
 });
 

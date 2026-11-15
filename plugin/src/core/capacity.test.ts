@@ -7,11 +7,15 @@
  * - 真机冒烟：takeFreshSample 形状不变式（不假设 ZCode 在场——降级与可信两态都合法）；
  * - C9 压缩联动（DESIGN-V0.7.md §5）：verdict.red 时 formatCapacityLines 追加
  *   compress-advice 建议行，绿样本不追加。
+ * - v0.7.2（C9-B3 修复）：缓存窗口内设备水位与 os.freemem() 交叉复核；
+ * - v0.7.2（C9-B4 修复）：第三条标红规则 turn-concurrency 与 XC_TURN_ESTIMATE_BYTES
+ *   在 README/PROTOCOL 登记（文档-行为一致性回归锁；红队 grep 0 命中）。
  */
 import { describe, expect, it } from 'vitest';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   classifyProcess,
   classifyZcodeProcesses,
@@ -354,10 +358,71 @@ describe('sampleCapacity 缓存窗口（XC_MEM_SAMPLE_MIN_MS）', () => {
         degraded: 'cim-unavailable',
       };
       const sampler = (): CapacitySample => degraded;
-      const first = await sampleCapacityWithSampler({}, cacheFile, 1000, sampler);
+      // osReader 注入同一组设备读数：隔离出「缓存还原」语义本身（不掺真实机器波动）。
+      const osReader = (): { totalBytes: number; freeBytes: number } => ({ totalBytes: 10, freeBytes: 5 });
+      const first = await sampleCapacityWithSampler({}, cacheFile, 1000, sampler, osReader);
       expect(first.degraded).toBe('cim-unavailable');
-      const cached = await sampleCapacityWithSampler({}, cacheFile, 1000 + 1000, sampler);
+      const cached = await sampleCapacityWithSampler({}, cacheFile, 1000 + 1000, sampler, osReader);
       expect(cached).toEqual(degraded);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // v0.7.2（C9-B3 修复）：窗口内缓存命中的设备水位字段必须与 os.freemem() 交叉复核，
+  // 缓存不再被逐字信任——伪造「100% 可用」的新鲜缓存不得制造假 GREEN。
+  it('窗口内缓存命中：设备水位与 os.freemem 交叉复核（C9-B3，伪造缓存不得制造虚假读数）', async () => {
+    try {
+      const dir = tmp();
+      const cacheFile = join(dir, 'sample.json');
+      const poisoned: CapacitySample = {
+        sampledAt: 1000,
+        totalBytes: 32 * GB,
+        freeBytes: 32 * GB, // 声称 100% 可用
+        watermark: 1,
+        steadyTreeBytes: 1000,
+        headlessTurnCount: 0,
+        headlessTurnMaxRssBytes: null,
+        degraded: null,
+        categoryCounts: { main: 1 },
+      };
+      writeFileSync(cacheFile, JSON.stringify(poisoned), 'utf8');
+      let calls = 0;
+      const sampler = (now: number): CapacitySample => {
+        calls += 1;
+        return sample({ sampledAt: now });
+      };
+      // 真实机器此刻只剩 ~20%：缓存说 100%，交叉复核后必须报真实水位
+      const osReader = (): { totalBytes: number; freeBytes: number } => ({ totalBytes: 32 * GB, freeBytes: Math.round(0.2 * 32 * GB) });
+      const b = await sampleCapacityWithSampler({}, cacheFile, 1000 + 59_999, sampler, osReader);
+      expect(calls).toBe(0); // 仍在窗口内：进程树不重采（缓存仍省 CIM 成本）
+      expect(b.sampledAt).toBe(1000); // sampledAt 保持进程树真采样时刻
+      expect(b.watermark).toBeCloseTo(0.2, 5); // 水位来自实时 os.freemem，不是缓存的 1
+      expect(b.freeBytes).toBe(Math.round(0.2 * 32 * GB));
+      expect(b.steadyTreeBytes).toBe(1000); // 进程树字段仍取缓存（CIM 才是缓存要省的成本）
+      expect(judgeCapacity(b, { XC_MEM_WARN_WATERMARK: '0.25' }).violated).toContain('watermark'); // 不会被钉成假 GREEN
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('窗口内缓存命中：osReader 异常/非法读数 → 回落缓存值（不崩、不虚报）', async () => {
+    try {
+      const dir = tmp();
+      const cacheFile = join(dir, 'sample.json');
+      const cachedSample = sample({ sampledAt: 1000 });
+      writeFileSync(cacheFile, JSON.stringify(cachedSample), 'utf8');
+      const sampler = (now: number): CapacitySample => sample({ sampledAt: now });
+      const b = await sampleCapacityWithSampler(
+        {},
+        cacheFile,
+        1000 + 1000,
+        sampler,
+        () => ({ totalBytes: Number.NaN, freeBytes: -1 }),
+      );
+      expect(b.totalBytes).toBe(cachedSample.totalBytes);
+      expect(b.freeBytes).toBe(cachedSample.freeBytes);
+      expect(b.watermark).toBe(cachedSample.watermark);
     } finally {
       cleanup();
     }
@@ -397,6 +462,42 @@ describe('formatCapacityLines（panel 直出文本）', () => {
     const lines = formatCapacityLines(s, judgeCapacity(s, {}));
     expect(lines[0]).toContain('RED');
     expect(lines[lines.length - 1]).toBe(COMPRESS_ADVICE_LINE);
+  });
+});
+
+// v0.7.2（C9-B4 修复）：第三条标红规则 turn-concurrency 与 XC_TURN_ESTIMATE_BYTES
+// 必须在公开文档登记——红队实证「文档 grep 0 命中」，运维面对标红无法解释无法调参。
+describe('文档登记：turn-concurrency 规则与 XC_TURN_ESTIMATE_BYTES（C9-B4）', () => {
+  const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+  const read = (rel: string): string => readFileSync(join(REPO_ROOT, rel), 'utf8');
+  const readme = read('README.md');
+  const protocol = read('docs/PROTOCOL.md');
+  const demo = read('docs/DEMO.md');
+
+  it('README 的 C9 段落登记三条规则与三个 env', () => {
+    expect(readme).toContain('XC_TURN_ESTIMATE_BYTES');
+    expect(readme).toContain('XC_MEM_WARN_WATERMARK');
+    expect(readme).toContain('XC_MEM_SESSION_LIMIT_BYTES');
+    expect(readme).toContain('并发 headless 回合数 × 单回合预估');
+  });
+
+  it('PROTOCOL §5 预警规则列全三条（含 turn-concurrency 判据）', () => {
+    expect(protocol).toContain('turn-concurrency');
+    expect(protocol).toContain('XC_TURN_ESTIMATE_BYTES');
+    expect(protocol).toContain('并发 headless 回合数 ×');
+  });
+
+  it('PROTOCOL §9 env 全表登记 XC_TURN_ESTIMATE_BYTES（含缺省 1.5GB 口径）', () => {
+    const envSection = protocol.split('## 9. 配置 env 全表')[1] ?? '';
+    expect(envSection).toContain('XC_TURN_ESTIMATE_BYTES');
+    expect(envSection).toContain('1.5GB');
+  });
+
+  it('DEMO 不含容量承诺歧义（未登记时不出现半截规则描述）', () => {
+    // DEMO 不展开容量规则；一旦展开就必须带 env 名，避免出现无法调参的标红描述。
+    if (/水位|容量/.test(demo)) {
+      expect(demo).toContain('XC_MEM_WARN_WATERMARK');
+    }
   });
 });
 

@@ -110,6 +110,11 @@ function routeIds(args: ReviewArgs, teamIds: readonly string[], peerIds: readonl
  * 状态迁移口径（§3.1 同一套枚举）：approve 可从 pending/refused/denied/approved
  * 转入（后者写者胜，§10.3-4）；deny 从 pending/approved/refused 转入；终态
  * （executed/error/expired）不被审批动作改写（请求已有结果或已过期）。
+ *
+ * v0.7.2（C7-B6 修复）：终态（executed/error/expired）在**写审批文件之前**就显式
+ * 拒绝。旧实现在 mutate 里静默放弃台账迁移，却仍然落盘审批文件、照发
+ * approval_result 回执并回报 ok（`ledgerState:"executed"`）——对已执行完的请求
+ * 「再批准一次」在语义与通知上都造成混乱（裁决日志 c7b6.jsonl）。
  */
 async function handleApprovalDecision(
   deps: ToolDeps,
@@ -129,6 +134,18 @@ async function handleApprovalDecision(
       error: "tool_request_not_found",
       requestId,
       message: `no tool_request ledger for "${requestId}" — the request may have expired and been cleaned up`,
+    });
+  }
+  // 终态闸（§3.1；v0.7.2 C7-B6）：已回投（executed/error）或已过期（expired）的
+  // 请求不再接受任何审批动作——不写审批文件、不发回执、不改台账。
+  if (ledger.state === "executed" || ledger.state === "error" || ledger.state === "expired") {
+    throw new ToolError({
+      error: "request_already_finalized",
+      requestId,
+      ledgerState: ledger.state,
+      message: `tool-transfer request "${requestId}" is already final (state=${ledger.state}); `
+        + "an approval cannot be added after the request has been answered or has expired — "
+        + "ask the requester to send a fresh request",
     });
   }
 
@@ -267,12 +284,22 @@ async function handleApprovalDecision(
 }
 
 /** v0.7 C7（§3.2）：axis:"approval" 待批清单——台账 pending 且无审批文件的请求。
- *  身份闸已由 handleReview 的 identityStore.require 承担（本清单不跨人）。 */
+ *  身份闸已由 handleReview 的 identityStore.require 承担（本清单不跨人）。
+ *
+ *  v0.7.2（C7-B7 修复）：已过 expiresAt 的 pending **不进可批清单**（旧实现照列，
+ *  附 remainingTtlMs:0 与 approveHow，按建议 approve 只得到 approval_window_closed
+ *  ——观测面误导，裁决日志 c7b7.jsonl）。这类请求单列为「等待 sweeper 标记 expired」
+ *  的计数说明，不附任何批准指引。 */
 async function listApprovalQueue(deps: ToolDeps): Promise<ToolResult> {
   const now = Date.now();
   const rows: Array<Record<string, unknown>> = [];
+  let lapsed = 0;
   for (const l of await listPendingToolRequests(deps.stateRoot)) {
     if (await approvalFileExists(deps.stateRoot, l.requestId, l.approvalFile)) continue;
+    if (l.expiresAt <= now) {
+      lapsed += 1;
+      continue;
+    }
     rows.push({
       requestId: l.requestId,
       from: l.from,
@@ -291,11 +318,14 @@ async function listApprovalQueue(deps: ToolDeps): Promise<ToolResult> {
   const lines = rows.map((r) =>
     `- ${r["requestId"]} from ${r["from"]} → ${r["to"]} tool=${r["tool"]} 剩余 ${Math.round((r["remainingTtlMs"] as number) / 1000)}s：${r["reason"]}`,
   );
+  const lapsedNote = lapsed > 0
+    ? `\n（另有 ${lapsed} 条已过 expiresAt、尚未被 sweeper 标记 expired 的请求，不在可批清单内；批准窗已关，需请求方重发）`
+    : "";
   return okResult(
     rows.length === 0
-      ? "没有待批准的转办请求（tool_request ledger pending 且无审批文件）。"
-      : `转办待批清单（${rows.length} 条）：\n${lines.join("\n")}`,
-    { action: "list", axis: "approval", count: rows.length, rows },
+      ? `没有待批准的转办请求（tool_request ledger pending 且无审批文件）。${lapsedNote}`
+      : `转办待批清单（${rows.length} 条）：\n${lines.join("\n")}${lapsedNote}`,
+    { action: "list", axis: "approval", count: rows.length, rows, ...(lapsed > 0 ? { lapsedWindowClosed: lapsed } : {}) },
   );
 }
 

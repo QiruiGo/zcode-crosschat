@@ -154,3 +154,93 @@ describe('toolapproval v0.7: 写入与 containment', () => {
     expect(isWithinStateRoot(stateRoot, join(stateRoot, '..', 'evil.json'))).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// v0.7.2 复验（P3 修复）：C7-B2 自批守卫大小写敏感 + C7-B3 畸形审批诊断分流
+// ---------------------------------------------------------------------------
+
+describe('toolapproval v0.7.2 (C7-B2): 自批守卫按成员键归一化', () => {
+  // 红队裁决 c7b2b.jsonl：approvedBy:"REQB"/"ExecA"/"LEAD1"/"Lead1" 均放行（字面串
+  // 比较），只有精确键 reqb/execa 被拒。成员键由 sanitizeKey 生成（小写折叠），
+  // 故审批文件里的 approvedBy 也过同一条清洗链再比对。
+  const variants = ['bee', 'BEE', 'Bee', 'bEe', 'aye', 'AYE', 'Aye', 'lead', 'LEAD', 'Lead', 'third-party', 'Third_Party'];
+
+  it('请求方/执行方的大小写与折叠变体一律 self-approval refused', () => {
+    for (const approvedBy of ['bee', 'BEE', 'Bee', 'bEe', 'bee ', 'bee-', 'aye', 'AYE', 'Aye']) {
+      const verdict = checkApproval({ status: 'ok', approval: approval({ approvedBy }) }, request, NOW);
+      expect(verdict.ok, approvedBy).toBe(false);
+      if (!verdict.ok) expect(verdict.reason, approvedBy).toBe('self-approval refused');
+    }
+  });
+
+  it('第三方（含大小写变体）照常放行', () => {
+    for (const approvedBy of ['lead', 'LEAD', 'Lead', 'third-party', 'Third_Party']) {
+      const verdict = checkApproval({ status: 'ok', approval: approval({ approvedBy }) }, request, NOW);
+      expect(verdict.ok, approvedBy).toBe(true);
+    }
+    expect(variants.length).toBeGreaterThan(0);
+  });
+
+  it('空 approvedBy 不触发自批闸（由字段校验另行拒）', () => {
+    // sanitizeKey('') = ''，与任何成员键都不等；空串在 readApprovalFile 侧已被
+    // invalid fields 拒掉，这里只锁定「不被误判成自批」。
+    const verdict = checkApproval({ status: 'ok', approval: approval({ approvedBy: '' }) }, request, NOW);
+    expect(verdict.ok).toBe(true);
+  });
+});
+
+describe('toolapproval v0.7.2 (C7-B3): 畸形审批文件诊断分流', () => {
+  // 红队裁决 c7b3.jsonl：9 个变体全部返回同一理由 unparseable JSON。修复后按形态分流：
+  // 不可解析 / 非对象 / 字段非法（逐项列出）/ requestId 与文件名不符。
+  it('真·不可解析 JSON → unparseable JSON', async () => {
+    await writeRaw('{"requestId":"r-001","decisi');
+    expect(await readApprovalFile(stateRoot, 'r-001')).toEqual({
+      status: 'malformed',
+      reason: 'approval file malformed (unparseable JSON)',
+    });
+  });
+
+  it('可解析但顶层不是对象 → not a JSON object', async () => {
+    for (const raw of ['[{"requestId":"r-001"}]', '"just a string"', '42', 'null', 'true']) {
+      await writeRaw(raw);
+      const read = await readApprovalFile(stateRoot, 'r-001');
+      expect(read, raw).toEqual({ status: 'malformed', reason: 'approval file malformed (not a JSON object)' });
+    }
+  });
+
+  it('字段缺失/非法 → invalid fields（逐项列名，不再谎称不可解析）', async () => {
+    const cases: Array<[string, unknown, RegExp]> = [
+      ['decision 非法值', { ...approval(), decision: 'maybe' }, /decision must be "approved" \| "denied"/],
+      ['decision 为 null', { ...approval(), decision: null }, /decision must be "approved" \| "denied"/],
+      ['缺 tool', (() => { const a = approval() as unknown as Record<string, unknown>; delete a['tool']; return a; })(), /tool missing/],
+      ['缺 approvedBy', (() => { const a = approval() as unknown as Record<string, unknown>; delete a['approvedBy']; return a; })(), /approvedBy missing/],
+      ['缺 expiresAt', (() => { const a = approval() as unknown as Record<string, unknown>; delete a['expiresAt']; return a; })(), /expiresAt missing/],
+      ['expiresAt 为字符串', { ...approval(), expiresAt: String(NOW + 60_000) }, /expiresAt must be number/],
+      ['decidedAt 为字符串', { ...approval(), decidedAt: 'x' }, /decidedAt must be number/],
+      ['缺 requestId', (() => { const a = approval() as unknown as Record<string, unknown>; delete a['requestId']; return a; })(), /requestId missing/],
+    ];
+    for (const [name, value, pattern] of cases) {
+      await writeRaw(JSON.stringify(value));
+      const read = await readApprovalFile(stateRoot, 'r-001');
+      expect(read.status, name).toBe('malformed');
+      if (read.status === 'malformed') {
+        expect(read.reason, name).toMatch(/^approval file malformed \(invalid fields: /);
+        expect(read.reason, name).toMatch(pattern);
+      }
+    }
+  });
+
+  it('requestId 与文件名不符 → requestId mismatch（附文件内实际值）', async () => {
+    await writeRaw(JSON.stringify(approval({ requestId: 'r-other' })));
+    const read = await readApprovalFile(stateRoot, 'r-001');
+    expect(read).toEqual({
+      status: 'malformed',
+      reason: 'approval file malformed (requestId mismatch: file says "r-other", expected "r-001")',
+    });
+  });
+
+  it('合法文件仍是 ok（分流不误伤）', async () => {
+    await writeRaw(JSON.stringify(approval()));
+    expect((await readApprovalFile(stateRoot, 'r-001')).status).toBe('ok');
+  });
+});

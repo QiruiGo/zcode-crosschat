@@ -15,6 +15,7 @@ import { mkdir, readFile } from 'node:fs/promises';
 import { isAbsolute, resolve, sep } from 'node:path';
 import { writeFileAtomic } from './atomic.js';
 import { approvalsDir, approvalsFile } from './paths.js';
+import { sanitizeKey } from './sanitize.js';
 
 /** 审批文件格式（E4 §5 原型形态，v0.7 落地同款）。 */
 export interface ApprovalFile {
@@ -36,16 +37,25 @@ export type ApprovalRead =
   | { status: 'malformed'; reason: string }
   | { status: 'ok'; approval: ApprovalFile };
 
-/** 门拒原因词表（§2.6 全表；approval window/tool 绑定为 §2.3 增量）。 */
+/**
+ * 门拒原因词表（§2.6 全表；approval window/tool 绑定为 §2.3 增量）。
+ *
+ * v0.7.2（C7-B3 修复）：畸形审批文件的理由分流——真·不可解析 JSON 与「JSON 可解析但
+ * 字段非法/不是对象/requestId 与文件名不符」共用同一句 `unparseable JSON` 会让运维
+ * 按错误方向排查（9/9 变体同理由，裁决日志 c7b3.jsonl）。词表保留家族前缀
+ * `approval file malformed (...)`（PROTOCOL §11.2 失败表按家族列示），括号内按
+ * 实际形态分流：`unparseable JSON` / `not a JSON object` / `invalid fields: <清单>` /
+ * `requestId mismatch`。
+ */
 export type ApprovalRefuseReason =
   | 'approval missing'
-  | 'approval file malformed (unparseable JSON)'
   | 'approval denied'
   | 'approval expired'
   | 'approval tool mismatch'
   | 'self-approval refused'
   | 'approval window exceeds request ttl'
-  | 'approval file outside state root';
+  | 'approval file outside state root'
+  | `approval file malformed (${string})`;
 
 /** 请求侧视图（门/校验只需要这几个字段）。 */
 export interface ApprovalRequestView {
@@ -61,14 +71,27 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function isApprovalShape(value: unknown): value is ApprovalFile {
-  if (!isRecord(value)) return false;
-  return typeof value['requestId'] === 'string'
-    && (value['decision'] === 'approved' || value['decision'] === 'denied')
-    && typeof value['approvedBy'] === 'string'
-    && typeof value['decidedAt'] === 'number'
-    && typeof value['expiresAt'] === 'number'
-    && typeof value['tool'] === 'string';
+/**
+ * 审批文件字段清单（缺字段/类型不符逐项列出，供诊断分流；顺序固定便于测试断言）。
+ * `decision` 只接受 'approved'|'denied'；`requestId` 与文件名的一致性在调用方判。
+ */
+const APPROVAL_FIELDS: ReadonlyArray<{ key: string; ok: (v: unknown) => boolean; want: string }> = [
+  { key: 'requestId', ok: (v) => typeof v === 'string' && v !== '', want: 'non-empty string' },
+  { key: 'decision', ok: (v) => v === 'approved' || v === 'denied', want: '"approved" | "denied"' },
+  { key: 'approvedBy', ok: (v) => typeof v === 'string' && v !== '', want: 'non-empty string' },
+  { key: 'decidedAt', ok: (v) => typeof v === 'number' && Number.isFinite(v), want: 'number' },
+  { key: 'expiresAt', ok: (v) => typeof v === 'number' && Number.isFinite(v), want: 'number' },
+  { key: 'tool', ok: (v) => typeof v === 'string' && v !== '', want: 'non-empty string' },
+];
+
+function invalidApprovalFields(value: Record<string, unknown>): string[] {
+  const bad: string[] = [];
+  for (const f of APPROVAL_FIELDS) {
+    const v = value[f.key];
+    if (v === undefined) bad.push(`${f.key} missing`);
+    else if (!f.ok(v)) bad.push(`${f.key} must be ${f.want}`);
+  }
+  return bad;
 }
 
 /**
@@ -97,10 +120,21 @@ export async function readApprovalFile(
   } catch {
     return { status: 'malformed', reason: 'approval file malformed (unparseable JSON)' };
   }
-  if (!isApprovalShape(value) || value.requestId !== requestId) {
-    return { status: 'malformed', reason: 'approval file malformed (unparseable JSON)' };
+  if (!isRecord(value)) {
+    // 可解析但不是对象（顶层数组/字符串/数字/null）——与不可解析分流，排查方向不同。
+    return { status: 'malformed', reason: 'approval file malformed (not a JSON object)' };
   }
-  return { status: 'ok', approval: value };
+  const bad = invalidApprovalFields(value);
+  if (bad.length > 0) {
+    return { status: 'malformed', reason: `approval file malformed (invalid fields: ${bad.join('; ')})` };
+  }
+  if (value.requestId !== requestId) {
+    return {
+      status: 'malformed',
+      reason: `approval file malformed (requestId mismatch: file says ${JSON.stringify(value.requestId)}, expected ${JSON.stringify(requestId)})`,
+    };
+  }
+  return { status: 'ok', approval: value as unknown as ApprovalFile };
 }
 
 /** 写审批文件（工具轨 xc_review approve/deny；原子写，返回落地路径）。 */
@@ -128,13 +162,22 @@ export async function approvalFileExists(stateRoot: string, requestId: string, o
  * 顺序：缺失 → 畸形 → denied → 自批 → 工具不符 → 过期 → 窗口越界。
  * 自批判据：approvedBy === 请求方或执行方均拒（「A 的模型自己写审批」的 naive
  * 路径与误操作同防——内部威胁模型声明：不防恶意同机进程伪造文件）。
+ *
+ * v0.7.2（C7-B2 修复）：自批守卫按**成员键归一化**后比较。旧实现是字面串比较，
+ * `approvedBy:"REQB"`（请求方键 reqb）能绕过 self-approval refused 直接放行
+ * （裁决日志 c7b2b.jsonl：`"REQB"`/`"ExecA"`/`"LEAD1"` 均放行）。成员键本身由
+ * sanitizeKey 生成（小写折叠 + 非字母数字折 `-`），故审批文件里的 approvedBy
+ * 也过同一条清洗链再比对——同一把键的不同写法不再构成绕过面。
  */
 export function checkApproval(read: ApprovalRead, request: ApprovalRequestView, now: number): { ok: true } | { ok: false; reason: ApprovalRefuseReason } {
   if (read.status === 'missing') return { ok: false, reason: 'approval missing' };
   if (read.status === 'malformed') return { ok: false, reason: read.reason as ApprovalRefuseReason };
   const approval = read.approval;
   if (approval.decision === 'denied') return { ok: false, reason: 'approval denied' };
-  if (approval.approvedBy === request.from || approval.approvedBy === request.to) {
+  const approver = sanitizeKey(approval.approvedBy);
+  const requester = sanitizeKey(request.from);
+  const executor = sanitizeKey(request.to);
+  if (approver !== '' && (approver === requester || approver === executor)) {
     return { ok: false, reason: 'self-approval refused' };
   }
   if (approval.tool !== request.tool) return { ok: false, reason: 'approval tool mismatch' };

@@ -309,6 +309,25 @@ export interface ToolResultLedgerView {
 }
 
 /**
+ * v0.7.2（B-03 修复）：tool_result.result 的**有效载荷**字符数。
+ *
+ * 旧实现一律取 `JSON.stringify(result).length`——字符串结果被算上外层引号，
+ * 有效载荷恒等于 `maxResultChars − 2`，「正好等于限值」的合法结果被拒
+ * （裁决日志 b03.jsonl：1000 vs 1000 → 拒，报文 "serializes to 1002 chars"）。
+ * 口径改为与 maxResultChars 的语义一致：**字符串取自身长度**（模型真正产出的
+ * 字符数），非字符串（对象/数组/数字/null）仍取序列化长度（无别的自然度量）。
+ * `resultTruncated{shown,total}` 的 shown 亦按同一口径自洽。
+ */
+export function toolResultPayloadChars(result: unknown): number {
+  if (typeof result === 'string') return result.length;
+  try {
+    return JSON.stringify(result ?? null).length;
+  } catch {
+    return Number.POSITIVE_INFINITY;
+  }
+}
+
+/**
  * tool_result 帧校验（发送侧；调用方持发送者身份 senderKey 与台账视图）。
  *
  * 判据（§2.6/§2.7）：
@@ -316,7 +335,8 @@ export interface ToolResultLedgerView {
  * - from === 台账.to（执行方身份；伪造回投 tool-result-rejected，不落箱不终填）；
  * - tool === 台账.tool（逐字节，与请求侧绑定同口径）；
  * - 台账状态必须已放行（approved）——未过门的回投拒收；
- * - 结果序列化 ≤ 台账.maxResultChars（超限 result_too_large，模型改投摘要+指针）。
+ * - 结果有效载荷 ≤ 台账.maxResultChars（超限 result_too_large，模型改投摘要+指针；
+ *   字符串按自身长度计，v0.7.2 B-03 修复——不再把 JSON 引号算进载荷）。
  */
 export function checkToolResultFrame(
   content: string,
@@ -391,7 +411,7 @@ export function checkToolResultFrame(
   let resultChars = 0;
   if (status === 'ok') {
     try {
-      resultChars = JSON.stringify(value['result'] ?? null).length;
+      resultChars = toolResultPayloadChars(value['result'] ?? null);
     } catch {
       return { ok: false, error: 'invalid_frame', message: 'tool_result.result is not JSON-serializable' };
     }
@@ -399,7 +419,7 @@ export function checkToolResultFrame(
       return {
         ok: false,
         error: 'result_too_large',
-        message: `tool_result.result serializes to ${resultChars} chars (limit ${ledger.maxResultChars}); `
+        message: `tool_result.result payload is ${resultChars} chars (limit ${ledger.maxResultChars}); `
           + 'send a summary plus a file pointer instead',
       };
     }

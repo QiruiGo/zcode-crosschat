@@ -136,7 +136,15 @@ describe("withGuards: removed 成员硬拒（§7.3.3，错误码 member_removed�
     }
     expect(engineLog()).toContain('"member-removed-gate"');
 
-    // a 未被移除：派发仍可走通（建任务 + 入箱；wake 关闭 → mailbox）。
+    // v0.7.2（红队五番战 C8-B3 修复）：派单面同样硬拒 removed 目标——建单即永久
+    // 搁浅（他人 not_assignee、pending 不在清扫域、创建者无回执），故显式拒绝
+    // 且不建单（错误码 member_removed，与 removed 门同码；audit dispatch-refused）。
+    const refused = await guarded.xc_dispatch({ to: "b", title: "t", prompt: "p" }, connA);
+    expect(refused.isError).toBe(true);
+    expect(payloadOf(refused)["error"]).toBe("member_removed");
+
+    // b 恢复 ready 后派发仍可走通（建任务 + 入箱；wake 关闭 → mailbox）。
+    await setMemberState("b", "ready");
     const res = await guarded.xc_dispatch({ to: "b", title: "t", prompt: "p" }, connA);
     expect(res.isError).toBeFalsy();
     // v0.5.1（故障注-5 修复）：新时代任务 id 带纪元前缀（`<era>-t1`）。

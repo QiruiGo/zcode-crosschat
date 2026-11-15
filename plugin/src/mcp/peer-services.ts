@@ -46,6 +46,7 @@ import {
   PEER_FORMER_NAMES_MAX,
   readPeerKeyFile,
   readPeerRecord,
+  removePeerRecord,
   scanPeers,
   touchPeerRecord,
   writePeerKeyFile,
@@ -427,7 +428,15 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
         // v0.5.2（竞态修复）：这里只做**一次**扫描，归属校验与花名 claim 共享——
         // scanPeers 会惰性删除死记录文件，两次独立扫描时第一次就把死花名的前任
         // 证据删掉了，peer-name-reclaimed 接管留痕失明（peer-round2 单测锁定）。
-      const scannedOnce = await scanPeers(r);
+        // v0.7.2（红队五番战 F-02/C8-B1 修复）：该扫描改为**只读**（sweep:false）。
+        // 默认扫描会顺手删掉全部死记录——包括别的会话的崩溃残留，而 pid-dead
+        // 记录正是 C8 离线判据（core/offline.ts memberLiveness）唯一的「进程死」
+        // 硬证据：注册路径（xc_identify，README 快速开始的第一动作）把它删掉后，
+        // 「崩溃 → 人不在场 → 重启后查看」流程里 task-offline 审计 / lead 转交通知 /
+        // overview offlineMembers 全部静默丢失（红队 c8b1 实测：identify 后仅剩
+        // 存活者记录）。死记录的回收改走**定向 GC**（reclaimDeadRecordsOfName：
+        // 只删本次认领花名的死前任），其余残留保留给队内 sweeper 消费。
+        const scannedOnce = await scanPeers(r, Date.now(), { sweep: false });
       const sidHolder = await findLiveSessionIdHolder(r, input.sessionId, scannedOnce);
       if (sidHolder !== undefined) {
         // v0.7.1（红队四番战 并发与-1 修复）：文案经 describeSessionIdConflict
@@ -480,10 +489,21 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
         // ① 花名占用判定：占用者就是本进程 ⇒ 同一连接的重复注册（agent 重试 /
         //    重连），幂等重认领自己的记录，不再 name_taken 硬拒；
         // ② 占用者是别的**活**会话 ⇒ 仍 name_taken（名字即地址，冲突必须显式）；
-        // ③ 占用者已死（pid 亡 / lastSeen 陈旧，惰性清扫已摘除）⇒ 接管留痕：
+        // ③ 占用者已死（pid 亡 / lastSeen 陈旧）⇒ 接管留痕：
         //    审计 peer-name-reclaimed 带上任身份，否则「活人顶替死花名」在观测面
         //    上完全静默（旧名既不进任何 formerNames，也没有任何事件）。
+        // v0.7.2（红队五番战 F-02/C8-B1 修复）：本路径的扫描改为**只读**
+        // （sweep:false）+  claim 后的**定向 GC**（见下方 reclaimDeadRecordsOfName
+        // 调用）——注册不得顺手删掉别的会话的崩溃残留：pid-dead 记录是 C8 离线
+        // 判据（offline.ts memberLiveness）唯一的「进程死」硬证据，被提前删掉
+        // 后 task-offline 审计 / lead 转交通知 / overview offlineMembers 在
+        // 「重启后查看」流程里全部静默丢失（红队 c8b1：任一会话 xc_identify
+        // → 残留被抹 → 四件套全失）。
         const reclaimedFrom = await claimPeerName(r, name, input.sessionId, scannedOnce);
+        // 定向 GC：只回收**本次认领的这个花名**的死前任（其身份已被
+        // peer-name-reclaimed 审计 + reclaimedFrom 消费完毕）；其他会话的崩溃
+        // 残留原样保留，交给队内 sweeper 的离线判据消费。
+        await reclaimDeadRecordsOfName(r, scannedOnce, name);
 
         const tokens = mintPeerTokens();
         const explicit = deps.env["XC_MESSAGING_SOCKET_PATH"];
@@ -1064,8 +1084,14 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
       // 故在外锁内直接 read-merge-write（合并语义与 touchPeerRecord 同款）。
       const now = Date.now();
       const claimed = await withFileLock(r, peerRegistryLockName(r), async () => {
-        const reclaimedFrom = await claimPeerName(r, next, me.sessionId);
-        const scanned = await scanPeers(r);
+        // v0.7.2（红队五番战 F-02/C8-B1 修复）：与 register 同款——claim 前的
+        // 扫描改只读（sweep:false），死记录回收走定向 GC（reclaimDeadRecordsOfName，
+        // 只删本次改到的这个花名的死前任）。改名同样经 xc_identify 触发，默认
+        // 清扫会抹掉别的会话的崩溃残留（C8 离线判据的进程死硬证据）。
+        const claimScan = await scanPeers(r, now, { sweep: false });
+        const reclaimedFrom = await claimPeerName(r, next, me.sessionId, claimScan);
+        await reclaimDeadRecordsOfName(r, claimScan, next);
+        const scanned = claimScan;
         const mine = scanned.active.find((record) => record.pid === process.pid);
         const formerNames = [...(mine?.formerNames ?? [])];
         if (previous !== undefined) formerNames.push({ name: previous, releasedAt: now });
@@ -1300,6 +1326,42 @@ async function claimPeerName(
     previous: reclaimedFrom,
   });
   return reclaimedFrom;
+}
+
+/**
+ * v0.7.2（红队五番战 F-02/C8-B1 修复）：**定向**回收某个花名的死前任记录。
+ *
+ * 背景：注册/改名路径原先共用 `scanPeers` 的默认惰性清扫——它会把注册表里
+ * **全部**死记录（pid 亡 / lastSeen 陈旧）一并删掉。其中「pid 亡」的崩溃残留
+ * 是 C8 离线判据（core/offline.ts `memberLiveness` → `pid-dead`）唯一的进程死
+ * 硬证据：README 快速开始的第一动作就是 xc_identify，于是「成员崩溃 → 无人
+ * 在场 → 任意会话重启后第一动作 identify」必然把残留抹掉，紧接的 stale 清扫
+ * 只能看到 no-record——task-offline 审计 / lead 转交通知 / overview
+ * offlineMembers 三样全静默丢失（红队 c8b1：对照组四件套齐全、故障组全失）。
+ *
+ * 新纪律：注册/改名路径的扫描一律只读（sweep:false），死记录的回收只在
+ * **身份已被消费**时定向发生——即本函数：本次认领（或改到）某个花名时，该
+ * 花名的死前任已被 `claimPeerName` 留痕（peer-name-reclaimed 审计 + 新记录
+ * reclaimedFrom），其证据价值消费完毕，删掉它防止注册表无限堆积；**其他**
+ * 会话的崩溃残留原样保留，交给队内 sweeper 的离线判据消费（sweepStaleTasksOnce
+ * 的只读扫描 → offlineVerdict → 回池 + 审计 + lead 通知）。
+ *
+ * 幂等且 best-effort：ENOENT（并发扫描已删）静默；只删 `scanned.dead` 里
+ * name 精确匹配的记录（活记录 / 异名残留一概不碰）。
+ */
+async function reclaimDeadRecordsOfName(
+  root: string,
+  scanned: PeerScanResult,
+  name: string,
+): Promise<void> {
+  for (const row of scanned.dead) {
+    if (row.record.name !== name) continue;
+    try {
+      await removePeerRecord(root, row.record.pid);
+    } catch {
+      // ENOENT（另一个扫描器抢先）或权限问题：best-effort，下轮认领再收。
+    }
+  }
 }
 
 /** 档类来源判定：基记录优先，其次显式兜底（并记审计 peer-mode-class-fallback）。 */

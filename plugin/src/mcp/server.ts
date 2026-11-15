@@ -35,7 +35,7 @@ import { stopPeerEndpoint } from "../transport/pipe.js";
 import { GuardedStdioTransport } from "../transport/mcpstdio.js";
 
 const SERVER_NAME = "zcode-crosschat";
-const SERVER_VERSION = "0.7.1";
+const SERVER_VERSION = "0.7.2";
 
 let shuttingDown = false;
 
@@ -67,32 +67,21 @@ export async function main(): Promise<void> {
   registerReviewTools(server, deps, core, registry);     // xc_review
   registerDoctorTool(server, {                           // xc_doctor（免注册只读体检）
     version: SERVER_VERSION, env: process.env, cwd: process.cwd(),
+    // v0.7.2（C9-B6 修复）：PROTOCOL §5 的「xc_overview/xc_doctor 调用时惰性采样」——
+    // doctor 这一半此前不成立；传入 stateRoot 即与 overview 同一 capacity 挂载口径
+    // （同一 sample.json 缓存 / 同一 XC_MEM_SAMPLE_MIN_MS 窗口 / 同一 judgeCapacity）。
+    stateRoot: deps.stateRoot,
   });
   // doctor 的 handler 也登记进分发面（alias 层接管 CallTool 后的唯一通路）。
   registry.set("xc_doctor", {
-    description: "Read-only self check: plugin version, runtime, auto-detected zcode_exe/zcode_cjs paths and probe attempts. Does not require registration.",
+    description: "Read-only self check: plugin version, runtime, auto-detected zcode_exe/zcode_cjs paths and probe attempts, capacity sample (watermark / red rules). Does not require registration.",
     shape: {},
     handler: async () => {
-      const { buildDoctorReport } = await import("./doctor-tool.js");
-      const report = buildDoctorReport({ version: SERVER_VERSION, env: process.env, cwd: process.cwd() });
-      const lines = [
-        `zcode-crosschat ${report.plugin.version}`,
-        `runtime: node ${report.runtime.node} @ ${report.runtime.execPath} (${report.runtime.platform})`,
-        `zcode_exe/zcode_cjs: env(set=${report.spawnPaths.zcode_exe_env_set}/${report.spawnPaths.zcode_cjs_env_set})` +
-          ` locate(found=${report.spawnPaths.locate.found}, source=${report.spawnPaths.locate.source || "-"})`,
-        `exe: ${report.spawnPaths.locate.exe || "(未定)"}`,
-        `cjs: ${report.spawnPaths.locate.cjs || "(未定)"}`,
-        `member_model(XC_MEMBER_MODEL): ${report.spawnPaths.member_model_env_value || "(空=枚举表自动选第一个)"}`,
-        ...(report.spawnPaths.locate.configError !== undefined ? [`WARNING: ${report.spawnPaths.locate.configError}`] : []),
-        ...report.spawnPaths.locate.attempts.map((a) => `- [${a.hit ? "命中" : "未中"}] ${a.step}: ${a.detail}`),
-        ...(report.guidance !== "" ? [`指引: ${report.guidance}`] : []),
-      ];
-      return {
-        content: [
-          { type: "text" as const, text: lines.join("\n") },
-          { type: "text" as const, text: JSON.stringify(report) },
-        ],
-      };
+      const { buildDoctorReport, sampleDoctorCapacity, doctorToolResult } = await import("./doctor-tool.js");
+      const capacity = await sampleDoctorCapacity({ env: process.env, stateRoot: deps.stateRoot });
+      return doctorToolResult(buildDoctorReport({
+        version: SERVER_VERSION, env: process.env, cwd: process.cwd(), capacity,
+      }));
     },
   });
 

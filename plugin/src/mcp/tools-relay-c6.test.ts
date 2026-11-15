@@ -9,7 +9,7 @@
  *   帧畸形 → 发送侧即拒、不落箱不建账；
  * - tool_request 免入站策略（XC_INBOUND_MODE=hold 时chat 被暂存、C6 帧直投邮箱）；
  * - tool_result：合法回投 → 台账 executed + 审计 tool-executed + 落箱 + 正常唤醒路径；
- *   error 回投 → 台账 error；伪造 from（≠台账.to）→ tool-result-rejected 拒收；
+ *   error 回投 → 台账 error；refused 辞谢 → 台账 refused 终态（v0.7.2 B-04，一请求一结果）；伪造 from（≠台账.to）→ tool-result-rejected 拒收；
  *   请求未放行（pending）→ request_not_approved；结果超 maxResultChars → result_too_large；
  * - C6/C7 帧走 peer 轴 → tool_frame_peer_axis_unsupported（最小链路=队内轴）；
  * - 旧行为回归：普通 chat 照旧（attemptWake 被调用、无台账副作用）。
@@ -272,6 +272,53 @@ describe('xc_relay v0.7 C6: tool_result 发送侧', () => {
     expect(await readToolRequest(stateRoot, REQUEST_ID)).toMatchObject({ state: 'error' });
     const mail = await readMailbox(stateRoot, 'default', 'a');
     expect(JSON.parse(mail[0]!.content)).toMatchObject({ status: 'error', error: 'No such tool available: mcp__x__no_such_tool' });
+  });
+
+  it('执行方辞谢（status:"refused"）→ 台账落 refused 终态；再回投 ok 被拒（一请求一结果）', async () => {
+    // 红队裁决 b04.jsonl：辞谢后台账停留 approved，之后仍可回投 ok 被接受（台账 executed）。
+    await seedApproved();
+    const core = createTeamRelayCore({ stateRoot, workspace: stateRoot, env: {} });
+    const declined = await core.xc_message(
+      relayArgs({ msg: toolResultMsg({ status: 'refused', result: undefined, reason: 'not my job' }) , to: 'a' }),
+      'conn-b',
+    );
+    expect(payloadOf(declined)).toMatchObject({ delivered: 'mailbox', frame: 'tool_result' });
+    const afterRefusal = await readToolRequest(stateRoot, REQUEST_ID);
+    expect(afterRefusal).toMatchObject({ state: 'refused', decidedBy: 'b', decisionReason: 'tool_result:refused' });
+    // 请求方确实收到了辞谢帧。
+    const mail = await readMailbox(stateRoot, 'default', 'a');
+    expect(JSON.parse(mail[mail.length - 1]!.content)).toMatchObject({ type: 'tool_result', status: 'refused', reason: 'not my job' });
+    // 迟到的 ok 回投被拒（不再二次结果）。
+    const late = await core.xc_message(relayArgs({ msg: toolResultMsg({ result: 'late pong' }), to: 'a' }), 'conn-b');
+    expect(late.isError).toBe(true);
+    expect(payloadOf(late)).toMatchObject({ error: 'tool_result_rejected', errorClass: 'request_not_approved' });
+    expect((await readToolRequest(stateRoot, REQUEST_ID))?.state).toBe('refused');
+    // 审计留痕两种 status。
+    const log = await events();
+    expect(log.filter((e) => e['event'] === 'tool-executed').map((e) => e['status'])).toEqual(['refused']);
+  });
+
+  it('error 回投仍是终态（error），且不再接受第二次回投', async () => {
+    await seedApproved();
+    const core = createTeamRelayCore({ stateRoot, workspace: stateRoot, env: {} });
+    await core.xc_message(
+      relayArgs({ msg: toolResultMsg({ status: 'error', result: undefined, error: 'No such tool available: x' }), to: 'a' }),
+      'conn-b',
+    );
+    expect((await readToolRequest(stateRoot, REQUEST_ID))?.state).toBe('error');
+    const again = await core.xc_message(relayArgs({ msg: toolResultMsg() , to: 'a' }), 'conn-b');
+    expect(again.isError).toBe(true);
+    expect(payloadOf(again)).toMatchObject({ errorClass: 'request_already_finalized' });
+  });
+
+  it('ok 回投的 resultChars 按有效载荷计（字符串不再 +2 引号）', async () => {
+    await seedApproved();
+    const core = createTeamRelayCore({ stateRoot, workspace: stateRoot, env: {} });
+    await core.xc_message(relayArgs({ msg: toolResultMsg({ result: 'x'.repeat(500) }), to: 'a' }), 'conn-b');
+    const ledger = await readToolRequest(stateRoot, REQUEST_ID);
+    expect(ledger?.resultChars).toBe(500);
+    const log = await events();
+    expect(log.find((e) => e['event'] === 'tool-executed')?.resultChars).toBe(500);
   });
 
   it('伪造回投：发送者不是执行方 → tool-result-rejected（不落箱不终填）', async () => {

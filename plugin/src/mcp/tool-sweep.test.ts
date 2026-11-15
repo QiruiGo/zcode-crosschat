@@ -136,5 +136,83 @@ describe('sweepToolRequestsOnce v0.7: 终态清理', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// v0.7.2 复验（P3 修复）：B-02 多进程竞态幂等 + C7-B5 lead 过期回执可达
+// ---------------------------------------------------------------------------
+
+describe('sweepToolRequestsOnce v0.7.2 (B-02): 多进程同相位竞态只回投一次', () => {
+  // 红队裁决 b02-b02c.jsonl：三 server 同相位起服，engine.jsonl 3 条 tool-expired
+  // （跨 117ms）+ B 邮箱 3 条同内容 tool_result{refused,"request expired"}。
+  // 修复 = 过期迁移进团队锁 + transitionToolRequest 只让真正落盘的那次进列表。
+  it('并发两次清扫（同相位）：只有一次回投 + 一条审计', async () => {
+    await createToolRequest(stateRoot, ledger({ requestId: 'r-race', expiresAt: NOW - 1 }));
+    const [a, b] = await Promise.all([sweepToolRequestsOnce(deps(), NOW), sweepToolRequestsOnce(deps(), NOW)]);
+    expect(a.expired + b.expired).toBe(1); // 锁内串行：第二个看到已 expired
+    const beeMail = await readMailbox(stateRoot, 'default', 'bee');
+    expect(beeMail).toHaveLength(1);
+    expect(JSON.parse(beeMail[0]!.content)).toMatchObject({ type: 'tool_result', status: 'refused', reason: 'request expired' });
+    expect((await events()).filter((e) => e['event'] === 'tool-expired' && e['requestId'] === 'r-race')).toHaveLength(1);
+    // 再跑一节拍仍然零新增（幂等）。
+    expect((await sweepToolRequestsOnce(deps(), NOW)).expired).toBe(0);
+    expect(await readMailbox(stateRoot, 'default', 'bee')).toHaveLength(1);
+  });
+});
+
+describe('sweepToolRequestsOnce v0.7.2 (C7-B5): lead 收过通知的请求必得过期回执', () => {
+  // 红队裁决 c7b5b.jsonl：req-read（A 读过→门拒→lead 已通知）等 100s 后台账仍
+  // refused、无 tool-expired、lead 无任何过期回执——「被通知⇒已读⇒refused⇒永不被扫」
+  // 与「被扫⇒从未被通知」两条路径互斥，§11.4 承诺的收尾不可达。
+  // 修复 = 对「通知过但停在 refused/denied 且窗口已关闭」的请求补发收尾（不改台账）。
+  it('门拒后无人批准（refused + approvalNotifiedAt）→ lead 得 approval_result{expired}，台账不变', async () => {
+    await createToolRequest(stateRoot, ledger({
+      requestId: 'r-notified-refused',
+      state: 'refused',
+      decidedAt: NOW - 10_000,
+      decidedBy: 'gate',
+      decisionReason: 'approval missing',
+      approvalNotifiedAt: NOW - 9000,
+      expiresAt: NOW - 1,
+    }));
+    const out = await sweepToolRequestsOnce(deps(), NOW);
+    expect(out.expired).toBe(0); // 拒绝态不在过期迁移域（不被改写成 expired）
+    const after = await readToolRequest(stateRoot, 'r-notified-refused');
+    expect(after?.state).toBe('refused');
+    expect(after?.approvalClosedAt).toBe(NOW);
+    const leadMail = await readMailbox(stateRoot, 'default', 'lead');
+    expect(leadMail).toHaveLength(1);
+    expect(JSON.parse(leadMail[0]!.content)).toMatchObject({ type: 'approval_result', decision: 'expired', requestId: 'r-notified-refused' });
+    const log = await events();
+    expect(log.some((e) => e['event'] === 'tool-approval-request' && e['closedAs'] === 'expired' && e['requestId'] === 'r-notified-refused')).toBe(true);
+  });
+
+  it('收尾只发一次（approvalClosedAt 记档；下一节拍不重复）', async () => {
+    await createToolRequest(stateRoot, ledger({
+      requestId: 'r-notified-refused',
+      state: 'refused',
+      approvalNotifiedAt: NOW - 9000,
+      expiresAt: NOW - 1,
+    }));
+    await sweepToolRequestsOnce(deps(), NOW);
+    await sweepToolRequestsOnce(deps(), NOW + 60_000);
+    await sweepToolRequestsOnce(deps(), NOW + 120_000);
+    expect(await readMailbox(stateRoot, 'default', 'lead')).toHaveLength(1);
+  });
+
+  it('denied + 已通知同样收尾；未通知/窗口未关/已批准的都不收尾', async () => {
+    await createToolRequest(stateRoot, ledger({ requestId: 'r-denied-notified', state: 'denied', approvalNotifiedAt: NOW - 9000, expiresAt: NOW - 1 }));
+    await createToolRequest(stateRoot, ledger({ requestId: 'r-refused-quiet', state: 'refused', expiresAt: NOW - 1 }));
+    await createToolRequest(stateRoot, ledger({ requestId: 'r-refused-open', state: 'refused', approvalNotifiedAt: NOW - 9000 }));
+    await createToolRequest(stateRoot, ledger({ requestId: 'r-approved-notified', state: 'approved', approvalNotifiedAt: NOW - 9000, expiresAt: NOW - 1 }));
+    await sweepToolRequestsOnce(deps(), NOW);
+    const leadMail = await readMailbox(stateRoot, 'default', 'lead');
+    const requestIds = leadMail.map((m) => JSON.parse(m.content).requestId);
+    expect(requestIds.sort()).toEqual(['r-approved-notified', 'r-denied-notified']);
+    // approved 走的是过期迁移路径（§3.3），refused 未通知/窗口未关的不收尾。
+    expect((await readToolRequest(stateRoot, 'r-refused-quiet'))?.approvalClosedAt).toBeUndefined();
+    expect((await readToolRequest(stateRoot, 'r-refused-open'))?.approvalClosedAt).toBeUndefined();
+    expect((await readToolRequest(stateRoot, 'r-denied-notified'))?.state).toBe('denied');
+  });
+});
+
 // 编译期引用守卫：approvalsDir 未直接用于本测试（经 approvalsFile 间接覆盖）。
 void mkdirSync;

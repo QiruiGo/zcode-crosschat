@@ -6,6 +6,7 @@
  * - 台账缺失（fail-closed）/ 目标不符 / 请求方不符 → 遮蔽 + 审计；
  * - 请求过期 → expired 迁移 + 回投请求方；
  * - denied/refused 既往态 → 渲染-only（不重复回投）；
+ * - v0.7.2（F-01）拒绝态台账 + 合法审批文件 → 重读并复活（写者胜）；
  * - executed/error → 放行（带头全文）；
  * - pending + 审批缺失 → 首拒侧效应三连（回投 + 台账 refused + lead 待批通知）；
  * - pending + 有效审批文件（文件轨）→ 放行 + 台账 approved；
@@ -282,6 +283,129 @@ describe('toolgate v0.7: 文件轨放行', () => {
     await approvalFile();
     expect((await gateToolRequestRender(toolRequestMessage(), ctx())).transitioned).toBe(true);
     expect((await gateToolRequestRender(toolRequestMessage(), ctx())).transitioned).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.7.2 复验（P2 修复）：F-01（B-01 ≡ C7-B1）文件轨审批写者胜——门在任意台账
+// 状态下都重读磁盘审批文件，refused/denied 台账 + 合法批准文件 → 放行并复活。
+// ---------------------------------------------------------------------------
+
+describe('toolgate v0.7.2 (F-01): 拒绝态台账的文件轨复活（写者胜）', () => {
+  it('refused（门首拒 approval missing）+ 合法审批文件 → 放行 + 台账迁回 approved', async () => {
+    // 红队裁决 b01.jsonl 变体 1：A 首读→门拒→用户按 README 落合法审批文件→门仍重放
+    // 首拒理由、台账卡死 refused、回投被 request_not_approved 拒。
+    await seedLedger({ state: 'refused', decidedAt: NOW - 1000, decidedBy: 'gate', decisionReason: 'approval missing', approvalNotifiedAt: NOW - 900 });
+    await approvalFile();
+    const result = await gateToolRequestRender(toolRequestMessage(), ctx());
+    expect(result.gate).toBe('pass');
+    expect(result.state).toBe('approved');
+    expect(result.transitioned).toBe(true);
+    expect(result.text).toContain('APPROVAL VERIFIED');
+    expect(result.text).toContain(SECRET_ARG);
+    const ledger = await readToolRequest(stateRoot, REQUEST_ID);
+    expect(ledger?.state).toBe('approved');
+    expect(ledger?.decidedBy).toBe('lead');
+    expect(ledger?.decisionReason).toContain('revived from refused');
+    // 复活是状态迁移而非侧效应风暴：不再补回执/通知（请求方已收到过首拒回执）。
+    expect(await receiptsIn('bee')).toHaveLength(0);
+    expect(await receiptsIn('lead')).toHaveLength(0);
+  });
+
+  it('denied 台账 + 同一文件翻转为 approved → 放行（b01b 变体 2）', async () => {
+    await seedLedger({ state: 'denied', decidedAt: NOW - 1000, decidedBy: 'gate', decisionReason: 'approval denied' });
+    await approvalFile();
+    const result = await gateToolRequestRender(toolRequestMessage(), ctx());
+    expect(result.gate).toBe('pass');
+    expect(result.transitioned).toBe(true);
+    expect((await readToolRequest(stateRoot, REQUEST_ID))?.state).toBe('approved');
+  });
+
+  it('复活后回投被接受（台账 approved → executed）', async () => {
+    await seedLedger({ state: 'refused', decisionReason: 'approval missing', approvalNotifiedAt: NOW - 900 });
+    await approvalFile();
+    expect((await gateToolRequestRender(toolRequestMessage(), ctx())).gate).toBe('pass');
+    const { checkToolResultFrame } = await import('./toolrelay.js');
+    const check = checkToolResultFrame(JSON.stringify({ type: 'tool_result', requestId: REQUEST_ID, from: 'aye', status: 'ok', tool: 'mcp__probe__ping', result: 'pong' }), 'aye', {
+      requestId: REQUEST_ID, from: 'bee', to: 'aye', tool: 'mcp__probe__ping',
+      state: (await readToolRequest(stateRoot, REQUEST_ID))!.state, maxResultChars: 64_000,
+    });
+    expect(check.ok).toBe(true);
+  });
+
+  it('拒绝态但磁盘上仍无审批文件 → 继续遮蔽（fail-closed 不被修复破坏）', async () => {
+    await seedLedger({ state: 'refused', decisionReason: 'approval missing', approvalNotifiedAt: NOW - 900 });
+    const result = await gateToolRequestRender(toolRequestMessage(), ctx());
+    expect(result.gate).toBe('refuse');
+    expect(result.reason).toBe('approval missing'); // 历史理由，不谎报新缺陷
+    expect(result.state).toBe('refused');
+    expect(result.transitioned).toBe(false);
+    expect(result.text).not.toContain(SECRET_ARG);
+    expect(await receiptsIn('bee')).toHaveLength(0);
+  });
+
+  it('拒绝态 + 审批文件在场但非法 → 用本次校验理由（更有信息量）', async () => {
+    await seedLedger({ state: 'refused', decisionReason: 'approval missing', approvalNotifiedAt: NOW - 900 });
+    await approvalFile({ approvedBy: 'BEE' }); // 自批（大小写变体，C7-B2 同批修复）
+    const result = await gateToolRequestRender(toolRequestMessage(), ctx());
+    expect(result.gate).toBe('refuse');
+    expect(result.reason).toBe('self-approval refused');
+    expect((await readToolRequest(stateRoot, REQUEST_ID))?.state).toBe('refused');
+  });
+
+  it('请求窗已关闭 → 不被审批文件复活（批准窗不可能同时满足 > now 与 ≤ 请求窗）', async () => {
+    await seedLedger({ state: 'refused', decisionReason: 'approval missing', approvalNotifiedAt: NOW - 900, expiresAt: NOW - 1 });
+    await approvalFile();
+    const result = await gateToolRequestRender(toolRequestMessage(), ctx(NOW + 10));
+    expect(result.gate).toBe('refuse');
+    expect(result.reason).toBe('request expired');
+    expect((await readToolRequest(stateRoot, REQUEST_ID))?.state).toBe('refused');
+  });
+
+  it('执行方辞谢终态（refused + resultMessageId）不被审批文件复活（一请求一结果）', async () => {
+    // F-01 写者胜 × B-04 终态的交互守卫：辞谢后重读箱不能靠旧审批文件复活再回投一次 ok。
+    await seedLedger({
+      state: 'refused',
+      decidedAt: NOW - 1000,
+      decidedBy: 'aye',
+      decisionReason: 'tool_result:refused',
+      resultMessageId: 'msg-answer-1',
+    });
+    await approvalFile();
+    const result = await gateToolRequestRender(toolRequestMessage(), ctx());
+    expect(result.gate).toBe('refuse');
+    expect(result.reason).toBe('tool_result:refused');
+    expect(result.state).toBe('refused');
+    expect(result.transitioned).toBe(false);
+    expect((await readToolRequest(stateRoot, REQUEST_ID))?.state).toBe('refused');
+    expect(result.text).not.toContain(SECRET_ARG);
+    // 门自动拒的 refused（无 resultMessageId）仍可复活——两条路径不混。
+    const { createToolRequest } = await import('./toolledger.js');
+    await createToolRequest(stateRoot, {
+      requestId: 'r-gate-refused', from: 'bee', to: 'aye', tool: 'mcp__probe__ping', reason: 'x',
+      ttlMs: 3_600_000, maxResultChars: 64_000, state: 'refused', createdAt: NOW - 10_000,
+      expiresAt: NOW + 3_600_000, decisionReason: 'approval missing', decidedBy: 'gate', approvalNotifiedAt: NOW - 900,
+    });
+    await writeApprovalFile(stateRoot, {
+      requestId: 'r-gate-refused', decision: 'approved', approvedBy: 'lead',
+      decidedAt: NOW - 5_000, expiresAt: NOW + 60_000, tool: 'mcp__probe__ping',
+    });
+    const revived = await gateToolRequestRender(
+      createMessage('bee', 'aye', JSON.stringify({
+        type: 'tool_request', requestId: 'r-gate-refused', from: 'bee', tool: 'mcp__probe__ping',
+        args: { token: SECRET_ARG }, reason: 'x', approval: { required: true },
+      })),
+      ctx(),
+    );
+    expect(revived.gate).toBe('pass');
+    expect((await readToolRequest(stateRoot, 'r-gate-refused'))?.state).toBe('approved');
+  });
+
+  it('executed/error 终态不看审批文件（回投已发生，仍带头全文）', async () => {
+    await seedLedger({ state: 'executed', decidedBy: 'aye' });
+    const result = await gateToolRequestRender(toolRequestMessage(), ctx());
+    expect(result.gate).toBe('pass');
+    expect(result.transitioned).toBe(false);
   });
 });
 

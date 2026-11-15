@@ -20,15 +20,15 @@
 
 ### 第 1 步：下载并解包
 
-1. 打开 <https://github.com/QiruiGo/zcode-crosschat/releases>，下载资产 **`zcode-crosschat-0.7.1-prebuilt-slim.tar.gz`**（约 4–5MB）。**保留原文件名**——随包发布的 `.sha256` 校验和按原名录，改名后校验会失败。
-2. （可选）校验完整性：在文件所在目录执行 `sha256sum -c zcode-crosschat-0.7.1-prebuilt-slim.tar.gz.sha256`（PowerShell 可用 `Get-FileHash` 对照 `.sha256` 文件里的值），期望输出 `OK`。
+1. 打开 <https://github.com/QiruiGo/zcode-crosschat/releases>，下载资产 **`zcode-crosschat-0.7.2-prebuilt-slim.tar.gz`**（约 4–5MB）。**保留原文件名**——随包发布的 `.sha256` 校验和按原名录，改名后校验会失败。
+2. （可选）校验完整性：在文件所在目录执行 `sha256sum -c zcode-crosschat-0.7.2-prebuilt-slim.tar.gz.sha256`（PowerShell 可用 `Get-FileHash` 对照 `.sha256` 文件里的值），期望输出 `OK`。
 3. 解包（Windows 10+ 自带 tar，PowerShell / Git Bash 均可）：
 
    ```bash
-   tar -xzf zcode-crosschat-0.7.1-prebuilt-slim.tar.gz
+   tar -xzf zcode-crosschat-0.7.2-prebuilt-slim.tar.gz
    ```
 
-   得到目录 `zcode-crosschat-0.7.1/`（下称「解包目录」，其下应有 `marketplace.json`）。
+   得到目录 `zcode-crosschat-0.7.2/`（下称「解包目录」，其下应有 `marketplace.json`）。
 
 ### 第 2 步：安装
 
@@ -43,11 +43,11 @@ zcode 命令行**不在系统 PATH 里**（它是桌面版内置的入口），�
 ```bash
 ZC() { ELECTRON_RUN_AS_NODE=1 "<安装目录>/ZCode.exe" "<安装目录>/resources/<variant>/zcode.cjs" "$@"; }
 
-ZC plugins marketplace add "<解包目录>/zcode-crosschat-0.7.1"
+ZC plugins marketplace add "<解包目录>/zcode-crosschat-0.7.2"
 # 期望：Added marketplace dev-zcode-crosschat (1 plugins)
 
 ZC plugins install zcode-crosschat@dev-zcode-crosschat
-# 期望：Installed plugin zcode-crosschat@dev-zcode-crosschat (0.7.1) [enabled]
+# 期望：Installed plugin zcode-crosschat@dev-zcode-crosschat (0.7.2) [enabled]
 ```
 
 **PowerShell**：
@@ -55,7 +55,7 @@ ZC plugins install zcode-crosschat@dev-zcode-crosschat
 ```powershell
 function ZC { $env:ELECTRON_RUN_AS_NODE = "1"; & "<安装目录>\ZCode.exe" "<安装目录>\resources\<variant>\zcode.cjs" @args }
 
-ZC plugins marketplace add "<解包目录>/zcode-crosschat-0.7.1"
+ZC plugins marketplace add "<解包目录>/zcode-crosschat-0.7.2"
 ZC plugins install zcode-crosschat@dev-zcode-crosschat
 ```
 
@@ -155,9 +155,9 @@ npm install && npm run build
 
 ### 长期任务：任务日志与交接（longtask）
 
-内置 `longtask` 技能给出三行约定：任务日志写在 `.crosschat/tasks/<任务 id>/journal.md`（每进展一行摘要 + 产物指针）；新会话接手靠 `xc_read({scope:"journal"})` 读档 + `xc_read({scope:"task"})` 读任务全文，**≤3 步进入状态**；压缩前先落 journal。成员停机（`/xc-team stop`，`archive` 缺省 true）会把 journal 与元数据写到 `.crosschat/archive/<名字>/`，恢复 = 新会话 identify + 读档。
+内置 `longtask` 技能给出三行约定：任务日志写在 `.crosschat/tasks/<任务 id>/journal.md`（每进展一行摘要 + 产物指针）；新会话接手靠 `xc_read({scope:"journal"})` 读档 + `xc_read({scope:"task"})` 读任务全文，**≤3 步进入状态**；压缩前先落 journal。成员停机（`/xc-team stop`，`archive` 缺省 true）会把 journal 与元数据写到 `.crosschat/archive/<名字>/`，恢复 = 新会话 identify + 读档——停机花名的重启用有两条可达路径：lead 的 `xc_team({action:"member-add"})` 幂等重供给（removed 成员的唯一重启用入口，之后新会话 identify 绑回该名），或直接用新花名 identify 接手；两条路都靠读档续上下文（留档 journal 的「交接注意」节按 v0.7.2 起写明这两条路径——同名 identify 在 removed 门处被显式拒绝，不再给出走不通的指令）。
 
-**容量标红与压缩联动（C9，建议级）**：`xc_overview` 容量标红（capacity.red）时面板会附 `compress-advice` 建议行——先按 longtask 技能 §3 的压缩前 checklist 落 journal，**之后**才接受压缩；lead 可 `xc_relay` 要求目标先 `xc_report(status:"in_progress")` 附 journal 路径，看到板面指针即算落盘。平台无宿主压缩钩子接口，插件**只能预警 + 建议，不能拦截或触发压缩**（详见「已知限制」）。
+**容量标红与压缩联动（C9，建议级）**：`xc_overview`（`view:"team"`/`"panel"`）与 `xc_doctor` 都会惰性采样容量（无定时器；`capacity/sample.json` 缓存最小间隔 60s，窗口内设备水位仍与 `os.freemem()` 实时交叉复核）。三条预警规则任一命中即标红（`capacity.red`，`violated` 给出明细）：①可用内存 < 15%（`XC_MEM_WARN_WATERMARK`）；②单会话 working set > 800MB（`XC_MEM_SESSION_LIMIT_BYTES`）；③并发 headless 回合数 × 单回合预估 1.5GB > 可用内存（`XC_TURN_ESTIMATE_BYTES`，建议减少并发回合或让成员休眠）。标红时面板附 `compress-advice` 建议行——先按 longtask 技能 §3 的压缩前 checklist 落 journal，**之后**才接受压缩；lead 可 `xc_relay` 要求目标先 `xc_report(status:"in_progress")` 附 journal 路径，看到板面指针即算落盘。平台无宿主压缩钩子接口，插件**只能预警 + 建议，不能拦截或触发压缩**（详见「已知限制」）。
 
 ### 跨会话工具转办（C6/C7，v0.7）：先查放置，再考虑转办
 
@@ -172,7 +172,7 @@ npm install && npm run build
 
 > 如实说明：crosschat 的 MCP server 是宿主之外的独立 stdio 进程，看不到宿主其他 MCP server 的清单，插件内**无法程序化诊断「B 缺什么」**——所以这条矩阵是文档/skill 层建议，不是自动诊断。
 
-**转办怎么走**（不新增工具，全走现有面）：B 用 `xc_relay` 发一帧 `{"type":"tool_request", requestId, tool, args, reason, approval:{required:true}, maxResultChars}` 给有该工具的 A；插件侧建台账（`toolrequests/<requestId>.json`）并**强制只投邮箱、不唤醒**（唤醒 prompt 会把请求全文带进 A 的上下文）。A 在 `xc_read({scope:"inbox"})` 或 `xc_read({scope:"mail"})` 读它时，两个读取面都过同一道审批门：**没有有效审批文件时看不到请求正文**（只出遮蔽占位），门同时回投 B 一帧 `refused` 并通知 lead 待批。授权只认审批文件 `.crosschat/approvals/<requestId>.json`（用户/lead 落盘，或 lead 调 `xc_review({action:"approve", axis:"approval", id})` 由插件代写同格式）——`tool` 字段与请求逐字节绑定，请求方与执行方都不能自批，批准窗不超出请求窗。A 跑完真实工具后用 `xc_relay` 回投 `{"type":"tool_result", requestId, status, result, ts}`，B 以邮箱原文 + requestId + ts 自判新旧。
+**转办怎么走**（不新增工具，全走现有面）：B 用 `xc_relay` 发一帧 `{"type":"tool_request", requestId, tool, args, reason, approval:{required:true}, maxResultChars}` 给有该工具的 A；插件侧建台账（`toolrequests/<requestId>.json`）并**强制只投邮箱、不唤醒**（唤醒 prompt 会把请求全文带进 A 的上下文）。A 在 `xc_read({scope:"inbox"})` 或 `xc_read({scope:"mail"})` 读它时，两个读取面都过同一道审批门：**没有有效审批文件时看不到请求正文**（只出遮蔽占位），门同时回投 B 一帧 `refused` 并通知 lead 待批。授权只认审批文件 `.crosschat/approvals/<requestId>.json`（用户/lead 落盘，或 lead 调 `xc_review({action:"approve", axis:"approval", id})` 由插件代写同格式）——`tool` 字段与请求逐字节绑定，请求方与执行方都不能自批（大小写/折叠变体等同拒绝，按成员键归一化判定），批准窗不超出请求窗。**写者胜**：门每次读箱都重读磁盘审批文件——用户先读到请求（门首拒、lead 收到待批通知）之后再落合法批准文件，下一次读取即放行，台账从 refused/denied 迁回 approved；两条轨（用户落盘 ≡ `xc_review` 代写）完全等价。A 跑完真实工具后用 `xc_relay` 回投 `{"type":"tool_result", requestId, status, result, ts}`（`status:"refused"` 的辞谢同样落终态，一请求一结果），B 以邮箱原文 + requestId + ts 自判新旧。
 
 **边界**：审批门防的是流程缺失与误操作（无审批/过期/畸形/工具不符/自批一律结构性拒绝），**不防同机进程直接伪造审批文件**；批准后的**执行仍是 A 的模型回合**——crosschat 的 MCP server 不持有宿主的其他 MCP 连接，无法代调宿主工具（详见「已知限制」12）。
 
@@ -202,13 +202,15 @@ npm install && npm run build
 | `xc_overview({view, history, offset})` | 全景观测：任务板（team）/ peer 清单（peers）/ 面板（panel：成员+任务+容量+停滞+入站策略） |
 | `xc_team(action, …)` | 指挥族：init / transfer / release / member-add / member-stop / idle / cancel / unblock |
 | `xc_review({action, axis, ids})` | 入站审阅（队内/跨会话两轴隔离区；`action` 增 approve/deny、`axis` 增 approval 用于转办审批，仅现任 lead 可批） |
-| `xc_doctor` | 只读体检：插件版本、运行时、zcode 路径探测线索（免注册） |
+| `xc_doctor` | 只读体检：插件版本、运行时、zcode 路径探测线索、容量采样（水位/标红规则；免注册） |
 
 所有工具做硬校验而非仅靠提示词纪律：未注册连接拒绝、目标必须在册、任务状态机非法转移拒绝、过期凭证硬拒、completed 缺证据拒收、证据必须是工作区内真实存在的**普通文件**且 sha256 与工具现算值一致、保留名注册拒绝、花名严格文法（全角/同形/路径符等会被静默归一到碰撞键的写法一律拒绝）、派单仅限受领人认领（not_assignee）、重复派发幂等去重。协议纪律（派发必须写验收标准、等待让位不轮询、认领失败不重试）由 `crosschat` 技能承载，随安装自动进入会话。
 
 **证据门**（`xc_report` 的 `evidence`）：每条 = 工作区内一个真实普通文件 + 工具现算的 sha256 + 可选一句话摘要（`note`）。三道硬闸：路径越出工作区 → `evidence_path_outside_workspace`；不是普通文件（目录/设备文件）→ `evidence_not_a_file`；不存在/不可读 → `evidence_file_missing`。`sha256` 可省略（由工具现算后落库，回执随带）；**带了就必须与文件内容一致**（hex 大小写不敏感），否则整单拒绝 `evidence_checksum_mismatch`。`note` 可省略（按空串入库），控制字符入库前清洗为空格、长度钳 500 字符。
 
 **重复派发幂等**（`xc_dispatch`）：去重键 = `(收方成员键, 任务票文本)` ∧ 该派发信封**未被读过** ∧ 仍是现行信封——**不含发送方**。同一张票、同一个收方、还没被读走，就算重复派发：不建新单，返回既有 `taskId` 与 `delivered:"duplicate"`，并在 payload 披露 `duplicateKey`（`to=<收方>|ticket=<票面 sha256 前 16 hex>`）与 `originalCreatedBy`（首派方，可能是别人）。收方已读旧票、或票面（标题/内容/验收标准）不同 → 建新单。键的完整定义见 [docs/PROTOCOL.md](docs/PROTOCOL.md) §4。
+
+**派单目标生命周期闸**（`xc_dispatch`，v0.7.2 C8-B3）：`to` 指向已停机（`xc_team member-stop`，state=removed）成员时**显式拒绝** `member_removed`——不建单、不投递（否则任务永久搁浅：他人 `not_assignee`、停机成员无法认领、pending 不在僵尸清扫域、创建者无回执），文案指引改派活成员或 lead 的 `xc_team member-add` 幂等重供给，审计落 `dispatch-refused`。详见 [docs/PROTOCOL.md](docs/PROTOCOL.md) §4.3。
 
 ## 配置项参考（插件设置）
 
@@ -277,6 +279,11 @@ Release 资产下载失败可换时间重试；或用实测更稳的源码压缩
 
 ## 版本记录（摘要）
 
+- **v0.7.2**（2026-11-15，能力反向检验 21 项 P2/P3 清理；三组修复合并记入本条）：
+  - **审批门与转办轨组（10 项）**：**写者胜落地（F-01）**——审批门在**任意台账状态**下都重读磁盘审批文件：拒绝态（refused/denied）台账 + 合法批准文件 → 门放行并把台账迁回 approved（审计附 `revivedFrom`），文件轨（用户/lead 落盘）与工具轨（`xc_review` 代写同格式）自此完全等价；两处不重读：请求窗已关闭（安全边界，批准窗不可能同时满足「> now」与「≤ 请求 expiresAt」）与已终态 executed/error（回投已发生，请求帧照常带头全文）；执行方辞谢终态（refused + `resultMessageId`）亦不被审批文件复活（一请求一结果）。**多进程过期竞态（B-02）**——过期迁移改走带状态闸的 `transitionToolRequest`（团队锁内），只有真正落盘的那一次进回投列表，同相位竞态不再重复回投/重复审计。**result 限额按有效载荷计（B-03）**——字符串取自身长度（不再把 JSON 引号算进载荷，「正好等于限值」不再被拒），非字符串仍取序列化长度。**执行方辞谢落终态（B-04）**——`tool_result{status:"refused"}` 记台账 refused：一请求一结果，之后不再接受第二次回投、不被 TTL 清扫改写。**失败表文案校正（B-05）**——PROTOCOL §11.2 按实际行为分列：显式 `名字 [team]` 后缀指向非花名册成员 = 队内闸 `not_a_member`；裸名双轴都未命中 = `target_not_found`（两者都 fail-closed，仅代码不同）。**自批守卫按成员键归一化（C7-B2）**——`approvedBy` 写大小写/折叠变体（`"REQB"` vs `reqb`）不再绕过 self-approval refused。**畸形审批诊断分流（C7-B3）**——`unparseable JSON` / `not a JSON object` / `invalid fields:<清单>` / `requestId mismatch` 四态各得其真因（9 变体不再一律误报）。**lead 收尾可达（C7-B5）**——停在 refused/denied 且窗口已关闭的请求，sweeper 补发 `approval_result{decision:"expired"}`（`approvalClosedAt` 记档防重复）。**终态台账拒审批（C7-B6）**——对 executed/error/expired 台账 approve/deny 显式拒绝 `request_already_finalized`（不写审批文件、不发回执、不改台账）。**待批清单剔除窗关请求（C7-B7）**——已过 `expiresAt` 的 pending 不进可批清单（另报 `lapsedWindowClosed` 计数 + 说明行），不再把「批准窗已关」呈现为可批。
+  - **离线与身份组（6 项）**：**崩溃残留保留（F-02/C8-B1）**——`xc_identify` 注册/改名路径的 peer 扫描改**只读**（`sweep:false`）+ 死记录**定向 GC**（只回收本次认领花名的死前任）：`pid-dead` 残留是 C8 离线判据唯一的进程死硬证据，「成员崩溃 → 无人值守 → 重启后第一动作 identify」不再抹掉它——task-offline 审计 / lead 转交通知 / overview offlineMembers 在「重启后查看」流程不再静默丢失。**idle-timeout 判据落盘（C8-B2）**——任务记录新增 `lastProgressTs` 字段（`appendTaskHistory` 唯一收口点随 history 末条刷新），读取口径 = history 末条与落盘字段中**较旧**的一个（外部改写/时间加速时保守方向）；idle-timeout 分支自此可达，且不把活进程/空闲误判为离线（live/heartbeat-stale 仍判 `offline:false`）。**派单目标生命周期闸（C8-B3）**——`to` 指向 removed 成员显式拒绝 `member_removed`（不建单、不投递；否则任务永久搁浅），文案指引改派活成员或 lead `member-add` 幂等重供给，审计落 `dispatch-refused`。**离线阈值非法值披露（C8-B4）**——`XC_OFFLINE_MINUTES=0`/负数/非数字不再静默回落：回落内置缺省 240min 并附 WARNING + payload `offlineThresholdFallback:true`（与 clamped 披露并存）。**停机恢复路径文档化（C9-B5）**——留档 journal「交接注意」与 README longtask 节按**真实可达**路径书写：member-add 幂等重启用（removed 成员唯一入口）或新花名接手 → 读档续作；同名 identify 在 removed 门处被显式拒绝，不再给出走不通的指令。**改名写 names.json 新绑定（CB-01）**——队内花名换绑后新键写入 names.json（旧键删除）：SessionStart 钩子不再误报「尚未注册跨会话花名」；新键已被别的 sid 占用（陈旧死绑定）时不覆盖别人的索引行。
+  - **C9 呈现与文档组**：任务板 ID 列加宽到 `<8hex>-t<N>` 全形（超宽保尾截断）——同一波派发的任务不再在文本面全同形，journal 路径 / `xc_read({scope:"journal"})` / `xc_claim` 依赖的 taskId 在板面上可定位（C9-B2）；RESULT/ERROR 列取消固定 24 字符截断，「看到板面指针即算落盘」在文本渲染面成立（行宽由注入预算窗口统一兜底，JSON 面本就全量不回归——C9-B1）；容量缓存窗口内与 `os.freemem()` 实时交叉复核设备水位——伪造/陈新缓存不再能制造最长 60s 的虚假读数（缓存仍只省 CIM 进程树采样成本——C9-B3）；第三条标红规则 `turn-concurrency`（并发 headless 回合 × `XC_TURN_ESTIMATE_BYTES` 单回合预估 > 可用内存）补登 README/PROTOCOL §5 与 §9 env 表（C9-B4）；`xc_doctor` 按 PROTOCOL §5 参与容量惰性采样并展示（与 `xc_overview` 同一 `sample.json` 缓存/窗口/判定，采样意外只丢该观测块——C9-B6）。
+  - 工具面仍恰 10，0 新增工具、0 新增必填配置（`XC_TURN_ESTIMATE_BYTES` 为 v0.7 起即存在的仅代码读取高级 env，本次仅补公共文档登记）。
 - **v0.7.1**（2026-11-15，红队四番战 P2/P3 清理；15 项分三组并行修复，本条合并各组条目）：
   - **证据与观测组**：evidence 的 sha256 恢复现算复核（v0.6 砍复核后回执恒 null、DEMO 核对流程落空——边界-7 P3；`evidence_checksum_mismatch` 硬拒，缺省由工具现算并随回执披露 `evidenceSha256`）；证据闸收紧（目录/设备文件不得作证据 `evidence_not_a_file`；`note` 可选性显式=省略按空串入库，控制字符清洗为空格、钳 500 字符——边界-8 P3）；peers 视图 `[ref]` 只在跨会话可寻址行（self/session）渲染且照抄即可作地址，`member` 行不再渲染不可寻址的 `[ref]`（边界-9 P3）；peer 入队闸 `dropped` 回执把「原因 + 恢复动作」透进 `xc_relay` payload `detail` 与摘要行（规模压-B1 P3）；成员上限报文自洽（`activeMembers`=当前活成员、另报 `activeAfterAdd`=本次写入后——规模压-B2 P3）；重复派发去重键明确定义为 `(收方, 任务票) ∧ 未读 ∧ 现行`、**不含发送方**，回执披露 `duplicateKey`/`originalCreatedBy`（规模压-B3 P3）。
   - **故障注入组**：provisioning 超时判据落盘 + 清扫（`provisionDeadlineAt`；lead server 中途死亡不再让成员永久卡 provisioning——后续 member-add/回合钩子清扫为 failed + 审计 `member-provision-timeout` + 同名重试干净接管，故障注-1 P2）；names.json 损坏报错带文件路径与恢复指引（可重建索引：删文件即重置，故障注-2 P2）；peer 消息 store 损坏返回显式 `message_corrupt`（带路径+恢复动作，不再误报 unknown msgId；未消费消息 queue 兜底仍可读，故障注-3 P2）；`xc_read({scope:"peer"})` 披露队列坏行计数 `malformedLines`（与 inbox/held 口径一致，故障注-4 P3）。
