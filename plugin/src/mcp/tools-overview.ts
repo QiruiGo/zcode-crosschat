@@ -1,16 +1,19 @@
 /**
  * v0.6 M1（DESIGN-V0.6.md §1.2 T7）：xc_overview —— 全景观测（+容量/停滞挂载点）。
  *
- * 合并 xc_status / xc_peers / xc_agents 的调用面：
- * - view 缺省/"team" ≈ xc_status（core.xc_status 平移实现；teamId 参数随合并移除
+ * 合并任务板 / peer 清单 / 面板三类观测的调用面：
+ * - view 缺省/"team" ≈ 原任务板观测（内部方法平移实现；teamId 参数随合并移除
  *   ——多团队从未启用，v0.1 遗留死参；snapshot.json 落盘、boardTruncated 分页指针
  *   全部保留）。任务板按 sortTasksForBoard（C2：priority → createdAt）排序呈现。
- * - view "peers" ≈ xc_peers（行格式与 rowsTruncated 分页原样；旧 kind 过滤参数
+ * - view "peers" ≈ 原 peer 清单（行格式与 rowsTruncated 分页原样；旧 kind 过滤参数
  *   不保留——一次列全三类，按行首 [self]/[member]/[session] 标记自行辨识）。
- * - view "panel" ≈ xc_agents（self+peers+members+tasks+入站策略）。
+ * - view "panel" ≈ 原全景面板（self+peers+members+tasks+入站策略）。
  * - 停滞挂载（C5，M5 core/stall.ts）：team/panel 附 stalled[]（XC_STALL_MINUTES，
  *   缺省 120min，小于 stale 阈值时钳制 + WARNING）；容量挂载（C3，M6）由
  *   core/capacity.ts 落位后在此追加 capacity 块（挂载点：overviewPayloadExtras）。
+ * - v0.7（C8，M4 core/offline.ts）：team 视图附 offlineMembers[]（离线成员 + 其名下
+ *   待转交任务 + 证据；XC_OFFLINE_MINUTES 缺省 240min，钳制 ≥ stale + WARNING）。
+ *   只读 peer 扫描失败 → 不挂载（观测面永不为难任务板，同 capacityMount 纪律）。
  * - 无需注册即可调用（只读纪律，SKILL §1 保留）。
  */
 
@@ -39,6 +42,10 @@ import { stalledTasks, stallThresholdMs, stallSuggestion, type StallFlag } from 
 import { staleThresholdMsFromEnv } from "./task-edges.js";
 import { getPeerServices } from "./peer-services.js";
 import { leadKeyOf } from "./tools-team.js";
+// v0.7（C8，M4）：离线成员挂载（DESIGN-V0.7.md §4.3）。
+import { peerRootFromEnv } from "../core/peerdir.js";
+import { scanPeers } from "../core/peerregistry.js";
+import { offlineMemberLine, offlineMembers, offlineThresholdMsFromEnv, type OfflineMember } from "../core/offline.js";
 import {
   capacityCacheFile,
   formatCapacityLines,
@@ -96,8 +103,31 @@ async function capacityMount(deps: ToolDeps): Promise<CapacityMount | null> {
 }
 
 // ---------------------------------------------------------------------------
-// zod 入参 schema（§1.2 T7）
+// v0.7（C8，M4）离线成员挂载（DESIGN-V0.7.md §4.3）：只读 peer 扫描 + 离线判据。
+// 与 capacityMount 同纪律：任何意外（peer 根不可读/扫描失败）→ 返回 null = 不挂载，
+// 任务板与其余观测块不受影响（安全底线：不崩）。
 // ---------------------------------------------------------------------------
+
+interface OfflineMount {
+  members: OfflineMember[];
+  lines: string[];
+  /** XC_OFFLINE_MINUTES 低于 stale 阈值被钳制（挂载面附 WARNING）。 */
+  clamped: boolean;
+}
+
+async function offlineMembersMount(deps: ToolDeps, team: TeamState, now: number): Promise<OfflineMount | null> {
+  try {
+    const staleMs = staleThresholdMsFromEnv(deps.env);
+    const threshold = offlineThresholdMsFromEnv(deps.env, staleMs);
+    // 只读扫描（sweep:false）：查询路径不得有清扫副作用（peerregistry.ts 的 hazard 自载）。
+    const scan = await scanPeers(peerRootFromEnv(deps.env), now, { sweep: false });
+    const members = offlineMembers(team, scan, now, threshold.ms);
+    if (members.length === 0 && !threshold.clamped) return null;
+    return { members, lines: members.map(offlineMemberLine), clamped: threshold.clamped };
+  } catch {
+    return null;
+  }
+}
 
 export const OverviewShape = {
   view: z.enum(["team", "peers", "panel"]).optional().describe("缺省 team：任务板+成员+未读；peers：本机可寻址 peer 清单；panel：self+peers+members+tasks+入站策略+容量+停滞"),
@@ -108,12 +138,12 @@ export const OverviewShape = {
 export type OverviewArgs = { view?: "team" | "peers" | "panel"; history?: boolean; offset?: number };
 
 export interface TeamOverviewCore {
-  /** 队内全景（原 xc_status 核心 1:1 平移；teamId 死参移除；板面按优先级排序）。 */
+  /** 队内全景（原任务板核心 1:1 平移；teamId 死参移除；板面按优先级排序）。 */
   xc_status(args: { history?: boolean; offset?: number }, connectionKey: string): Promise<ToolResult>;
 }
 
 // ---------------------------------------------------------------------------
-// core.xc_status（原 tools.ts 平移；差异：teamId 移除 + 板面 priority 排序 + stalled 挂载）
+// 队内全景核心（原 tools.ts 平移；差异：teamId 移除 + 板面 priority 排序 + stalled 挂载）
 // ---------------------------------------------------------------------------
 
 export function createTeamOverviewCore(deps: ToolDeps): TeamOverviewCore {
@@ -244,6 +274,8 @@ export function createTeamOverviewCore(deps: ToolDeps): TeamOverviewCore {
 
         // C3 挂载（M6）：容量采样在 payload 组装前做；采样失败只丢观测块，任务板不受影响。
         const capacity = await capacityMount(deps);
+        // v0.7（C8，M4）离线成员挂载：同 capacity 纪律（扫描失败只丢观测块）。
+        const offlineMount = team !== undefined ? await offlineMembersMount(deps, team, now) : null;
         const rollbackWarnings: string[] = [];
         const payload = {
           ...snapshot,
@@ -280,6 +312,13 @@ export function createTeamOverviewCore(deps: ToolDeps): TeamOverviewCore {
             : {}),
           // C3 挂载（M6）：capacity 块（采样失败则不挂载，任务板不受影响）。
           ...(capacity !== null ? capacity.payload : {}),
+          // v0.7（C8，M4）挂载点：offlineMembers 块（离线成员 + 名下待转交任务 + 证据）。
+          ...(offlineMount !== null && (offlineMount.members.length > 0 || offlineMount.clamped)
+            ? {
+                offlineMembers: offlineMount.members,
+                ...(offlineMount.clamped ? { offlineThresholdClamped: true } : {}),
+              }
+            : {}),
         };
         if (staleCompletedReceipts !== undefined) {
           const parts = Object.entries(staleCompletedReceipts)
@@ -296,6 +335,11 @@ export function createTeamOverviewCore(deps: ToolDeps): TeamOverviewCore {
             "WARNING XC_STALL_MINUTES 低于僵尸清扫阈值（XC_STALE_TASK_MINUTES）——stall 阈值已按 stale 阈值钳制（无在途唤醒的死任务会先被清扫回池，stall 面轮不到展示）",
           );
         }
+        if (offlineMount !== null && offlineMount.clamped) {
+          rollbackWarnings.push(
+            "WARNING XC_OFFLINE_MINUTES 低于僵尸清扫阈值（XC_STALE_TASK_MINUTES）——离线阈值已按 stale 阈值钳制（无进展任务会先被 stale 回收，idle-timeout 分支轮不到展示）",
+          );
+        }
         const text = renderStatusTable({
           ...snapshot,
           tasks: windowedTasks,
@@ -309,6 +353,9 @@ export function createTeamOverviewCore(deps: ToolDeps): TeamOverviewCore {
           + (rollbackWarnings.length > 0 ? `\n${rollbackWarnings.join("\n")}` : "")
           + (stalled.length > 0
             ? `\nStalled: ${stalled.map((f) => `${f.taskId}(${f.kind}, idle ${f.idleForMin}min → ${stallSuggestion(f.kind, f.status)})`).join(", ")}`
+            : "")
+          + (offlineMount !== null && offlineMount.members.length > 0
+            ? `\nOffline: ${offlineMount.lines.join(", ")}`
             : "")
           + (capacity !== null ? `\n${capacity.lines.join("\n")}` : "");
         return okResult(text, payload);
@@ -343,7 +390,7 @@ export async function handleOverview(deps: ToolDeps, args: OverviewArgs, connect
   return overviewPanel(deps);
 }
 
-/** view:"peers"（原 xc_peers 1:1；kind 过滤参数不保留——一次列全三类）。 */
+/** view:"peers"（原 peer 清单 1:1；kind 过滤参数不保留——一次列全三类）。 */
 export async function overviewPeers(deps: ToolDeps, args: OverviewArgs): Promise<ToolResult> {
   const services = getPeerServices(deps);
   const all = await services.list(undefined);
@@ -378,7 +425,7 @@ export async function overviewPeers(deps: ToolDeps, args: OverviewArgs): Promise
   );
 }
 
-/** view:"panel"（原 xc_agents 1:1）+ C5 stalled 计数挂载。 */
+/** view:"panel"（原全景面板 1:1）+ C5 stalled 计数挂载。 */
 export async function overviewPanel(deps: ToolDeps): Promise<ToolResult> {
   const services = getPeerServices(deps);
   const panel = await services.agents();
@@ -450,7 +497,7 @@ export function registerOverviewTools(
   registry: PrimaryRegistry,
 ): void {
   const description =
-    "Observation snapshot (replaces xc_status + xc_peers + xc_agents). view=team (default): members with isLead, priority-ordered task board (budget-windowed with boardTruncated pointer), unread counts, orphan/stale-receipt warnings, stalled flags (C5); " +
+    "Observation snapshot (task board / members / peers / capacity / stall in one tool). view=team (default): members with isLead, priority-ordered task board (budget-windowed with boardTruncated pointer), unread counts, orphan/stale-receipt warnings, stalled flags (C5); " +
     "history:true appends leadHistory; view=peers: addressable cross-session peers (self/member/session rows, rowsTruncated pointer); " +
     "view=panel: self + peers + members + task counts + inbound policy. Does not require registration; writes snapshot.json (always the full board).";
   const handler = async (args: Record<string, unknown>, extra: unknown): Promise<ToolResult> =>

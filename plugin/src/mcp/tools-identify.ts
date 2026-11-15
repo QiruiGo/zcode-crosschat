@@ -1,7 +1,7 @@
 /**
  * v0.6 M1（DESIGN-V0.6.md §1.2 T1）：xc_identify —— 注册/重绑/改名/接管（两轴合一）。
  *
- * 合并 xc_register + xc_peer_register + xc_peer_rename 的调用面；两轴存储不合并
+ * 合并队内注册 + peer 注册 + 改名的调用面；两轴存储不合并
  * （SKILL §9 独立性边界不变）——本文件只把两次注册合为一次调用：
  * - 队内轴 = xcRegister（identity.ts，软身份校验：name_taken / session_already_bound /
  *   removed 门 / wakeToken 路径；regToken 硬闸已随 §2.2-P1 砍除）。
@@ -9,7 +9,7 @@
  *   session_not_anchored 锚定存在性、name_taken 先到者为准）。
  *
  * 改名（T1 #4）：连接已有身份且 name 与现名不同 → peer 轴 rename（formerNames +
- * control:rename 通知，xc_peer_rename 现状行为）；队内花名换绑仅在该成员
+ * control:rename 通知，peer 轴改名现状行为）；队内花名换绑仅在该成员
  * 「板面干净」（名下无任何任务引用且邮箱为空）时执行 member key 换绑——有在途
  * 引用时显式拒（team_rename_blocked），不串号不丢信。
  *
@@ -88,7 +88,7 @@ export type IdentifyArgs = {
 };
 
 export interface IdentifyCore {
-  /** 队内轴注册（原 xc_register 核心 1:1 平移；regToken 已砍）。 */
+  /** 队内轴注册（原注册核心 1:1 平移；regToken 已砍）。 */
   xc_register(args: { name: string; sessionId: string; role?: "peer" | "worker"; wakeToken?: string }, connectionKey: string): Promise<ToolResult>;
 }
 
@@ -351,7 +351,7 @@ export async function handleIdentify(deps: ToolDeps, rawArgs: IdentifyArgs, conn
           ...(founderKeyFollowed ? { founderKeyFollowed: true } : {}),
         });
       }
-      // peer 轴改名（已注册时）：formerNames + control:rename 通知（xc_peer_rename 现状行为）。
+      // peer 轴改名（已注册时）：formerNames + control:rename 通知（peer 轴改名现状行为）。
       const peerContext = getPeerSessionContext();
       if (peerContext !== undefined) {
         peerRename = await services.rename(rawArgs.name);
@@ -504,7 +504,7 @@ export function registerIdentifyTools(
   registry: PrimaryRegistry,
 ): void {
   const description =
-    "Register/rebind/rename/take over this session's identity on BOTH axes in one call (replaces xc_register + xc_peer_register + xc_peer_rename). " +
+    "Register/rebind/rename/take over this session's identity on BOTH axes in one call (team axis and peer axis unified). " +
     "The name is the address on each axis; sessionId comes from the SessionStart hook (interactive) or the wake prompt (headless) - never invent it: a sessionId already held by another live session is refused (session_id_in_use, team axis included). " +
     "Names must already be in canonical key form (letters/digits/single dashes, ≤48 chars); silently-normalizing spellings (fullwidth, homoglyphs, path/control characters, spaces, underscores) are refused - same strict grammar as the peer axis. " +
     "takeover:true (explicit) rebinds a dead holder's name and requeues its open tasks with receipts; it refuses while an in-flight wake round exists or the old holder is still live (takeover_live_holder). " +

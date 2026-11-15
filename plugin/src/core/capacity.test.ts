@@ -4,7 +4,9 @@
  * - 预警公式 red1/red2/red3 + degraded 降级 + env 防御解析；
  * - 采样缓存窗口（XC_MEM_SAMPLE_MIN_MS）与损坏/未来缓存防御；
  * - parseCimRows 形态防御（数组/单对象/null CommandLine/垃圾输出）；
- * - 真机冒烟：takeFreshSample 形状不变式（不假设 ZCode 在场——降级与可信两态都合法）。
+ * - 真机冒烟：takeFreshSample 形状不变式（不假设 ZCode 在场——降级与可信两态都合法）；
+ * - C9 压缩联动（DESIGN-V0.7.md §5）：verdict.red 时 formatCapacityLines 追加
+ *   compress-advice 建议行，绿样本不追加。
  */
 import { describe, expect, it } from 'vitest';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -13,6 +15,7 @@ import { join } from 'node:path';
 import {
   classifyProcess,
   classifyZcodeProcesses,
+  COMPRESS_ADVICE_LINE,
   formatCapacityLines,
   judgeCapacity,
   memSampleMinMsFromEnv,
@@ -362,20 +365,38 @@ describe('sampleCapacity 缓存窗口（XC_MEM_SAMPLE_MIN_MS）', () => {
 });
 
 describe('formatCapacityLines（panel 直出文本）', () => {
-  it('绿样本：一行摘要，无 detail', () => {
+  it('绿样本：一行摘要，无 detail、无压缩建议行', () => {
     const s = sample();
     const lines = formatCapacityLines(s, judgeCapacity(s, {}));
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain('GREEN');
     expect(lines[0]).toContain('50.0%');
+    expect(lines.some((l) => l.startsWith('compress-advice:'))).toBe(false);
   });
 
   it('红样本：RED 头 + violated detail 逐行', () => {
     const s = sample({ headlessTurnCount: 1, headlessTurnMaxRssBytes: 900 * MB });
     const lines = formatCapacityLines(s, judgeCapacity(s, {}));
     expect(lines[0]).toContain('RED');
-    expect(lines).toHaveLength(2);
+    expect(lines).toHaveLength(3); // 摘要 + session-limit detail + C9 压缩建议行
     expect(lines[1]).toContain('session-limit');
+  });
+
+  // C9（DESIGN-V0.7.md §5）：标红追加固定压缩建议行（longtask checklist + lead 操作序）。
+  it('红样本：追加 compress-advice 建议行（文案与导出的常量一致）', () => {
+    const s = sample({ headlessTurnCount: 1, headlessTurnMaxRssBytes: 900 * MB });
+    const lines = formatCapacityLines(s, judgeCapacity(s, {}));
+    expect(lines[lines.length - 1]).toBe(COMPRESS_ADVICE_LINE);
+    expect(lines[lines.length - 1]).toContain('longtask checklist');
+    expect(lines[lines.length - 1]).toContain('journal');
+    expect(lines[lines.length - 1]).toContain('xc_report(status:"in_progress")');
+  });
+
+  it('degraded 红样本（仅水位红灯）同样给建议行', () => {
+    const s = sample({ freeBytes: 1 * GB, watermark: 1 / 32, degraded: 'cim-unavailable' });
+    const lines = formatCapacityLines(s, judgeCapacity(s, {}));
+    expect(lines[0]).toContain('RED');
+    expect(lines[lines.length - 1]).toBe(COMPRESS_ADVICE_LINE);
   });
 });
 

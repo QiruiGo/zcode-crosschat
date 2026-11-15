@@ -9,7 +9,7 @@
  *   xc_status{offset} 分页；snapshot.json 落盘仍全量（R-21）。
  * - SCALE-2（#19，P1）：peer 入站队列上限 64→1024 且可配（XC_PEER_MAX_QUEUE_
  *   DEPTH）；queue-full 丢弃的 detail 带上限值与恢复动作（发方可行动）。
- * - SCALE-3（#20，P2）：xc_peer_inbox 批次改为「窥视→预算窗口→只消费窗口内」，
+ * - SCALE-3（#20，P2）：peer 排空批次改为「窥视→预算窗口→只消费窗口内」，
  *   窗口外消息留在队列、remaining/「再拉一次」指针名副其实，响应不再出现
  *   「已省略（超注入预算）」占位符（消费即省略的根因）。
  * - SCALE-4（#21，P2）：发送限速常量契约锁定（README 文档化 30 条/10s，实现
@@ -107,8 +107,8 @@ describe("SCALE-1: xc_status 板面注入预算窗口（xc_status/history 接入
     // 响应整体有界：人可读表 + JSON payload 都算上（未修复时 40 任务 ≈ 数万字符）
     expect(textOf(res).length).toBeLessThan(6000);
 
-    // 指针行：给出 xc_status({offset}) 续读
-    expect(textOf(res)).toContain("xc_status({offset:");
+    // 指针行：给出 xc_overview({offset}) 续读
+    expect(textOf(res)).toContain("xc_overview({offset:");
     expect(textOf(res)).toContain(`本页 ${payload.tasks.length}/40`);
 
     // 磁盘真源：snapshot.json 落盘仍是全量（R-21）
@@ -248,7 +248,7 @@ describe("SCALE-2: peer 入站队列上限（默认 1024、XC_PEER_MAX_QUEUE_DEP
     const detail = admissionDropDetail("queue-full", 1024);
     expect(detail).toContain("1024");
     expect(detail).toContain("NOT delivered");
-    expect(detail).toContain("xc_peer_inbox");
+    expect(detail).toContain('xc_read({scope:"peer"})');
     const rate = admissionDropDetail("rate-limited", 1024);
     expect(rate).toContain(String(PEER_RATE_LIMIT));
     expect(rate).toContain("10s");
@@ -267,9 +267,9 @@ describe("SCALE-4: 发送限速契约锁定（README 文档化 30 条/10s 窗口
   });
 });
 
-// ─────────────────────────── SCALE-3（#20，P2）：xc_peer_inbox 窗口外保持未读 ───────────────────────────
+// ─────────────────────────── SCALE-3（#20，P2）：peer 排空窗口外保持未读 ───────────────────────────
 
-describe("SCALE-3: xc_peer_inbox 批次窗口（窗口外消息留在队列 + 再拉指针，无占位符省略）", () => {
+describe("SCALE-3: peer 排空批次窗口（窗口外消息留在队列 + 再拉指针，无占位符省略）", () => {
   let root: string;
   let workspace: string;
   let stateRoot2: string;
@@ -370,7 +370,7 @@ describe("SCALE-3: xc_peer_inbox 批次窗口（窗口外消息留在队列 + �
     expect(all.size).toBe(20);
   }, 20_000);
 
-  it("单条超批次预算也保底消费一条（item 截断 + xc_peer_read 指针兜住单条上限）", async () => {
+  it("单条超批次预算也保底消费一条（item 截断 + peer-msg 指针兜住单条上限）", async () => {
     // 红队场景等价：批次预算 600 < 单条成本 → 保底一条消费，截断只发生在注入层
     const services = createDefaultPeerServices({
       stateRoot: stateRoot2,
@@ -381,7 +381,7 @@ describe("SCALE-3: xc_peer_inbox 批次窗口（窗口外消息留在队列 + �
     const bigText = "B".repeat(5000);
     await appendPeerQueue(root, "sess-alice2", item("m-big", bigText));
 
-    // 工具面全链路：预算传给服务面（窗口与排布同源），单条被 item 截断 + xc_peer_read 指针
+    // 工具面全链路：预算传给服务面（窗口与排布同源），单条被 item 截断 + peer-msg 指针
     const server: { tools: Array<{ name: string; handler: (args: Record<string, unknown>) => Promise<ToolResult> }> } = new (class {
       readonly tools: Array<{ name: string; handler: (args: Record<string, unknown>) => Promise<ToolResult> }> = [];
       tool(name: string, _desc: string, _schema: unknown, handler: (args: Record<string, unknown>) => Promise<ToolResult>): void {
@@ -405,7 +405,7 @@ describe("SCALE-3: xc_peer_inbox 批次窗口（窗口外消息留在队列 + �
     expect(payload.count).toBe(1);
     expect(payload.remaining).toBe(0);
     expect(payload.envelopes[0]?.length).toBeLessThan(1200);
-    expect(payload.envelopes.join("\n")).toContain("xc_peer_read");
+    expect(payload.envelopes.join("\n")).toContain('xc_read({scope:"peer-msg"');
     expect(payload.budgetTruncated).toBe(true);
     expect(payload.envelopes.join("\n")).not.toContain("已省略");
     // 服务面直证：队列已排空（消费真发生，不是「省略了事」）
@@ -415,7 +415,7 @@ describe("SCALE-3: xc_peer_inbox 批次窗口（窗口外消息留在队列 + �
 
 // v0.5.1 既有契约保持：validateSendModeArgs 不受本轮改动影响（冒烟，防接线回归）
 describe("本轮改动的接线冒烟", () => {
-  it("xc_peer_inbox handler 把预算传给服务面（窗口与排布同源）", async () => {
+  it("peer 排空 handler 把预算传给服务面（窗口与排布同源）", async () => {
     let receivedBudget: unknown;
     const server: { tools: Array<{ name: string; handler: (args: Record<string, unknown>) => Promise<ToolResult> }> } = new (class {
       readonly tools: Array<{ name: string; handler: (args: Record<string, unknown>) => Promise<ToolResult> }> = [];

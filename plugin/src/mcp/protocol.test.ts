@@ -24,7 +24,7 @@ describe("protocol: 结构化错误", () => {
   it("notRegisteredError 的码为 not_registered（DESIGN §2.3-2）", () => {
     const err = notRegisteredError();
     expect(err.payload.error).toBe("not_registered");
-    expect(String(err.payload.message)).toContain("xc_register first");
+    expect(String(err.payload.message)).toContain("xc_identify first");
   });
 
   it("staleAttemptError 携带期望的当前 attemptId（§2.6 硬拒）", () => {

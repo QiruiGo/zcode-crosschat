@@ -276,7 +276,7 @@ export function renderPeerEnvelopeTag(attrs: PeerEnvelopeAttrs): string {
 /** The reply instruction (CC constant `i` @9494876, zcode tool name). */
 export function renderPeerReplyInstruction(from: string | undefined): string {
   const target = from !== undefined && from !== '' ? from : '<from 属性>';
-  return `After completing your current task, decide whether/how to respond: reply with \`xc_peer_send({to: "${target}"})\`, copying the \`from\` attribute above.`;
+  return `After completing your current task, decide whether/how to respond: reply with \`xc_relay({to: "${target}"})\`, copying the \`from\` attribute above.`;
 }
 
 /**
@@ -419,7 +419,7 @@ export interface TeamEnvelopeInput {
 
 /**
  * R-16：队内域逐条信封——`<crosschat-team-message type="…" from="…"[ origin="user"]>`
- * 包裹正文 + 归因尾注（按 origin 分叉）+ 回复指引（xc_message）。
+ * 包裹正文 + 归因尾注（按 origin 分叉）+ 回复指引（xc_relay）。
  * 幂等：已渲染（team tag + 页脚 marker）的 content 原样返回（peerenvelope 同款守卫）。
  * v0.6（DESIGN-V0.6.md §2.2 行 3）：防伪造 verified 标记砍除；嵌套 team 信封仍剥离
  * ≤4 轮（渲染卫生）。
@@ -433,7 +433,7 @@ export function renderTeamEnvelope(input: TeamEnvelopeInput): string {
   const originAttr = input.origin === 'user' ? ' origin="user"' : '';
   const openTag = `<${TEAM_ENVELOPE_TAG} type="${escapePeerAttr(frameType)}" from="${escapePeerAttr(input.from)}"${originAttr}>`;
   const attribution = input.origin === 'user' ? TEAM_FOOTER_USER_ORIGIN : TEAM_FOOTER_ATTRIBUTION;
-  const reply = `After completing your current task, decide whether/how to respond: reply with \`xc_message({to: "${input.from}"})\`.`;
+  const reply = `After completing your current task, decide whether/how to respond: reply with \`xc_relay({to: "${input.from}"})\`.`;
   return [
     openTag,
     body,

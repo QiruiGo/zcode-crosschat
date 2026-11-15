@@ -47,7 +47,12 @@ import { readTeam } from './teamstate.js';
 /** v0.2 协议帧白名单：未知具名帧一律拒收（W3 unblock-notice / W2 shutdown-request /
  * W4 idle-notification / W5 delivery-refused 均已列入）。
  * v0.5（DESIGN-V0.5 §3.1，M3 的白名单扩展 hunk）：第七值 lead-transfer——lead 移交/
- * 接管/释放的通知与回执帧（字段固定模板，R-15-4 可控字段纪律；只是通知，不带授权语义）。 */
+ * 接管/释放的通知与回执帧（字段固定模板，R-15-4 可控字段纪律；只是通知，不带授权语义）。
+ * v0.7（DESIGN-V0.7 §2.2，C6/C7 M1）：再扩 4 值——tool_request/tool_result（转办请求/
+ * 回投）与 approval_request/approval_result（审批通知/回执）。E4 §7.1 实测：未加白的
+ * 具名帧被读取面静默剔除（frame-rejected 审计），「传得到、收不到」——故 C6 帧型
+ * 必须进本表。**新帧型只做通知/回执，不带授权语义**（授权只认审批文件，§2.3/C7）；
+ * 混合版本降级（v0.6.1 端点收新帧）走 readMailboxDetailed 的剔除+审计路径，不崩。 */
 export const FRAME_TYPES = [
   'task-assignment',
   'task-receipt',
@@ -56,6 +61,10 @@ export const FRAME_TYPES = [
   'shutdown-request',
   'delivery-refused',
   'lead-transfer',
+  'tool_request',
+  'tool_result',
+  'approval_request',
+  'approval_result',
 ] as const;
 export type FrameType = (typeof FRAME_TYPES)[number];
 

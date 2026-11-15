@@ -107,7 +107,7 @@ describe('renderPeerEnvelope', () => {
 
   it('names the reply target in the footer instruction', () => {
     const text = renderPeerEnvelope(item());
-    expect(text).toContain('xc_peer_send({to: "alice"})');
+    expect(text).toContain('xc_relay({to: "alice"})');
   });
 });
 
@@ -254,12 +254,12 @@ describe('v0.6 渲染卫生（对抗检测砍除后的保留底线；round3 验�
 });
 
 describe('v0.5 队内域信封族（R-16）', () => {
-  it('renderTeamEnvelope：tag 含 type/from，页脚按 origin 分叉，回复指引指向 xc_message', () => {
+  it('renderTeamEnvelope：tag 含 type/from，页脚按 origin 分叉，回复指引指向 xc_relay', () => {
     const agent = renderTeamEnvelope({ frameType: 'task-receipt', from: 'alice', content: '{"type":"task-receipt"}' });
     expect(agent.startsWith(`<${TEAM_ENVELOPE_TAG} type="task-receipt" from="alice">`)).toBe(true);
     expect(agent).toContain('</crosschat-team-message>');
     expect(agent).toContain(TEAM_FOOTER_ATTRIBUTION);
-    expect(agent).toContain('xc_message({to: "alice"})');
+    expect(agent).toContain('xc_relay({to: "alice"})');
     expect(agent).not.toContain(TEAM_FOOTER_USER_ORIGIN);
 
     const user = renderTeamEnvelope({ frameType: 'chat', from: 'alice', content: '周五上线', origin: 'user' });

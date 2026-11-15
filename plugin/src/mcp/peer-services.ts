@@ -14,7 +14,7 @@
  * §3.b-2（SendMessage @34233387 / ListAgents @8463121）。
  *
  * 与队内工具的关系（DESIGN §8.2）：**发送面分立**。跨会话 peer 消息不经过
- * `xc_register`（队内注册），因此「两个无任何团队关系」的会话也能互发（硬验收 1）。
+ * `xc_identify`（队内注册），因此「两个无任何团队关系」的会话也能互发（硬验收 1）。
  * 队内 13 个 `xc_*` 工具一字不改。
  *
  * 装配形态：工具层只依赖 `PeerServices` 接口（测试注入假实现，不依赖真实管道）；
@@ -22,7 +22,7 @@
  * W4（入站三态/暂存区）、W5（队列/信封）四个并行模块——依赖方向 W1 → W6 单向
  * 无环（DESIGN §10.1 的依赖纪律）。
  *
- * 发送侧权限防线（R-17 / CC @34233402）：`xc_peer_send` 的工具描述内嵌反 launder
+ * 发送侧权限防线（R-17 / CC @34233402）：`xc_relay` 的工具描述内嵌反 launder
  * 警示；接收侧尾注里也有一份（D7 的对偶面，由 W5 的信封渲染器负责）。
  *
  * @module mcp/peer-services
@@ -185,14 +185,14 @@ export interface PeerSendInput {
   summary?: string;
 }
 
-/** v0.5（R-22）：xc_peer_read 入参——只读分页器，不消费。 */
+/** v0.5（R-22）：xc_read peer-msg scope 入参——只读分页器，不消费。 */
 export interface PeerReadInput {
   msgId: string;
   offset?: number;
   limit?: number;
 }
 
-/** v0.5（R-22）：xc_peer_read 返回。 */
+/** v0.5（R-22）：xc_read peer-msg scope 返回。 */
 export interface PeerReadResult {
   msgId: string;
   total: number;
@@ -322,7 +322,7 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
   /**
    * 列表口径（DESIGN §8.1 / §9.2）：**不指定 kind 时返回三类行**（self / member /
    * session）——CC 的 ListAgents 一次给出全部可寻址会话，且硬验收 2 要求
-   * 「`xc_peers` 里同时出现 `self(alice)` 与 `session(bob)`」以及「在队成员行与
+   * 「`xc_overview` peers 视图里同时出现 `self(alice)` 与 `session(bob)`」以及「在队成员行与
    * peer 行同表」。故缺省不是「只列 session」。
    */
   async function listRows(kind?: 'self' | 'member' | 'session'): Promise<PeerRow[]> {
@@ -649,7 +649,7 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
       // to 指向本会话（当前名或本会话的 formerNames 别名）时，消息经自己的管道
       // 回来，按当前入站策略处理：accept 档下回执 delivered 且真的入自己的队
       // （下一回合注入自己的上下文），hold/自动档下回执 held 后躺在自己的隔离区
-      // 里、xc_peer_inbox 永远看不到（红队观察到的「delivered 但永不入队」）。
+      // 里、peer 排空面永远看不到（红队观察到的「delivered 但永不入队」）。
       // 队内轴同款防护：tools.ts「cannot message yourself」。
       // 判定按 sessionId（不是 pid）：formerNames 别名行解析回来时 pid 相同，
       // 而 record.sessionId 是唯一稳定的会话身份。
@@ -660,7 +660,7 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
             to: input.to,
             name: resolved.row.name,
             message: `cannot send to yourself: "${resolved.row.name}" is this session ` +
-              "(the team axis xc_message refuses self-targeting the same way)",
+              "(the team axis relay refuses self-targeting the same way)",
           },
           `cannot send to yourself: "${resolved.row.name}" is this session`,
         );
@@ -841,7 +841,7 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
      * 现在：先只读窥视队列（readPeerQueue 不消费）→ 按每条在预算下的注入成本
      * （injectBlockCost，item 截断后长度）算到达序窗口（保底一条）→ 只 drain 窗口
      * 内条目；窗口外消息**留在队列**，`remaining` 与摘要行的「再拉一次」指针
-     * 因此名副其实（内容全程可经 xc_peer_read 取回，store 在接收入队时已落盘）。
+     * 因此名副其实（内容全程可经 xc_read({scope:"peer-msg"}) 取回，store 在接收入队时已落盘）。
      *
      * @param budget 调用方的注入预算（缺省按本会话 env 现算；工具层传入以保持
      *   「同一响应内窗口与排布同源」）。注入的假服务可忽略它（单测脚本化场景）。
@@ -904,8 +904,8 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
       const ids = input.ids ?? held.map((message) => message.item.msgId);
 
       if (input.action === "accept") {
-        // v0.5.1（BND-2/边界与-2 修复）：xc_peer_review 的 accept 是**收方的显式放行批准**
-        // （README L129「hold 进隔离区等 xc_peer_review 放行」）。释放时的重新裁决
+        // v0.5.1（BND-2/边界与-2 修复）：xc_review 的 accept 是**收方的显式放行批准**
+        // （README L129「hold 进隔离区等 xc_review 放行」）。释放时的重新裁决
         // （DESIGN §6.3「释放路径按当前策略重裁」）只保留 refuse 一道闸：当前策略已转为
         // refuse（含 kill-switch / opt-out）→ 仍拒放（fail-closed，收方已整体退出跨会话接收，
         // 智能体的 accept 不得越过）；**hold 不再回吞暂存件**——旧逻辑在显式 hold 策略下
@@ -1198,7 +1198,7 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
 /**
  * v0.5.2（二番战 peer-3 修复）：peer 花名的保留名闸，与队内轴同一张表同一个码。
  *
- * `identity.ts`（xc_register）与 `member-tools.ts`（xc_member_add）都用
+ * `identity.ts`（xc_identify）与 `tools-team.ts`（xc_team member-add）都用
  * `RESERVED_MEMBER_KEYS` 拒绝 lead/default：字面成员名会与 lead 角色语义、缺省
  * teamId 撞名。peer 轴此前只受 addressing 层 `PEER_RESERVED_NAMES`
  * （main/team-lead/user/system）约束，lead/default 可以注册也可以改名过去，
@@ -1230,7 +1230,7 @@ export { findLiveSessionIdHolder } from "../core/peerregistry.js";
  *    这条不变（`isPeerNameFree` 的原语义）。
  * 3. **占用者已死** ⇒ 记录已被惰性清扫摘除，花名可以接管，但必须留痕：审计
  *    `peer-name-reclaimed` 带上任身份，并把前任写进新记录的 `reclaimedFrom`
- *    （`xc_peers` 因此能显示「这个地址换过人」）。旧实现两者都没有——死花名
+ *    （`xc_overview` peers 视图因此能显示「这个地址换过人」）。旧实现两者都没有——死花名
  *    被静默替换（红队 peer-5）。
  *
  * @returns 接管过来的前任身份；花名此前无主时为 undefined。
@@ -1414,7 +1414,7 @@ export async function receivePeerMessage(
   }
 
   await appendPeerQueue(root, mine.sessionId, item);
-  // v0.5（F-3）：store 入队即落——排空即消费后 queue/inbox/held 皆空，xc_peer_read
+  // v0.5（F-3）：store 入队即落——排空即消费后 queue/inbox/held 皆空，xc_read peer-msg
   // 与 forwardOf 必须仍能解析原文与 origin 元数据（P2）。幂等；失败不阻断投递。
   // v0.5.2（SEC-5）：store 记录带收方 sessionId——机器全局 store 里 msgId 存在
   // 不等于「本会话收到过」，forwardOf 的所有权校验依赖本字段。
@@ -1458,16 +1458,16 @@ async function storeAfterEnqueue(root: string, item: PeerQueueItem, toSessionId:
 /**
  * v0.5.2（SCALE-2 修复）：入队闸丢弃原因 → 发给发送方的**可行动** detail。
  *
- * 背景：`receipt:"dropped"` 在 `xc_peer_send` 里不是错误（isError=false），
+ * 背景：`receipt:"dropped"` 在 `xc_relay` 里不是错误（isError=false），
  * 旧 detail 只有裸原因码（`queue-full` / `rate-limited`），红队实测「发送方
  * 工具响应成功但载荷 dropped，模型极易忽略」。现在把上限值与恢复动作写进
- * detail，并由 xc_peer_send 的摘要行透出（README 已知限制同步文档化）。
+ * detail，并由 xc_relay 的摘要行透出（README 已知限制同步文档化）。
  */
 export function admissionDropDetail(reason: string | undefined, maxQueueDepth: number): string {
   switch (reason) {
     case 'queue-full':
       return `queue-full: the receiver's pending peer queue is at its cap (${maxQueueDepth} messages) — `
-        + 'this message was NOT delivered; ask the receiver to drain with xc_peer_inbox, or retry later';
+        + 'this message was NOT delivered; ask the receiver to drain with xc_read({scope:"peer"}), or retry later';
     case 'rate-limited':
       return `rate-limited: the receiver's per-sender inbound rate limit is ${PEER_RATE_LIMIT} messages / `
         + `${PEER_RATE_WINDOW_MS / 1000}s — this message was NOT delivered; pace your sends (e.g. ~5s apart) and retry`;
@@ -1500,7 +1500,7 @@ export function countReleaseOutcomes(
 }
 
 /**
- * v0.5.1（BND-2 修复）：xc_peer_review 的摘要行必须反映**真实终态**。
+ * v0.5.1（BND-2 修复）：xc_review 的摘要行必须反映**真实终态**。
  * 旧版 accept/discard 一律报「影响 N 条」——still-held（未放行）也计入，
  * 红队 BND-2 据此把假成功定性为 P1（accept 3 次均「影响 1 条」而投递 0 条）。
  * accept 现按终态分组如实播报；list/discard 的旧文案不变（discard 的全部

@@ -47,7 +47,7 @@ import { findInflightWakeNonce } from "../core/registry.js";
 import { appendMailbox, createMessage, readMailbox } from "../core/mailbox.js";
 import { logEngineEvent } from "../core/log.js";
 import { withTeamLock } from "../core/lock.js";
-import { appendTaskHistory, memberOpenTasks, readTeam, writeTeam } from "../core/teamstate.js";
+import { appendTaskHistory, leadKeyOf, memberOpenTasks, readTeam, writeTeam } from "../core/teamstate.js";
 import {
   collectDependencyOutputs,
   deadlockedDependents,
@@ -60,10 +60,28 @@ import { refreshSnapshot } from "../core/snapshot.js";
 import {
   DEFAULT_TEAM_ID,
   TERMINAL_TASK_STATUSES,
+  type TaskStatus,
   type TeamMessage,
   type TeamState,
 } from "../core/types.js";
 import { attemptWake } from "../engine/wake.js";
+// v0.7（C8，DESIGN-V0.7.md §4）：离线判定纯函数 + 只读 peer 扫描。
+import { peerRootFromEnv } from "../core/peerdir.js";
+import { scanPeers, type PeerScanResult } from "../core/peerregistry.js";
+import { lastProgressTs } from "../core/stall.js";
+import {
+  memberLiveness,
+  offlineSuggestion,
+  offlineThresholdMsFromEnv,
+  offlineVerdict,
+  type MemberLiveness,
+  type OfflineEvidence,
+  type OfflineMember,
+  type OfflineTaskInfo,
+} from "../core/offline.js";
+// v0.7（C6/C7，DESIGN-V0.7.md §2.5/§3.3）：转办台账过期节拍 + 终态清理。
+import { cleanupToolArtifacts, expireToolRequests, TOOL_APPROVAL_KEEP_MS } from "../core/toolledger.js";
+import { buildApprovalResult, buildRefusedToolResult } from "../core/toolrelay.js";
 
 // ─────────────────────────── 配置解析（V18 同款防御） ───────────────────────────
 
@@ -143,6 +161,12 @@ export interface TaskEdgeOutcome {
   unblocked: UnblockedTaskInfo[];
   /** v0.5.3（A3 修复）：随终态报告被解除的死锁下游。 */
   deadlocked: DeadlockedTaskInfo[];
+  /**
+   * v0.7（C8，DESIGN-V0.7.md §4.2）：本轮被判「成员离线」的属主及其名下被扫任务
+   * （进程死硬证据 / 空闲超时兜底）。进工具 payload 与 engine.jsonl `task-offline`
+   * 审计；lead 另收一条转交通知（邮箱 + 唤醒计划）。空数组 = 无离线命中。
+   */
+  offline: OfflineMember[];
 }
 
 /** 锁内收集、锁外执行的唤醒计划项。 */
@@ -160,21 +184,35 @@ interface WakePlanItem {
  * 清扫 + 回执（调用方持团队锁）。回执路由 = task.createdBy（派发方）——§5.4 的
  * 「lead 邮箱」在 lead 主导派发流中即 createdBy（与 v0.1.0 回执路由 tools.ts §2.9-1
  * 一致）。唤醒计划返回给调用方在锁外执行。
+ *
+ * v0.7（C8，DESIGN-V0.7.md §4.1/§4.2）：`opts.scan` 给出时（调用方锁外做好的**只读**
+ * peer 扫描）对本轮被扫任务逐条算 offlineVerdict——`process-dead`（进程死硬证据，
+ * 免空闲阈值）或 `idle-timeout`（240min 兜底）命中的属主，除 createdBy 回执外**额外
+ * 通知 lead**（一条成员级转交通知 + 唤醒计划），并进 `offline` 返回面 / `task-offline`
+ * 审计。回池路径本身不新开：仍是 stale sweeper 的 revokeAttempt（§4.2「复用 sweeper」）。
+ * `opts` 缺省 = 不产离线判定（旧调用点零行为变化）。
  */
 async function sweepStaleTasksLocked(
   stateRoot: string,
   team: TeamState,
   thresholdMs: number,
   now: number,
-): Promise<{ swept: SweptTaskInfo[]; wakePlan: WakePlanItem[] }> {
+  opts: { scan?: PeerScanResult; offlineThresholdMs?: number } = {},
+): Promise<{ swept: SweptTaskInfo[]; wakePlan: WakePlanItem[]; offline: OfflineMember[] }> {
   const teamId = team.teamId;
   const candidates = staleTasks(team.tasks, now, thresholdMs);
   const swept: SweptTaskInfo[] = [];
   const wakePlan: WakePlanItem[] = [];
   const seenRecipients = new Set<string>();
+  // C8：本轮离线命中的属主（按成员聚合——一名成员多任务只通知 lead 一次）。
+  const offlineHits = new Map<
+    string,
+    { member: TeamState["members"][number]; liveness: MemberLiveness; evidence: OfflineEvidence; tasks: OfflineTaskInfo[] }
+  >();
   for (const task of candidates) {
     // 豁免条件（§5.4）：该成员有在途 wake nonce → 本次跳过（唤醒回合可能仍在跑，
-    // 其下一份 report/心跳会刷新 updatedAt）。
+    // 其下一份 report/心跳会刷新 updatedAt）。进程死证据**不绕过**豁免（nonce 有
+    // TTL，保守优先；§4.2 边界）。
     if (task.assignee !== null) {
       const inflight = await findInflightWakeNonce(stateRoot, task.assignee, { teamId, now });
       if (inflight !== undefined) continue;
@@ -182,6 +220,26 @@ async function sweepStaleTasksLocked(
     const assigneeBefore = task.assignee;
     const revokedAttemptId = task.attemptId;
     const staleMinutes = Math.max(1, Math.round((now - task.updatedAt) / 60_000));
+    // C8（§4.1）：活性 + 离线判据。必须在 revokeAttempt **之前**取（重置后 assignee
+    // 置 null、status 回 pending，判据就归不到属主名下了）。
+    let offlineHit:
+      | { liveness: MemberLiveness; evidence: OfflineEvidence; idleForMin: number; status: TaskStatus }
+      | undefined;
+    if (opts.scan !== undefined && opts.offlineThresholdMs !== undefined && assigneeBefore !== null) {
+      const member = team.members.find((m) => m.key === assigneeBefore);
+      if (member !== undefined) {
+        const liveness = memberLiveness(member, opts.scan, now);
+        const verdict = offlineVerdict(task, member, liveness, now, opts.offlineThresholdMs);
+        if (verdict.offline && verdict.evidence !== null) {
+          offlineHit = {
+            liveness,
+            evidence: verdict.evidence,
+            idleForMin: Math.max(1, Math.round((now - lastProgressTs(task)) / 60_000)),
+            status: task.status,
+          };
+        }
+      }
+    }
     if (!revokeAttempt(task, { by: "engine", now, event: "revoked-stale" })) continue;
     swept.push({ taskId: task.id, assignee: assigneeBefore, revokedAttemptId, staleMinutes });
     // 回执帧：attempt 关联保留在 JSON 内容（与 tools.ts receiptText 同构；不带
@@ -222,8 +280,104 @@ async function sweepStaleTasksLocked(
       revokedAttemptId,
       receiptTo: task.createdBy,
     });
+    if (offlineHit !== undefined && assigneeBefore !== null) {
+      const entry = offlineHits.get(assigneeBefore) ?? {
+        member: team.members.find((m) => m.key === assigneeBefore)!,
+        liveness: offlineHit.liveness,
+        evidence: offlineHit.evidence,
+        tasks: [],
+      };
+      entry.tasks.push({ taskId: task.id, title: task.title, status: offlineHit.status, idleForMin: offlineHit.idleForMin });
+      offlineHits.set(assigneeBefore, entry);
+    }
   }
-  return { swept, wakePlan };
+  const offline = await notifyOfflineLeadLocked(stateRoot, team, offlineHits, wakePlan, now);
+  return { swept, wakePlan, offline };
+}
+
+/**
+ * C8（§4.2）：离线属主的 lead 转交通知（调用方持团队锁；邮箱帧 + 唤醒计划项）。
+ *
+ * 帧型 = `task-receipt`（W5 白名单既有成员，任务域引擎回执；**不新添帧型**——帧型属
+ * M1 的 mailbox.ts，且 C6/C7 的四个新帧型都是转办/审批语义，与离线转交无关）。载荷在
+ * stale-swept 回执之外多带一个 `offline` 块（属主/证据/活性/任务清单/转交建议），
+ * status 仍为 "failed"——不触发 mailbox.staleCompletedReceiptTaskIds 的
+ * 「completed 回执 vs 未完成任务板矛盾」检测（该检测只认 completed）。
+ *
+ * 两条跳过规则（保守，避免惊动与自娱）：
+ * 1. 离线属主**就是 lead 自己**——通知 lead「你没了」没有行动意义（其任务照常回池 +
+ *    createdBy 回执 + overview 行仍在，信息不丢）；
+ * 2. 该属主本轮没有被扫任务（无 offlineHits 条目）——本函数只被命中路径调用。
+ *
+ * 通知按**成员**聚合：一名成员名下多任务只发一条（任务 id 全列在帧里），
+ * 唤醒计划同一形态（reason "task-offline"，非守则场景）。
+ */
+async function notifyOfflineLeadLocked(
+  stateRoot: string,
+  team: TeamState,
+  offlineHits: Map<
+    string,
+    { member: TeamState["members"][number]; liveness: MemberLiveness; evidence: OfflineEvidence; tasks: OfflineTaskInfo[] }
+  >,
+  wakePlan: WakePlanItem[],
+  now: number,
+): Promise<OfflineMember[]> {
+  const out: OfflineMember[] = [];
+  if (offlineHits.size === 0) return out;
+  const teamId = team.teamId;
+  // lead 判定走 core 单一事实源（teamstate.leadKeyOf，v0.7 C7 落位；与 mcp/tools-team.ts
+  // 的同名判断同口径）——本模块不 import mcp 面，避免 tools-team ↔ task-edges 模块环。
+  const leadKey = leadKeyOf(team);
+  for (const [key, hit] of offlineHits) {
+    const idleForMin = hit.tasks.reduce((max, t) => (t.idleForMin > max ? t.idleForMin : max), 0);
+    out.push({
+      key,
+      sessionId: hit.member.sessionId ?? null,
+      liveness: hit.liveness,
+      evidence: hit.evidence,
+      idleForMin,
+      tasks: hit.tasks,
+    });
+    if (key === leadKey) continue; // 规则 1：不通知 lead 关于它自己
+    const notice = JSON.stringify({
+      type: "task-receipt",
+      teamId,
+      taskId: hit.tasks[0]!.taskId,
+      attemptId: null,
+      status: "failed",
+      result: null,
+      error: `offline-handover: member "${key}" looks gone (${hit.evidence}) — open task(s) requeued to the pending pool`,
+      evidence: [],
+      offline: {
+        member: key,
+        evidence: hit.evidence,
+        liveness: hit.liveness,
+        idleForMin,
+        taskIds: hit.tasks.map((t) => t.taskId),
+        suggestion: offlineSuggestion(hit.evidence),
+      },
+    });
+    const msg = createMessage("engine", leadKey, notice, { deliveryClaimedAt: now });
+    await appendMailbox(stateRoot, teamId, leadKey, msg);
+    wakePlan.push({
+      to: leadKey,
+      sessionId: team.members.find((m) => m.key === leadKey)?.sessionId ?? null,
+      reason: "task-offline",
+      receiptIds: [msg.id],
+      ticket: notice,
+    });
+    await logEngineEvent(stateRoot, {
+      event: "task-offline",
+      teamId,
+      member: key,
+      evidence: hit.evidence,
+      liveness: hit.liveness,
+      idleForMin,
+      taskIds: hit.tasks.map((t) => t.taskId),
+      noticeTo: leadKey,
+    });
+  }
+  return out;
 }
 
 // ─────────────────────────── ② 依赖解除（E-b ②，completed 专属） ───────────────────────────
@@ -473,6 +627,8 @@ export function sweepTickMsFromThreshold(thresholdMs: number): number {
 export interface StaleSweepSummary {
   swept: number;
   skipped: boolean;
+  /** v0.7（C8，§4.2）：本轮被判离线的属主数（0 = 无离线命中；通知/审计细节在 engine.jsonl `task-offline`）。 */
+  offline: number;
 }
 
 /**
@@ -495,22 +651,99 @@ export async function sweepStaleTasksOnce(deps: ToolDeps, now: number = Date.now
     // 无锁预检：没有僵尸候选就不碰锁（常态节拍的零成本路径）。
     const probe = await readTeam(stateRoot, teamId);
     if (probe === undefined || staleTasks(probe.tasks, now, thresholdMs).length === 0) {
-      return { swept: 0, skipped: true };
+      return { swept: 0, skipped: true, offline: 0 };
     }
+    // v0.7（C8，§4.1/§4.2）：只读 peer 扫描在锁外做（查询路径无清扫副作用，
+    // peerregistry.ts scanPeers 的 sweep:false 契约），活性/离线判据在锁内纯函数完成。
+    const scan = await scanPeers(peerRootFromEnv(env), now, { sweep: false });
+    const offlineThresholdMs = offlineThresholdMsFromEnv(env, thresholdMs).ms;
     const outcome = await withTeamLock(stateRoot, teamId, async () => {
       const team = await readTeam(stateRoot, teamId);
-      if (team === undefined) return { swept: [] as SweptTaskInfo[], wakePlan: [] as WakePlanItem[] };
-      const sweep = await sweepStaleTasksLocked(stateRoot, team, thresholdMs, now);
+      if (team === undefined) {
+        return { swept: [] as SweptTaskInfo[], wakePlan: [] as WakePlanItem[], offline: [] as OfflineMember[] };
+      }
+      const sweep = await sweepStaleTasksLocked(stateRoot, team, thresholdMs, now, { scan, offlineThresholdMs });
       if (sweep.swept.length > 0) await writeTeam(stateRoot, team);
       return sweep;
     });
     await runWakePlan(deps, outcome.wakePlan);
     if (outcome.swept.length > 0) await refreshSnapshotBestEffort(deps);
-    return { swept: outcome.swept.length, skipped: false };
+    return { swept: outcome.swept.length, skipped: false, offline: outcome.offline.length };
   } catch {
     // 永不抛出（withTaskEdges 同款纪律）：清扫面失败不影响任何工具结果，
     // 邮箱/团队真源兜底，下一轮节拍重算。
-    return { swept: 0, skipped: true };
+    return { swept: 0, skipped: true, offline: 0 };
+  }
+}
+
+/**
+ * v0.7 C6/C7（DESIGN-V0.7 §2.5/§2.6/§3.3，M3）：转办台账节拍——过期标记 + 回投 +
+ * 终态清理。与 {@link sweepStaleTasksOnce} 同一个 setInterval 节拍（无新定时器），
+ * 锁外 best-effort（台账/邮箱追加的原子性由 JSONL O_APPEND + 原子 rename 承担；
+ * 失败不影响任务清扫，下轮重算）：
+ *
+ * 1. **过期**（§2.6 R5）：pending/approved 且 now ≥ expiresAt 的台账标 expired，
+ *    回投请求方 `tool_result{status:"refused", reason:"request expired"}`（A 不在线
+ *    躺箱的场景由本节拍收口——队内轴无活性闸，E4 §6.4）；lead 收过 approval_request
+ *    通知的，补一条 `approval_result{decision:"expired"}` 收尾（§3.3）。
+ * 2. **清理**（§3.3）：终态（executed/error/refused/denied/expired）台账与审批文件
+ *    保留 TOOL_APPROVAL_KEEP_MS（7 天，常量不新增 env）后删除；邮箱帧不预清理
+ *    （JSONL 追加真源纪律，v0.6 起不做 TTL）。
+ *
+ * 永不抛出：任何 IO 失败吞掉返回零计数（与 sweepStaleTasksOnce 同纪律）。
+ */
+export async function sweepToolRequestsOnce(deps: ToolDeps, now: number = Date.now()): Promise<{ expired: number; cleanedLedgers: number; cleanedApprovals: number }> {
+  const { stateRoot } = deps;
+  const empty = { expired: 0, cleanedLedgers: 0, cleanedApprovals: 0 };
+  try {
+    const expiredList = await expireToolRequests(stateRoot, now);
+    for (const ledger of expiredList) {
+      const frame = buildRefusedToolResult(ledger.requestId, ledger.tool, ledger.to, "request expired", now);
+      const msg = createMessage(ledger.to, ledger.from, JSON.stringify(frame), { deliveryClaimedAt: now });
+      await appendMailbox(stateRoot, DEFAULT_TEAM_ID, ledger.from, msg);
+      await logEngineEvent(stateRoot, {
+        event: "tool-expired",
+        teamId: DEFAULT_TEAM_ID,
+        requestId: ledger.requestId,
+        from: ledger.from,
+        to: ledger.to,
+        tool: ledger.tool,
+        expiresAt: ledger.expiresAt,
+        receiptMessageId: msg.id,
+      });
+      // §3.3：lead 收过待批通知 → approval_result{expired} 收尾。
+      if (ledger.approvalNotifiedAt !== undefined) {
+        const team = await readTeam(stateRoot, DEFAULT_TEAM_ID);
+        const leadKey = team !== undefined ? leadKeyOf(team) : null;
+        if (leadKey !== null && leadKey !== "") {
+          const closeFrame = buildApprovalResult(ledger.requestId, "expired", "engine", now);
+          const closeMsg = createMessage("engine", leadKey, JSON.stringify(closeFrame), { deliveryClaimedAt: now });
+          await appendMailbox(stateRoot, DEFAULT_TEAM_ID, leadKey, closeMsg);
+          await logEngineEvent(stateRoot, {
+            event: "tool-approval-request",
+            teamId: DEFAULT_TEAM_ID,
+            requestId: ledger.requestId,
+            to: leadKey,
+            closedAs: "expired",
+            messageId: closeMsg.id,
+          });
+        }
+      }
+    }
+    const cleaned = await cleanupToolArtifacts(stateRoot, now);
+    if (cleaned.ledgers.length > 0 || cleaned.approvals.length > 0) {
+      await logEngineEvent(stateRoot, {
+        event: "tool-artifacts-cleaned",
+        teamId: DEFAULT_TEAM_ID,
+        ledgers: cleaned.ledgers.length,
+        approvals: cleaned.approvals.length,
+        keepMs: TOOL_APPROVAL_KEEP_MS,
+      });
+    }
+    return { expired: expiredList.length, cleanedLedgers: cleaned.ledgers.length, cleanedApprovals: cleaned.approvals.length };
+  } catch {
+    // 永不抛出（清扫面纪律）：下轮节拍重算。
+    return empty;
   }
 }
 
@@ -518,11 +751,13 @@ export async function sweepStaleTasksOnce(deps: ToolDeps, now: number = Date.now
  * 启动周期清扫定时器（server.ts 在 main() 里调用；单测可直接驱动 sweepStaleTasksOnce）。
  * 节拍由 XC_STALE_TASK_MINUTES 推导（sweepTickMsFromThreshold）；定时器 unref——
  * 不改变进程退出语义（EOF 纪律的 shutdown 仍以 process.exit 收口）。
+ * v0.7（C6/C7）：同一节拍顺带扫转办台账（过期标记+回投+7 天终态清理）——无新定时器。
  */
 export function startStaleSweeper(deps: ToolDeps, intervalMs?: number): NodeJS.Timeout {
   const tick = intervalMs ?? sweepTickMsFromThreshold(staleThresholdMsFromEnv(deps.env));
   const timer = setInterval(() => {
     void sweepStaleTasksOnce(deps);
+    void sweepToolRequestsOnce(deps);
   }, tick);
   timer.unref();
   return timer;
@@ -560,16 +795,26 @@ export function withTaskEdges(core: ToolCore, deps: ToolDeps): ToolCore {
 
       const teamId = DEFAULT_TEAM_ID;
       const now = Date.now();
-      const outcome: TaskEdgeOutcome = { swept: [], unblocked: [], deadlocked: [] };
+      const outcome: TaskEdgeOutcome = { swept: [], unblocked: [], deadlocked: [], offline: [] };
       try {
         if (TERMINAL_TASK_STATUSES.includes(status as (typeof TERMINAL_TASK_STATUSES)[number])) {
           // E-b 边沿：① 清扫 → ② 依赖解除（completed）→ ②' 依赖死锁解除（failed）
           // （v0.5.3 A3 修复）；唤醒统一锁外。
+          // v0.7（C8，§4.2）：离线判定的 peer 扫描在**锁外**做（只读 scanPeers，
+          // 不持团队锁），结果随 sweepStaleTasksLocked 进锁内判据。
+          const scan = await scanPeers(peerRootFromEnv(env), now, { sweep: false });
           const plan = await withTeamLock(stateRoot, teamId, async () => {
             const team = await readTeam(stateRoot, teamId);
             if (team === undefined) return [] as WakePlanItem[];
-            const sweep = await sweepStaleTasksLocked(stateRoot, team, staleThresholdMsFromEnv(env), now);
+            const sweep = await sweepStaleTasksLocked(
+              stateRoot,
+              team,
+              staleThresholdMsFromEnv(env),
+              now,
+              { scan, offlineThresholdMs: offlineThresholdMsFromEnv(env, staleThresholdMsFromEnv(env)).ms },
+            );
             outcome.swept = sweep.swept;
+            outcome.offline = sweep.offline;
             if (sweep.swept.length > 0) await writeTeam(stateRoot, team);
             if (status === "completed") {
               const unblock = await unblockDependentsLocked(stateRoot, team, taskId, now);
@@ -607,6 +852,7 @@ export function withTaskEdges(core: ToolCore, deps: ToolDeps): ToolCore {
       if (outcome.swept.length > 0) edges["swept"] = outcome.swept;
       if (outcome.unblocked.length > 0) edges["unblocked"] = outcome.unblocked;
       if (outcome.deadlocked.length > 0) edges["deadlocked"] = outcome.deadlocked;
+      if (outcome.offline.length > 0) edges["offline"] = outcome.offline; // v0.7（C8，§4.2）
       if (Object.keys(edges).length === 0) return result;
       return {
         ...result,

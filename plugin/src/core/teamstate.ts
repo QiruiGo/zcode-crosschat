@@ -65,7 +65,7 @@ function parseTeamText(raw: string, teamId: string): { state?: TeamState; defect
 //    重写治好），`lastTeamRecoveryNotice`/`teamRecoveryWarning` 供工具面披露。
 // 2. 持续矛盾：回退后的任务板与邮箱里已发出的 completed 回执矛盾
 //    （`completedReceiptTaskIds` 纯探测），只要矛盾存在（含 server 重启后）就
-//    可被 xc_status / xc_claim 检出，不依赖台账内存。
+//    可被 xc_overview / xc_claim 检出，不依赖台账内存。
 // 回执链只用于**检测与披露**，不改写任务状态（回执内容是协作消息，不能当真源
 // 写回——伪造回执不得变成伪造完成态）。
 // ---------------------------------------------------------------------------
@@ -265,7 +265,7 @@ export async function writeTeam(stateRoot: string, team: TeamState): Promise<voi
   const content = JSON.stringify(team, null, 2);
   await writeFileAtomic(teamFile(stateRoot, team.teamId), content);
   // v0.5.2（故障注-1 二番战修复）：真源成功落盘 = 备份恢复残留已被治好，
-  // 清除该团队的恢复披露台账（xc_status 的恢复告警随之消失）。
+  // 清除该团队的恢复披露台账（xc_overview 的恢复告警随之消失）。
   recoveryNotices.delete(recoveryNoticeKey(stateRoot, team.teamId));
   try {
     await writeFileAtomic(teamBackupFile(stateRoot, team.teamId), content);
@@ -380,6 +380,16 @@ export function unsatisfiedDependencies(tasks: readonly Task[], dependencies: re
 /** Open (claimed/in_progress/blocked——v0.6 C2 起含 blocked 单开槽位) tasks owned by one member. */
 export function memberOpenTasks(tasks: readonly Task[], assignee: string): Task[] {
   return tasks.filter((task) => task.assignee === assignee && OPEN_TASK_STATUSES.includes(task.status));
+}
+
+/**
+ * v0.7（C7，DESIGN-V0.7 §3.2）：lead 判定（team.leadKey，未设置时 founder 视为 lead）——
+ * core 侧（审批门/台账清扫）需要它而 core 不能 import mcp，故在 core 提供单一事实源；
+ * mcp/tools-team.ts 的原有第二份实现已改为转出本函数（v0.7 集成收口去重），
+ * 两处不再各写一份。
+ */
+export function leadKeyOf(team: TeamState): string {
+  return team.leadKey ?? team.founderKey;
 }
 
 /** Append one history entry and bump updatedAt. */
@@ -663,7 +673,7 @@ export async function noteTeamReset(stateRoot: string, teamId: string): Promise<
     `team.json was missing while previous-era state still exists in teams/${teamId}/ `
     + `(${inboxEntries.length} inbox file(s)${hasSnapshot ? ' + snapshot.json' : ''}); `
     + 'a new team era was created — old envelopes may reference tasks that no longer exist '
-    + '(orphan warnings appear in xc_status)'
+    + '(orphan warnings appear in xc_overview)'
   );
 }
 

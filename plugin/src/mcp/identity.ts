@@ -1,5 +1,5 @@
 /**
- * M3 identity：连接绑定身份表 + xc_register 双路径校验（DESIGN.md §2.3、§2.7-3）。
+ * M3 identity：连接绑定身份表 + xc_identify 双路径校验（DESIGN.md §2.3、§2.7-3）。
  *
  * 身份模型（§2.3）：
  * - 身份绑定在 stdio 连接上，不绑进程：stdio 一条连接=一个客户端会话；无头回合
@@ -20,7 +20,7 @@
  * - v0.5.3（安全对-3/a8 修复）：注册成功后把 boundName 盖到机器全局基记录
  *   peers/base/<sid>.json（options.peerRoot 给出时）——peer 轴据此识别「已绑定
  *   队内身份的 sid」（v0.6 起不再强制验令牌，仅观测面保留标记）。
- * - 锁序全局固定：registry → team（§2.7-3）。xc_register 是唯一同时持两把锁的
+ * - 锁序全局固定：registry → team（§2.7-3）。xc_identify 是唯一同时持两把锁的
  *   路径，直接用 M1 的 withRegistryThenTeamLocks（先 registry 绑名、后 team 入队；
  *   join 失败经 unbindName 回滚绑名——M1 专门为回滚设计的条件删除）。
  *
@@ -56,7 +56,7 @@ export { DEFAULT_TEAM_ID };
 export const STALE_LASTSEEN_WARN_MS = 10 * 60 * 1000;
 
 /**
- * 协议摘要：对协议要素的规范串做 sha256 截断，xc_register 返回给调用方，
+ * 协议摘要：对协议要素的规范串做 sha256 截断，xc_identify 返回给调用方，
  * 让两端可核对各自理解的协议一致（DESIGN §2.8 返回字段 protocolDigest）。
  */
 const PROTOCOL_CANON = [
@@ -134,13 +134,13 @@ export interface RegisterOutcome {
 }
 
 /**
- * xc_register 主体（双路径校验 + join default team）。
+ * xc_identify 主体（双路径校验 + join default team）。
  * 成功后由本函数把身份绑定到 connectionKey（§2.3-2：校验通过即绑定）。
  * 抛出的 LockBusyError 由 tools.ts runCore 映射为 {error:"busy"} 信封。
  *
  * v0.5.3（安全对-1/a6 修复）：`options.peerRoot` 缺省 undefined——给出时（生产装配
  * 由 tools.ts 传 `peerRootFromEnv(deps.env)`），注册成功后会在机器全局基记录
- * `peers/base/<sid>.json` 上盖 `boundName` 队内绑定标记；peer 轴（xc_peer_register）
+ * `peers/base/<sid>.json` 上盖 `boundName` 队内绑定标记；peer 轴（xc_identify）
  * 据此识别「该 sid 已是队内成员身份」并强制验 regToken（跨工作区也可见）。
  */
 export async function xcRegister(
@@ -183,8 +183,8 @@ export async function xcRegister(
     let sidHolder: PeerRecord | undefined;
 
     // ---- v0.2（DESIGN-V0.2 §7.4-I5/§7.3.3）：removed 成员的注册一律拒绝 ----
-    // xc_member_stop 后花名不释放（roster 记录保留）；重新启用必须由 lead 走
-    // xc_member_add 幂等重供给——供给流程会先把 roster state 置回 provisioning
+    // xc_team member-stop 后花名不释放（roster 记录保留）；重新启用必须由 lead 走
+    // xc_team member-add 幂等重供给——供给流程会先把 roster state 置回 provisioning
     // 再发欢迎 prompt（W2 契约 §6.4），故正常的重供给注册不受此门影响。
     // 先于 wake/hook 分支：不给 removed 会话消费任何一次性 nonce 的机会。
     const teamNow = await readTeam(stateRoot, teamId);
@@ -196,8 +196,8 @@ export async function xcRegister(
           name: agentKey,
           sessionId,
           teamId,
-          message: `member "${agentKey}" was removed from team "${teamId}" (xc_member_stop); ` +
-            "re-enable it via the lead's xc_member_add (idempotent reprovision)",
+          message: `member "${agentKey}" was removed from team "${teamId}" (xc_team member-stop); ` +
+            "re-enable it via the lead's xc_team member-add (idempotent reprovision)",
         });
       }
     }
@@ -335,7 +335,7 @@ export async function xcRegister(
 
     // ---- v0.5.3（安全对-3/a8 修复）：队内绑定标记盖章 ----
     // 注册成功 ⇒ 该 sid 已是队内成员身份。把 boundName 盖到机器全局基记录
-    //（peers/base/<sid>.json，跨工作区可见）上，peer 轴 xc_peer_register 据此识别
+    //（peers/base/<sid>.json，跨工作区可见）上，peer 轴 xc_identify 据此识别
     //「受保护 sid」并强制验锚定令牌——堵住「任意花名 + 队内成员真 sid」的 peer
     // 冒充。基记录缺失时按注册事实补建（cwd=进程工作区；regToken 与 workspace 侧
     // 锚定记录同值）；盖章失败只审计不回滚注册（保护是尽力面，注册本身已验证）。

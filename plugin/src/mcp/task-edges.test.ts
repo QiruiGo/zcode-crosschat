@@ -12,16 +12,17 @@
  * - 永不抛出：基座错误信封原样透传、不触发边沿。
  */
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { payloadOf, type ToolResult } from "./protocol.js";
 import { createToolCore, type ToolCore, type ToolDeps } from "./core.js";
-import { withTaskEdges } from "./task-edges.js";
+import { sweepStaleTasksOnce, withTaskEdges } from "./task-edges.js";
 import { readMailbox } from "../core/mailbox.js";
 import { createWakeNonce, writeSession } from "../core/registry.js";
 import { readTeam, writeTeam } from "../core/teamstate.js";
 import type { TeamState } from "../core/types.js";
+import { localPidDomain } from "../core/peerdir.js";
 
 // v0.4（DESIGN-V0.4 §2.4）：attemptWake 的 spawn 配置解析改为「env → 自动探测」后，
 // 本文件「XC_WAKE_ENABLED=true 且未配 exe → spawn 同步失败」的原前提会被
@@ -492,5 +493,293 @@ describe("withTaskEdges: 透传与错误隔离（§11.1 基座不动）", () => 
     );
     expect(res["status"]).toBe("completed");
     expect(existsSync(snapshotFile())).toBe(true);
+  });
+});
+
+// ─────────────────────────── v0.7（C8）：离线判定 + lead 转交通知 ───────────────────────────
+// DESIGN-V0.7.md §4.1/§4.2 / AC7+AC8：进程死（pid-dead 硬证据）免空闲阈值、心跳过期/
+// 无记录不得判离线（成员是回合制瞬态）、回池复用 stale sweeper、lead 另收转交通知、
+// 在途 nonce 豁免不被绕过、离线属主是 lead 自己时不自我通知。
+
+/** 一个确定不存在的 pid（pidAlive → ESRCH → false）：进程死硬证据。 */
+const C8_DEAD_PID = 2_147_483_646;
+
+/** 在临时 peer 根里落一条注册记录（lastSeen 由调用方给：陈旧 = 死记录）。 */
+function writePeerRecordFor(peerRoot: string, sid: string, pid: number, lastSeen: number): void {
+  mkdirSync(join(peerRoot, "sessions"), { recursive: true });
+  writeFileSync(
+    join(peerRoot, "sessions", `${pid}.json`),
+    JSON.stringify({
+      pid,
+      sessionId: sid,
+      messagingSocketPath: "\\\\.\\pipe\\LOCAL\\xcc-msg-c8test",
+      pidDomain: localPidDomain(),
+      peerProtocol: 1,
+      peerFeatures: [],
+      kind: "bg",
+      formerNames: [],
+      startedAt: Date.now() - 3_600_000,
+      lastSeen,
+    }),
+    "utf8",
+  );
+}
+
+/** C8 测试装配：peer 根指向临时目录（XC_MESSAGING_DIR 优先于一切回退路径）。 */
+function makeC8Core(): { core: ToolCore; deps: ToolDeps; peerRoot: string } {
+  const peerRoot = join(workDir, "peer-root");
+  mkdirSync(join(peerRoot, "sessions"), { recursive: true });
+  const env: NodeJS.ProcessEnv = { XC_MESSAGING_DIR: peerRoot };
+  const deps: ToolDeps = { stateRoot, workspace: workDir, env };
+  return { core: withTaskEdges(createToolCore(deps), deps), deps, peerRoot };
+}
+
+/** 一名成员认领并推进到 in_progress（C8 剧本的最小在途任务）。 */
+async function claimForMember(core: ToolCore, conn: string, taskId: string): Promise<string> {
+  const claim = unwrap(await core.xc_claim({ taskId }, conn));
+  const attemptId = claim["attemptId"] as string;
+  unwrap(await core.xc_report({ taskId, attemptId, status: "in_progress" }, conn));
+  return attemptId;
+}
+
+function offlineAuditRows(): Array<Record<string, unknown>> {
+  return readEngineEvents().filter((e) => e["event"] === "task-offline");
+}
+
+/**
+ * 把该成员开放任务的「最后进展时刻」整体回拨（updatedAt + history 末条 + createdAt）——
+ * offlineVerdict 的 idle 取自 stall.lastProgressTs（history 末条优先），只回拨
+ * updatedAt 会让 idle ≈ 0（stale 回收了但判据不命中），这正是本测试要防的暗礁。
+ */
+async function backdateLastProgress(memberKey: string, minusMs: number): Promise<void> {
+  const team = await mutateTeam((t) => {
+    const open = t.tasks.find((x) => x.assignee === memberKey && (x.status === "claimed" || x.status === "in_progress"));
+    if (open === undefined) return;
+    open.updatedAt = Date.now() - minusMs;
+    open.createdAt = Math.min(open.createdAt, Date.now() - minusMs);
+    for (const entry of open.history) entry.ts = Math.min(entry.ts, Date.now() - minusMs);
+  });
+  await writeTeam(stateRoot, team);
+}
+
+async function mailboxOf(key: string): Promise<Array<{ content: string }>> {
+  return readMailbox(stateRoot, "default", key);
+}
+
+describe("withTaskEdges/sweeper：C8 离线转交（进程死硬证据）", () => {
+  it("属主进程死（pid-dead）→ 任务回池 + lead 收转交通知 + task-offline 审计", async () => {
+    const { core, deps, peerRoot } = makeC8Core();
+    await hookRegister(core, "conn-a", "a", "sess_a");
+    await hookRegister(core, "conn-m1", "m1", "sess_m1");
+    const t1 = (unwrap(await core.xc_dispatch({ to: "m1", title: "平方表", prompt: "算 1..10 平方" }, "conn-a"))["taskId"]) as string;
+    const attemptId = await claimForMember(core, "conn-m1", t1);
+    // 崩溃残留：m1 的 sid 持有进程亡、记录未优雅摘除（优雅退出会摘记录，不可检出）。
+    writePeerRecordFor(peerRoot, "sess_m1", C8_DEAD_PID, Date.now() - 3_600_000);
+    await backdateOpenTask("m1", 40 * 60_000); // 超 stale 30min → 本轮清扫（回池快刀仍是 stale 的职责）
+
+    const summary = await sweepStaleTasksOnce(deps);
+    expect(summary).toMatchObject({ swept: 1, skipped: false, offline: 1 });
+
+    // 任务回 pending 池（引擎特权重置，attempt 历史保留在 history）。
+    const team = (await readTeam(stateRoot, "default"))!;
+    const t1rec = team.tasks.find((t) => t.id === t1)!;
+    expect(t1rec.status).toBe("pending");
+    expect(t1rec.assignee).toBeNull();
+    expect(t1rec.attemptId).toBeNull();
+    expect(t1rec.history[t1rec.history.length - 1]!.event).toBe("revoked-stale");
+    expect(t1rec.attempt).toBeGreaterThanOrEqual(1); // 回池保留 attempt 历史（§4.2）
+
+    // lead（a）邮箱：stale-swept 回执 + **额外**的 offline-handover 转交通知。
+    const box = await mailboxOf("a");
+    const notices = box.filter((m) => m.content.includes("offline-handover"));
+    expect(notices).toHaveLength(1);
+    const frame = JSON.parse(notices[0]!.content) as Record<string, unknown>;
+    expect(frame["type"]).toBe("task-receipt"); // 既有白名单帧型（不新添帧型）
+    expect(frame["status"]).toBe("failed"); // 不触发 completed 回执矛盾检测
+    const offline = frame["offline"] as Record<string, unknown>;
+    expect(offline).toMatchObject({ member: "m1", evidence: "process-dead", liveness: "pid-dead" });
+    expect(offline["taskIds"]).toEqual([t1]);
+    expect(String(offline["suggestion"])).toContain("xc_dispatch");
+    expect(box.some((m) => m.content.includes("stale-swept"))).toBe(true); // createdBy 回执仍在
+
+    // engine.jsonl 审计：task-offline（成员/证据/活性/任务清单/通知对象）。
+    const rows = offlineAuditRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ member: "m1", evidence: "process-dead", liveness: "pid-dead", noticeTo: "a" });
+    expect(rows[0]!["taskIds"]).toEqual([t1]);
+    void attemptId;
+  });
+
+  it("多名离线属主各通知 lead 一次（按成员聚合，不按任务轰炸）+ 第二轮零候选不重复通知", async () => {
+    const { core, deps, peerRoot } = makeC8Core();
+    await hookRegister(core, "conn-a", "a", "sess_a");
+    await hookRegister(core, "conn-m1", "m1", "sess_m1");
+    await hookRegister(core, "conn-m2", "m2", "sess_m2");
+    const t1 = (unwrap(await core.xc_dispatch({ to: "m1", title: "T1", prompt: "P" }, "conn-a"))["taskId"]) as string;
+    const t2 = (unwrap(await core.xc_dispatch({ to: "m2", title: "T2", prompt: "P" }, "conn-a"))["taskId"]) as string;
+    await claimForMember(core, "conn-m1", t1);
+    await claimForMember(core, "conn-m2", t2);
+    writePeerRecordFor(peerRoot, "sess_m1", C8_DEAD_PID, Date.now() - 3_600_000);
+    writePeerRecordFor(peerRoot, "sess_m2", C8_DEAD_PID - 1, Date.now() - 3_600_000);
+    await backdateOpenTask("m1", 40 * 60_000);
+    await backdateOpenTask("m2", 40 * 60_000);
+
+    const first = await sweepStaleTasksOnce(deps);
+    expect(first).toMatchObject({ swept: 2, offline: 2 }); // 两名离线属主，两条任务
+    const rows = offlineAuditRows();
+    expect(rows).toHaveLength(2);
+    expect(rows.map((r) => r["member"]).sort()).toEqual(["m1", "m2"]);
+    const notices = (await mailboxOf("a")).filter((m) => m.content.includes("offline-handover"));
+    expect(notices).toHaveLength(2); // 一名成员一条（不是一任务一条）
+
+    const second = await sweepStaleTasksOnce(deps);
+    expect(second).toMatchObject({ swept: 0, skipped: true, offline: 0 }); // 幂等：不重复通知
+    expect((await mailboxOf("a")).filter((m) => m.content.includes("offline-handover"))).toHaveLength(2);
+  });
+
+  it("E-b 边沿（xc_report 终态）同样产出 offline：进工具 payload edges.offline", async () => {
+    const { core, peerRoot } = makeC8Core();
+    await hookRegister(core, "conn-a", "a", "sess_a");
+    await hookRegister(core, "conn-m1", "m1", "sess_m1");
+    await hookRegister(core, "conn-m2", "m2", "sess_m2");
+    const t1 = (unwrap(await core.xc_dispatch({ to: "m1", title: "T1", prompt: "P" }, "conn-a"))["taskId"]) as string;
+    await claimForMember(core, "conn-m1", t1);
+    const t3 = (unwrap(await core.xc_dispatch({ to: "m2", title: "独立单", prompt: "P" }, "conn-a"))["taskId"]) as string;
+    const attemptId3 = await claimForMember(core, "conn-m2", t3);
+    writePeerRecordFor(peerRoot, "sess_m1", C8_DEAD_PID, Date.now() - 3_600_000);
+    await backdateOpenTask("m1", 40 * 60_000);
+
+    const res = unwrap(
+      await core.xc_report(
+        { taskId: t3, attemptId: attemptId3, status: "completed", result: "ok", evidence: [{ path: evidenceFile("c8.txt") }] },
+        "conn-m2",
+      ),
+    );
+    const edges = res["edges"] as Record<string, unknown>;
+    expect(edges["offline"]).toHaveLength(1);
+    expect(edges["offline"]).toEqual([
+      expect.objectContaining({ key: "m1", evidence: "process-dead", liveness: "pid-dead" }),
+    ]);
+    expect(offlineAuditRows()).toHaveLength(1);
+  });
+});
+
+describe("withTaskEdges/sweeper：C8 边界（空闲 ≠ 离线）", () => {
+  it("属主活着但空闲（heartbeat-stale）且任务未超 XC_OFFLINE_MINUTES → 回池但不判离线", async () => {
+    const { core, deps, peerRoot } = makeC8Core();
+    await hookRegister(core, "conn-a", "a", "sess_a");
+    await hookRegister(core, "conn-m1", "m1", "sess_m1");
+    const t1 = (unwrap(await core.xc_dispatch({ to: "m1", title: "T1", prompt: "P" }, "conn-a"))["taskId"]) as string;
+    await claimForMember(core, "conn-m1", t1);
+    // pid 活着（本进程）、心跳过期 → lastSeen-stale：进程活着，只是空闲/长回合。
+    writePeerRecordFor(peerRoot, "sess_m1", process.pid, Date.now() - 3_600_000);
+    await backdateOpenTask("m1", 40 * 60_000);
+
+    const summary = await sweepStaleTasksOnce(deps);
+    expect(summary).toMatchObject({ swept: 1, skipped: false, offline: 0 });
+    expect(offlineAuditRows()).toHaveLength(0);
+    const box = await mailboxOf("a");
+    expect(box.some((m) => m.content.includes("offline-handover"))).toBe(false);
+    expect(box.some((m) => m.content.includes("stale-swept"))).toBe(true); // 回执照旧（stale 的职责）
+  });
+
+  it("无注册记录（回合间隙）且任务未超阈 → 回池但不判离线", async () => {
+    const { core, deps } = makeC8Core();
+    await hookRegister(core, "conn-a", "a", "sess_a");
+    await hookRegister(core, "conn-m1", "m1", "sess_m1");
+    const t1 = (unwrap(await core.xc_dispatch({ to: "m1", title: "T1", prompt: "P" }, "conn-a"))["taskId"]) as string;
+    await claimForMember(core, "conn-m1", t1);
+    await backdateOpenTask("m1", 40 * 60_000);
+
+    const summary = await sweepStaleTasksOnce(deps);
+    expect(summary).toMatchObject({ swept: 1, offline: 0 });
+    expect(offlineAuditRows()).toHaveLength(0);
+  });
+
+  it("进程死证据不绕过在途 wake nonce 豁免（保守优先）", async () => {
+    const { core, deps, peerRoot } = makeC8Core();
+    await hookRegister(core, "conn-a", "a", "sess_a");
+    await hookRegister(core, "conn-m1", "m1", "sess_m1");
+    const t1 = (unwrap(await core.xc_dispatch({ to: "m1", title: "T1", prompt: "P" }, "conn-a"))["taskId"]) as string;
+    await claimForMember(core, "conn-m1", t1);
+    writePeerRecordFor(peerRoot, "sess_m1", C8_DEAD_PID, Date.now() - 3_600_000);
+    await backdateOpenTask("m1", 40 * 60_000);
+    await createWakeNonce(stateRoot, { teamId: "default", agentKey: "m1", sid: "sess_m1", now: Date.now() });
+
+    const summary = await sweepStaleTasksOnce(deps);
+    // skipped=false：候选存在（预检通过）但在途 nonce 豁免了它——与 stale-sweep.test.ts
+    // 的既有口径一致（skipped 只表示「零候选/异常」两条早退路径）。
+    expect(summary).toMatchObject({ swept: 0, offline: 0 });
+    expect(offlineAuditRows()).toHaveLength(0);
+    const t1rec = (await readTeam(stateRoot, "default"))!.tasks.find((t) => t.id === t1)!;
+    expect(t1rec.status).toBe("in_progress"); // 原样保留（豁免）
+  });
+
+  it("离线属主就是 lead 自己 → 任务照常回池，但不给 lead 发「你没了」通知", async () => {
+    const { core, deps, peerRoot } = makeC8Core();
+    await hookRegister(core, "conn-a", "a", "sess_a");
+    await hookRegister(core, "conn-m1", "m1", "sess_m1");
+    // lead（a）持一单在途后崩溃。xc_dispatch 不允许派给自己，故按可达形态直接置态：
+    // 「回池后的共享待领单被 lead 认领」正是这条路径的真实来源（to 已随 revoke 清除）。
+    const t1 = (unwrap(await core.xc_dispatch({ to: "m1", title: "T1", prompt: "P" }, "conn-a"))["taskId"]) as string;
+    const team = await mutateTeam((t) => {
+      const rec = t.tasks.find((x) => x.id === t1)!;
+      rec.assignee = "a";
+      rec.status = "in_progress";
+      rec.attemptId = "att-lead";
+      delete rec.to;
+    });
+    await writeTeam(stateRoot, team);
+    writePeerRecordFor(peerRoot, "sess_a", C8_DEAD_PID, Date.now() - 3_600_000);
+    await backdateOpenTask("a", 40 * 60_000);
+
+    const summary = await sweepStaleTasksOnce(deps);
+    expect(summary).toMatchObject({ swept: 1, offline: 1 }); // 判据命中（成员级）
+    // 但没有 offline-handover 通知（不自我惊动）；createdBy=a 自己的 stale 回执仍在。
+    const box = await mailboxOf("a");
+    expect(box.some((m) => m.content.includes("offline-handover"))).toBe(false);
+    expect(box.some((m) => m.content.includes("stale-swept"))).toBe(true);
+    const t1rec = (await readTeam(stateRoot, "default"))!.tasks.find((t) => t.id === t1)!;
+    expect(t1rec.status).toBe("pending"); // 任务照常回池（信息不丢）
+  });
+
+  it("removed 成员不判离线（「不在册」不是「离线」；其任务已由 xc_member_stop 回池）", async () => {
+    const { core, deps, peerRoot } = makeC8Core();
+    await hookRegister(core, "conn-a", "a", "sess_a");
+    await hookRegister(core, "conn-m1", "m1", "sess_m1");
+    const t1 = (unwrap(await core.xc_dispatch({ to: "m1", title: "T1", prompt: "P" }, "conn-a"))["taskId"]) as string;
+    await claimForMember(core, "conn-m1", t1);
+    await setMemberState("m1", "removed");
+    writePeerRecordFor(peerRoot, "sess_m1", C8_DEAD_PID, Date.now() - 3_600_000);
+    await backdateOpenTask("m1", 40 * 60_000);
+
+    const summary = await sweepStaleTasksOnce(deps);
+    expect(summary).toMatchObject({ swept: 1, offline: 0 });
+    expect(offlineAuditRows()).toHaveLength(0);
+  });
+});
+
+describe("withTaskEdges/sweeper：C8 空闲超时兜底（idle-timeout，窄可达路径）", () => {
+  it("无注册记录 + 任务无进展超 XC_OFFLINE_MINUTES → 判离线（兜底路径）并通知 lead", async () => {
+    const { core, deps } = makeC8Core();
+    await hookRegister(core, "conn-a", "a", "sess_a");
+    await hookRegister(core, "conn-m1", "m1", "sess_m1");
+    const t1 = (unwrap(await core.xc_dispatch({ to: "m1", title: "T1", prompt: "P" }, "conn-a"))["taskId"]) as string;
+    await claimForMember(core, "conn-m1", t1);
+    // 240min 无进展：早已被 30min stale 回收过——本路径只在「回池后再次被认领又失联」
+    // 或「全员静默后首轮清扫」时可达（§4.1 可达性如实声明）。这里直接置态验判据本身。
+    await backdateLastProgress("m1", 241 * 60_000);
+
+    const summary = await sweepStaleTasksOnce(deps);
+    expect(summary).toMatchObject({ swept: 1, offline: 1 });
+    const rows = offlineAuditRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ member: "m1", evidence: "idle-timeout", liveness: "no-record" });
+    const notices = (await mailboxOf("a")).filter((m) => m.content.includes("offline-handover"));
+    expect(notices).toHaveLength(1);
+    const frame = JSON.parse(notices[0]!.content) as Record<string, unknown>;
+    const offline = frame["offline"] as Record<string, unknown>;
+    expect(offline).toMatchObject({ member: "m1", evidence: "idle-timeout" });
+    expect(String(offline["suggestion"])).toContain('xc_team({action:"cancel"}'); // 兜底建议：重派或取消
   });
 });

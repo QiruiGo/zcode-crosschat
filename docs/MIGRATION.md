@@ -1,35 +1,36 @@
-# MIGRATION：v0.5.x → v0.6.0 迁移表（26 工具 → 10 工具）
+# MIGRATION：v0.5.x → v0.6.0 迁移表（26 工具 → 10 工具；旧名 v0.7.0 已移除）
 
 > v0.6.0 把 MCP 工具面从 26 个收敛为 10 个（ breaking change，方案 §2）。
-> **旧名不会立刻消失**：22 个更名旧名经弃用覆盖层保持可调用（打印弃用警告 + payload 披露），
-> **v0.7.0 移除**。本文是迁移细节的唯一下沉处。
+> v0.6.0 期间 22 个更名旧名经弃用覆盖层保持可调用（打印弃用警告 + payload 披露）；
+> **v0.7.0 已移除**（MIGRATION §5 承诺执行）：alias 覆盖层整文件删除，调用旧名得标准错误
+> `Tool <name> not found`（InvalidParams）。本文是迁移细节的唯一下沉处，下表保留为历史对照。
 
-## 1. 新旧对照（22 个更名旧名）
+## 1. 新旧对照（22 个更名旧名；v0.7.0 已移除，下表为历史对照）
 
-| 旧名（v0.5.x） | 新入口（v0.6.0） | 参数映射 | 备注 |
-|---|---|---|---|
-| `xc_register` | `xc_identify` | `name→name`；`sessionId→sessionId`（必填透传）；`role→role`；`wakeToken→wakeToken` | `regToken` 忽略，响应 payload 以 `ignored:["regToken"]` 披露 |
-| `xc_peer_register` | `xc_identify` | `name/displayName/kind/modeClass/contextChars→同名`；`sessionId` 必填透传 | `regToken` 以 `ignored` 披露 |
-| `xc_peer_rename` | `xc_identify` | `name→name`（改名语义） | 纯旧参（只有 name）的调用需补 `sessionId`，否则 `invalid_params` |
-| `xc_check_inbox` | `xc_read` | `→{scope:"inbox"}` | 读即消费；预算窗口外消息保持未读 |
-| `xc_mail_read` | `xc_read` | `messageId→id`；`offset/limit→同名`；`→{scope:"mail"}` | — |
-| `xc_task_read` | `xc_read` | `taskId→id`；`field→field`；`offset/limit→同名`；`→{scope:"task"}` | — |
-| `xc_peer_inbox` | `xc_read` | `limit→limit`；`→{scope:"peer"}` | — |
-| `xc_peer_read` | `xc_read` | `msgId→id`；`offset/limit→同名`；`→{scope:"peer-msg"}` | — |
-| `xc_message` | `xc_relay` | `content→msg`；`to/sourceTaskId/sourceAttemptId→同名` | `forwardOf` → 显式错误 `forwardOf_removed` |
-| `xc_peer_send` | `xc_relay` | `message→msg`；`to/summary→同名` | `forwardOf` → 显式错误 `forwardOf_removed` |
-| `xc_status` | `xc_overview` | `history→history`；`offset→offset` | `teamId` 忽略（v0.6 单队固定 default）；缺省 view=team |
-| `xc_peers` | `xc_overview` | `→{view:"peers"}` | `kind` 忽略（新面一次列全三类） |
-| `xc_agents` | `xc_overview` | `→{view:"panel"}` | — |
-| `xc_team_init` | `xc_team` | `→{action:"init", takeover}` | — |
-| `xc_lead_transfer` | `xc_team` | `to/reason→同名`；`→{action:"transfer"}` | — |
-| `xc_lead_release` | `xc_team` | `→{action:"release"}` | — |
-| `xc_member_add` | `xc_team` | `name/model/reasoningLevel/note→同名`；`context→contextChars`；`→{action:"member-add"}` | — |
-| `xc_member_stop` | `xc_team` | `name/reason→同名`；`→{action:"member-stop"}` | 新面 `archive` 缺省 true（停止前留档） |
-| `xc_idle` | `xc_team` | `summary/idleReason/completedTaskId/completedStatus/failureReason/result→同名`；`→{action:"idle"}` | — |
-| `xc_cancel` | `xc_team` | `taskId→taskId`；`→{action:"cancel"}` | — |
-| `xc_inbound_review` | `xc_review` | `action/ids→同名`；`→{axis:"team"}` | — |
-| `xc_peer_review` | `xc_review` | `action/ids→同名`；`→{axis:"peer"}` | — |
+| 旧名（v0.5.x） | 新入口（v0.6.0） | 参数映射 | 备注 | v0.7.0 状态 |
+|---|---|---|---|---|
+| `xc_register` | `xc_identify` | `name→name`；`sessionId→sessionId`（必填透传）；`role→role`；`wakeToken→wakeToken` | `regToken` 忽略，响应 payload 以 `ignored:["regToken"]` 披露 | 已移除 |
+| `xc_peer_register` | `xc_identify` | `name/displayName/kind/modeClass/contextChars→同名`；`sessionId` 必填透传 | `regToken` 以 `ignored` 披露 | 已移除 |
+| `xc_peer_rename` | `xc_identify` | `name→name`（改名语义） | 纯旧参（只有 name）的调用需补 `sessionId`，否则 `invalid_params` | 已移除 |
+| `xc_check_inbox` | `xc_read` | `→{scope:"inbox"}` | 读即消费；预算窗口外消息保持未读 | 已移除 |
+| `xc_mail_read` | `xc_read` | `messageId→id`；`offset/limit→同名`；`→{scope:"mail"}` | — | 已移除 |
+| `xc_task_read` | `xc_read` | `taskId→id`；`field→field`；`offset/limit→同名`；`→{scope:"task"}` | — | 已移除 |
+| `xc_peer_inbox` | `xc_read` | `limit→limit`；`→{scope:"peer"}` | — | 已移除 |
+| `xc_peer_read` | `xc_read` | `msgId→id`；`offset/limit→同名`；`→{scope:"peer-msg"}` | — | 已移除 |
+| `xc_message` | `xc_relay` | `content→msg`；`to/sourceTaskId/sourceAttemptId→同名` | `forwardOf` → 显式错误 `forwardOf_removed` | 已移除 |
+| `xc_peer_send` | `xc_relay` | `message→msg`；`to/summary→同名` | `forwardOf` → 显式错误 `forwardOf_removed` | 已移除 |
+| `xc_status` | `xc_overview` | `history→history`；`offset→offset` | `teamId` 忽略（v0.6 单队固定 default）；缺省 view=team | 已移除 |
+| `xc_peers` | `xc_overview` | `→{view:"peers"}` | `kind` 忽略（新面一次列全三类） | 已移除 |
+| `xc_agents` | `xc_overview` | `→{view:"panel"}` | — | 已移除 |
+| `xc_team_init` | `xc_team` | `→{action:"init", takeover}` | — | 已移除 |
+| `xc_lead_transfer` | `xc_team` | `to/reason→同名`；`→{action:"transfer"}` | — | 已移除 |
+| `xc_lead_release` | `xc_team` | `→{action:"release"}` | — | 已移除 |
+| `xc_member_add` | `xc_team` | `name/model/reasoningLevel/note→同名`；`context→contextChars`；`→{action:"member-add"}` | — | 已移除 |
+| `xc_member_stop` | `xc_team` | `name/reason→同名`；`→{action:"member-stop"}` | 新面 `archive` 缺省 true（停止前留档） | 已移除 |
+| `xc_idle` | `xc_team` | `summary/idleReason/completedTaskId/completedStatus/failureReason/result→同名`；`→{action:"idle"}` | — | 已移除 |
+| `xc_cancel` | `xc_team` | `taskId→taskId`；`→{action:"cancel"}` | — | 已移除 |
+| `xc_inbound_review` | `xc_review` | `action/ids→同名`；`→{axis:"team"}` | — | 已移除 |
+| `xc_peer_review` | `xc_review` | `action/ids→同名`；`→{axis:"peer"}` | — | 已移除 |
 
 **4 个同名保留**（无弃用警告）：`xc_dispatch`（新增 `priority`）、`xc_claim`、`xc_report`（status 增 `blocked`）、`xc_doctor`。
 
@@ -58,8 +59,8 @@
 | `/xc-status` | 保留，改调 `xc_overview` | 缺省 team 视图；「全景」用 panel |
 | `/xc-team` | 保留，改调 `xc_team` | 吸收 `/xc-member` 的 add/stop |
 | `/xc-say` | 保留，改调 `xc_relay` | urgent/interrupt 用法写入正文 |
-| `/xc-agents` | **弃用存根**（v0.7.0 删文件） | 已并入 `/xc-status`（panel 视图） |
-| `/xc-member` | **弃用存根**（v0.7.0 删文件） | 已并入 `/xc-team add|stop` |
+| `/xc-agents` | **已删文件**（v0.7.0 执行移除） | 已并入 `/xc-status`（panel 视图） |
+| `/xc-member` | **已删文件**（v0.7.0 执行移除） | 已并入 `/xc-team add|stop` |
 
 ## 4. 行为变化清单（改名之外）
 
@@ -76,14 +77,18 @@
 
 ## 5. 弃用策略与时点
 
-1. 旧名**不注册**进 `tools/list`（恰好 10 个新名）；调用侧经弃用覆盖层可达。
-2. 覆盖层行为：参数映射（未映射旧参一律进 `ignored` 显式披露，禁静默丢弃）→ 同一核心实现 → 结果首块前缀
+> **移除已执行（v0.7.0）**：以下 1–2 条为 v0.6.0–v0.6.1 期间的弃用覆盖层行为（历史记录）；
+> v0.7.0 起覆盖层整文件删除（`mcp/alias.ts`），22 个别名与 2 个命令存根同版移除。
+
+1. （v0.6 历史）旧名**不注册**进 `tools/list`（恰好 10 个新名）；调用侧经弃用覆盖层可达。
+2. （v0.6 历史）覆盖层行为：参数映射（未映射旧参一律进 `ignored` 显式披露，禁静默丢弃）→ 同一核心实现 → 结果首块前缀
    `[DEPRECATED] <旧名> 已更名为 <新名>（v0.7.0 移除）。本次调用已正常执行。迁移表见 docs/MIGRATION.md。`
    + payload 注入 `deprecated:{tool, replacement, ignored?}`。
-3. **移除时点：v0.7.0**——22 个别名与 2 个命令存根（`/xc-agents`、`/xc-member`）同版删除。
+3. **移除时点：v0.7.0——已执行**：22 个别名（`mcp/alias.ts` 整文件删除，含 `installAliasLayer`/`ALIASES`/`DEPRECATION_NOTE`）与 2 个命令存根（`/xc-agents`、`/xc-member`，删文件）同版删除。未知名调用得标准错误 `Tool <name> not found`（InvalidParams）。**信封如实说明**：alias 覆盖层删除后运行时不再经 `dispatchPrimary` 中转，未知名由 MCP SDK 自带的未注册工具分支处理（`@modelcontextprotocol/sdk` `server/mcp.js`：抛 `McpError(InvalidParams, "Tool <name> not found")`，`McpServer` 再包成 `result.isError=true`、正文 `MCP error -32602: Tool <name> not found`）——错误码与消息文本与 v0.6.1 完全一致，只是信封从 JSON-RPC error 变成标准工具错误结果（两者都是 MCP 规范内的标准未知错误）。`dispatchPrimary` 仍保留同一消息文本（直接分发路径/单测口径）。`xc_relay({forwardOf})` 的显式 `forwardOf_removed` 由主路径守卫 `assertNoForwardOf` 承担（`mcp/tools-relay.ts`）。回归见 `mcp/legacy-removal.test.ts`（含 stdio 黑盒逐名抽验）。
 4. 数据兼容：v0.5.3 的 `team.json`/邮箱/注册表在新版下照常读写（`priority/blocked*/urgent` 等新字段全部 optional 缺省化）。
 
 ## 6. 迁移自检
 
 - 全量旧名 26 个 = 22 别名（本文 §1）+ 4 同名（§1 末行）；与 `git show v0.5.3:plugin/src/mcp/{tools,lead-tools,member-tools,peer-tools,guards,doctor-tool}.ts` 的注册名清单集合相等。
-- 旧名调用抽验：`tools/call xc_status` → 非 isError + 首块 `[DEPRECATED]` + payload `deprecated.replacement=xc_overview`（集成期实测通过）。
+- （v0.6 期实测）旧名调用抽验：`tools/call xc_status` → 非 isError + 首块 `[DEPRECATED]` + payload `deprecated.replacement=xc_overview`。
+- （v0.7.0 起）旧名调用抽验口径反转：`tools/call xc_status`（及 §1 表全部 22 个）→ 标准未知错误 `Tool <name> not found`（InvalidParams -32602；运行时信封 = `result.isError=true` + 正文 `MCP error -32602: Tool <name> not found`，见 §5-3）；`tools/list` 仍恰 10 个新名——由 `mcp/legacy-removal.test.ts` 逐名断言（dispatcher 直驱 + stdio 黑盒双口径）。

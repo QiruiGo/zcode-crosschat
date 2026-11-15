@@ -10,7 +10,7 @@
  *   ② setModel 枚举 create 结果 settings.model.available[].ref（P1）→ 命中 XC_MEMBER_MODEL
  *             否则首个 → session/setModel（E4：回合 modelId=glm-5.3-flash 即生效实据）
  *   ③ 欢迎 send session/send（welcome prompt = 身份行 + 引擎签发 wakeToken + 守则 v2 摘要 +
- *             「无单直接结束回合、不发 xc_idle」——R1 修正，§6.2 ③/§6.3）
+ *             「无单直接结束回合、不发 idle 通知」——R1 修正，§6.2 ③/§6.3）
  *   ④ 等待+收尾 轮询 session/messages（4s 间隔，超时 XC_MEMBER_BOOTSTRAP_TIMEOUT_MS 默认
  *             300s）；完成判定 = P2 过滤（assistant ∧ finish∈{completed,stop} ∧ ≥1 text part）
  *
@@ -51,7 +51,7 @@ export function bootstrapTimeoutFromEnv(env: NodeJS.ProcessEnv = process.env): n
 
 /**
  * 供给模式（§6.4 的实现入口）：
- * - "fresh"：总是全新 create（xc_member_stop 后同名重加 = 新成员生命周期）；
+ * - "fresh"：总是全新 create（xc_team member-stop 后同名重加 = 新成员生命周期）；
  * - "auto"（默认）：§6.4 幂等重供给——names.json 已绑定 ∧ session/messages 可读 →
  *   session/resume 续用；否则全新 create（半程死亡自愈）。
  */
@@ -106,11 +106,11 @@ export function buildWelcomePrompt(input: {
     `你是 zcode-crosschat 团队 "${input.teamId}" 的成员 "${input.key}"（sessionId=${input.sessionId}）。` +
       `本连接由团队引擎创建；引擎已为本次供给签发一次性 wakeToken="${input.wakeToken}"。`,
     "请严格按以下顺序执行，不要做其他任何事：",
-    `1) 调用 xc_register 绑定身份：name 填 "${input.key}"，sessionId 填 "${input.sessionId}"，` +
+    `1) 调用 xc_identify 绑定身份：name 填 "${input.key}"，sessionId 填 "${input.sessionId}"，` +
       `wakeToken 填 "${input.wakeToken}"；`,
-    "2) 调用 xc_check_inbox 读取未读消息；",
+    "2) 调用 xc_read({scope:\"inbox\"}) 读取未读消息；",
     "3) 若有未读任务/通知：按下方成员守则开工；若没有：本回合是欢迎回合——直接结束回合，" +
-      "不要调用 xc_idle，你的就绪状态由引擎写入的花名册（state=ready）表达。",
+      "不要调用 xc_team({action:\"idle\"})，你的就绪状态由引擎写入的花名册（state=ready）表达。",
     MEMBER_RULES_V2,
   ].join("\n");
 }

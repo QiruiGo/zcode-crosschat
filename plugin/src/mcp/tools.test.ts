@@ -319,9 +319,10 @@ describe("v0.6 改判：xc_message forwardOf 砍除（R-13 → §2.2 行 4）", 
     const bMail = await readMailbox(stateRoot, "default", "b");
     const orig = bMail.find((m) => m.content === "周五上线")!;
 
-    // v0.6（§2.2 行 4）：core 层 xc_message 签名无 forwardOf——直调时多余键被忽略
-    // （消息照发，转发语义消失）。显式 forwardOf_removed 报错在工具层（alias 覆盖层 +
-    // "xc_relay" 的 assertNoForwardOf，tools-relay.ts），由 alias 冒烟覆盖。
+    // v0.6（§2.2 行 4）：core 层发送签名无 forwardOf——直调时多余键被忽略
+    // （消息照发，转发语义消失）。显式 forwardOf_removed 报错在工具层
+    // （xc_relay 主路径的 assertNoForwardOf，tools-relay.ts；v0.7 旧名垫片删除后
+    // 由主路径守卫承担，legacy-removal.test.ts 覆盖）。
     const fwd = await stamped.xc_message(
       { to: "c", msg: "周五上线", forwardOf: orig.id } as unknown as Parameters<typeof stamped.xc_message>[0],
       "conn-b",
@@ -361,7 +362,7 @@ describe("tools v0.5: xc_check_inbox 预算截断 + content[2] 信封块（R-16/
     // content[2]：逐条 <crosschat-team-message> 信封块（chat 帧型 + 截断指针）
     const envelopeBlock = res.content[2]?.text ?? "";
     expect(envelopeBlock).toContain("<crosschat-team-message");
-    expect(envelopeBlock).toContain("xc_mail_read");
+    expect(envelopeBlock).toContain('xc_read({scope:"mail"');
     // 磁盘行全文不动（截断只在渲染层）
     const disk = (await readMailbox(stateRoot, "default", "b")).find((m) => m.id === payload.messages[0]?.id);
     expect(disk?.content).toBe(bigText);

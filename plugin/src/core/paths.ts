@@ -108,6 +108,30 @@ export function snapshotFile(root: string, teamId: string): string {
   return join(root, 'teams', teamId, 'snapshot.json');
 }
 
+// --- v0.7 C6/C7：转办台账与审批文件（状态根级，不随 teamId） -----------------
+
+/**
+ * v0.7（DESIGN-V0.7 §2.5/§3.1）：tool_request 台账目录
+ * （`.crosschat/toolrequests/<requestId>.json`）。requestId 同时是审批文件名
+ * （approvals/<requestId>.json）——天然可检索（E4 §5）。requestId 的路径段
+ * 合法性由 toolrelay.ts 的 REQUEST_ID_RE 在帧入口校验（防穿越）。
+ */
+export function toolRequestsDir(root: string): string {
+  return join(root, 'toolrequests');
+}
+export function toolRequestFile(root: string, requestId: string): string {
+  return join(root, 'toolrequests', `${requestId}.json`);
+}
+
+/** v0.7（DESIGN-V0.7 §2.3/§3.1）：审批授权文件目录（`.crosschat/approvals/<requestId>.json`）。
+ *  授权锚点：用户/lead 落盘（文件轨）或 xc_review approve 代写（工具轨，同格式）。 */
+export function approvalsDir(root: string): string {
+  return join(root, 'approvals');
+}
+export function approvalsFile(root: string, requestId: string): string {
+  return join(root, 'approvals', `${requestId}.json`);
+}
+
 // --- locks & logs -----------------------------------------------------------
 
 export function locksDir(root: string): string {

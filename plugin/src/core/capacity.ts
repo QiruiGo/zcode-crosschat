@@ -329,7 +329,18 @@ export function judgeCapacity(s: CapacitySample, env: NodeJS.ProcessEnv = proces
   return { red: violated.length > 0, violated, detail };
 }
 
-/** 单行 panel 摘要 + violated detail 行（tools-overview/doctor 直接拼用）。 */
+/**
+ * C9 压缩联动建议行（DESIGN-V0.7.md §5）：verdict.red 时由 formatCapacityLines
+ * 追加——「预警 + 建议 + 落盘副本」最小闭环。**建议级非拦截级**：平台无宿主压缩
+ * 钩子接口，插件不能拦截/触发压缩，只能提醒先落 journal 再接受压缩。
+ * team/panel 两视图都经 tools-overview.ts 的 capacityMount → 改一处两处生效。
+ */
+export const COMPRESS_ADVICE_LINE =
+  'compress-advice: 容量预警——先按 longtask checklist 落 journal'
+  + '（.crosschat/tasks/<taskId>/journal.md）再接受压缩；'
+  + 'lead 可 relay 要求目标先 xc_report(status:"in_progress") 附 journal 路径';
+
+/** 单行 panel 摘要 + violated detail 行 + C9 压缩建议行（tools-overview/doctor 直接拼用）。 */
 export function formatCapacityLines(s: CapacitySample, verdict: CapacityVerdict): string[] {
   const turnPart = s.headlessTurnMaxRssBytes === null
     ? `${s.headlessTurnCount}`
@@ -342,6 +353,8 @@ export function formatCapacityLines(s: CapacitySample, verdict: CapacityVerdict)
       + (s.degraded === null ? '' : ` | degraded=${s.degraded}`),
   ];
   for (const d of verdict.detail) lines.push(`  - ${d}`);
+  // C9（DESIGN-V0.7.md §5）：标红才给压缩建议行——绿样本不噪声化面板。
+  if (verdict.red) lines.push(COMPRESS_ADVICE_LINE);
   return lines;
 }
 

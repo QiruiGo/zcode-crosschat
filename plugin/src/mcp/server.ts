@@ -8,8 +8,10 @@
  * stdio 纪律：协议独占 stdout——任何日志/报错只准写 stderr，否则握手即坏。
  *
  * v0.6 工具面（26→10）：server.tool() 只注册 10 个新名（tools/list 恰 10 个——
- * 条款 1 硬验收）；旧名 22 个的可调用性由 alias.ts 覆盖层实现（CallTool 处理器
- * 整体替换，参数映射 + 弃用警告 + payload.deprecated；DESIGN §1.3）。
+ * 条款 1 硬验收）。
+ * v0.7.0（MIGRATION §5 承诺执行）：22 个旧名弃用覆盖层（alias.ts）整体移除——
+ * 未知名经 dispatcher 抛标准 `Tool <name> not found`（InvalidParams，本文件
+ * dispatchPrimary），不再有 [DEPRECATED] 垫片。
  * 「双入口单实现」：dispatcher 与 server.tool 回调共用同一 handler（PrimaryRegistry）。
  *
  * 组装链不变：composeCore = base → withTaskEdges → withGuards → withPeerDrain。
@@ -20,7 +22,6 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import { composeCore, resolveDeps, type PrimaryRegistry, type ToolDeps } from "./core.js";
-import { installAliasLayer } from "./alias.js";
 import { registerIdentifyTools } from "./tools-identify.js";
 import { registerTaskTools } from "./tools-tasks.js";
 import { registerReadTools } from "./tools-read.js";
@@ -34,7 +35,7 @@ import { stopPeerEndpoint } from "../transport/pipe.js";
 import { GuardedStdioTransport } from "../transport/mcpstdio.js";
 
 const SERVER_NAME = "zcode-crosschat";
-const SERVER_VERSION = "0.6.1";
+const SERVER_VERSION = "0.7.0";
 
 let shuttingDown = false;
 
@@ -95,10 +96,11 @@ export async function main(): Promise<void> {
     },
   });
 
-  // v0.6（§1.3）：旧名弃用覆盖层——必须全部注册之后、connect 之前安装。
-  // dispatcher 对 PRIMARY 名做 zod 校验（与 SDK 同款 InvalidParams 错误）后调
-  // registry 的 handler；未知名抛标准 "Tool not found"。
-  installAliasLayer(server, (name, args, extra) => dispatchPrimary(registry, name, args, extra));
+  // v0.7.0：旧名弃用覆盖层已按 MIGRATION §5 承诺移除（alias.ts 整文件删除）——
+  // 22 个旧名调用经 dispatcher 得标准 `Tool <name> not found`（InvalidParams）；
+  // `xc_relay({forwardOf})` 的显式错误由 relay 轴守卫 assertNoForwardOf 承担
+  // （tools-relay.ts 主路径调用，防 zod object 默认 strip 静默丢参）。
+  // doctor 的 handler 已登记进分发面（registry），CallTool 直达。
 
   // v0.5.1（CONC-2 修复）：带大帧守卫的 stdio 传输——≥10MiB 帧 JSON-RPC 拒收且
   // server 继续服务（transport/mcpstdio.ts）。

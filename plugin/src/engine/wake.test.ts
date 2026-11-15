@@ -206,8 +206,8 @@ describe("buildWakePrompt", () => {
     expect(p).toContain('wakeToken 填 "tok-123"');
     expect(p).toContain("计算 17*23");
     expect(p).toContain("成员守则");
-    expect(p).toContain("xc_register");
-    expect(p).toContain("xc_check_inbox");
+    expect(p).toContain("xc_identify");
+    expect(p).toContain('xc_read({scope:"inbox"})');
     expect(p.length).toBeLessThanOrEqual(WAKE_PROMPT_MAX_CHARS);
   });
 
@@ -419,7 +419,7 @@ describe("MEMBER_RULES_V2（守则 v2 全文，§3.4）", () => {
     expect(MEMBER_RULES_V2).toContain("成员守则 v2");
     expect(MEMBER_RULES_V2).toContain("一个回合可以做多单");
     expect(MEMBER_RULES_V2).toContain("xc_report(in_progress)"); // 心跳
-    expect(MEMBER_RULES_V2).toContain("xc_idle"); // 空闲通知
+    expect(MEMBER_RULES_V2).toContain('xc_team({action:"idle"})'); // 空闲通知
     expect(MEMBER_RULES_V2).toContain("unblock-notice"); // 依赖解除通知处理
     expect(MEMBER_RULES_V2).toContain("shutdown-request"); // 停止帧收尾
     expect(MEMBER_RULES_V2).toContain("task_not_pending");

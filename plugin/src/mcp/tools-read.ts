@@ -1,19 +1,18 @@
 /**
  * v0.6 M1（DESIGN-V0.6.md §1.2 T5）：xc_read —— 统一分页读（6 个 scope）。
  *
- * 合并 xc_check_inbox / xc_mail_read / xc_task_read / xc_peer_inbox / xc_peer_read
- * 的调用面；各 scope 的语义逐条对应旧工具（行为不改，只换入口；预算与分页口径
- * 全部沿用 core/budget.ts 的现行常数）：
- * | scope     | 替代旧工具       | 消费性 | 说明 |
- * | inbox     | xc_check_inbox   | 消费   | urgent 消息排最前（C1 读取序，core/mailbox.urgentFirst）；坏行跳过+审计；批量按注入预算开窗 |
- * | mail      | xc_mail_read     | 只读   | 邮箱历史单件分页（offset/limit 语义原样）|
- * | task      | xc_task_read     | 只读   | team.json 任务字段分页；field 缺省 result |
- * | peer      | xc_peer_inbox    | 消费   | 跨会话队列排空；count=本次真实呈现数；urgent 优先 |
- * | peer-msg  | xc_peer_read     | 只读   | 跨会话单件分页 |
+ * 统一六个 scope 的读面（v0.6 收敛时合并五个旧读面工具；行为不改，只换入口；
+ * 预算与分页口径全部沿用 core/budget.ts 的现行常数）：
+ * | scope     | 消费性 | 说明 |
+ * | inbox     | 消费   | urgent 消息排最前（C1 读取序，core/mailbox.urgentFirst）；坏行跳过+审计；批量按注入预算开窗 |
+ * | mail      | 只读   | 邮箱历史单件分页（offset/limit 语义原样）|
+ * | task      | 只读   | team.json 任务字段分页；field 缺省 result |
+ * | peer      | 消费   | 跨会话队列排空；count=本次真实呈现数；urgent 优先 |
+ * | peer-msg  | 只读   | 跨会话单件分页 |
  * | journal   | （新，C4）       | 只读   | id=<taskId> → tasks/<taskId>/journal.md；id="archive:<name>" → archive/<name>/journal.md |
  *
- * core 层方法名保留 v0.5.3 形态（xc_check_inbox / xc_mail_read / xc_task_read，
- * 旧测试直接驱动）；v0.6 变化仅两处：邮箱哈希链校验砍除（§2.2 行 1）与 inbox
+ * core 层方法名保留 v0.5.3 内部形态（旧测试直接驱动，非 MCP 工具名，不在 v0.7
+ * 旧名移除范围）；v0.6 变化仅两处：邮箱哈希链校验砍除（§2.2 行 1）与 inbox
  * 读取序 urgent-first（C1 数据面，core/mailbox.ts urgentFirst）。
  */
 
@@ -28,6 +27,7 @@ import { getTask, readTeam } from "../core/teamstate.js";
 import {
   acknowledgeMailbox,
   classifyFrame,
+  discardMailboxMessages,
   isCurrentMail,
   readCurrentMailboxLocked,
   readMailbox,
@@ -35,6 +35,8 @@ import {
   urgentFirst,
   type MailboxReadDiagnostics,
 } from "../core/mailbox.js";
+import { gateToolRequestRender, type ToolGateContext, type ToolGateRenderResult } from "../core/toolgate.js";
+import { parseToolFrameType } from "../core/toolrelay.js";
 import type { TeamMessage, TeamState } from "../core/types.js";
 import { logEngineEvent } from "../core/log.js";
 import {
@@ -98,15 +100,21 @@ export function countUnread(team: TeamState, messages: TeamMessage[]): number {
 }
 
 /**
- * v0.5.1（SCALE-1 修复）：xc_check_inbox 单条消息在本响应两个面的形态与成本——
+ * v0.5.1（SCALE-1 修复）：inbox 消费单条消息在本响应两个面的形态与成本——
  * `entry` = content[1] JSON payload 的逐条对象；`block` = content[2] 的信封块；
  * `cost` = 两个面的字符成本之和（批次窗口记账用）。磁盘 JSONL 全文不动。
+ *
+ * v0.7（C6，DESIGN-V0.7 §2.7）：`gate` 在场（tool_request 帧过了审批门）时，
+ * 两个面都以门的渲染文本为准——遮蔽占位或「APPROVAL VERIFIED」头+全文；
+ * 原始帧全文不进注入面（mail scope 的原文旁路同理由本 scope 的分页门修掉）。
  */
 function inboxEntry(
   m: TeamMessage,
   budgetItem: number,
+  gate?: ToolGateRenderResult,
 ): { entry: Record<string, unknown>; block: string; cost: number; truncated: boolean } {
-  const cut = truncateField(m.content, budgetItem, sha256Of);
+  const source = gate?.text ?? m.content;
+  const cut = truncateField(source, budgetItem, sha256Of);
   const entry: Record<string, unknown> = {
     ...m,
     content: cut.text,
@@ -116,10 +124,20 @@ function inboxEntry(
           contentPointer: "xc_read",
         }
       : {}),
+    ...(gate !== undefined
+      ? {
+          toolGate: {
+            gate: gate.gate,
+            ...(gate.requestId !== undefined ? { requestId: gate.requestId } : {}),
+            ...(gate.state !== undefined ? { state: gate.state } : {}),
+            ...(gate.reason !== undefined ? { reason: gate.reason } : {}),
+          },
+        }
+      : {}),
   };
   let block: string;
-  if (isTeamEnvelopeRendered(m.content)) {
-    block = m.content; // 幂等守卫：已包裹原样返回
+  if (isTeamEnvelopeRendered(source)) {
+    block = source; // 幂等守卫：已包裹原样返回
   } else {
     const body = cut.text + (cut.truncated ? `\n${truncateNote("mail", m.id, cut.truncated.shown, cut.truncated.total)}` : "");
     const cls = classifyFrame(m.content);
@@ -155,10 +173,54 @@ export function createMailboxReadCore(deps: ToolDeps): MailboxReadCore {
           const team = (await readTeam(stateRoot, me.teamId)) ?? teamBefore;
           const current = await readCurrentMailboxLocked(stateRoot, team, me.agentKey, undefined, diagnostics);
           const unread = urgentFirst(current.filter((m) => m.readAt === undefined));
-          const entries = unread.map((m) => inboxEntry(m, budget.item));
+          // v0.7（C6，DESIGN-V0.7 §2.7）：审批门（inbox 路）——tool_request 帧按台账
+          // state 裁决：拒 → 遮蔽占位 + 标记 discarded（不进注入面；首拒已由门回投
+          // 请求方并通知 lead）；放 → 「APPROVAL VERIFIED」头 + 全文。门只对
+          // tool_request 生效，其他消息原路径（零影响）。
+          const gateCtx: ToolGateContext = { stateRoot, teamId: me.teamId, readerKey: me.agentKey, now };
+          const gated = new Map<string, ToolGateRenderResult>();
+          for (const m of unread) {
+            if (parseToolFrameType(m.content) === "tool_request") {
+              gated.set(m.id, await gateToolRequestRender(m, gateCtx));
+            }
+          }
+          const entries = unread.map((m) => inboxEntry(m, budget.item, gated.get(m.id)));
           const windowCount = batchWindowCount(entries.map((e) => e.cost), budget.total);
-          await acknowledgeMailbox(stateRoot, me.teamId, me.agentKey, unread.slice(0, windowCount).map((m) => m.id), now);
-          return { messages: unread.slice(0, windowCount), entries: entries.slice(0, windowCount), totalUnread: unread.length };
+          const windowed = unread.slice(0, windowCount);
+          await acknowledgeMailbox(
+            stateRoot,
+            me.teamId,
+            me.agentKey,
+            windowed.filter((m) => gated.get(m.id)?.gate !== "refuse").map((m) => m.id),
+            now,
+          );
+          // 门拒的请求帧标记 discarded（§2.7「不进注入面」的落盘面）——复读时门已处
+          // 拒绝态，渲染-only，不会重复回投。
+          await discardMailboxMessages(
+            stateRoot,
+            me.teamId,
+            me.agentKey,
+            windowed.filter((m) => gated.get(m.id)?.gate === "refuse").map((m) => m.id),
+            now,
+          );
+          const refusedCount = [...gated.values()].filter((g) => g.gate === "refuse").length;
+          if (refusedCount > 0) {
+            await logEngineEvent(stateRoot, {
+              event: "inbox-check",
+              teamId: me.teamId,
+              agentKey: me.agentKey,
+              consumed: windowed.length,
+              unreadLeft: unread.length - windowed.length,
+              gatedToolRequestsRefused: refusedCount,
+            });
+          }
+          return {
+            messages: windowed,
+            entries: entries.slice(0, windowCount),
+            totalUnread: unread.length,
+            gatedRefused: [...gated.values()].filter((g) => g.gate === "refuse").length,
+            gatedPassed: [...gated.values()].filter((g) => g.gate === "pass").length,
+          };
         });
 
         // 消费后剩余未读（读路径无锁，§2.7-5 rename 原子写）——含本批窗口留在箱外的部分。
@@ -215,6 +277,9 @@ export function createMailboxReadCore(deps: ToolDeps): MailboxReadCore {
             ...(diagnostics.malformed.length > 0 ? { malformedLines: diagnostics.malformed.length } : {}),
             ...(diagnostics.discarded > 0 ? { staleDiscarded: diagnostics.discarded } : {}),
             ...(batchTruncated ? { batchTruncated: true, batchTotalUnread: consumed.totalUnread, batchBudgetChars: budget.total } : {}),
+            ...(consumed.gatedRefused > 0 || consumed.gatedPassed > 0
+              ? { toolRequests: { gatedRefused: consumed.gatedRefused, gatedPassed: consumed.gatedPassed } }
+              : {}),
           },
         );
         if (envelopeText !== "") {
@@ -225,8 +290,14 @@ export function createMailboxReadCore(deps: ToolDeps): MailboxReadCore {
     },
 
     /**
-     * xc_mail_read（v0.5 R-22 → v0.6 T5 scope:"mail"）：读本人邮箱 JSONL 历史件
+     * scope:"mail"（v0.5 R-22 → v0.6 T5）：读本人邮箱 JSONL 历史件
      * （含已消费行）的全文分页——只读不消费。v0.6：哈希链校验砍除（§2.2 行 1）。
+     *
+     * v0.7（C6，§2.7）：mail 分页同受审批门——v0.6.1 的实现直接 paginateText
+     * 原始 content（无门），是「mail scope 原文旁路」；现在 tool_request 帧先过
+     * {@link gateToolRequestRender}（与 inbox 路同一个门）：未放行只出遮蔽占位，
+     * 放行出「APPROVAL VERIFIED」头 + 全文。门可能带首拒侧效应（回投请求方）——
+     * 门是唯一的门，读哪条路都过它。
      */
     async xc_mail_read(args, connectionKey) {
       return runCore(stateRoot, async () => {
@@ -236,7 +307,11 @@ export function createMailboxReadCore(deps: ToolDeps): MailboxReadCore {
           throw invalidParamsError(`unknown messageId "${args.messageId}"; xc_read({scope:"mail"}) only reads your own mailbox history`);
         }
         const itemBudget = receiverInjectBudget(contextCharsFromEnv(deps.env), deps.env).item;
-        const page = paginateText(message.content, args.offset, args.limit, itemBudget);
+        const gate = parseToolFrameType(message.content) === "tool_request"
+          ? await gateToolRequestRender(message, { stateRoot, teamId: me.teamId, readerKey: me.agentKey, now: Date.now() })
+          : undefined;
+        const source = gate?.text ?? message.content;
+        const page = paginateText(source, args.offset, args.limit, itemBudget);
         return okResult(
           `Mailbox message ${message.id} from ${message.from}: ${page.total} chars (offset ${page.offset}, hasMore=${page.hasMore}).`,
           {
@@ -245,13 +320,23 @@ export function createMailboxReadCore(deps: ToolDeps): MailboxReadCore {
             offset: page.offset,
             text: page.text,
             hasMore: page.hasMore,
+            ...(gate !== undefined
+              ? {
+                  toolGate: {
+                    gate: gate.gate,
+                    ...(gate.requestId !== undefined ? { requestId: gate.requestId } : {}),
+                    ...(gate.state !== undefined ? { state: gate.state } : {}),
+                    ...(gate.reason !== undefined ? { reason: gate.reason } : {}),
+                  },
+                }
+              : {}),
           },
         );
       });
     },
 
     /**
-     * xc_task_read（v0.5 R-22 → v0.6 T5 scope:"task"）：分页读 team.json 任务字段
+     * scope:"task"（v0.5 R-22 → v0.6 T5）：分页读 team.json 任务字段
      * ——读路径无锁；xc_overview 观测面截断的全文拉取通道。
      */
     async xc_task_read(args, connectionKey) {
@@ -323,7 +408,7 @@ export async function handleRead(deps: ToolDeps, args: ReadArgs, connectionKey: 
   }
 }
 
-/** scope=peer（原 xc_peer_inbox 面 C 1:1）：排空跨会话队列；count=真实呈现数。 */
+/** scope=peer（v0.5.3 peer 排空面 1:1）：排空跨会话队列；count=真实呈现数。 */
 async function readPeerScope(deps: ToolDeps, args: ReadArgs): Promise<ToolResult> {
   const services = getPeerServices(deps);
   const budget = receiverInjectBudget(contextCharsFromEnv(deps.env), deps.env);
@@ -350,7 +435,7 @@ async function readPeerScope(deps: ToolDeps, args: ReadArgs): Promise<ToolResult
   );
 }
 
-/** scope=peer-msg（原 xc_peer_read 1:1）：跨会话单件分页（只读不消费）。 */
+/** scope=peer-msg（v0.5.3 peer 单件读 1:1）：跨会话单件分页（只读不消费）。 */
 async function readPeerMsgScope(deps: ToolDeps, args: ReadArgs, connectionKey: string): Promise<ToolResult> {
   void connectionKey;
   const services = getPeerServices(deps);
@@ -425,7 +510,7 @@ export function registerReadTools(
   registry: PrimaryRegistry,
 ): void {
   const description =
-    "Unified paged reader (replaces xc_check_inbox / xc_mail_read / xc_task_read / xc_peer_inbox / xc_peer_read, plus the new journal scope). " +
+    "Unified paged reader (scopes: inbox/mail/task/peer/peer-msg/journal). " +
     "scope=inbox reads and consumes your team mailbox (urgent messages first, budgeted batches, leftover stays unread); " +
     "scope=mail pages one mailbox history item; scope=task pages one team.json task field (field defaults to result); " +
     "scope=peer drains cross-session messages (count = what this response actually presents; leftover stays queued and remaining tells you to poll again); scope=peer-msg pages one cross-session item; " +

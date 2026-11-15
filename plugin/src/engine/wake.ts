@@ -260,26 +260,27 @@ export interface WakePromptInput {
  * 替换 v0.1.0 MEMBER_RULES 摘要版；§9.2 W3 对外接口 `export const MEMBER_RULES_V2: string`）。
  * 这是 G2「成员自动开工」的执行协议本体，逐条对应 CC 队友工作流（11-cc逆向 §4.3-5）。
  * 与 §3.4 比仅去掉两处纯设计内引用（§6.2 ③ / scheduler.js:178），语义零改动。
- * W2 的成员欢迎 prompt（xc_member_add 步骤③）经本导出复用同一文本（§9.1 依赖方向）。
+ * W2 的成员欢迎 prompt（xc_team member-add 步骤③）经本导出复用同一文本（§9.1 依赖方向）。
+ * v0.7（M6）：守则内工具名随旧名移除同步改新名（xc_identify/xc_read/xc_team/xc_overview）。
  */
 export const MEMBER_RULES_V2 = [
   "成员守则 v2（多任务自驱版）：",
-  "1) 身份：先 xc_register（本 prompt 已给出 name/sessionId/wakeToken），再 xc_check_inbox 读消息。",
+  "1) 身份：先 xc_identify（本 prompt 已给出 name/sessionId/wakeToken），再 xc_read({scope:\"inbox\"}) 读消息。",
   "2) 工作循环（一个回合可以做多单，做完一单领下一单）：",
   "   a. 取一单：优先看收件箱未读的 task-assignment / unblock-notice；",
   "   b. xc_claim(taskId) 拿 attemptId → xc_report(in_progress) → 执行；",
   "   c. 预计超过 10 分钟的任务每 ≤10 分钟 xc_report(in_progress)（心跳，附一句进展）；",
   "   d. 完成：xc_report(completed, result=结果摘要, evidence=[文件路径+至少一条])；",
   "      失败：xc_report(failed, error=原因)。回执发出后回到 a 取下一单。",
-  "3) 没有可做的活：向 lead 发 xc_idle（summary 必填；刚完成的单附 completedTaskId/completedStatus），",
-  "   然后立即结束回合。不要空转轮询。（例外：首次供给的欢迎回合无单直接结束回合、不发 xc_idle",
+  "3) 没有可做的活：向 lead 发 xc_team({action:\"idle\"})（summary 必填；刚完成的单附 completedTaskId/completedStatus），",
+  "   然后立即结束回合。不要空转轮询。（例外：首次供给的欢迎回合无单直接结束回合、不发 idle 通知",
   "   ——就绪由 roster state 表达。）",
   "4) xc_claim 被拒：task_not_pending（已被领）→ 不重试，回到 a；",
   "   dependencies_unmet → 该任务等 unblock-notice 再做，回到 a 看有没有别的活；",
   "   already_has_open_task → 先把手头的单做完报掉。",
   "5) stale attempt（attemptId 不匹配）→ 立即停手，该任务已被重置，回 a 取别的；",
-  "   error:\"busy\" → 稍后重试一次，仍忙则 xc_idle 结束回合。",
-  "6) 依赖任务的输出：claim 后如需上游产出，用 xc_status 看依赖任务的 result 字段；",
+  "   error:\"busy\" → 稍后重试一次，仍忙则 xc_team({action:\"idle\"}) 结束回合。",
+  "6) 依赖任务的输出：claim 后如需上游产出，用 xc_overview 看依赖任务的 result 字段；",
   "   unblock-notice 里也会带上游结果摘要（有截断预算）。",
   "7) 收到 shutdown-request 帧 → 不再领取新任务，把手头单报告（或直接 failed）后结束回合。",
   "8) 一切与协作有关的状态只经 xc_* 工具读写；.crosschat/ 状态目录是只读诊断面。",
@@ -349,9 +350,9 @@ export function buildWakePrompt(input: WakePromptInput, maxChars: number = WAKE_
   const receipt = formatReceipt(input.teamId, input.recipientKey, input.receiptIds);
   const identity =
     `你是 zcode 会话 "${input.recipientKey}"，sessionId=${input.recipientSessionId}。` +
-    `本连接是新的：先调用 xc_register 绑定本连接身份（name 填 "${input.recipientKey}"，` +
+    `本连接是新的：先调用 xc_identify 绑定本连接身份（name 填 "${input.recipientKey}"，` +
     `sessionId 填 "${input.recipientSessionId}"，wakeToken 填 "${input.wakeToken}"），` +
-    `注册成功后调用 xc_check_inbox 读取回执对应的消息。`;
+    `注册成功后调用 xc_read({scope:"inbox"}) 读取回执对应的消息。`;
   const rules = input.includeMemberRules === true ? MEMBER_RULES_V2 : undefined;
 
   // v0.6（C1）：urgent 唤醒 → 正文携带段首位插横幅（横幅 + 原正文合计受正文预算

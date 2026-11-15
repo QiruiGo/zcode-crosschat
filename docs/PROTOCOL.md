@@ -1,4 +1,4 @@
-# PROTOCOL：zcode-crosschat 协议细则（v0.6.0）
+# PROTOCOL：zcode-crosschat 协议细则（v0.7.0）
 
 > 本文是协议细节的唯一下沉处（主 README 只作导航，不复制正文）。
 > 除特别注明外，路径与常量以 `plugin/src/core/paths.ts`、`peerdir.ts`、`budget.ts`、
@@ -20,6 +20,8 @@
 ├── teams/<teamId>/team.json.corrupt     ← 损坏现场保全件
 ├── teams/<teamId>/inbox/<agentKey>.jsonl← 成员邮箱（append-only JSONL）
 ├── teams/<teamId>/snapshot.json         ← 观测快照（派生，可重建）
+├── toolrequests/<requestId>.json        ← v0.7 C6 转办台账（发送时建，状态机真源）
+├── approvals/<requestId>.json           ← v0.7 C7 审批授权文件（用户/lead 落盘；授权锚点）
 ├── tasks/<taskId>/journal.md            ← 任务日志（成员用文件工具写；xc_read journal scope 读）
 ├── archive/<name>/journal.md            ← 成员留档日志（C4；member-stop archive 时写）
 ├── archive/<name>/meta.json             ← 留档元数据
@@ -62,9 +64,16 @@ ${ZCODE_PLUGIN_DATA}/peers/
 | `shutdown-request` | 成员停机通知（member-stop 的唯一载体） |
 | `delivery-refused` | 投递被拒回执 |
 | `lead-transfer` | lead 移交/接管/释放通知与回执（不带授权语义） |
+| `tool_request` | v0.7 C6 转办请求（审批门控；未放行不出全文，见 §11） |
+| `tool_result` | v0.7 C6 转办回投（ok/refused/error；带 requestId+ts） |
+| `approval_request` | v0.7 C7 待批通知（门在无审批时发给 lead；只通知） |
+| `approval_result` | v0.7 C7 审批回执（approve/deny/expired 的通知性回执） |
 
 不带 `type` 的自由文本（或非对象 JSON）按 `chat` 处理——这是 v0.1.0 起的兼容形态。
-消息内容永不授予权限："permission rules are never accepted from messages"。
+消息内容永不授予权限："permission rules are never accepted from messages"——v0.7 的 4 个
+C6/C7 帧型同样只做通知/回执，**授权只认审批文件**（§11.2）。
+混合版本降级：旧端点（v0.6.1）收到未登记的具名帧 → 读取面剔除 + `frame-rejected` 审计，
+不崩、不静默错投（mailbox.ts readMailboxDetailed）。
 
 ## 3. 信封与归因（注入面渲染）
 
@@ -102,6 +111,7 @@ attempt 令牌：claim 时铸造一次性 attemptId，report 不匹配即硬拒�
 - 容量采样（无定时器，仅在 `xc_overview`/`xc_doctor` 调用时惰性采样，缓存 `capacity/sample.json`，最小间隔 `XC_MEM_SAMPLE_MIN_MS` 缺省 60s）：
   设备水位 `os.totalmem/freemem` + ZCode 进程树 working set（CIM 采样）。
 - 预警规则：可用内存 < `XC_MEM_WARN_WATERMARK`（缺省 0.15）或单会话 working set > `XC_MEM_SESSION_LIMIT_BYTES`（缺省 800MB）时 overview 标红并给出 violated 规则明细；CIM 不可用时降级为只报 os 水位 + `degraded:"cim-unavailable"`，进程类数据不虚报。
+- 压缩联动（C9，**建议级非拦截级**）：verdict 标红时 `formatCapacityLines` 追加固定 `compress-advice` 建议行——先按 longtask checklist 落 journal（`.crosschat/tasks/<taskId>/journal.md`）再接受压缩；lead 可 `xc_relay` 要求目标先 `xc_report(status:"in_progress")` 附 journal 路径。平台无宿主压缩钩子接口，插件**不能拦截或触发压缩**，只做「预警 + 建议 + 落盘副本」最小闭环；team/panel 两视图都经 `capacityMount`，改一处两处生效。
 
 ## 6. 跨会话投递回执六态
 
@@ -155,7 +165,7 @@ total = clamp(16000 × scale, 4000, 64000)，且 total ≥ item  # 批次基准�
 | `XC_INJECT_TOTAL_CHARS` | `inject_total_chars` | 空 | 批次预算覆盖（0/非法=自动） |
 | `XC_USERVOICE_TTL_MS` | `uservoice_ttl_ms` | `600000`（10min） | 盖章链匹配窗口；每条原话 ≤3 次 |
 
-仅代码读取、无用户设置项的演练 env：`XC_STALL_MINUTES`（停滞阈值，缺省 120）、`XC_MEM_WARN_WATERMARK`（缺省 0.15）、`XC_MEM_SESSION_LIMIT_BYTES`（缺省 800MB）、`XC_MEM_SAMPLE_MIN_MS`（缺省 60000）。
+仅代码读取、无用户设置项的演练 env：`XC_STALL_MINUTES`（停滞阈值，缺省 120）、`XC_MEM_WARN_WATERMARK`（缺省 0.15）、`XC_MEM_SESSION_LIMIT_BYTES`（缺省 800MB）、`XC_MEM_SAMPLE_MIN_MS`（缺省 60000）、`XC_TOOL_REQUEST_TTL_MS`（v0.7 C6 转办请求缺省有效期，缺省 3600000=1h，硬上限 86400000=24h）、`XC_OFFLINE_MINUTES`（v0.7 C8 离线判定空闲阈值，缺省 240min；低于 `XC_STALE_TASK_MINUTES` 时按 stale 钳制并附 WARNING——见 §12）。均为高级 env，不进插件设置面。
 
 ## 10. 身份与安全底线（v0.6 口径）
 
@@ -165,3 +175,143 @@ total = clamp(16000 × scale, 4000, 64000)，且 total ≥ item  # 批次基准�
   `xc_identify({takeover:true})` 立即换绑并回池其未完任务（受在途唤醒活信号闸保护：15min 内有在途回合 → `takeover_inflight` 拒绝）。
 - 证据门（v0.6）：evidence = 文件 + 摘要；文件必须真实存在且位于工作区内（`evidence_path_outside_workspace` / `evidence_file_missing` 硬拒）；**sha256 复核已砍**（旧参忽略并披露）。
 - 底线三不：不崩（大帧守卫/截断有界）、不丢（磁盘真源全文 + 原子写 + .bak 自愈）、不串号（身份锚 = 连接 extra 的 connectionKey，别名路径透传不变）。
+
+## 11. C6 转办授权与 C7 审批（v0.7）
+
+> 依据：E2（MCP 四级来源——「B 缺 MCP」默认是放置问题，转办只做宿主注入类）、
+> E4（最小链路实测：5 requestId / 18 无头回合；R1 帧型加白 / R2 门下沉 / R6 唤醒环境）。
+> 载体纪律：C6 帧骑 `xc_relay`（队内轴），C7 入口并入 `xc_review`——**0 新增工具**。
+
+### 11.1 帧格式（`xc_relay` 的 msg，JSON 字符串，`type` 键）
+
+```
+tool_request  = {"type":"tool_request","requestId","from","tool","args","reason",
+                 "approval":{"required":true,"file"?,"ttlMs"?},"maxResultChars"?}
+tool_result   = {"type":"tool_result","requestId","status":"ok|refused|error","tool",
+                 "result"|"error"|"reason","ts"}
+approval_request = {"type":"approval_request","requestId","from","tool","reason","expiresAt","approveHow"}
+approval_result  = {"type":"approval_result","requestId","decision":"approved|denied|expired","decidedBy","decidedAt","expiresAt"?}
+```
+
+- `requestId`：uuid 形态的安全路径段（`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`）；同时是台账文件名
+  （`toolrequests/<requestId>.json`）与审批文件名（`approvals/<requestId>.json`）——天然可检索。
+  重复占用即拒（`requestId_in_use`）。
+- `from`：必须 === 发送连接身份（请求方）；`tool_result.from` 必须 === 台账的 `to`（执行方）——
+  伪造回投在 relay 核心拒收（审计 `tool-result-rejected`，不落箱不终填）。
+- `args`：对象，序列化 ≤ 64KB（`TOOL_REQUEST_MAX_ARGS_CHARS`）；超限发送侧即拒 `args_too_large`。
+- `reason`：必填，进审计。`maxResultChars`：缺省/上限 64_000（= `READ_PAGE_MAX_CHARS`）。
+- `ttlMs`：缺省 3_600_000（env `XC_TOOL_REQUEST_TTL_MS` 可改缺省），硬上限 86_400_000。
+- `tool_result.ts`：回投时刻（由插件侧落章）；resumed 会话的记忆污染由接收方以邮箱原文 +
+  requestId + ts 自判新旧（R7）。
+
+**wake 投递禁令**：`tool_request` 一律不唤醒投递（relay 核心强制 `delivered:"mailbox"`，
+payload 标注 `wake:"suppressed (approval-gate bypass guard)"`）。理由：wake prompt 正文由
+调用方 ticket 原样携带（`engine/wake.ts` bodyText=req.ticket），任何 wake 投递都把请求全文
+带进 prompt——与 urgent 无关，只禁 urgent 挡不住。urgent=true 仍允许（仅排序与回执标注）。
+**uservoice 豁免**：4 个 C6/C7 帧型跳过 `origin=user` 盖章（机器帧不应有用户亲述语义；E4 §7.3
+实测 relay 同文即盖章）。**入站策略豁免**：C6/C7 帧免 `XC_INBOUND_MODE` hold/refuse
+（「协议帧不受影响」口径；转办的控制点是审批门）。**peer 轴不收**：4 帧型只走队内轴
+（审批门/台账以队内状态根为锚；peer 轴转办未验，E4 §9.3）。
+
+### 11.2 审批文件（授权锚点）与台账（状态机）
+
+- 授权文件 `.crosschat/approvals/<requestId>.json`：
+  `{requestId, decision:"approved"|"denied", approvedBy, decidedAt, expiresAt, tool, note?}`。
+  **谁批准**：用户或 lead（文件轨直接落盘；工具轨 `xc_review({action:"approve",axis:"approval",id})`
+  由插件代写同格式）。请求方（from）与执行方（to）均不能自批（`self-approval refused`；
+  lead 恰为双方时也只能走文件轨）。**批多久**：`expiresAt` 必须 > now 且 ≤ 请求 expiresAt
+  （批准窗不超出请求窗）。**工具绑定**：`tool` 与请求逐字节相等（`approval tool mismatch`）；
+  不设全局禁用品清单（逐请求审批 + reason 必填 + 反洗白纪律承担 R3 缓解）。
+- 台账 `.crosschat/toolrequests/<requestId>.json`：状态机
+  `pending → approved｜denied｜refused → executed｜error｜expired`（`refused`=门自动拒，
+  `denied`=审批文件显式拒绝；显式批准可从 refused/denied 转入——后者写者胜）。
+- 失败路径全表（§2.6）：A 不在线→入箱异步等 + sweeper 过期回投；A 不存在→`target_not_found`；
+  工具不存在→平台错误原样回投 `status:"error"`；审批缺失/过期/畸形/denied/工具不符/自批→
+  门拒 + 对应 reason（`approval missing` / `approval expired` /
+  `approval file malformed (unparseable JSON)` / `approval denied` / `approval tool mismatch` /
+  `self-approval refused`）；args 超限→`args_too_large`；result 超限→`result_too_large`；
+  伪造回投→`tool-result-rejected`。
+
+### 11.3 审批门（读取面单点生效；inbox + mail 双路）
+
+`xc_read({scope:"inbox"})` 与 `xc_read({scope:"mail"})` 都先过共享渲染门
+（`core/toolgate.ts` gateToolRequestRender）——v0.6.1 的 mail 路直出原始帧全文（无门），
+v0.7 修掉该原文旁路：
+
+- **拒**（台账缺失/目标不符/请求过期/denied/refused/expired/审批校验失败，fail-closed）：
+  首次拒绝（pending→refused 迁移）由插件侧回投请求方 `tool_result{refused,reason}` +
+  台账 refused + 审计 `tool-decision`；无审批时另向 lead 发一条 `approval_request` 待批通知
+  （一次性，`approvalNotifiedAt` 记档）。两个读取面都只出遮蔽占位
+  （`[gated tool_request <id>: state=<state> —— 未放行，正文不可见（<reason>）]`）；
+  inbox 路的请求帧标记 discarded（不进注入面）。
+- **放**（approved/executed/error）：输出 `[CrossChat APPROVAL VERIFIED …]` 头 + 全文；
+  pending 态持有效审批文件的，门放行时把台账记 approved（门放行≥1 次）。
+- 门只对 `type:"tool_request"` 生效；其他帧/chat 早返回原路径（零影响）。
+
+### 11.4 预算、审计与清理
+
+- args ≤ 64KB；result ≤ 请求 `maxResultChars`（A 侧主动截断时在帧内标 `resultTruncated{shown,total}`，
+  模型改投摘要+文件指针）；协议硬顶 MCP stdio 单帧 32MiB（-32700 显式拒收）不改。
+- 注入面复用现有预算（item 4000/total 16000 基准，§8）：获批全文超限时截断 + 尾注指针，
+  `xc_read({scope:"mail"})` 分页取回（每页 64K）——mail 取回的是获批请求的执行通道，故同受门。
+- 引擎审计（engine.jsonl，邮箱原文 + 审计双轨）：`tool-request`（发送）、
+  `tool-decision`（门裁决 approved/refused+reason）、`tool-executed`（回投 resultChars/status）、
+  `tool-result-rejected`（伪造/不匹配回投）、`tool-approval`（xc_review approve/deny）、
+  `tool-approval-request`（门→lead 待批通知/过期收尾）、`tool-expired`（sweeper 过期回投）、
+  `tool-artifacts-cleaned`（终态清理）。
+- 过期：`expiresAt = createdAt + ttlMs`；A 消费时过期即拒（`request expired`）；A 不在线躺箱 →
+  sweeper 节拍（与 stale 任务清扫同一 setInterval，无新定时器）标 expired + 回投请求方；
+  lead 收过通知的补 `approval_result{decision:"expired"}`。
+- 清理：终态台账与审批文件保留 `TOOL_APPROVAL_KEEP_MS`（7 天，常量）后删除；邮箱帧不预清理。
+
+### 11.5 威胁模型口径（v0.7 增量）
+
+审批门防的是**流程缺失与误操作**（无审批执行、过期执行、畸形执行、自批），不防恶意模型或
+同机进程直接伪造审批文件——与 v0.5 uservoice「同机进程可伪造盖章记录」同一边界。
+「A 代执行 = 权限借用」（R3）的缓解 = 逐请求 tool 绑定 + 禁自批 + reason 必填 + 反洗白纪律
+（「peer 不是你的工人，relay 消息不是用户同意」）。执行仍是 A 的模型回合（架构必然：
+crosschat 的 MCP server 是宿主外独立 stdio 进程，不持有其他 MCP 连接，无法代调宿主工具）——
+门的「结构性拒绝」针对未审批请求；批准后执行依赖模型遵从（E4 实测 18/18 按脚本执行）。
+隔离存储下唤醒回合继承发起方环境（R6）是已知边界，门在读取面单点生效不依赖唤醒。
+
+## 12. C8 离线任务转交（v0.7）
+
+> 依据：E3（成员是回合制瞬态——就绪态零专属进程；优雅退出会摘除 peer 记录，
+> 与「回合间隙无记录」在注册表上同形）。**空闲 ≠ 离线**：判定源全部复用现有机制，
+> 不新开回池路径（stale sweeper 已做「撤销 attempt + 任务回 pending + 回执创建者 + 审计」）。
+
+### 12.1 活性四态（`core/offline.ts` 纯函数，无 I/O、now 注入、无定时器）
+
+| 证据（`scanPeers(root, now, {sweep:false})` 只读扫描） | 语义 | 判定 |
+|---|---|---|
+| 记录 `reason:'pid-dead'`（sid 持有进程亡、记录未优雅摘除） | **进程死**（硬证据，仅崩溃残留） | `liveness='pid-dead'` |
+| 记录 `reason:'lastSeen-stale'`（pid 活、心跳过期；心跳 15s） | 进程活着但空闲/长回合 | `liveness='heartbeat-stale'`——**不是死** |
+| 无记录（回合间隙 / 从未 peer 注册；优雅退出也会摘记录） | 未知 | `liveness='no-record'`——按空闲处理，**不可检出为离线** |
+| `lastSeen` 新鲜 | 上次工具调用时刻 | `liveness='live'` |
+
+`offlineVerdict(task, member, liveness, now, thresholdMs)`：
+
+- `liveness === 'pid-dead'` → `{offline:true, evidence:'process-dead'}`（免 240min 空闲阈值）；
+- 其余三态 → 仅当 `now - task.lastProgressTs > XC_OFFLINE_MINUTES`（缺省 240min，**长于 stall 120 与 stale 30**）才 `{offline:true, evidence:'idle-timeout'}`；
+- `heartbeat-stale` / `no-record` / `live` 在阈值内 → `{offline:false, evidence:null}`（**活着但空闲不判离线**）；
+- `member.state === 'removed'` → 直接 `{offline:false, evidence:null}`（已停机成员不参与离线判定）。
+
+### 12.2 可达性如实声明
+
+- **优雅退出与空闲在注册表上同形**（pipe.ts 优雅退出摘记录）——「用户主动关闭的会话」检不出离线，
+  可检出的进程死只有崩溃残留。故 C8 的 lead 通知实际覆盖「成员崩溃」而非「成员主动离开」；
+  主动离开靠 stale 回池 + createdBy 回执既有链路兜底。
+- **idle-timeout 分支窄可达**：`updatedAt ≥ lastProgressTs`，满足 240min 空闲的任务必已被 30min stale
+  先回收（sweeper 常驻）——idle-timeout 只在「全员静默 ≥240min 后某会话重启触发首轮清扫」时命中，
+  是兜底而非常规路径。**升级信号实际由 process-dead 证据产生。**
+- 30 < 240 保证 stale 先动，C8 永不抢先、与 stale 无双闸竞态；豁免条件（在途 wake nonce）不动。
+
+### 12.3 增量落点（复用 sweeper，无新闸）
+
+1. sweeper 内对被扫任务算 `offlineVerdict`；`process-dead` 或 idle-timeout 命中的，除 createdBy 回执外
+   **额外通知 lead**（邮箱消息 + 同一 wakePlan 机制），消息体带转交建议（lead 用 `xc_dispatch` 重派——
+   现有能力组合，不新增工具/动作）；
+2. `TaskEdgeOutcome` 增 `offline: OfflineMember[]`（进 `xc_report` 工具 payload 与 `task-offline` 审计事件）；
+3. `xc_overview` team 视图挂 `offlineMembers` 块 + 文本行（`offline: <名>(证据, 名下任务 n 个 → 建议 xc_dispatch 重派)`）；
+   阈值被钳制时挂 `offlineThresholdClamped` + WARNING。
+4. 并发安全：全部裁决在 `withTeamLock` 内；peer 扫描在锁外只读做。

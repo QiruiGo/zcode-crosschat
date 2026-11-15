@@ -138,7 +138,7 @@ describe('layoutInjectBlocks（R-17 排布，对齐 CC gca）', () => {
     expect(result.blocks).toHaveLength(1);
     const text = result.blocks[0]!;
     expect(text.startsWith('x'.repeat(3999) + '\n')).toBe(true);
-    expect(text).toContain('xc_peer_read({msgId:"m-1"})');
+    expect(text).toContain('xc_read({scope:"peer-msg", id:"m-1"})');
     expect(text).toContain('显示 3999/5000');
   });
 
@@ -177,10 +177,10 @@ describe('layoutInjectBlocks（R-17 排布，对齐 CC gca）', () => {
     expect(text).toContain('显示 20/1000');
   });
 
-  it('mail 指针分叉：xc_mail_read 尾注', () => {
+  it('mail 指针分叉：xc_read scope:mail 尾注', () => {
     const rendered = 'z'.repeat(5000);
     const result = layoutInjectBlocks([block({ rendered })], { item: 4000, total: 16000, scale: 1 }, 'mail');
-    expect(result.blocks[0]).toContain('xc_mail_read({messageId:"m-1"})');
+    expect(result.blocks[0]).toContain('xc_read({scope:"mail", id:"m-1"})');
   });
 
   it('user origin 的摘要行（调用方装配的 summaryLine 原样使用）', () => {
@@ -242,14 +242,14 @@ describe('paginateText（R-22 分页原语）', () => {
   });
 });
 
-describe('truncateNote（R-20 指针格式）', () => {
+describe('truncateNote（R-20 指针格式；v0.7 旧名移除后指 xc_read scope）', () => {
   it('peer 指针', () => {
     expect(truncateNote('peer', 'm-1', 100, 9000))
-      .toBe('[消息已截断：显示 100/9000 字符 —— 用 xc_peer_read({msgId:"m-1"}) 取全文/分页]');
+      .toBe('[消息已截断：显示 100/9000 字符 —— 用 xc_read({scope:"peer-msg", id:"m-1"}) 取全文/分页]');
   });
 
   it('mail 指针', () => {
     expect(truncateNote('mail', 'm-2', 7, 12))
-      .toBe('[消息已截断：显示 7/12 字符 —— 用 xc_mail_read({messageId:"m-2"}) 取全文/分页]');
+      .toBe('[消息已截断：显示 7/12 字符 —— 用 xc_read({scope:"mail", id:"m-2"}) 取全文/分页]');
   });
 });

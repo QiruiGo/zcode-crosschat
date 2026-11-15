@@ -1,6 +1,6 @@
 /**
  * M3/W4 render：工具的人可读输出（一行摘要沿用 dsh tools.js render 思路）、
- * xc_status 任务板与 v0.2 全景渲染（DESIGN.md §2.8/§4.3；DESIGN-V0.2.md §7.3.1）。
+ * xc_overview 任务板与 v0.2 全景渲染（DESIGN.md §2.8/§4.3；DESIGN-V0.2.md §7.3.1）。
  *
  * v0.2（W4 改动边界，DESIGN-V0.2 §9.1）：
  * - StatusSnapshot/StatusSnapshotTask 类型改从 core/snapshot.ts 导入（W3 承载，
@@ -9,7 +9,7 @@
  * - 新增 renderPanorama：v2 全景渲染 = 成员状态表（working/idle/provisioning/
  *   failed/removed，含 lead 标注）+ 任务板 + DAG 一行图（`t1 ─▶ t2`）。
  * - renderStatusTable 升级为双形态：快照带全景字段（leadKey/dag/engine，W3
- *   refreshSnapshot 的 v2 形状）→ 全景渲染；v0.1.0 形状（tools.ts xc_status 构造）
+ *   refreshSnapshot 的 v2 形状）→ 全景渲染；v0.1.0 形状（tools.ts 板面构造）
  *   → 输出与 v0.1.0 逐字符一致（回归锁定，render.test.ts 双路径覆盖）。
  *
  * 依赖纪律：对 M1 只 import writeFileAtomic（atomic.ts，Windows 原子写 §2.7-6）
@@ -64,7 +64,7 @@ export function renderMessage(messageId: string, from: string, to: string, deliv
 }
 
 // ---------------------------------------------------------------------------
-// v0.2 全景（§7.3.1 xc_status v2 / snapshot.json v2）
+// v0.2 全景（§7.3.1 overview v2 / snapshot.json v2）
 // ---------------------------------------------------------------------------
 
 /**
@@ -189,8 +189,8 @@ export const STATUS_TASK_TABLE_HEADER =
 
 /**
  * 单条任务的人可读板面行（renderTaskTable 逐行同款）。
- * v0.5.2（SCALE-1 修复）导出：xc_status 的板面注入预算窗口要按「人可读行 + JSON
- * 条目」的联合成本估窗（与 xc_check_inbox 的 inboxEntry 成本口径一致），此处是
+ * v0.5.2（SCALE-1 修复）导出：xc_overview 的板面注入预算窗口要按「人可读行 + JSON
+ * 条目」的联合成本估窗（与 xc_read inbox 的 inboxEntry 成本口径一致），此处是
  * 人可读面成本的单一事实源。
  */
 export function statusTaskRowText(task: StatusSnapshotTask): string {
@@ -224,7 +224,7 @@ function renderTaskTable(snapshot: StatusSnapshot): string {
 export function renderBoardTruncationNote(shown: number, total: number, budgetChars: number): string {
   return (
     `[任务板已按注入预算（${budgetChars} 字符）截断：本页 ${shown}/${total} 条；`
-    + `其余任务用 xc_status({offset:${shown}}) 分页读，snapshot.json 仍含全量]`
+    + `其余任务用 xc_overview({offset:${shown}}) 分页读，snapshot.json 仍含全量]`
   );
 }
 
@@ -232,7 +232,7 @@ export function renderBoardTruncationNote(shown: number, total: number, budgetCh
 export const BOARD_TRUNCATION_NOTE_MAX_CHARS = 220;
 
 /**
- * xc_status 的人可读任务板（v0.1.0 输出形态原样保留，DESIGN §4.2）；
+ * xc_overview 的人可读任务板（v0.1.0 输出形态原样保留，DESIGN §4.2）；
  * 快照带 v2 全景字段（leadKey/dag/engine）时升级为全景渲染（§7.3.1，W4）。
  */
 export function renderStatusTable(snapshot: StatusSnapshot & PanoramaExtras): string {
@@ -258,7 +258,7 @@ function unreadText(snapshot: StatusSnapshot, key: string): string {
 }
 
 /**
- * xc_status 快照落盘（DESIGN §2.8：人可读观测面 snapshot.json；§4.3 观测点之一）。
+ * xc_overview 快照落盘（DESIGN §2.8：人可读观测面 snapshot.json；§4.3 观测点之一）。
  * 整文件 → 走 M1 的 Windows 原子写（写临时文件 → rename，EPERM/EACCES/EBUSY 重试）；
  * writeFileAtomic 不建父目录（M1 各调用方均先 mkdir），团队未建时此处自建。
  */

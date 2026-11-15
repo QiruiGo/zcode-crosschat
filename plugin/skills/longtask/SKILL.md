@@ -1,6 +1,6 @@
 ---
 name: longtask
-description: 长期任务的三行约定——任务日志、交接、压缩前留档。当任务是长任务/长期任务、要跨天执行、新会话要接手或交接他人任务、成员即将休眠（xc_team member-stop）、上下文即将被压缩、或容量预警（xc_overview 标红）需要先落盘再压缩时使用。
+description: 长期任务的三行约定——任务日志、交接、压缩前留档。当任务是长任务/长期任务、要跨天执行、新会话要接手或交接他人任务、成员即将休眠（xc_team member-stop）、上下文即将被压缩、或容量预警（xc_overview 容量标红 / capacity.red）需要先落盘再压缩时使用。
 ---
 
 # longtask：长期任务三行约定（C4）
@@ -36,11 +36,17 @@ description: 长期任务的三行约定——任务日志、交接、压缩前�
 
 一句话恢复模板：**接手 \<名\>：identify → 读 archive:\<名\> journal → 按 journal 指针读 task prompt → 认领续作。**
 
-## 3. 压缩前 checklist（容量预警或自知即将压缩时，逐项过完再压缩）
+## 3. 压缩前 checklist（`xc_overview` 容量标红 / capacity.red，或自知即将压缩时，逐项过完再压缩）
 
 - [ ] journal「当前进度」写全：此刻做到哪一步、下一步具体动作是什么；
 - [ ] 全部产物路径落成 journal 行（压缩后你记忆里的路径不作数）；
 - [ ] `xc_report({ "status": "in_progress" })` 附 journal 路径——给 lead/创建者一个落盘指针；
 - [ ] 以上完成**之后**才接受压缩；成员休眠走 `xc_team({ "action": "member-stop" })`（缺省先写 `.crosschat/archive/<名>/` 留档再停，任务回池不丢）。
 
-> 容量预警（`xc_overview` 标红）出现时，把本 checklist 当作压缩前置条件执行：journal 是唯一承诺落盘的副本。
+> 容量预警（`xc_overview` 容量标红 / capacity.red）出现时，把本 checklist 当作压缩前置条件执行：journal 是唯一承诺落盘的副本。压缩联动是**建议级非拦截级**——平台无宿主压缩钩子，插件只能预警+建议（overview 红样本附 `compress-advice` 行），拦不住压缩本身；规则靠回合自觉：看到标红，先落盘再压缩。
+
+### lead 操作序（容量标红时，C9）
+
+1. `xc_relay` 提醒目标成员：容量已标红，先按本 checklist 落 journal；
+2. 等目标 `xc_report({ "status": "in_progress" })` 附 journal 路径——板面上看到指针即算落盘；
+3. 确认落盘后才允许其接受压缩；目标迟迟不落盘按任务流程处理（重派/接管），不反复催压缩。

@@ -1,9 +1,9 @@
 /**
  * v0.6 M1（DESIGN-V0.6.md §1.2 T8）：xc_team —— 指挥族合一（action 分发）。
  *
- * 合并 xc_team_init / xc_lead_transfer / xc_lead_release / xc_member_add /
- * xc_member_stop / xc_idle / xc_cancel 的调用面；每个 action 的核心逻辑 =
- * 现行对应工具原样平移（lead-tools.ts / member-tools.ts 的 core 函数整体迁入，
+ * 合并 init/transfer/release/member-add/member-stop/idle/cancel/unblock 各旧指挥
+ * 工具的调用面；每个 action 的核心逻辑 = 现行对应工具原样平移（v0.5.3 的
+ * core 函数整体迁入，
  * 权限矩阵不变：init/transfer/release/member-add/member-stop 仅 lead；cancel
  * 仅 lead 或任务创建者；idle 是成员自己上报；unblock 允许 lead、任务创建者或
  * 该任务认领者）。
@@ -29,7 +29,7 @@ import { logEngineEvent } from "../core/log.js";
 import { appendMailbox, createMessage, readMailbox, readUnreadMailbox } from "../core/mailbox.js";
 import { bindName, readSession, writeSession } from "../core/registry.js";
 import { sanitizeKey, validateMemberName } from "../core/sanitize.js";
-import { getTask, memberOpenTasks, newTeamState, readTeam, transitionTask, unblockTask, writeTeam } from "../core/teamstate.js";
+import { getTask, leadKeyOf, memberOpenTasks, newTeamState, readTeam, transitionTask, unblockTask, writeTeam } from "../core/teamstate.js";
 import { taskJournalPath, writeArchive } from "../core/archive.js";
 import {
   DEFAULT_TEAM_ID,
@@ -67,7 +67,7 @@ export function blocksWake(provisionState: MemberState): boolean {
 // zod 入参 schema（§1.2 T8）
 // ---------------------------------------------------------------------------
 
-/** xc_idle 的 idleReason 取值约定（§5.3，对齐 11-cc逆向 §3c-4 idle_notification）。 */
+/** action=idle 的 idleReason 取值约定（§5.3，对齐 11-cc逆向 §3c-4 idle_notification）。 */
 export const IDLE_REASONS = ["no-claimable-task", "inbox-empty", "blocked-only"] as const;
 
 export const TeamShape = {
@@ -163,10 +163,14 @@ export function activeMembersAfterUpsert(team: TeamState, existing: TeamMember |
   );
 }
 
-/** lead 判定（§6.1 step 1）：team.leadKey，未设置时 founder 视为 lead。 */
-export function leadKeyOf(team: TeamState): string {
-  return team.leadKey ?? team.founderKey;
-}
+/**
+ * lead 判定（§6.1 step 1）：team.leadKey，未设置时 founder 视为 lead。
+ *
+ * v0.7 集成收口：实现已在 core/teamstate.ts 提供单一事实源（core 侧审批门/台账清扫
+ * 需要它而 core 不能 import mcp）；本文件改为转出同一实现，删除逐字节重复的第二份
+ * （防未来两处漂移）。既有 `from "./tools-team.js"` 的导入方不受影响。
+ */
+export { leadKeyOf };
 
 /**
  * 同名重调的分流（§6.4/§6.1）。
@@ -1403,7 +1407,7 @@ export function registerTeamTools(
   registry: PrimaryRegistry,
 ): void {
   const description =
-    "Command family in one tool (replaces xc_team_init / xc_lead_transfer / xc_lead_release / xc_member_add / xc_member_stop / xc_idle / xc_cancel, plus the new unblock). " +
+    "Command family in one tool (actions: init/transfer/release/member-add/member-stop/idle/cancel/unblock). " +
     "action=init becomes lead (takeover:true ONLY on explicit user instruction); transfer/release move/drop the metadata lead role; " +
     "member-add provisions an engine member (lead only); member-stop removes a member, requeues its open tasks with receipts and (default archive:true) writes .crosschat/archive/<name>/ first (C4); " +
     "idle reports idleness to the lead; cancel cancels a task (lead or creator); unblock releases a blocked task back to its preBlocked status (lead/creator/claimant) with an unblock-notice to the claimant.";

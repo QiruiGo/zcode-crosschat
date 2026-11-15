@@ -204,7 +204,7 @@ describe("面 B · v0.5 注入预算排布（R-23）", () => {
     expect(JSON.parse(result.content[1]!.text)).toEqual({ ok: true });
     const block = result.content[2]!.text;
     // 总预算 300：新块 m-new 截到 199+指针；旧块 m-old 降一行摘要（含 msgId/from）。
-    expect(block).toContain("xc_peer_read({msgId:\"m-new\"})");
+    expect(block).toContain("xc_read({scope:\"peer-msg\", id:\"m-new\"})");
     expect(block).toContain("[已省略 bob 的消息 m-old（超注入预算）]");
     expect(block.length).toBeLessThan(big.length + 400);
   });

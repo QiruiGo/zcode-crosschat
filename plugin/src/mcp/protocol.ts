@@ -32,11 +32,13 @@ export function busyError(lock: string): ToolError {
   );
 }
 
-/** 未注册连接调用身份类工具（DESIGN §2.3-2、§2.8）。 */
+/** 未注册连接调用身份类工具（DESIGN §2.3-2、§2.8）。
+ *  v0.7（M6）：文案随旧名移除改指 xc_identify——未知名另走 dispatcher 的
+ *  `Tool <name> not found`（server.ts dispatchPrimary），与本错误不同路。 */
 export function notRegisteredError(): ToolError {
   return new ToolError(
-    { error: "not_registered", message: "not registered: call xc_register first" },
-    "not registered: call xc_register first",
+    { error: "not_registered", message: "not registered: call xc_identify first" },
+    "not registered: call xc_identify first",
   );
 }
 

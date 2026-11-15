@@ -58,11 +58,13 @@ export function receiverInjectBudget(
 
 export type InjectPointer = "peer" | "mail";
 
-/** 截断尾注（R-20；对齐 CC "[result truncated — ask the agent for the rest…]" @9943602）。 */
+/** 截断尾注（R-20；对齐 CC "[result truncated — ask the agent for the rest…]" @9943602）。
+ *  v0.7（M6）：尾注是可行动指令（每条被截断消息都带），旧读面名随旧名移除同步改为
+ *  xc_read 的 scope 形态——否则照旧文本行事的回合会撞 Tool not found。 */
 export function truncateNote(pointer: InjectPointer, id: string, shown: number, total: number): string {
   return pointer === "peer"
-    ? `[消息已截断：显示 ${shown}/${total} 字符 —— 用 xc_peer_read({msgId:"${id}"}) 取全文/分页]`
-    : `[消息已截断：显示 ${shown}/${total} 字符 —— 用 xc_mail_read({messageId:"${id}"}) 取全文/分页]`;
+    ? `[消息已截断：显示 ${shown}/${total} 字符 —— 用 xc_read({scope:"peer-msg", id:"${id}"}) 取全文/分页]`
+    : `[消息已截断：显示 ${shown}/${total} 字符 —— 用 xc_read({scope:"mail", id:"${id}"}) 取全文/分页]`;
 }
 
 export interface InjectBlock {
@@ -85,7 +87,7 @@ export interface LayoutResult {
 
 /**
  * 单块的 item 截断（R-20；对齐 CC gca 的逐条截断）。
- * 导出供**批次窗口记账**复用：xc_check_inbox / xc_peer_inbox / 快照板面在「消费前」
+ * 导出供**批次窗口记账**复用：xc_read 各 scope / 快照板面在「消费前」
  * 必须按同一口径预估每条的成本（截断后长度含尾注），否则窗口算小了会把装不下的
  * 条目也算进窗口、排布阶段再降级成占位摘要（v0.5.2 SCALE-3 的「消费即省略」根因）。
  */
@@ -124,7 +126,7 @@ export function layoutInjectBlocks(
   let remaining = budget.total;
   let truncatedCount = 0;
   let degradedCount = 0;
-  // v0.5.2（SCALE-3 修正）：三个消费面（A 钩子 / B 工具间隙 / C xc_peer_inbox）
+  // v0.5.2（SCALE-3 修正）：三个消费面（A 钩子 / B 工具间隙 / C peer 排空面）
   // 都是**先消费后排布**——排布时块对应的队列项已被取走。因此第一块（最新）
   // 在 item 截断后仍装不下时，必须硬切到剩余预算 + 指针，**绝不许降级成
   // 「已省略」占位摘要**：占位摘要 = 消费即省略（红队 #20 的根因形态）。
@@ -186,7 +188,7 @@ export function truncateField(text: string, itemBudget: number, sha256Of: (s: st
  * 由调用方的 item 截断兜住单条上限）；`costs` 为空返回 0。
  *
  * 与 layoutInjectBlocks（peer 面 A/B/C 的注意力排布：新→旧花费、旧条降摘要）的
- * 差异是**有意的**：xc_check_inbox / xc_peer_inbox / xc_status 板面是消费面/观测面，
+ * 差异是**有意的**：xc_read 各 scope / xc_overview 板面是消费面/观测面，
  * 被窗口留在外面的消息保持未读（或留在队列）、下一批继续消费，不需要降级摘要行；
  * 预算口径同源（budget.total）。
  *

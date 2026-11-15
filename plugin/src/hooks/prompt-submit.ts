@@ -2,7 +2,7 @@
  * M4 hooks-and-face: UserPromptSubmit hook — lastSeen refresh + inbox pull.
  *
  * v0.2 behavior（DESIGN.md §2.3-1、§7 M4）：刷新 registry/sessions/<sid>.json 的
- * lastSeen；有未读队内邮件时用 additionalContext 提示「有 N 条未读，先 xc_check_inbox」。
+ * lastSeen；有未读队内邮件时用 additionalContext 提示「有 N 条未读，先 xc_read({scope:"inbox"})」。
  *
  * v0.3 增量（DESIGN-V0.3.md §7.1 面 A、§6.2 档类新鲜度）：
  * - 跨会话 peer 消息的信封注入：排空机器全局 peers/queue/<sid>.jsonl，把每条渲染成
@@ -119,7 +119,7 @@ async function main(): Promise<void> {
         const senders = summary.senders.length > 0 ? `，来自 ${summary.senders.join('、')}` : '';
         blocks.push(
           `[zcode-crosschat] 你（${names[0]}）有 ${summary.count} 条未读协作消息${senders}。`
-          + '先调用 xc_check_inbox 查看并处理，再继续当前工作；任务回执先核对证据再向用户汇报。',
+          + '先调用 xc_read({scope:"inbox"}) 查看并处理，再继续当前工作；任务回执先核对证据再向用户汇报。',
         );
         await logHookEvent(ctx.stateRoot, {
           event: 'hook-prompt-submit-unread',

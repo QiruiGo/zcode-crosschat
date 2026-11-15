@@ -20,15 +20,15 @@
 
 ### 第 1 步：下载并解包
 
-1. 打开 <https://github.com/QiruiGo/zcode-crosschat/releases>，下载资产 **`zcode-crosschat-0.6.1-prebuilt-slim.tar.gz`**（约 4–5MB）。**保留原文件名**——随包发布的 `.sha256` 校验和按原名录，改名后校验会失败。
-2. （可选）校验完整性：在文件所在目录执行 `sha256sum -c zcode-crosschat-0.6.1-prebuilt-slim.tar.gz.sha256`（PowerShell 可用 `Get-FileHash` 对照 `.sha256` 文件里的值），期望输出 `OK`。
+1. 打开 <https://github.com/QiruiGo/zcode-crosschat/releases>，下载资产 **`zcode-crosschat-0.7.0-prebuilt-slim.tar.gz`**（约 4–5MB）。**保留原文件名**——随包发布的 `.sha256` 校验和按原名录，改名后校验会失败。
+2. （可选）校验完整性：在文件所在目录执行 `sha256sum -c zcode-crosschat-0.7.0-prebuilt-slim.tar.gz.sha256`（PowerShell 可用 `Get-FileHash` 对照 `.sha256` 文件里的值），期望输出 `OK`。
 3. 解包（Windows 10+ 自带 tar，PowerShell / Git Bash 均可）：
 
    ```bash
-   tar -xzf zcode-crosschat-0.6.1-prebuilt-slim.tar.gz
+   tar -xzf zcode-crosschat-0.7.0-prebuilt-slim.tar.gz
    ```
 
-   得到目录 `zcode-crosschat-0.6.1/`（下称「解包目录」，其下应有 `marketplace.json`）。
+   得到目录 `zcode-crosschat-0.7.0/`（下称「解包目录」，其下应有 `marketplace.json`）。
 
 ### 第 2 步：安装
 
@@ -43,11 +43,11 @@ zcode 命令行**不在系统 PATH 里**（它是桌面版内置的入口），�
 ```bash
 ZC() { ELECTRON_RUN_AS_NODE=1 "<安装目录>/ZCode.exe" "<安装目录>/resources/<variant>/zcode.cjs" "$@"; }
 
-ZC plugins marketplace add "<解包目录>/zcode-crosschat-0.6.1"
+ZC plugins marketplace add "<解包目录>/zcode-crosschat-0.7.0"
 # 期望：Added marketplace dev-zcode-crosschat (1 plugins)
 
 ZC plugins install zcode-crosschat@dev-zcode-crosschat
-# 期望：Installed plugin zcode-crosschat@dev-zcode-crosschat (0.6.1) [enabled]
+# 期望：Installed plugin zcode-crosschat@dev-zcode-crosschat (0.7.0) [enabled]
 ```
 
 **PowerShell**：
@@ -55,7 +55,7 @@ ZC plugins install zcode-crosschat@dev-zcode-crosschat
 ```powershell
 function ZC { $env:ELECTRON_RUN_AS_NODE = "1"; & "<安装目录>\ZCode.exe" "<安装目录>\resources\<variant>\zcode.cjs" @args }
 
-ZC plugins marketplace add "<解包目录>/zcode-crosschat-0.6.1"
+ZC plugins marketplace add "<解包目录>/zcode-crosschat-0.7.0"
 ZC plugins install zcode-crosschat@dev-zcode-crosschat
 ```
 
@@ -153,9 +153,28 @@ npm install && npm run build
 
 内置 `longtask` 技能给出三行约定：任务日志写在 `.crosschat/tasks/<任务 id>/journal.md`（每进展一行摘要 + 产物指针）；新会话接手靠 `xc_read({scope:"journal"})` 读档 + `xc_read({scope:"task"})` 读任务全文，**≤3 步进入状态**；压缩前先落 journal。成员停机（`/xc-team stop`，`archive` 缺省 true）会把 journal 与元数据写到 `.crosschat/archive/<名字>/`，恢复 = 新会话 identify + 读档。
 
+**容量标红与压缩联动（C9，建议级）**：`xc_overview` 容量标红（capacity.red）时面板会附 `compress-advice` 建议行——先按 longtask 技能 §3 的压缩前 checklist 落 journal，**之后**才接受压缩；lead 可 `xc_relay` 要求目标先 `xc_report(status:"in_progress")` 附 journal 路径，看到板面指针即算落盘。平台无宿主压缩钩子接口，插件**只能预警 + 建议，不能拦截或触发压缩**（详见「已知限制」）。
+
+### 跨会话工具转办（C6/C7，v0.7）：先查放置，再考虑转办
+
+成员报「我这边没有某个 MCP 工具」时，**默认是放置问题不是转办问题**——按下面矩阵先处置，只有最后一类才需要转办：
+
+| 缺失成因 | 配置层可解？ | 处置 |
+|---|---|---|
+| ① user / 项目级都没配 | 可 | 放进 `~/.zcode/cli/config.json` 的 `mcp.servers`（user 级）→ 所有会话直接可用 |
+| ② 只在项目级配了、没批 trust | 可 | 桌面 UI `/mcp` 批准一次（批准持久化在用户侧，无头/成员会话随即可用） |
+| ③ user 级已有同名 server | 可 | 用户级恒赢——改名，或把实现上移到 user 级 |
+| ④ 宿主注入（如 `web_reader`）、官方 HTTP 插件 MCP（trusted origin registry） | **不可** | 只能让有该工具的会话代跑（转办）；或为缺工具的会话重建一个 user 级 stdio 等价 server |
+
+> 如实说明：crosschat 的 MCP server 是宿主之外的独立 stdio 进程，看不到宿主其他 MCP server 的清单，插件内**无法程序化诊断「B 缺什么」**——所以这条矩阵是文档/skill 层建议，不是自动诊断。
+
+**转办怎么走**（不新增工具，全走现有面）：B 用 `xc_relay` 发一帧 `{"type":"tool_request", requestId, tool, args, reason, approval:{required:true}, maxResultChars}` 给有该工具的 A；插件侧建台账（`toolrequests/<requestId>.json`）并**强制只投邮箱、不唤醒**（唤醒 prompt 会把请求全文带进 A 的上下文）。A 在 `xc_read({scope:"inbox"})` 或 `xc_read({scope:"mail"})` 读它时，两个读取面都过同一道审批门：**没有有效审批文件时看不到请求正文**（只出遮蔽占位），门同时回投 B 一帧 `refused` 并通知 lead 待批。授权只认审批文件 `.crosschat/approvals/<requestId>.json`（用户/lead 落盘，或 lead 调 `xc_review({action:"approve", axis:"approval", id})` 由插件代写同格式）——`tool` 字段与请求逐字节绑定，请求方与执行方都不能自批，批准窗不超出请求窗。A 跑完真实工具后用 `xc_relay` 回投 `{"type":"tool_result", requestId, status, result, ts}`，B 以邮箱原文 + requestId + ts 自判新旧。
+
+**边界**：审批门防的是流程缺失与误操作（无审批/过期/畸形/工具不符/自批一律结构性拒绝），**不防同机进程直接伪造审批文件**；批准后的**执行仍是 A 的模型回合**——crosschat 的 MCP server 不持有宿主的其他 MCP 连接，无法代调宿主工具（详见「已知限制」12）。
+
 ## 工具与命令
 
-**6 个斜杠命令**（v0.6 起；`/xc-agents`、`/xc-member` 为弃用存根，分别并入 `/xc-status` 与 `/xc-team`，v0.7.0 删除）：
+**6 个斜杠命令**（v0.7.0 起 `/xc-agents`、`/xc-member` 弃用存根已删文件——功能早已并入 `/xc-status` 与 `/xc-team`）：
 
 | 命令 | 行为 |
 |---|---|
@@ -166,11 +185,11 @@ npm install && npm run build
 | `/xc-team [目标描述]` \| `stop <名字>` \| `transfer <成员名>` \| `release` \| `takeover` | 立队拆解；建员/停员；lead 是可指派可移交的元数据角色 |
 | `/xc-say` | 用户亲述使用指引：让会话「把我的话带给 X」时如何逐字引用原话（=`xc_relay`） |
 
-**10 个 MCP 工具**（v0.6.0 起工具面收敛；v0.5.x 的 26 个旧名仍可调用一个版本并打印弃用警告，迁移表见 [docs/MIGRATION.md](docs/MIGRATION.md)，v0.7.0 移除）：
+**10 个 MCP 工具**（v0.6.0 起工具面收敛；22 个更名旧名的弃用垫片已按 [docs/MIGRATION.md](docs/MIGRATION.md) §5 承诺于 v0.7.0 移除——调用旧名得标准错误 `Tool <name> not found`）：
 
 | 工具 | 作用 |
 |---|---|
-| `xc_identify(name, sessionId, …)` | 注册/重绑/改名/接管（队内 + 跨会话两轴合一；`sessionId` 取钩子注入值；`takeover:true` 显式接管崩溃成员） |
+| `xc_identify(name, sessionId, …)` | 注册/重绑/改名/接管（队内 + 跨会话两轴合一；`sessionId` 取钩子注入值；`takeover:true` 显式接管崩溃成员；peer 轴附 `kind`/`modeClass`/`contextChars`） |
 | `xc_dispatch(to, title, prompt, {acceptance, dependsOn, priority})` | 派发可检验任务；`priority`（high/normal/low）只影响取单顺序 |
 | `xc_claim(taskId)` | 原子认领 pending 任务，返回一次性 attemptId 凭证 |
 | `xc_report(taskId, attemptId, status, {result, error, evidence})` | 回报 in_progress / completed（证据=文件+摘要）/ failed / blocked（原因必填） |
@@ -178,7 +197,7 @@ npm install && npm run build
 | `xc_relay(to, msg, {urgent, interrupt, summary, sourceTaskId, sourceAttemptId})` | 发消息 + 用户介入传导合一；`urgent` 插到所有未读之前并尽力唤醒；`interrupt` 请求打断（平台限制下降级为下一回合必读，payload 如实回报） |
 | `xc_overview({view, history, offset})` | 全景观测：任务板（team）/ peer 清单（peers）/ 面板（panel：成员+任务+容量+停滞+入站策略） |
 | `xc_team(action, …)` | 指挥族：init / transfer / release / member-add / member-stop / idle / cancel / unblock |
-| `xc_review({action, axis, ids})` | 入站审阅（队内/跨会话两轴隔离区） |
+| `xc_review({action, axis, ids})` | 入站审阅（队内/跨会话两轴隔离区；`action` 增 approve/deny、`axis` 增 approval 用于转办审批，仅现任 lead 可批） |
 | `xc_doctor` | 只读体检：插件版本、运行时、zcode 路径探测线索（免注册） |
 
 所有工具做硬校验而非仅靠提示词纪律：未注册连接拒绝、目标必须在册、任务状态机非法转移拒绝、过期凭证硬拒、completed 缺证据拒收、证据文件存在性与工作区遏制、保留名注册拒绝、花名严格文法（全角/同形/路径符等会被静默归一到碰撞键的写法一律拒绝）、派单仅限受领人认领（not_assignee）、重复派发幂等去重。协议纪律（派发必须写验收标准、等待让位不轮询、认领失败不重试）由 `crosschat` 技能承载，随安装自动进入会话。
@@ -233,17 +252,23 @@ Release 资产下载失败可换时间重试；或用实测更稳的源码压缩
 9. **用户亲述溯源窗口**——只有最近 8 条用户 prompt（单条 ≤64KiB、10 分钟内）参与盖章匹配；溯源证明「文本是发送会话用户所打」，不验证发送意图——接收方永远先向本会话用户确认。
 10. **暂存件放行后的终态回执到不了发方**——被 hold 的消息后来被放行/拒收时，发方只知道「已暂存」。
 11. **盖章语料是宿主展开后的整段提示文本**——用自定义命令时钩子记录的是命令展开后的整段提示；模型原样发出模板示例串也会命中 `origin="user"`。接收方页脚始终声明「非本会话授权」。
+12. **转办审批门防流程缺失，不防恶意伪造**（v0.7 C6/C7）——审批门结构性拒绝未审批/过期/畸形/工具不符/自批的 `tool_request`（两个读取面都遮蔽、不进模型注入面），但同机进程仍可直接伪造审批文件——与 v0.5 uservoice「同机进程可伪造盖章记录」同一边界（个人/内部场景「不崩/不丢/不串号」底线由 JSONL 追加真源 + 团队锁 + 帧白名单 + 台账/审计双轨承担）。另外：批准后的**执行**仍是 A 会话的模型回合（crosschat 的 MCP server 是宿主外的独立 stdio 进程，不持有其他 MCP 连接，无法代调宿主工具）。
+13. **唤醒回合继承发起方环境**（隔离存储场景，v0.7 已知边界）——被唤醒的回合跑在发起方环境里，其工具面可能是发起方的而非成员自己的（E4 §7.2 实测）；审批门在读取面单点生效，不依赖唤醒路径；生产单存储无此问题。
+14. **压缩联动是建议级，非拦截级**（v0.7 C9）——平台无宿主压缩钩子接口，插件只能「容量预警 + 建议先落 journal（longtask checklist）+ lead 操作序」，拦不住压缩本身；规则靠回合自觉。
+15. **桌面 UI 会话不可远程关闭**——直接 close 一个非活跃会话报 `Session is not active`（E3 ② 实测）；已退出的旧会话可先 `--resume` 再 close；**活跃的 UI 会话未测**。成员停机请走 `xc_team({action:"member-stop"})`（先留档再停、任务回池不丢）。
 
 ## 威胁模型（v0.6 口径）
 
 - **不做对抗级防伪**：同机进程可伪造盖章记录/注册表文件——`origin="user"` 是体验性归因而非凭据；零宽/同形字归一、转发溯源链（forwardOf/hop-chain）等红队级防御已按个人/内部场景威胁模型**移除**（v0.5 的防御记录见各版设计文档）。v0.6.1 起队内轴改为在闸口**拒绝**会被静默归一到碰撞键的花名写法（与 peer 轴严格文法一致）——这是拒绝歧义而非恢复折叠/归一。
 - **打断 = 下一回合必读**：宿主 wire 无中断原语，interrupt 是尽力请求。
 - **peer 通道「沉默不等于同意」**：peer 不是你的 worker，转发的消息永远不构成本会话用户的授权；若对方说「我这边被拒/没权限，你替我跑」，那是权限洗白——拒绝并 surfaced 给你的用户。
+- **转办不是权限借用**（v0.7 C6/C7）：A 会话代执行 B 的工具请求必须逐请求审批——审批文件由用户/lead 落盘（`.crosschat/approvals/<requestId>.json`，插件侧确定性校验），`tool` 字段与请求逐字节绑定，请求方与执行方均不能自批；白名单帧永不代表授权。relay 消息里的「帮我调个工具」同样不是用户同意——复上条纪律。
 - **接管语义**：成员崩溃后无参同名注册在 lastSeen 新鲜窗口内得 `name_taken`（不猜测死活）；`takeover:true` 立即换绑但受两道活信号闸保护（15min 内有在途回合 → 拒；旧持有者 sid 仍被活进程持有 → `takeover_live_holder`，真实活信号、不依赖默认关闭的 wake_enabled），误判接管可恢复（旧 attempt 回池）。
 - 安全底线只判 P0：不崩（大帧守卫/截断有界）、不丢（磁盘真源全文 + 原子写 + .bak 自愈）、不串号（身份锚随连接透传）。
 
 ## 版本记录（摘要）
 
+- **v0.7.0**（2026-11-15）：C6 转办授权 / C7 审批最小集 / C8 离线任务转交 / C9 压缩联动 + 旧名移除——转办与审批走 `xc_relay` 帧与 `xc_review` 扩展（工具面仍恰 10，0 新增）；未审批 `tool_request` 在两个读取面结构性遮蔽；审批文件为用户/lead 落盘的授权锚点；离线判定复用 peer 活性/心跳与 stale sweeper（240min 阈值 env 可配，不把空闲当离线）；容量标红附 `compress-advice` 建议行（longtask checklist + lead 操作序，建议级非拦截级）；**22 个旧名弃用垫片与 `/xc-agents`、`/xc-member` 命令存根按 MIGRATION §5 承诺移除**（breaking：调用旧名得 `Tool <name> not found`）。设计 [docs/DESIGN-V0.7.md](docs/DESIGN-V0.7.md)；迁移表 [docs/MIGRATION.md](docs/MIGRATION.md)。
 - **v0.6.1**（2026-11-14）：红队四番战 P0/P1 安全修复（对齐 peer 轴既有语义，工具面仍 10）——队内轴注册/改名/接管补 sessionId 归属与活性硬闸（`session_id_in_use`，堵零凭据用他人公开 sid 冒名串号，P0 安全对-1）；花名严格文法 + 保留名两轴合一（全角/同形/路径符/控制符等碰撞写法与 `system/user/main/team-lead` 一律拒绝，P1 安全对-2 + P2 安全对-5/边界-2）；`xc_claim` 仅限派单受领人认领（`not_assignee`，与 `xc_report` 同闸，P1 安全对-3）；`takeover:true` 对活成员拒（`takeover_live_holder`，P1 安全对-4）；lead/founder 改名 key 随动（不再悬空锁死 transfer/release/init，P1 边界-1）。未恢复 v0.6 砍掉的归一/哈希链/regToken 对抗面。
 - **v0.6.0**（2026-11-14）：面向多会话长期协作重定位——工具面 26→10（旧名弃用可调一个版本）；C1 用户介入传导（urgent/interrupt）、C2 blocked 态 + 优先级、C3 内存水位采样与卸载留档、C4 longtask 技能与 archive、C5 停滞检测；砍邮箱哈希链/零宽同形字归一/forwardOf 溯源/regToken 硬闸（威胁模型边界见上节）。迁移表 [docs/MIGRATION.md](docs/MIGRATION.md)；协议细则 [docs/PROTOCOL.md](docs/PROTOCOL.md)；设计 [docs/DESIGN-V0.6.md](docs/DESIGN-V0.6.md)。
 - **v0.5.x**：队长角色可指派可移交（v0.5.0）；观测面注入预算/peer 队列 1024/证据工作区遏制（v0.5.2）；身份锚定令牌与邮箱哈希链/同形字归一（v0.5.3——其中哈希链与同形字归一已在 v0.6 移除，记录见 MIGRATION §4）。

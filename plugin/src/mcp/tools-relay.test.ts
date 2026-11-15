@@ -10,8 +10,7 @@
  *   自发/成对校验/not_a_member；
  * - peer 轴：未注册拒、自发拒（self 行）、文件退化件携带 urgent（管道不可达 →
  *   stale_socket → fallback inbox 行 urgent:true）、管道帧不带 urgent（白名单冻结）；
- * - 迁移垫片：assertNoForwardOf / relayArgsFromLegacyMessage / relayArgsFromLegacyPeerSend
- *   （content→msg、message→msg 映射，未映射旧参 ignored 显式披露）；
+ * - forwardOf 移除守卫（v0.7：旧名垫片删除后改挂 xc_relay 主路径）；
  * - splitAxisSuffix 用例。
  */
 import { mkdtempSync, rmSync, existsSync, readFileSync } from 'node:fs';
@@ -30,8 +29,7 @@ import { uservoiceWrite } from '../core/uservoice.js';
 import {
   assertNoForwardOf,
   createTeamRelayCore,
-  relayArgsFromLegacyMessage,
-  relayArgsFromLegacyPeerSend,
+  registerRelay,
   splitAxisSuffix,
   xcRelay,
   INTERRUPT_DEFERRED_REASON,
@@ -39,6 +37,7 @@ import {
 } from './tools-relay.js';
 import { setPeerSessionContext, clearPeerSessionContext } from './peer-drain.js';
 import type { WakeRequest } from '../engine/wake.js';
+import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 
 // attemptWake 换成 spy（实现委托真身——XC_WAKE_ENABLED 未设时立即 mailbox 降级，
 // 不触 spawn；调用入参用于断言 urgent 透传）。
@@ -376,27 +375,39 @@ describe('xc_relay peer 轴', () => {
   }, 20000);
 });
 
-// ─────────────────────────── 迁移垫片 ───────────────────────────
+// ─────────────────────────── forwardOf 移除守卫（v0.7 主路径） ───────────────────────────
 
-describe('迁移垫片（xc_message / xc_peer_send → xc_relay）', () => {
-  it('relayArgsFromLegacyMessage：content→msg；未映射旧参 ignored 显式披露', () => {
-    const mapped = relayArgsFromLegacyMessage({ to: 'b', content: '正文', sourceTaskId: 't1', sourceAttemptId: 'at1' });
-    expect(mapped.args).toEqual({ to: 'b', msg: '正文', sourceTaskId: 't1', sourceAttemptId: 'at1' });
-    expect(mapped.ignored).toEqual([]);
-    const withExtra = relayArgsFromLegacyMessage({ to: 'b', content: 'x', regToken: 'tok', mysterious: 1 });
-    expect(withExtra.ignored).toEqual(['regToken', 'mysterious']);
-  });
-
-  it('relayArgsFromLegacyPeerSend：message→msg；summary 透传', () => {
-    const mapped = relayArgsFromLegacyPeerSend({ to: 'p', message: '正文', summary: '摘要' });
-    expect(mapped.args).toEqual({ to: 'p', msg: '正文', summary: '摘要' });
-    expect(mapped.ignored).toEqual([]);
-  });
-
-  it('forwardOf：两个垫片都显式拒绝（forwardOf_removed），不静默丢参', () => {
+describe('forwardOf 移除守卫（v0.7：旧名垫片删除后挂 xc_relay 主路径）', () => {
+  it('assertNoForwardOf：带 forwardOf 显式抛 forwardOf_removed，不静默丢参', () => {
     expect(() => assertNoForwardOf({ forwardOf: 'm1' })).toThrow(/forwardOf_removed/);
-    expect(() => relayArgsFromLegacyMessage({ to: 'b', forwardOf: 'm1' })).toThrow(/forwardOf_removed/);
-    expect(() => relayArgsFromLegacyPeerSend({ to: 'p', forwardOf: 'm1' })).toThrow(/forwardOf_removed/);
+    expect(() => assertNoForwardOf({ to: 'b', msg: 'x' })).not.toThrow();
+  });
+
+  it('xc_relay 主路径：handler 收到 forwardOf → forwardOf_removed（先于 zod strip）', async () => {
+    await seedTeam();
+    // handler 内部 connectionKeyOf(extra) = extra.sessionId —— 绑定该键的身份。
+    identityStore.bind('sess_a', {
+      sessionKey: 'xc:default:a',
+      teamId: 'default',
+      name: 'a',
+      agentKey: 'a',
+      sessionId: 'sess_a',
+      role: 'peer',
+      boundAt: Date.now(),
+    });
+    let captured: ((args: Record<string, unknown>, extra: unknown) => Promise<ToolResult>) | undefined;
+    const fakeServer = {
+      tool: (_name: string, _desc: string, _shape: unknown, handler: (args: Record<string, unknown>, extra: unknown) => Promise<ToolResult>) => {
+        captured = handler;
+      },
+    } as unknown as McpServer;
+    registerRelay(fakeServer, relayDeps(), core());
+    expect(captured).toBeDefined();
+    // forwardOf 在主路径守卫处即拒——zod object 的默认 strip 来不及静默丢参。
+    await expect(captured!({ to: 'b', msg: '正文', forwardOf: 'm1' }, { sessionId: 'sess_a' })).rejects.toThrow(/forwardOf_removed/);
+    // 无 forwardOf 的正常调用不受影响（仍走主路径落箱）。
+    const ok = await captured!({ to: 'b', msg: '正常正文' }, { sessionId: 'sess_a' });
+    expect(payloadOf_(ok)['delivered']).toBe('mailbox');
   });
 
   it('splitAxisSuffix：[team]/[peer] 大小写不敏感、仅串尾；无后缀原样', () => {
@@ -411,7 +422,7 @@ describe('迁移垫片（xc_message / xc_peer_send → xc_relay）', () => {
 // ─────────────────────────── 回归：urgent 与邮箱消费面联动 ───────────────────────────
 
 describe('C1 联动回归：relay urgent → 消费面插队（端到端时序）', () => {
-  it('普通件先落箱，urgent 后到：readCurrentMailboxLocked（xc_check_inbox 消费序）urgent 先出', async () => {
+  it('普通件先落箱，urgent 后到：readCurrentMailboxLocked（inbox 消费序）urgent 先出', async () => {
     await seedTeam();
     bindIdentity();
     await core().xc_message({ to: 'b', msg: '先发的普通件' }, 'conn-a');

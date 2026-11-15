@@ -1,9 +1,11 @@
 /**
- * W5 单测：withGuards（removed 成员硬拒 + chat 入站策略）+ xc_inbound_review
+ * W5 单测：withGuards（removed 成员硬拒 + chat 入站策略）+ xc_review
  * （DESIGN-V0.2.md §7.4-I4/I5、§7.3.3；错误码 member_removed / inbound_refused）。
  *
- * 策略只在 chat 入口（xc_message）裁决；协议帧与 v0.1.0 错误路径（自发消息、
+ * 策略只在 chat 入口（队内轴发送）裁决；协议帧与 v0.1.0 错误路径（自发消息、
  * source 不成对）原样透传内层。accept 模式下全部行为与 v0.1.0 等价（回归红线）。
+ * v0.7（M6）：held 队列审阅入口自 v0.6 起并入 xc_review；guards.ts 的
+ * registerSecurityTools 死代码已删（见 legacy-removal.test.ts 断言）。
  */
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -13,7 +15,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createToolCore, type ToolCore, type ToolDeps } from "./core.js";
 import type { PrimaryRegistry } from "./core.js";
 import { FRAME_TYPES, withGuards } from "./guards.js";
-import { ReviewShape as InboundReviewShape, registerReviewTools as registerSecurityTools } from "./tools-review.js";
+import { ReviewShape, registerReviewTools } from "./tools-review.js";
 import { payloadOf, type ToolResult } from "./protocol.js";
 import { heldInboxFile, policyFile, writeInboundPolicy } from "../core/policy.js";
 import { writeSession } from "../core/registry.js";
@@ -81,7 +83,7 @@ function engineLog(): string {
 
 type SecurityHandler = (args: unknown, extra: unknown) => Promise<ToolResult>;
 
-/** 捕获 registerSecurityTools 注册的 handler，直接驱动（绕开 SDK server 类型面）。 */
+/** 捕获 registerReviewTools 注册的 handler，直接驱动（绕开 SDK server 类型面）。 */
 function captureSecurityHandler(): SecurityHandler {
   const handlers: SecurityHandler[] = [];
   const server = {
@@ -89,7 +91,7 @@ function captureSecurityHandler(): SecurityHandler {
       handlers.push(handler);
     },
   } as unknown as McpServer;
-  registerSecurityTools(server as unknown as McpServer, deps, createToolCore(deps), new Map());
+  registerReviewTools(server as unknown as McpServer, deps, createToolCore(deps), new Map());
   return handlers[handlers.length - 1]!;
 }
 
@@ -157,7 +159,7 @@ describe("withGuards: hold 策略（§7.4-I4）", () => {
     const inbox = await guarded.xc_check_inbox({}, connB);
     expect(payloadOf(inbox)["messages"]).toHaveLength(0);
 
-    // xc_inbound_review：list → 1；accept → 主邮箱 1 行、held 清空。
+    // xc_review：list → 1；accept → 主邮箱 1 行、held 清空。
     const list = await securityCall(connB, { action: "list" });
     expect(list["count"]).toBe(1);
     const heldId = (list["rows"] as Array<{ msgId: string }>)[0]!.msgId;
@@ -268,9 +270,10 @@ describe("入站策略解析（policy.json > env > default，fail-open）", () =
   });
 });
 
-describe("xc_inbound_review（registerSecurityTools / §9.2 契约）", () => {
-  it("工具形状存在且 action 枚举 list/accept/discard；FRAME_TYPES 转出与 core 同一常量", () => {
-    expect(Object.keys(InboundReviewShape)).toEqual(["action", "axis", "ids"]);
+describe("xc_review（原 xc_inbound_review 契约；v0.7 增 approve/deny 与 axis:approval）", () => {
+  it("工具形状存在且 action/axis 枚举含审批扩展；FRAME_TYPES 转出与 core 同一常量", () => {
+    // v0.7（M3）：action 增 approve/deny、axis 增 approval、附 id/ttlMs/note（DESIGN-V0.7 §3.2）。
+    expect(Object.keys(ReviewShape)).toEqual(["action", "axis", "ids", "id", "ttlMs", "note"]);
     expect(FRAME_TYPES).toBe(CORE_FRAME_TYPES); // 单一定义点（core/mailbox.ts）
     expect(FRAME_TYPES).toContain("unblock-notice");
     expect(FRAME_TYPES).toContain("shutdown-request");

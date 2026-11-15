@@ -148,7 +148,7 @@ function requireMember(team: TeamState, agentKey: string): void {
     throw new ToolError({
       error: "not_a_member",
       agentKey,
-      message: `"${agentKey}" is not a member of team "${team.teamId}"; register first (xc_register)`,
+      message: `"${agentKey}" is not a member of team "${team.teamId}"; register first (xc_identify)`,
     });
   }
 }
