@@ -34,18 +34,19 @@ import { okResult, ToolError, type ToolResult } from "./protocol.js";
 import { renderRegister } from "./render.js";
 import { connectionKeyOf, identityStore, xcRegister } from "./identity.js";
 import { withTeamLock, withRegistryThenTeamLocks } from "../core/lock.js";
-import { appendMailbox, createMessage, readMailbox } from "../core/mailbox.js";
+import { appendMailbox, createMessage, readMailbox, readUnreadMailbox } from "../core/mailbox.js";
 import { logEngineEvent } from "../core/log.js";
-import { readNames, unbindName, bindName, findInflightWakeNonce, WAKE_INFLIGHT_MS } from "../core/registry.js";
+import { readNames, readSession, unbindName, bindName, findInflightWakeNonce, WAKE_INFLIGHT_MS } from "../core/registry.js";
 import { sanitizeKey, validateMemberName } from "../core/sanitize.js";
-import { DEFAULT_TEAM_ID } from "../core/types.js";
+import { DEFAULT_TEAM_ID, TERMINAL_TASK_STATUSES } from "../core/types.js";
 import type { MemberRole } from "../core/types.js";
 import { memberOpenTasks, readTeam, writeTeam } from "../core/teamstate.js";
 import { revokeAttempt } from "../core/graph.js";
 import { peerRootFromEnv } from "../core/peerdir.js";
+import { carryCheckpointDir } from "../core/checkpoint.js";
 // v0.6.1（安全对-1 修复）：findLiveSessionIdHolder 唯一实现移入 core/peerregistry.ts
 // （队内轴 sid 归属校验也要用它；经 peer-services.ts import 会与 tools-team.ts 成环）。
-import { findLiveSessionIdHolder } from "../core/peerregistry.js";
+import { findLivePeerByName, findLiveSessionIdHolder } from "../core/peerregistry.js";
 import { getPeerServices, type PeerRegisterResult } from "./peer-services.js";
 import { getPeerSessionContext } from "./peer-drain.js";
 import { pushLeadHistory } from "./tools-team.js";
@@ -123,23 +124,81 @@ export function createIdentifyCore(deps: ToolDeps): IdentifyCore {
 // xc_identify 工具层（两轴合一 + 改名 + 接管）
 // ---------------------------------------------------------------------------
 
-/** 队内花名换绑的「板面干净」判定：名下无任何任务引用（assignee/createdBy）且邮箱为空。 */
+/**
+ * 队内花名换绑的「板面干净」判定。
+ *
+ * v0.8.1（29-v080 C6-BUG-6 修复）：判据从「名下**任何**任务引用」改为
+ * 「名下**非终态**任务引用」——completed/cancelled/failed 是历史审计痕迹
+ * （assignee/createdBy 永驻），旧判据下「做完手上的活再改名」这条错误文案
+ * 指定的恢复动作全部做完也仍被 `team_rename_blocked`：有任务历史的成员永远
+ * 无法改名（红队 lane-b6 实测死胡同；无任何工具能移除终态记录）。终态引用
+ * 不再挡路，但**开放**引用照旧挡（开放任务换主会串号、pending 任务的指定
+ * 受领人 `to` 换名会搁浅——他人 claim 得 not_assignee、pending 又不在
+ * stale 清扫域内，与 member-stop 的停机任务同款 stranded 形态）。
+ * 邮箱非空照旧挡（未读件会锁死在不再存在的花名箱里）。
+ *
+ * @returns clean + 挡路项明细（开放任务 id / 指定受领的 pending id / 邮箱条数）
+ *  与保留的终态引用数（改名成功回执里披露，不静默）。
+ */
 async function teamMemberCleanForRename(
   stateRoot: string,
   teamId: string,
   agentKey: string,
-): Promise<{ clean: boolean; reason?: string }> {
+): Promise<{
+  clean: boolean;
+  reason?: string;
+  openTaskIds: string[];
+  designatedPendingIds: string[];
+  mailboxCount: number;
+  terminalRefCount: number;
+}> {
   const team = await readTeam(stateRoot, teamId);
-  if (team === undefined) return { clean: true };
-  const referenced = team.tasks.some((t) => t.assignee === agentKey || t.createdBy === agentKey);
-  if (referenced) {
-    return { clean: false, reason: "task references (assignee/createdBy) exist on the board" };
+  if (team === undefined) {
+    return { clean: true, openTaskIds: [], designatedPendingIds: [], mailboxCount: 0, terminalRefCount: 0 };
   }
-  const mail = await readMailbox(stateRoot, teamId, agentKey);
-  if (mail.length > 0) {
-    return { clean: false, reason: "mailbox still holds message(s)" };
+  const openTaskIds = team.tasks
+    .filter((t) => !TERMINAL_TASK_STATUSES.includes(t.status) && t.assignee === agentKey)
+    .map((t) => t.id);
+  const designatedPendingIds = team.tasks
+    .filter((t) => !TERMINAL_TASK_STATUSES.includes(t.status) && t.assignee !== agentKey && t.to === agentKey)
+    .map((t) => t.id);
+  const createdOpenIds = team.tasks
+    .filter((t) => !TERMINAL_TASK_STATUSES.includes(t.status) && t.createdBy === agentKey)
+    .map((t) => t.id);
+  const terminalRefCount = team.tasks.filter(
+    (t) => TERMINAL_TASK_STATUSES.includes(t.status) && (t.assignee === agentKey || t.createdBy === agentKey),
+  ).length;
+  // 邮箱判据用**未读**（readUnreadMailbox）：已读历史只是留痕，换名后照旧躺在旧花名
+  // 的 inbox 文件里，没有功能路径会再读它；会锁死的是**未读**件（换名后旧箱不再被
+  // 任何工具面引用——成员视角按花名册键寻址，旧键已不在册）。v0.8.1 修正：旧实现用
+  // readMailbox 全史判定，「收到过任何消息」与「有未读」混同，是 C6-BUG-6 死胡同的
+  // 另一条触发路径（读完历史也改不了名）。
+  const unread = await readUnreadMailbox(stateRoot, teamId, agentKey);
+  if (openTaskIds.length > 0 || createdOpenIds.length > 0 || designatedPendingIds.length > 0) {
+    const parts: string[] = [];
+    if (openTaskIds.length > 0) parts.push(`open task(s) assigned to you: ${openTaskIds.join(", ")}`);
+    if (createdOpenIds.length > 0) parts.push(`open task(s) you created: ${createdOpenIds.join(", ")}`);
+    if (designatedPendingIds.length > 0) parts.push(`pending task(s) dispatched to you: ${designatedPendingIds.join(", ")}`);
+    return {
+      clean: false,
+      reason: parts.join("; "),
+      openTaskIds,
+      designatedPendingIds,
+      mailboxCount: unread.length,
+      terminalRefCount,
+    };
   }
-  return { clean: true };
+  if (unread.length > 0) {
+    return {
+      clean: false,
+      reason: `mailbox still holds ${unread.length} unread message(s) — drain with xc_read({scope:"inbox"}) first`,
+      openTaskIds,
+      designatedPendingIds,
+      mailboxCount: unread.length,
+      terminalRefCount,
+    };
+  }
+  return { clean: true, openTaskIds, designatedPendingIds, mailboxCount: unread.length, terminalRefCount };
 }
 
 /**
@@ -375,6 +434,76 @@ export async function handleIdentify(deps: ToolDeps, rawArgs: IdentifyArgs, conn
 
     // ---- 改名（T1 #4）：连接已有身份且 name 与现名不同 ----
     if (existing !== undefined && existing.agentKey !== newKey) {
+      // ---- v0.8.1（29-v080 M01 修复，P1）：改名两轴**前置校验**（零副作用）----
+      // M01 根因：队内轴花名换绑先落地（roster 成员键直接换成 newKey），peer 轴
+      // 改名随后才做，且落地前不问「newKey 是不是已经有人」。两种碰撞都把队内轴
+      // 写成损坏态：
+      // ① newKey 已是队内花名册另一位成员 → members 出现重复键 → readTeam 拒读
+      //    （duplicate member keys）、.bak 被同一份坏内容镜像中毒 → 全队 team-axis
+      //    工具 internal；undoTeamRename 自己也要 readTeam，回滚随之失败。
+      // ② newKey 在 peer 轴被另一个活会话占着 → peer rename name_taken，同样的
+      //    「落地→失败→回滚失败」链（红队 C2-B1/C6-BUG-2，含 plain identify 变体）。
+      // 修复 = 任何状态变更之前两轴各问一次：队内占用 → team_rename_blocked；
+      // peer 占用 → peer_axis_failed（预检形态：teamAxis.registered:false，
+      // 两轴都没动，调用方可直接重试）。
+      const teamForRename = await readTeam(deps.stateRoot, existing.teamId);
+      const rosterHolder = teamForRename?.members.find((m) => m.key === newKey);
+      if (rosterHolder !== undefined) {
+        throw new ToolError(
+          {
+            error: "team_rename_blocked",
+            agentKey: existing.agentKey,
+            requestedName: rawArgs.name,
+            reason:
+              `name "${newKey}" is held by another member on the team roster ` +
+              `(session ${rosterHolder.sessionId})`,
+            renamed: { peer: false, team: false },
+            message:
+              `rename refused on BOTH axes: "${newKey}" is already a member of team "${existing.teamId}" ` +
+              `(held by session ${rosterHolder.sessionId}), so renaming you onto it would corrupt the roster ` +
+              `(duplicate member keys) — neither axis was changed and this session keeps its single identity ` +
+              `"${existing.agentKey}". Pick a free name and re-run xc_identify. Taking over that member's ` +
+              `identity is a different operation: it requires a session that does not already hold an ` +
+              `identity (fresh xc_identify({name:"${newKey}", sessionId:<your own sid>, takeover:true})), ` +
+              `or the lead runs xc_team member-stop/transfer.`,
+          },
+          `rename refused on both axes: "${newKey}" is held by another roster member; peer axis unchanged`,
+        );
+      }
+      // peer 轴预检：只读扫描（不惰性清扫——死记录是 C8 离线判据的进程死证据），
+      // 本进程自己的记录豁免（幂等重认领不构成冲突）。仅当本会话**在 peer 轴在册**
+      // 时问这一句——wake 回合身份从不上 peer 轴（改名也只会动队内轴），不替它加闸
+      // （保持 v0.8.0 对 wake 会话的既有行为）；在册会话的 peer 改名随后才会真发生，
+      // 预检正是要把它的 name_taken 从「落地后失败」提前成「落地前拒绝」。
+      const peerContextForCheck = getPeerSessionContext();
+      const peerHolder = peerContextForCheck === undefined
+        ? undefined
+        : await findLivePeerByName(peerRootFromEnv(deps.env), newKey);
+      if (peerHolder !== undefined) {
+        const holderName = peerHolder.name ?? `pid-${peerHolder.pid}`;
+        throw new ToolError(
+          {
+            error: "peer_axis_failed",
+            peer: {
+              error: "name_taken",
+              name: newKey,
+              boundName: holderName,
+              boundPid: peerHolder.pid,
+              message:
+                `peer name "${newKey}" is already registered on this machine by a live session ` +
+                `(pid ${peerHolder.pid}, name "${holderName}")`,
+            },
+            teamAxis: { registered: false, rolledBack: false, agentKey: existing.agentKey, teamId: existing.teamId },
+            renamed: { peer: false, team: false },
+            message:
+              `rename refused on BOTH axes: the peer axis already holds "${newKey}" (live session pid ` +
+              `${peerHolder.pid}, name "${holderName}"), so the team-axis rename was never applied — this ` +
+              `session keeps its single identity "${existing.agentKey}" and the call had no side effect. ` +
+              `Resolve the peer-axis conflict (that session renames or exits) and re-run xc_identify.`,
+          },
+          `peer-axis rename refused by pre-check (name_taken); team-axis rename not applied`,
+        );
+      }
       const teamRename = await teamMemberCleanForRename(deps.stateRoot, existing.teamId, existing.agentKey);
       let peerRename: Awaited<ReturnType<typeof services.rename>> | undefined;
       let formerName: string | undefined;
@@ -396,12 +525,21 @@ export async function handleIdentify(deps: ToolDeps, rawArgs: IdentifyArgs, conn
             requestedName: rawArgs.name,
             reason: teamRename.reason,
             renamed: { peer: false, team: false },
+            openTaskIds: teamRename.openTaskIds,
+            designatedPendingIds: teamRename.designatedPendingIds,
+            mailboxCount: teamRename.mailboxCount,
+            terminalTaskRefs: teamRename.terminalRefCount,
             message:
               `rename refused on BOTH axes: the team axis blocks the rename (${teamRename.reason}), ` +
               `so the peer axis was left unchanged too — this session keeps its single identity ` +
-              `"${existing.agentKey}". Clear the board references (finish/cancel the tasks, drain the ` +
-              `mailbox) and re-run xc_identify, or ask the lead to run xc_team member-stop/transfer ` +
-              `if the identity must move now.`,
+              `"${existing.agentKey}". Finish or cancel the open task(s), or ask the dispatcher/lead to ` +
+              `redispatch/cancel the ones designated to you, and drain the mailbox ` +
+              `(xc_read({scope:"inbox"})), then re-run xc_identify; if the identity must move now, ask the ` +
+              `lead to run xc_team member-stop/transfer. ` +
+              (teamRename.terminalRefCount > 0
+                ? `Note: ${teamRename.terminalRefCount} completed/cancelled/failed record(s) still reference ` +
+                  `"${existing.agentKey}" — those are historical audit entries and do NOT block the rename.`
+                : ""),
           },
           `rename refused on both axes: team-axis rename blocked (${teamRename.reason}); peer axis unchanged`,
         );
@@ -516,10 +654,40 @@ export async function handleIdentify(deps: ToolDeps, rawArgs: IdentifyArgs, conn
         }
       }
       const roleFollowed = leadKeyFollowed || founderKeyFollowed;
+      // v0.8.1（29-v080 C2-B3 修复）：改名连续性——检查点目录随花名换绑搬迁
+      // （best-effort：搬失败不阻断已成功的两轴改名，只在回执里披露旧路径）。
+      // 此前改名只换 roster 键，`checkpoints/<旧名>/` 原地成孤儿：默认 self
+      // 接手包七要素之一「最近检查点」静默变 null，旧目录不再被任何工具面引用
+      // （红队 adj-b3 实测：改名前后 handoff checkpoint present→null 无 warning）。
+      // 放在 peer 轴改名成功之后：任一轴失败都会走回滚，目录不该先搬。
+      const carried = await carryCheckpointDir(deps.stateRoot, existing.agentKey, newKey);
+      if (carried.carried) {
+        await logEngineEvent(deps.stateRoot, {
+          event: "register-rename-checkpoint-carried",
+          teamId: existing.teamId,
+          from: existing.agentKey,
+          to: newKey,
+        });
+      } else if (carried.error !== undefined) {
+        await logEngineEvent(deps.stateRoot, {
+          event: "register-rename-checkpoint-carry-failed",
+          teamId: existing.teamId,
+          from: existing.agentKey,
+          to: newKey,
+          error: carried.error,
+        });
+      }
       return okResult(
         `Renamed to ${rawArgs.name}${formerName !== undefined ? ` (former: ${formerName})` : ""} on both axes; ` +
           `roster key is now "${newKey}".` +
-          (roleFollowed ? ` leadKey/founderKey updated to "${newKey}" (role follows this session).` : ""),
+          (roleFollowed ? ` leadKey/founderKey updated to "${newKey}" (role follows this session).` : "") +
+          (carried.carried ? ` Checkpoint history carried over from "${existing.agentKey}".` : "") +
+          (carried.error !== undefined
+            ? ` WARNING: checkpoint directory could not be carried over (${carried.error}) — the old files stay at checkpoints/${existing.agentKey}/ and the default handoff packet will not show them.`
+            : "") +
+          (teamRename.terminalRefCount > 0
+            ? ` Note: ${teamRename.terminalRefCount} terminal task record(s) still name "${existing.agentKey}" as assignee/creator — kept as historical audit (they no longer block renames).`
+            : ""),
         {
           renamed: { peer: peerContext !== undefined, team: true },
           ...(peerRename !== undefined ? { peer: peerRename } : {}),
@@ -527,6 +695,11 @@ export async function handleIdentify(deps: ToolDeps, rawArgs: IdentifyArgs, conn
           agentKey: newKey,
           ...(leadKeyFollowed ? { leadKeyFollowed: true } : {}),
           ...(founderKeyFollowed ? { founderKeyFollowed: true } : {}),
+          ...(carried.carried ? { checkpointCarried: { from: existing.agentKey, to: newKey } } : {}),
+          ...(carried.error !== undefined
+            ? { warnings: [`checkpoint directory could not be carried over: ${carried.error}`] }
+            : {}),
+          ...(teamRename.terminalRefCount > 0 ? { terminalTaskRefs: teamRename.terminalRefCount } : {}),
         },
       );
     }
@@ -537,6 +710,35 @@ export async function handleIdentify(deps: ToolDeps, rawArgs: IdentifyArgs, conn
     const teamNow = await readTeam(deps.stateRoot, TEAM_ID);
     const rosterMember = teamNow?.members.find((m) => m.key === newKey);
     if (heldByOther && rawArgs.takeover === true && rosterMember !== undefined && rosterMember.sessionId !== rawArgs.sessionId) {
+      // ---- v0.8.1（29-v080 C6-BUG-1 修复，P2）：takeover **先验后改** ----
+      // xcRegister 的 hook 路径会在 bindName/joinTeam **之前**校验 sessionId
+      // （锚定存在性 → session_not_anchored；sid 未被别的花名绑 → session_already_bound），
+      // 但 takeover 路径此前先做 `takeoverRevokeTasks`（在途 attempt 撤销、任务回池、
+      // 创建者回执）与 `unbindName`（摘 names 绑定）才走到 xcRegister——一个未锚定
+      // sid 的失败调用于是带着全部副作用返回，违反 §10「失败=无副作用、可直接重试」
+      // （红队 lane-b1-repro 实测：attempt 1→2、任务 claimed→pending、names 丢绑定）。
+      // 修复 = 同一批校验前置到任何状态变更之前；错误码/文案与 xcRegister 逐字一致。
+      const anchored = await readSession(deps.stateRoot, rawArgs.sessionId);
+      if (anchored === undefined) {
+        throw new ToolError({
+          error: "session_not_anchored",
+          sessionId: rawArgs.sessionId,
+          message:
+            `no session record for "${rawArgs.sessionId}": the SessionStart hook did not anchor this session; ` +
+            "use a wakeToken (headless rounds) or verify the hook ran",
+        });
+      }
+      const sidBoundElsewhere = Object.entries(names).find(
+        ([otherName, binding]) => otherName !== newKey && binding.sessionId === rawArgs.sessionId,
+      );
+      if (sidBoundElsewhere !== undefined) {
+        throw new ToolError({
+          error: "session_already_bound",
+          sessionId: rawArgs.sessionId,
+          boundName: sidBoundElsewhere[0],
+          message: `session "${rawArgs.sessionId}" is already bound to name "${sidBoundElsewhere[0]}"`,
+        });
+      }
       // 三道活信号闸（在途唤醒 / 接管方新 sid 活冲突 / v0.6.1 安全对-4：旧持有者活性）。
       await takeoverGates(deps, newKey, rawArgs.sessionId, rosterMember.sessionId, now);
       // 名下 OPEN（含 blocked）任务回池 + 创建者回执 + lead 追加审计。

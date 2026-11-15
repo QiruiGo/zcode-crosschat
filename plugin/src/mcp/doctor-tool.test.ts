@@ -293,6 +293,35 @@ describe("v0.7.2 C9-B6：xc_doctor 容量采样与展示（PROTOCOL §5 对齐�
     }
   });
 
+  // v0.8.1（29 红队 C4-O1 修复）：XC_MEM_WARN_WATERMARK 越界（≥1/0/负数/非数字）
+  // 不再静默按缺省判定——doctor 的诊断面给出 payload 键 + WARNING 行（裁决建议的
+  // 「至少在 xc_doctor 或 payload detail 里给一条提示」两处都落）。
+  it("C4-O1：水位预警线越界 → capacity.memWarnWatermarkFallback + 文本 WARNING；合法值不披露", async () => {
+    const stateRoot = mkdtempSync(join(tmpdir(), "xc-doctor-cap-"));
+    try {
+      const cap = await sampleDoctorCapacity({
+        env: { XC_MEM_WARN_WATERMARK: "2" }, // 越界：字面执行应恒 RED，旧实现静默按 0.15
+        stateRoot,
+        capacitySampler: recordingSampler(greenSample()),
+      });
+      expect(cap!.memWarnWatermarkFallback).toBe(true);
+      const report = buildDoctorReport({ ...envHitInput(), capacity: cap });
+      expect(renderDoctorText(report)).toContain("WARNING XC_MEM_WARN_WATERMARK 越界");
+      expect(JSON.stringify(report)).toContain("memWarnWatermarkFallback");
+
+      const ok = await sampleDoctorCapacity({
+        env: { XC_MEM_WARN_WATERMARK: "0.1" }, // 合法域内
+        stateRoot,
+        capacitySampler: recordingSampler(greenSample()),
+      });
+      expect(ok!.memWarnWatermarkFallback).toBeUndefined();
+      expect(renderDoctorText(buildDoctorReport({ ...envHitInput(), capacity: ok })))
+        .not.toContain("WARNING XC_MEM_WARN_WATERMARK");
+    } finally {
+      rmSync(stateRoot, { recursive: true, force: true });
+    }
+  });
+
   it("buildDoctorReport：capacity 给定时进 report，absent 时不出键（形状兼容）", () => {
     const cap = buildDoctorReport(envHitInput()).capacity;
     expect(cap).toBeUndefined();

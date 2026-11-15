@@ -14,7 +14,9 @@
  * - 超限走**固定降级序列**（逐步重算、命中即停）：pool 整章 → unread 计数行 →
  *   tasks 首条 → suggestions 首条 → 整体硬截；
  * - 每级留名：payload `truncated: {budgetChars, shownChars, droppedSections,
- *   cappedItems}`——**静默丢弃 = 验收失败**。
+ *   cappedItems}`——**静默丢弃 = 验收失败**。v0.8.1（C2-B5 修复）：payload 数组与
+ *   文本面按同一级裁切，`cappedItems.shown === payload 数组长度`恒成立——旧实现
+ *   cappedItems 描述文本层而 payload 保留全量，只读 JSON 的消费方会误判「没丢」。
  *
  * id 三视角七要素冻结语义（§4.1 表）：tasks 按视角过滤；pool/unread/capacity 的
  * self/task/member 口径差异由本模块的纯函数钉死（selectHandoffTasks /
@@ -37,7 +39,7 @@ import { checkpointUnreadRef, type CapacityLevel } from './checkpoint.js';
 
 /** 接手包文本预算（§4.3；方案 §2 A2「默认预算 ≤4000 字符」）。 */
 export const HANDOFF_BUDGET_CHARS = 4000;
-/** 基础帽：文本面 tasks 章最多列几条（payload 仍给全量）。 */
+/** 基础帽：tasks 章最多列几条（payload 同帽裁切，C2-B5：文本与 JSON 不分裂）。 */
 export const HANDOFF_TASKS_MAX = 5;
 /** 基础帽：待领池列前 N（数据源级，与 checkpoint 第 3 章同口径）。 */
 export const HANDOFF_POOL_MAX = 10;
@@ -119,7 +121,7 @@ export interface HandoffCapacity {
 
 export interface HandoffCheckpoint {
   path: string;
-  /** 文件 mtime（epoch ms）。 */
+  /** front-matter createdAt（epoch ms；外部拷贝/还原后与 mtime 分歧时以它为准，回退见 checkpoint.ts）。 */
   createdAt: number;
   ageMin: number;
   bytes: number;
@@ -145,6 +147,14 @@ export interface HandoffInput {
   stalled: StallFlag[];
   /** 我的在途任务 id（task 视角的单在途规则提示用；self 视角可为 null）。 */
   myOpenTaskId: string | null;
+  /**
+   * v0.8.1（29 红队 C2-B3 修复）：**连续性指针**（仅 self 视角由工具层在「本包三要素
+   * 全空」时算出并注入）——花名册里有成员的会话已不在场、却持有开放任务/未读/检查点，
+   * 而本会话的接手包一样都没有。此时默认 self 包不得静默呈现「白纸一张」：指针行进
+   * suggestions 首位（文本面可见），提示经成员视角 `xc_read({scope:"handoff", id:<名>})`
+   * 寻回旧身份的状态。absent = 不出该提示（有自己任务的成员不需要）。
+   */
+  continuityHint?: string;
   /** 工具层披露（容量采样失败 / 花名漂移等）；原样进 payload。 */
   warnings?: string[];
 }
@@ -154,7 +164,11 @@ export interface HandoffTruncation {
   shownChars: number;
   /** 因预算被略去/缩减的章名（pool/unread/tasks/suggestions/正文）——留名不静默。 */
   droppedSections: string[];
-  /** 各章文本面 shown/total（基础帽与降级都记）。 */
+  /**
+   * 各章 **payload 实际给出**的 shown/total（基础帽与降级都记；v0.8.1 修复 C2-B5：
+   * 旧实现这里描述文本层而 payload 数组保留全量，只读 JSON 的消费方会误判「没丢」。
+   * 现在 `shown === payload 数组长度`恒成立，`total` = 未裁前的全量）。
+   */
   cappedItems: Record<string, { shown: number; total: number }>;
 }
 
@@ -173,7 +187,8 @@ export type HandoffPayload = {
   pool: Array<{
     taskId: string;
     title: string;
-    priority: TaskPriority | undefined;
+    /** 恒在（§14.3 冻结形状）：缺省 normal 的旧记录在此归一，不丢键。 */
+    priority: TaskPriority;
     dependsOn: string[];
     unmetDependsOn: string[];
   }>;
@@ -274,6 +289,12 @@ function buildHandoffSuggestions(input: HandoffInput): string[] {
   const me = input.identity.agentKey;
   const flagById = new Map(input.stalled.map((f) => [f.taskId, f]));
   const items: string[] = [];
+  // v0.8.1（C2-B3 修复）：self 视角的连续性指针置顶——本包三要素全空而花名册有
+  // 不在场成员持有状态时，默认包曾静默呈现「（暂无：按 journal 指针继续）」。
+  // 放首位保证 ≤5 的基础帽下仍可见（其余建议按既有语义随后）。
+  if (input.filter.kind === 'self' && input.continuityHint !== undefined && input.continuityHint !== '') {
+    items.push(input.continuityHint);
+  }
   for (const t of input.tasks) {
     const flag = flagById.get(t.taskId);
     if (flag !== undefined) {
@@ -310,6 +331,20 @@ function buildHandoffSuggestions(input: HandoffInput): string[] {
       }
     } else if (claimable !== null) {
       items.push(`无在途任务且有待领 → 可认领 ${claimable}（pending 且依赖已满足）`);
+    }
+  }
+  if (input.filter.kind === 'member' && input.tasks.length > 0) {
+    // 成员视角同样给单在途任务规则（§14.3 suggestions 冻结语义「该成员名下的任务逐条给
+    // 建议」；v0.8.1 修复 C2-B9：旧实现只有 self 视角给该规则，member 视角退化成
+    // 「（暂无：按 journal 指针继续）」）。第三人称——读者不一定是该成员，不得给出
+    // 「你替别人 xc_report」这种走不通的指令（C9-B5 纪律）；可认领项按**该成员**
+    // 视角算（受领指定给他的池项对他才是可达的）。
+    const memberKey = sanitizeKey(input.filter.id);
+    const claimableForMember = firstClaimable(input.pool, memberKey);
+    if (claimableForMember !== null) {
+      items.push(
+        `单在途任务规则：${memberKey} 需先 xc_report 收尾当前任务（${input.tasks[0]!.taskId}）再认领 ${claimableForMember}`,
+      );
     }
   }
   if (input.filter.kind === 'member' && input.tasks.length === 0) {
@@ -353,7 +388,34 @@ type DegradeLevel = 0 | 1 | 2 | 3 | 4 | 5;
 interface RenderedBody {
   body: string;
   dropped: string[];
-  capped: Record<string, { shown: number; total: number }>;
+}
+
+// ---------------------------------------------------------------------------
+// 各章 shown 数（v0.8.1 修复 C2-B5）：**文本面与 payload 共用同一组数**——
+// 旧实现文本按级降级而 payload 保留全量，`truncated.cappedItems` 描述文本层，
+// 只读 JSON 的消费方对着「shown:0 但数组 6 条」会误判「没丢」。现在
+// `cappedItems.shown === payload 数组长度`恒成立（降级级相同、取数同源）。
+// ---------------------------------------------------------------------------
+
+/** tasks：L3 起只留第 1 条；否则基础帽 5。 */
+function tasksShownCount(level: DegradeLevel, total: number): number {
+  return level >= 3 ? Math.min(1, total) : Math.min(HANDOFF_TASKS_MAX, total);
+}
+
+/** pool：L1 起整章略去（shown=0）；否则基础帽 10。 */
+function poolShownCount(level: DegradeLevel, total: number): number {
+  return level >= 1 ? 0 : Math.min(HANDOFF_POOL_MAX, total);
+}
+
+/** unread.top：L2 起只留计数行（shown=0）；否则基础帽 5。 */
+function unreadShownCount(level: DegradeLevel, total: number): number {
+  return level >= 2 ? 0 : Math.min(HANDOFF_UNREAD_MAX, total);
+}
+
+/** suggestions：L4 起只留第 1 条；否则展示列表全长（披露行不计入 shown）。 */
+function suggestionsShownCount(level: DegradeLevel, displayed: readonly string[]): number {
+  if (level >= 4) return Math.min(1, displayed.length);
+  return displayed.length - (hasSuggestionDisclosure(displayed) ? 1 : 0);
 }
 
 function viewLine(filter: HandoffFilter): string {
@@ -406,7 +468,6 @@ function checkpointEmptyLine(input: HandoffInput): string {
 /** 固定降级序列的某一级渲染（body 不含截断尾行；尾行由 compose 拼）。 */
 function renderBody(input: HandoffInput, level: DegradeLevel, suggestions: readonly string[]): RenderedBody {
   const droppedSet = new Set<string>();
-  const capped: Record<string, { shown: number; total: number }> = {};
   const lines: string[] = [];
 
   lines.push(viewLine(input.filter));
@@ -424,11 +485,10 @@ function renderBody(input: HandoffInput, level: DegradeLevel, suggestions: reado
   if (input.tasks.length === 0) {
     lines.push(emptyTasksLine(input.filter));
   } else {
-    const shownCount = level >= 3 ? 1 : Math.min(HANDOFF_TASKS_MAX, input.tasks.length);
+    const shownCount = tasksShownCount(level, input.tasks.length);
     for (const t of input.tasks.slice(0, shownCount)) lines.push(taskRow(t, input.now));
     const omitted = input.tasks.length - shownCount;
     if (omitted > 0) lines.push(`（另有 ${omitted} 条任务略去）`);
-    capped.tasks = { shown: shownCount, total: input.tasks.length };
     if (level >= 3) droppedSet.add('tasks');
   }
 
@@ -437,10 +497,9 @@ function renderBody(input: HandoffInput, level: DegradeLevel, suggestions: reado
     lines.push('## 3. 待领池');
     lines.push(`（待领池按 ${HANDOFF_BUDGET_CHARS} 字符预算略去：xc_overview 看板）`);
     droppedSet.add('pool');
-    capped.pool = { shown: 0, total: input.poolTotal };
   } else {
     lines.push('## 3. 待领池（前 10，priority → createdAt）');
-    const shown = input.pool.slice(0, HANDOFF_POOL_MAX);
+    const shown = input.pool.slice(0, poolShownCount(level, input.pool.length));
     if (input.pool.length === 0) {
       lines.push('（待领池为空）');
     } else {
@@ -448,12 +507,11 @@ function renderBody(input: HandoffInput, level: DegradeLevel, suggestions: reado
       if (input.poolTotal > shown.length) {
         lines.push(`（待领池共 ${input.poolTotal} 个，列前 ${shown.length}）`);
       }
-      if (input.poolTotal > shown.length) capped.pool = { shown: shown.length, total: input.poolTotal };
     }
   }
 
   // 4. 未读（L2 降级：计数行；top 防御性截到基础帽——调用方理应已截）
-  const topShown = input.unread.top.slice(0, HANDOFF_UNREAD_MAX);
+  const topShown = input.unread.top.slice(0, unreadShownCount(level, input.unread.top.length));
   if (level >= 2) {
     lines.push('## 4. 未读');
     lines.push(
@@ -461,7 +519,6 @@ function renderBody(input: HandoffInput, level: DegradeLevel, suggestions: reado
       + `——主题按 ${HANDOFF_BUDGET_CHARS} 字符预算略去，用 xc_read({scope:"inbox"}) 取`,
     );
     droppedSet.add('unread');
-    capped.unreadTop = { shown: 0, total: input.unread.count };
   } else {
     lines.push('## 4. 未读');
     if (input.unread.count === 0) {
@@ -472,7 +529,6 @@ function renderBody(input: HandoffInput, level: DegradeLevel, suggestions: reado
       for (const t of topShown) lines.push(unreadRow(t));
       if (input.unread.count > topShown.length) {
         lines.push(`（另有 ${input.unread.count - topShown.length} 条未读，xc_read({scope:"inbox"}) 消费）`);
-        capped.unreadTop = { shown: topShown.length, total: input.unread.count };
       }
     }
   }
@@ -503,18 +559,14 @@ function renderBody(input: HandoffInput, level: DegradeLevel, suggestions: reado
   if (level >= 4) {
     lines.push(`- ${suggestions[0] ?? '（暂无：按 journal 指针继续）'}`);
     droppedSet.add('suggestions');
-    capped.suggestions = { shown: 1, total: suggestionsTotal(input, suggestions) };
   } else {
     for (const s of suggestions) lines.push(`- ${s}`);
-    const raw = suggestionsTotal(input, suggestions);
-    const shownCount = suggestions.length - (hasSuggestionDisclosure(suggestions) ? 1 : 0);
-    if (shownCount < raw) capped.suggestions = { shown: shownCount, total: raw };
   }
 
   // droppedSections 按**固定降级序**排列（不是章序）：pool → unread → tasks → suggestions。
   const DROP_ORDER = ['pool', 'unread', 'tasks', 'suggestions'] as const;
   const dropped = DROP_ORDER.filter((name) => droppedSet.has(name));
-  return { body: lines.join('\n'), dropped, capped };
+  return { body: lines.join('\n'), dropped };
 }
 
 /** suggestions 的原始条数（含被基础帽/披露行吃掉的部分；用于 cappedItems.total）。 */
@@ -553,7 +605,11 @@ function compose(body: string, level: DegradeLevel, dropped: readonly string[]):
 /**
  * 组装接手包（文本 + JSON 双层）。先按基础帽渲染七章；超 4000 字符走固定降级序列
  * （逐步重算、命中即停）：pool → unread → tasks → suggestions → 整体硬截。
- * 每级留名进 payload `truncated`——不静默丢要素（AC2）。
+ *
+ * v0.8.1（C2-B5 修复）：**payload 数组与文本面按同一降级级裁切**——`cappedItems.shown`
+ * 恒等于 payload 数组长度、`total` 为未裁全量；只要任一章被裁（基础帽或降级），
+ * `truncated` 就在场（旧实现只在降级时给，基础帽对 JSON 消费方完全隐身）。
+ * 不静默丢要素（AC2）：被裁章节在 cappedItems 留名，并用 xc_read/xc_overview 指针取全文。
  */
 export function assembleHandoff(input: HandoffInput): HandoffAssembly {
   const suggestions = buildHandoffSuggestions(input);
@@ -571,12 +627,31 @@ export function assembleHandoff(input: HandoffInput): HandoffAssembly {
   const final = chosen!;
   const { level, text, rendered } = final;
 
+  // 文本面与 payload 共用同一组 shown 数（C2-B5：cappedItems 必须描述 payload）。
+  const tasksShown = tasksShownCount(level, input.tasks.length);
+  const poolShown = poolShownCount(level, input.pool.length);
+  const unreadShown = unreadShownCount(level, input.unread.top.length);
+  const suggestionsShown = suggestionsShownCount(level, suggestions);
+  const suggestionsRawTotal = suggestionsTotal(input, suggestions);
+  const cappedItems: Record<string, { shown: number; total: number }> = {};
+  if (tasksShown < input.tasks.length) cappedItems.tasks = { shown: tasksShown, total: input.tasks.length };
+  if (poolShown < input.poolTotal) cappedItems.pool = { shown: poolShown, total: input.poolTotal };
+  // member 视角的 top 为空是 §4.4 隐私 withhold（payload 另有 unreadWithheld 键说明），
+  // 不是预算裁切——不进 cappedItems，免得消费方把「不披露主题」误读成「被截断」。
+  if (input.unread.withheld === undefined && unreadShown < input.unread.count) {
+    cappedItems.unreadTop = { shown: unreadShown, total: input.unread.count };
+  }
+  if (suggestionsShown < suggestionsRawTotal) {
+    cappedItems.suggestions = { shown: suggestionsShown, total: suggestionsRawTotal };
+  }
+  const anyCapped = Object.keys(cappedItems).length > 0;
+
   const unreadTop = input.unread.top
-    .slice(0, HANDOFF_UNREAD_MAX)
+    .slice(0, unreadShown)
     .map((t) => ({ msgId: t.msgId, from: t.from, subject: t.subject }));
   const payload: HandoffPayload = {
     identity: input.identity,
-    tasks: input.tasks.map((t) => ({
+    tasks: input.tasks.slice(0, tasksShown).map((t) => ({
       taskId: t.taskId,
       title: t.title,
       status: t.status,
@@ -585,25 +660,26 @@ export function assembleHandoff(input: HandoffInput): HandoffAssembly {
       lastProgressTs: t.lastProgressTs,
       ...(t.blockedReason !== undefined ? { blockedReason: t.blockedReason } : {}),
     })),
-    pool: input.pool.map((p) => ({
+    pool: input.pool.slice(0, poolShown).map((p) => ({
       taskId: p.taskId,
       title: p.title,
-      priority: p.priority,
+      // §14.3 冻结形状：priority 恒在（缺省 normal 的旧记录在此归一，不丢键——C2-B8）。
+      priority: p.priority ?? 'normal',
       dependsOn: p.dependsOn,
       unmetDependsOn: p.unmetDependsOn,
     })),
     unread: { count: input.unread.count, urgentCount: input.unread.urgentCount, top: unreadTop },
     capacity: input.capacity,
     checkpoint: input.checkpoint,
-    suggestions: [...suggestions],
+    suggestions: suggestions.slice(0, suggestionsShown),
     filter: input.filter,
-    ...(level >= 1
+    ...(level >= 1 || anyCapped
       ? {
           truncated: {
             budgetChars: HANDOFF_BUDGET_CHARS,
             shownChars: text.length,
             droppedSections: level === 5 ? [...rendered.dropped, '正文'] : [...rendered.dropped],
-            cappedItems: rendered.capped,
+            cappedItems,
           },
         }
       : {}),

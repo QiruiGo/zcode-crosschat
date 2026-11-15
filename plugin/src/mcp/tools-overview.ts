@@ -20,6 +20,11 @@
  *   容量色+水位/离线成员/checkpoint 年龄/未读数；复用 capacityMount /
  *   offlineMembersMount / stalledTasks / countUnreadFor / latestCheckpoint，
  *   零重复实现）。两者都是**纯派生视图**：免注册、不写 snapshot.json。
+ * - v0.8.1（29-v080 红队 C3 组修复）：timeline 的 actor 链补 approvedBy/from/member
+ *   （M03）、按 ts 降序（B2）、skippedEvents 跳过披露（B3）、文本视图控制字符清洗
+ *   （B4）、尾窗截断每页披露 olderEventsOmitted（M04）、续读 offset 位置游标语义
+ *   披露（B7）、预算刻度接 identify 的 contextChars 逐会话声明（B8）——逐项对应
+ *   PROTOCOL §14.4 冻结式同步。
  * - 无需注册即可调用（只读纪律，SKILL §1 保留）。
  */
 
@@ -47,21 +52,27 @@ import { lastTeamRecoveryNotice, teamRecoveryWarning } from "../core/teamstate.j
 import { stalledTasks, stallThresholdMs, stallSuggestion, type StallFlag } from "../core/stall.js";
 import { staleThresholdMsFromEnv } from "./task-edges.js";
 import { getPeerServices } from "./peer-services.js";
+// v0.8.1（C3-B8）：调用方 peer 会话上下文（contextChars 逐会话声名的旁路解析）。
+import { getPeerSessionContext } from "./peer-drain.js";
 import { leadKeyOf } from "./tools-team.js";
 // v0.7（C8，M4）：离线成员挂载（DESIGN-V0.7.md §4.3）。
 import { peerRootFromEnv } from "../core/peerdir.js";
 import { scanPeers } from "../core/peerregistry.js";
 import { offlineMemberLine, offlineMembers, offlineThresholdMsFromEnv, type OfflineMember } from "../core/offline.js";
+// C3 容量挂载（M6）+ v0.8.1（C4-O1）：水位越界回落披露助手。
 import {
   capacityCacheFile,
   formatCapacityLines,
   judgeCapacity,
+  memWarnWatermarkInfoFromEnv,
+  MEM_WATERMARK_FALLBACK_WARNING,
   sampleCapacity,
   type CapacitySample,
   type CapacityVerdict,
 } from "../core/capacity.js";
 // v0.8.0（A3/A4）：时间线尾部窗口读 + 事件族归一化；checkpoint 年龄/容量 level 推导助手。
-import { readTimeline } from "../core/timeline.js";
+// v0.8.1（C3-B4）：timelineTextField——文本视图控制字符清洗（JSON payload 不洗）。
+import { readTimeline, timelineTextField } from "../core/timeline.js";
 import { capacityLevelOf, latestCheckpoint } from "../core/checkpoint.js";
 import type { ToolDeps } from "./core.js";
 import { runCore } from "./core.js";
@@ -90,6 +101,10 @@ async function capacityMount(deps: ToolDeps): Promise<CapacityMount | null> {
   } catch {
     return null;
   }
+  // v0.8.1（29 红队 C4-O1 修复）：XC_MEM_WARN_WATERMARK 越界（0/负数/≥1/非数字）
+  // 不再静默按缺省判定——payload 附 memWarnWatermarkFallback + 文本附 WARNING
+  // （与 offline/stall 家族的回落披露同款两级）。
+  const watermark = memWarnWatermarkInfoFromEnv(deps.env);
   return {
     payload: {
       capacity: {
@@ -105,9 +120,13 @@ async function capacityMount(deps: ToolDeps): Promise<CapacityMount | null> {
         red: verdict.red,
         violated: verdict.violated,
         detail: verdict.detail,
+        ...(watermark.fellBack ? { memWarnWatermarkFallback: true } : {}),
       },
     },
-    lines: formatCapacityLines(sample, verdict),
+    lines: [
+      ...formatCapacityLines(sample, verdict),
+      ...(watermark.fellBack ? [MEM_WATERMARK_FALLBACK_WARNING] : []),
+    ],
   };
 }
 
@@ -146,12 +165,12 @@ async function offlineMembersMount(deps: ToolDeps, team: TeamState, now: number)
 export const OverviewShape = {
   view: z.enum(["team", "peers", "panel", "timeline", "status"]).optional().describe(
     "缺省 team：任务板+成员+未读；peers：本机可寻址 peer 清单；panel：self+peers+members+tasks+入站策略+容量+停滞；"
-    + "timeline：引擎日志时间线（新→旧；limit 缺省 20 上限 100，offset=自最新往回跳过 N 条，预算截断披露+续读指针）；"
+    + "timeline：引擎日志时间线（ts 降序；limit 缺省 20 上限 100，offset=自最新往回跳过 N 条的位置游标，预算截断披露+续读指针，跳过行计 skippedEvents，尾窗截断每页披露 olderEventsOmitted）；"
     + "status：紧凑状态视图（任务七态计数/stalled/容量色+水位/离线成员/checkpoint 年龄/未读数，替代状态栏）",
   ),
   history: z.boolean().optional().describe("附 lead 角色变更史（R-7）"),
   offset: z.number().int().min(0).optional().describe(
-    "分页起点：team=任务板自头部偏移；peers=清单自头部偏移；timeline=自最新往回跳过 N 条（语义不同，防误用）",
+    "分页起点：team=任务板自头部偏移；peers=清单自头部偏移；timeline=自最新往回跳过 N 条的位置游标（语义不同，防误用；实时追加下会漂移）",
   ),
   limit: z.number().int().min(1).optional().describe("仅 view=timeline：单页事件条数（缺省 20，上限 100，超限钳制并披露 limitClamped）"),
 } as const;
@@ -281,12 +300,12 @@ export function createTeamOverviewCore(deps: ToolDeps): TeamOverviewCore {
         const boardTruncated = boardOffset + boardShown < allTasks.length;
 
         // v0.6（C5）：停滞挂载（team 视图；blocked 超阈以 blocked-long 单列）。
-        const stalled = team !== undefined
-          ? stalledTasks(team.tasks, now, stallThresholdMs(deps.env, staleThresholdMsFromEnv(deps.env)).ms)
-          : [];
-        const stallClamped = team !== undefined
-          ? stallThresholdMs(deps.env, staleThresholdMsFromEnv(deps.env)).clamped
-          : false;
+        // v0.8.1（C4-F2）：阈值解析三态一次算完（clamped 钳制 / fellBack 非法回落），
+        // 与 offline 家族同款两级披露（payload 键 + WARNING）——0/负数/非数字不再静默。
+        const stall = stallThresholdMs(deps.env, staleThresholdMsFromEnv(deps.env));
+        const stalled = team !== undefined ? stalledTasks(team.tasks, now, stall.ms) : [];
+        const stallClamped = team !== undefined && stall.clamped;
+        const stallFellBack = team !== undefined && stall.fellBack;
 
         await logEngineEvent(stateRoot, {
           event: "status",
@@ -311,7 +330,12 @@ export function createTeamOverviewCore(deps: ToolDeps): TeamOverviewCore {
             : snapshot.members,
           ...(args.history === true && team !== undefined
             ? {
-                leadKey: team.leadKey ?? null,
+                // v0.8.1（M05 收口）：与同一 payload 的 members[].isLead（leadKeyOf 兜底）
+                // 及 status 视图的 leadKey 同源——直读 team.leadKey 会在无显式 lead 时
+                // 给 null，而 isLead 又按 founder 判 true，同一块自相矛盾（29 红队 M05
+                // 的同类形态）。leadSince/leadHistory 仍是原始字段（无显式 lead 时
+                // leadSince=null，属「角色未显式移交」的真实事实）。
+                leadKey: leadKeyOf(team) ?? null,
                 leadSince: team.leadSince ?? null,
                 leadHistory: historyEntries.slice(0, historyShown),
                 ...(historyTruncated
@@ -329,11 +353,12 @@ export function createTeamOverviewCore(deps: ToolDeps): TeamOverviewCore {
                 },
               }
             : {}),
-          // C5 挂载点：stalled / 建议行 / 阈值钳制 WARNING。
-          ...(stalled.length > 0 || stallClamped
+          // C5 挂载点：stalled / 建议行 / 阈值钳制 WARNING / v0.8.1（C4-F2）非法回落披露。
+          ...(stalled.length > 0 || stallClamped || stallFellBack
             ? {
                 stalled: stalled.map((flag) => ({ ...flag, suggestion: stallSuggestion(flag.kind, flag.status) })),
                 ...(stallClamped ? { stalledThresholdClamped: true } : {}),
+                ...(stallFellBack ? { stalledThresholdFallback: true } : {}),
               }
             : {}),
           // C3 挂载（M6）：capacity 块（采样失败则不挂载，任务板不受影响）。
@@ -360,6 +385,13 @@ export function createTeamOverviewCore(deps: ToolDeps): TeamOverviewCore {
         if (stallClamped) {
           rollbackWarnings.push(
             "WARNING XC_STALL_MINUTES 低于僵尸清扫阈值（XC_STALE_TASK_MINUTES）——stall 阈值已按 stale 阈值钳制（无在途唤醒的死任务会先被清扫回池，stall 面轮不到展示）",
+          );
+        }
+        // v0.8.1（C4-F2 修复）：非法值（0/负数/非数字）不再静默回落——与 offline 家族
+        // （v0.7.2 C8-B4）同款两级披露：payload stalledThresholdFallback + 本 WARNING。
+        if (stallFellBack) {
+          rollbackWarnings.push(
+            "WARNING XC_STALL_MINUTES 非法（须为有限正数；0/负数/非数字不被接受）——已回落内置缺省 120min（stall 检测本身按缺省值正常交付）；如只想用缺省值请取消该 env 设置",
           );
         }
         if (offlineMount !== null && offlineMount.clamped) {
@@ -421,7 +453,7 @@ export async function handleOverview(deps: ToolDeps, args: OverviewArgs, connect
     return overviewPeers(deps, args);
   }
   if (view === "timeline") {
-    return timelineView(deps, args);
+    return timelineView(deps, args, connectionKey);
   }
   if (view === "status") {
     return statusView(deps, connectionKey);
@@ -527,22 +559,30 @@ void ToolError;
 // ---------------------------------------------------------------------------
 
 /**
- * view:"timeline"：引擎日志时间线（新→旧）。core/timeline.ts 自持尾部窗口读
- * （256 KiB，窗口首行丢弃防半行；坏行跳过）；limit 缺省 20/上限 100（钳制披露
- * limitClamped）；offset = 自最新往回跳过 N 条（与板面偏移语义不同，describe 已写明）；
- * 预算开窗超限给 truncated + 续读指针；窗口不足披露 tailWindowBytes/olderEventsOmitted。
+ * view:"timeline"：引擎日志时间线（ts 降序）。core/timeline.ts 自持尾部窗口读
+ * （256 KiB，窗口首行丢弃防半行；坏行/形状不符行跳过并计数披露 skippedEvents）；
+ * limit 缺省 20/上限 100（钳制披露 limitClamped）；offset = 自最新往回跳过 N 条
+ * （与板面偏移语义不同，describe 已写明；**位置游标**——实时追加下会漂移，截断
+ * 尾注与 PROTOCOL §14.4 双面披露）；预算开窗超限给 truncated + 续读指针；
+ * 文件被尾窗截断 ⇒ 每页披露 tailWindowBytes/olderEventsOmitted。
+ * v0.8.1（C3-B8）：预算刻度优先取调用方经 identify 逐会话声名的 contextChars
+ * （PROTOCOL §8 逐会话覆盖），回落 env XC_CONTEXT_CHARS/200k。
  */
-export async function timelineView(deps: ToolDeps, args: OverviewArgs): Promise<ToolResult> {
+export async function timelineView(deps: ToolDeps, args: OverviewArgs, connectionKey: string): Promise<ToolResult> {
   return runCore(deps.stateRoot, async () => {
-    const budget = receiverInjectBudget(contextCharsFromEnv(deps.env), deps.env);
+    const budget = receiverInjectBudget(
+      (await callerDeclaredContextChars(deps, connectionKey)) ?? contextCharsFromEnv(deps.env),
+      deps.env,
+    );
     const result = await readTimeline(engineLogFile(deps.stateRoot), {
       ...(args.limit !== undefined ? { limit: args.limit } : {}),
       ...(args.offset !== undefined ? { offset: args.offset } : {}),
       budgetChars: budget.total,
     });
+    // v0.8.1（C3-B4）：文本视图控制字符清洗（JSON payload 保持原值）。
     const lines = result.events.map(
       (e) =>
-        `${new Date(e.ts).toISOString()} | ${e.event} | ${e.family} | ${e.actor ?? "-"} | ${e.taskId ?? "-"} | ${e.summary}`,
+        `${new Date(e.ts).toISOString()} | ${timelineTextField(e.event)} | ${e.family} | ${timelineTextField(e.actor ?? "-")} | ${timelineTextField(e.taskId ?? "-")} | ${timelineTextField(e.summary)}`,
     );
     const parts: string[] = [
       result.total === 0
@@ -553,13 +593,22 @@ export async function timelineView(deps: ToolDeps, args: OverviewArgs): Promise<
     if (result.truncated !== undefined) {
       parts.push(
         `[时间线已按注入预算（${budget.total} 字符）截断：本页 ${result.truncated.shown}/${result.truncated.total} 条`
-        + `——用 xc_overview({view:"timeline", offset:${result.truncated.shown}}) 续读]`,
+        + `——用 xc_overview({view:"timeline", offset:${result.truncated.shown}}) 续读]`
+        // v0.8.1（C3-B7）：位置游标语义披露——offset 是「自最新往回跳过 N 条」，
+        // 日志实时追加时跳号/重叠都可能发生（静态日志下精确）。
+        + `[续读 offset 为位置游标（自最新往回跳过 N 条）：期间若有新事件追加，可能跳号或重叠]`,
       );
     }
     if (result.olderEventsOmitted === true) {
       parts.push(
         `[尾部窗口 ${result.tailWindowBytes ?? 0} 字节：更早事件未读入（olderEventsOmitted）`
         + `——引擎日志无上界，时间线只保最近窗口]`,
+      );
+    }
+    // v0.8.1（C3-B3）：跳过披露——坏行/形状不符行不计入 total，此处显式留数。
+    if (result.skippedEvents !== undefined && result.skippedEvents > 0) {
+      parts.push(
+        `[窗口内 ${result.skippedEvents} 行未能归一化（坏行/缺 ts/缺 event）已跳过——total 只计成功事件]`,
       );
     }
     return okResult(parts.join("\n"), {
@@ -570,10 +619,38 @@ export async function timelineView(deps: ToolDeps, args: OverviewArgs): Promise<
       limit: result.limit,
       ...(result.limitClamped !== undefined ? { limitClamped: result.limitClamped } : {}),
       ...(result.truncated !== undefined ? { truncated: result.truncated } : {}),
+      ...(result.skippedEvents !== undefined ? { skippedEvents: result.skippedEvents } : {}),
       ...(result.tailWindowBytes !== undefined ? { tailWindowBytes: result.tailWindowBytes } : {}),
       ...(result.olderEventsOmitted !== undefined ? { olderEventsOmitted: result.olderEventsOmitted } : {}),
     });
   });
+}
+
+/**
+ * v0.8.1（C3-B8）：调用方经 xc_identify 逐会话声名的 contextChars（落 peer 注册
+ * 记录的 `contextChars` 字段）——timeline 预算刻度优先取它，取不到回落
+ * env XC_CONTEXT_CHARS/200k（PROTOCOL §8「成员/peer 可在 identify 时用 contextChars
+ * 逐会话覆盖声明值」；v0.8.0 的 timeline 只认 env，逐会话声明被忽略）。
+ *
+ * 解析：连接绑定身份的 sessionId（队内轴）→ 本进程 peer 会话上下文（peer 轴）
+ * → 只读扫描 peer 注册表（sweep:false）按 sessionId 取记录。任何意外
+ * （未注册/扫描失败/记录无声明）→ undefined（回落 env；误声明只影响刻度，
+ * 安全方向 = 多截断，观测面永不为难）。
+ */
+async function callerDeclaredContextChars(deps: ToolDeps, connectionKey: string): Promise<number | undefined> {
+  try {
+    const sessionId = identityStore.get(connectionKey)?.sessionId ?? getPeerSessionContext()?.sessionId;
+    if (sessionId === undefined) return undefined;
+    const scan = await scanPeers(peerRootFromEnv(deps.env), Date.now(), { sweep: false });
+    const rows = [...scan.active, ...scan.dead.map((row) => row.record)];
+    const mine = rows.find((record) => record.sessionId === sessionId);
+    const declared = mine?.contextChars;
+    return typeof declared === 'number' && Number.isSafeInteger(declared) && declared > 0
+      ? declared
+      : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** latestCheckpoint 的安全包装：段闸抛错按「无检查点」降级（观测面永不为难任务板）。 */
@@ -590,12 +667,16 @@ async function latestCheckpointAgeSafe(
   }
 }
 
-/** 检查点年龄展示：<60min → Nmin前；<24h → Nh前；否则 Nd前。 */
+/**
+ * 检查点年龄展示：**精确分钟**（`Nmin前`；无检查点 → `(none)`）。
+ * v0.8.1（C5-BUG-C5-02 修复）：旧实现按 min/h/d 阶梯向下取整（26h → 「1d前」=1440min），
+ * 与 handoff 文本面的精确 ageMin（「1560min 前」）跨面粒度不一致——同一事实两种粒度。
+ * PROTOCOL §14.5 散文本就承诺「年龄 min 前」；现在 status 文本 / handoff 文本 / 两视图
+ * payload 的 ageMin 三者同值同粒度。
+ */
 function formatCheckpointAge(ageMin: number | null): string {
   if (ageMin === null) return "(none)";
-  if (ageMin < 60) return `${ageMin}min前`;
-  if (ageMin < 1440) return `${Math.floor(ageMin / 60)}h前`;
-  return `${Math.floor(ageMin / 1440)}d前`;
+  return `${ageMin}min前`;
 }
 
 /** status 视图降级级（0=全量；1=unread 行；2=checkpoint 行；3=offline/stalled 明细；4=容量明细；5=硬截）。 */
@@ -670,7 +751,9 @@ function renderStatusLines(input: StatusRenderInput, level: StatusDegradeLevel):
  *   team / tasks / capacity / checkpoint / unread
  * 字段口径与真实状态一致（AC4）：七态计数全量；stalled = stalledTasks 计数；
  * offline = offlineMembersMount 成员数；capacity 复用 capacityMount（挂载 null → UNKNOWN，
- * 不谎报 GREEN；RED 附 C9 原句 COMPRESS_ADVICE_LINE）；checkpoint 年龄按 mtime；
+ * 不谎报 GREEN；RED 附 C9 原句 COMPRESS_ADVICE_LINE）；checkpoint 年龄 = now − front-matter
+ * createdAt（缺失/不可解析回退 mtime——C2-B4：外部拷贝/还原后 mtime 与产品事实分歧），
+ * 文本按精确分钟渲染（C5-BUG-C5-02：与 handoff 同粒度，不再按天向下取整）；
  * unread 与板面同口径 countUnreadFor。预算超限走固定降级序（unread 行 → checkpoint 行
  * → offline/stalled 明细 → capacity 明细），每级留名披露 truncated。
  */
@@ -702,9 +785,14 @@ export async function statusView(deps: ToolDeps, connectionKey: string): Promise
       capacityPayload === undefined ? null : { red: capacityPayload["red"] === true },
     );
     const capacityLine = capacity?.lines[0] ?? null;
+    // C9 建议行按前缀定位（不取末行）：v0.8.1（C4-O1）起水位越界 WARNING 也可能挂在
+    // 容量行之后，末行不再恒为 compress-advice。
     const capacityAdvice = capacity !== null && capacityPayload?.["red"] === true
-      ? capacity.lines[capacity.lines.length - 1] ?? null
+      ? capacity.lines.find((line) => line.startsWith("compress-advice:")) ?? null
       : null;
+    // v0.8.1（C4-O1）：水位阈值越界回落标记（capacityMount 已附 WARNING 行；status 的
+    // 紧凑容量行只取 lines[0]，故 WARNING 走 extraWarnings 通道，文本层不丢）。
+    const watermarkFellBack = capacityPayload?.["memWarnWatermarkFallback"] === true;
 
     // C8 离线成员挂载（复用；null = 扫描意外，不猜）
     const offlineMount = await offlineMembersMount(deps, team, now);
@@ -781,6 +869,8 @@ export async function statusView(deps: ToolDeps, connectionKey: string): Promise
     const final = chosen!;
 
     const extraWarnings: string[] = [];
+    // v0.8.1（C4-F1 修复）：offline 家族的阈值披露补齐 payload 键（team 视图早有；
+    // status 此前只有文本 WARNING——两视图机器可读面不对称）。
     if (offlineMount !== null && offlineMount.clamped) {
       extraWarnings.push(
         "WARNING XC_OFFLINE_MINUTES 低于僵尸清扫阈值（XC_STALE_TASK_MINUTES）——离线阈值已按 stale 阈值钳制（无进展任务会先被 stale 回收，idle-timeout 分支轮不到展示）",
@@ -791,6 +881,20 @@ export async function statusView(deps: ToolDeps, connectionKey: string): Promise
         "WARNING XC_OFFLINE_MINUTES 非法（须为有限正数；0/负数/非数字不被接受）——已回落内置缺省 240min（安全方向：取最保守的离线阈值）；如只想用缺省值请取消该 env 设置",
       );
     }
+    // v0.8.1（C4-F2 修复）：stall 家族两级披露拉齐——钳制/非法回落都附 WARNING
+    // （此前 status 只有 payload 键、无 WARNING；offline 反之——现在两家族同形）。
+    if (stall.clamped) {
+      extraWarnings.push(
+        "WARNING XC_STALL_MINUTES 低于僵尸清扫阈值（XC_STALE_TASK_MINUTES）——stall 阈值已按 stale 阈值钳制（无在途唤醒的死任务会先被清扫回池，stall 面轮不到展示）",
+      );
+    }
+    if (stall.fellBack) {
+      extraWarnings.push(
+        "WARNING XC_STALL_MINUTES 非法（须为有限正数；0/负数/非数字不被接受）——已回落内置缺省 120min（stall 检测本身按缺省值正常交付）；如只想用缺省值请取消该 env 设置",
+      );
+    }
+    // v0.8.1（C4-O1 修复）：容量水位预警线越界的回落披露（与 capacityMount 同句）。
+    if (watermarkFellBack) extraWarnings.push(MEM_WATERMARK_FALLBACK_WARNING);
     if (extraWarnings.length > 0) final.text = `${final.text}\n${extraWarnings.join("\n")}`;
 
     return okResult(final.text, {
@@ -801,6 +905,9 @@ export async function statusView(deps: ToolDeps, connectionKey: string): Promise
       taskCounts: counts,
       stalled: stalled.length,
       ...(stall.clamped ? { stalledThresholdClamped: true } : {}),
+      ...(stall.fellBack ? { stalledThresholdFallback: true } : {}),
+      ...(offlineMount !== null && offlineMount.clamped ? { offlineThresholdClamped: true } : {}),
+      ...(offlineMount !== null && offlineMount.fellBack ? { offlineThresholdFallback: true } : {}),
       capacity: capacityPayload === undefined
         ? null
         : { ...capacityPayload, level: capacityLevel },
@@ -839,7 +946,7 @@ export function registerOverviewTools(
     "Observation snapshot (task board / members / peers / capacity / stall in one tool). view=team (default): members with isLead, priority-ordered task board (budget-windowed with boardTruncated pointer), unread counts, orphan/stale-receipt warnings, stalled flags (C5); " +
     "history:true appends leadHistory; view=peers: addressable cross-session peers (self/member/session rows, rowsTruncated pointer); " +
     "view=panel: self + peers + members + task counts + inbound policy; " +
-    "view=timeline: engine.jsonl timeline newest-first (limit defaults 20, max 100 with limitClamped disclosure; offset skips back N from the newest event; budget window with truncated pointer); " +
+    "view=timeline: engine.jsonl timeline ordered by ts descending (limit defaults 20, max 100 with limitClamped disclosure; offset is a positional cursor skipping back N from the newest event — drifts under live appends; budget window with truncated pointer; skippedEvents counts unnormalizable lines; olderEventsOmitted disclosed on every page when the tail window truncates the file); " +
     "view=status: compact status block (task counts by status / stalled / capacity level + watermark / offline members / checkpoint ages / unread counts — the no-statusline substitute). Does not require registration; writes snapshot.json (always the full board) only for view=team.";
   const handler = async (args: Record<string, unknown>, extra: unknown): Promise<ToolResult> =>
     handleOverview(deps, args as unknown as OverviewArgs, connectionKeyOf(extra));

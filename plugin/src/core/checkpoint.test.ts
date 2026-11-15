@@ -12,7 +12,7 @@
  * - 路径安全（段闸把穿越探针吸收成安全段，落点恒在 stateRoot 内）；
  * - 未读只抄索引不搬原文 + `tool_request` 帧 subject 遮蔽（R6 审批门不开侧门）。
  */
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
@@ -25,6 +25,7 @@ import {
   capacityViewOf,
   checkpointNudgeDecision,
   checkpointNudgeState,
+  checkpointCreatedAtFromMarkdown,
   checkpointStamp,
   checkpointUnreadRef,
   frontMatterCapacityLine,
@@ -36,6 +37,7 @@ import {
   readTaskJournalTail,
   renderCheckpointNudgeLine,
   safeCheckpointSegment,
+  sweepCheckpointTmpFiles,
   writeCheckpoint,
   writeNudgeMarker,
   buildCheckpointMarkdown,
@@ -408,7 +410,7 @@ describe('writeCheckpoint → latestCheckpoint 往返（落盘 + 滚动）', () 
     const latest = await latestCheckpoint(root, 'alice', writtenAt + 5 * MIN);
     expect(latest).not.toBeNull();
     expect(latest!.bytes).toBeGreaterThan(0);
-    expect(latest!.ageMin).toBe(5); // 年龄 = now - 最新 *.md mtime
+    expect(latest!.ageMin).toBe(5); // 年龄 = now - front-matter createdAt（v0.8.1：拷贝/还原不回退 mtime 口径）
   });
 
   it('latestCheckpoint：只认 stamp 形态的 *.md（stray 的 .md 不冒充分检点）', async () => {
@@ -618,5 +620,126 @@ describe('CheckpointJournalTail 形状（供 G2 接手包复用同一读取助�
     const md = buildCheckpointMarkdown(data({ journalTails: [tail] }));
     expect(md).toContain('### t（.crosschat/tasks/t/journal.md）');
     expect(md).toContain('- x');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.8.1（29 红队 C1-B01 / C1-B02 修复）：同毫秒并发不再静默覆写 + .tmp 残留清扫。
+// ---------------------------------------------------------------------------
+describe('writeCheckpoint：同毫秒并发的排他落盘（C1-B01）', () => {
+  it('8 个同刻并发调用各得一份文件、各自 note 幸存（无静默覆写、无路径共享）', async () => {
+    const calls = Array.from({ length: 8 }, (_, i) =>
+      writeCheckpoint(root, data({ now: T, note: `p${i}-note` })),
+    );
+    const results = await Promise.all(calls);
+    const paths = results.map((r) => r.path);
+    expect(new Set(paths).size).toBe(8); // 一次调用一份文件（旧实现：同刻探针稳定撞名）
+    const names = readdirSync(checkpointDir(root, 'alice')).filter((n) => n.endsWith('.md'));
+    expect(names).toHaveLength(8);
+    for (const [i, r] of results.entries()) {
+      const text = readFileSync(r.path, 'utf8');
+      expect(text).toContain(`p${i}-note`); // 先发者的内容不被后发者吞掉
+      expect(text.endsWith('\n')).toBe(true);
+    }
+    // 字典序=时间序：stamp 互异且整体有序（latest 取最后一份）
+    const stamps = results.map((r) => r.stamp);
+    expect(new Set(stamps).size).toBe(8);
+    expect([...stamps].sort()).toEqual(stamps.sort());
+  });
+
+  it('排他写撞名的轮次记入 stampCollisions（并发下 >0 时调用方/审计可见）', async () => {
+    const results = await Promise.all(
+      Array.from({ length: 6 }, (_, i) => writeCheckpoint(root, data({ now: T, note: `c${i}` }))),
+    );
+    for (const r of results) {
+      if (r.stampCollisions !== undefined) expect(r.stampCollisions).toBeGreaterThanOrEqual(1);
+    }
+    // 无论是否撞名：六份文件、六个 note 全幸存（不变量）
+    for (const [i, r] of results.entries()) {
+      expect(readFileSync(r.path, 'utf8')).toContain(`c${i}`);
+    }
+  });
+});
+
+describe('writeCheckpoint：.tmp 残留清扫（C1-B02）', () => {
+  it('60s 外的残留 .tmp 被清掉；刚建的在途 temp 不碰；.md 与 .nudge 不受影响', async () => {
+    const dir = checkpointDir(root, 'alice');
+    mkdirSync(dir, { recursive: true });
+    const stale = join(dir, '2026-11-15T17-00-00-000Z.md.999.deadbeef.tmp');
+    const fresh = join(dir, '2026-11-15T18-00-00-000Z.md.999.inflight.tmp');
+    const keep = join(dir, '.nudge');
+    writeFileSync(stale, 'x'.repeat(1024), 'utf8');
+    writeFileSync(fresh, 'y'.repeat(1024), 'utf8');
+    writeFileSync(keep, '2026-11-15T18:00:00.000Z\n', 'utf8');
+    const old = Date.now() - 10 * 60_000; // 10min 前 → 超 60s 阈值
+    utimesSync(stale, new Date(old), new Date(old));
+
+    const result = await writeCheckpoint(root, data({ now: T, note: 'after-sweep' }));
+    expect(result.tmpRemoved).toBe(1); // 只清残留那份
+    expect(existsSync(stale)).toBe(false);
+    expect(existsSync(fresh)).toBe(true); // 在途写（毫秒级生命周期）不误删
+    expect(existsSync(keep)).toBe(true);
+    expect(existsSync(result.path)).toBe(true);
+  });
+
+  it('sweepCheckpointTmpFiles：目录不存在 → 不抛、记 error；非 .tmp 文件不在清扫域', async () => {
+    const missing = join(root, 'no-such-dir');
+    const r1 = await sweepCheckpointTmpFiles(missing);
+    expect(r1.removed).toBe(0);
+    expect(typeof r1.error).toBe('string');
+
+    const dir = checkpointDir(root, 'bob');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'keep.md'), 'x', 'utf8');
+    writeFileSync(join(dir, 'keep.md.tmp'), 'x', 'utf8'); // 也在 .tmp 域（按后缀口径）
+    const old = Date.now() - 10 * 60_000;
+    utimesSync(join(dir, 'keep.md.tmp'), new Date(old), new Date(old));
+    const r2 = await sweepCheckpointTmpFiles(dir);
+    expect(r2).toEqual({ removed: 1 });
+    expect(existsSync(join(dir, 'keep.md'))).toBe(true);
+    expect(existsSync(join(dir, 'keep.md.tmp'))).toBe(false);
+  });
+});
+
+
+
+// ---------------------------------------------------------------------------
+// v0.8.1 红队二十九番修复回归（本组：C2-B4 检查点年龄取数 = front-matter createdAt 优先）
+// ---------------------------------------------------------------------------
+
+describe('checkpoint v0.8.1: 年龄取数 front-matter createdAt 优先（C2-B4）', () => {
+  it('checkpointCreatedAtFromMarkdown：有合法 createdAt → 取它；缺/坏 → 回退 mtime', () => {
+    const mtime = Date.UTC(2026, 10, 15, 12, 0, 0);
+    const fm = '---\nagent: alice\ncreatedAt: 2026-11-15T09:30:00.000Z\ntaskCounts: {claimed:0, in_progress:0, blocked:0}\n---\n';
+    expect(checkpointCreatedAtFromMarkdown(fm, mtime)).toBe(Date.UTC(2026, 10, 15, 9, 30, 0));
+    // 无 front-matter（手写/外部文件）→ mtime 口径（宽容，不升级成「无检查点」）
+    expect(checkpointCreatedAtFromMarkdown('---\nagent: alice\n---\n', mtime)).toBe(mtime);
+    // 坏值（不可解析）→ mtime 口径
+    expect(checkpointCreatedAtFromMarkdown('---\ncreatedAt: not-a-time\n---\n', mtime)).toBe(mtime);
+    // createdAt 行必须在 front-matter 区内且整行匹配（正文里的同名词不冒领）
+    expect(checkpointCreatedAtFromMarkdown('## 1. 身份\ncreatedAt: 2020-01-01T00:00:00.000Z\n', mtime)).toBe(mtime);
+  });
+
+  it('latestCheckpoint：mtime 被外部拨到 3h 前 → 年龄仍按 front-matter createdAt（拷贝/还原不失真）', async () => {
+    const writtenAt = Date.now();
+    const result = await writeCheckpoint(root, data({ now: writtenAt }));
+    const old = new Date(writtenAt - 3 * 60 * 60_000);
+    utimesSync(result.path, old, old); // 模拟外部拷贝/同步工具重置 mtime
+    const latest = await latestCheckpoint(root, 'alice', writtenAt + 5 * 60_000);
+    expect(latest).not.toBeNull();
+    expect(latest!.createdAt).toBe(writtenAt); // front-matter 优先，不用 mtime
+    expect(latest!.ageMin).toBe(5); // 旧实现此处得 180（mtime 口径）
+  });
+
+  it('latestCheckpoint：无 front-matter 的手写文件 → 回退 mtime（既有宽容不回归）', async () => {
+    const dir = checkpointDir(root, 'alice');
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, '2026-11-15T18-00-00-000Z.md');
+    writeFileSync(path, '---\nagent: alice\n---\n', 'utf8');
+    const mtime = new Date(Date.now() - 45 * 60_000);
+    utimesSync(path, mtime, mtime);
+    const latest = await latestCheckpoint(root, 'alice', Date.now());
+    expect(latest!.ageMin).toBe(45);
+    expect(latest!.createdAt).toBe(mtime.getTime());
   });
 });

@@ -333,7 +333,7 @@ xc_overview({ view: "status" })
 team: default | lead: alice | members: 3 (offline 1)
 tasks: pending 2 / claimed 1 / in_progress 2 / blocked 1 / completed 3 / failed 0 / cancelled 0 | stalled 1
 capacity: GREEN | 水位 23.5% 可用 | 并发回合 2 | sampledAt 2026-11-15T18:00:00Z
-checkpoint: alice=12min前, bob=3h前, carol=(none)
+checkpoint: alice=12min前, bob=180min前, carol=(none)
 unread: alice=3, bob=0, carol=1
 ```
 
@@ -341,7 +341,7 @@ unread: alice=3, bob=0, carol=1
   - 任务计数：按 `team.tasks[].status` 全量计数（七态一个不漏；`stalled` = `stalledTasks` 计数，`stall.ts:67`，阈值含钳制披露 `stalledThresholdClamped`）；
   - `offline`：`offlineMembersMount`（`tools-overview.ts:123-135`）成员数；阈值钳制/非法回落照旧附 WARNING（复用现有两条 WARNING 文案，不新造）；
   - `capacity`：`capacityMount`（`tools-overview.ts:75-103`）——**挂载返回 null 时新代码写 `UNKNOWN`，不写 GREEN**（不谎报水位；`capacity.ts:283-286` 的 verdict 无 `level` 字段，RED/GREEN 由新代码按 `verdict.red` 推导）；RED 时附 `COMPRESS_ADVICE_LINE`（`capacity.ts:340`，C9 原句复用）；
-  - `checkpoint`：对 `me`（已注册时）与所有有检查点的成员列「年龄 min 前」，无检查点记 `(none)`；年龄 = `now - 最新 *.md mtime`；
+  - `checkpoint`：对 `me`（已注册时）与**所有花名册成员**列「年龄 min 前」（v0.8.1 C4-F3：原散文「所有有检查点的成员」与同节示例 `carol=(none)` 自相矛盾，以散文对齐示例——无检查点的成员也列出记 `(none)`，与 unread 行「对每个成员」平行；v0.8.1 C5-BUG-C5-02：精确分钟，不再按 min/h/d 阶梯向下取整——26h 曾渲染成「1d前」，与 handoff 的精确 ageMin 跨面不一致），无检查点记 `(none)`；年龄 = `now - front-matter createdAt`（回退 mtime，C2-B4，与 handoff 同源）；
   - `unread`：对每个成员 `readMailbox` + `countUnreadFor`（`tools-overview.ts:380-382`，与板面同口径——观测面必须自洽）。
 - 预算：同样 `receiverInjectBudget` + 固定降级序（`unread` 行 → `checkpoint` 行 → `offline`/`stalled` 明细行 → `capacity` 明细行），每级留名披露 `truncated`。
 - **复用点明示**（防实现方重写一遍）：容量 = capacityMount；离线 = offlineMembersMount；停滞 = stalledTasks/stallSuggestion；未读 = countUnreadFor；checkpoint 年龄 = core/checkpoint.ts 的 latestCheckpoint。**C9 的采样/判定、C8 的活性判定、C5 的停滞判定全部原样复用，零重复实现**。

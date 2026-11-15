@@ -35,7 +35,19 @@ import { stopPeerEndpoint } from "../transport/pipe.js";
 import { GuardedStdioTransport } from "../transport/mcpstdio.js";
 
 const SERVER_NAME = "zcode-crosschat";
-const SERVER_VERSION = "0.8.0";
+const SERVER_VERSION = "0.8.1";
+
+// v0.8.1（29 红队 M01 修复）：xc_doctor 的 action 形状在**入口模块**构建——本模块是
+// bundle 入口（模块体最后求值），此处用 zod 无初始化次序风险；而 doctor-tool.ts 若自建
+// zod 依赖边会翻转 esbuild 模块次序使 SDK types.js 先于 zod/v4 core 求值（server 起不来）。
+// 语义：缺省调用 = 纯只读体检；action="repair-team" = 自愈双重复员键中毒的 team.json。
+const DOCTOR_ACTION_SHAPE = {
+  action: z.enum(["repair-team"]).optional().describe(
+    '缺省 = 纯只读体检（不写任何字节）。"repair-team" = 自愈被双重复员键中毒的 team.json'
+    + '（M01 的持久伤害：names 权威索引保留原持有者行、丢弃改名残留行，残损字节保全为 team.json.corrupt，'
+    + '真源与 .bak 一并重写）；其他缺陷形态不猜，交还原人工恢复路径',
+  ),
+} as const;
 
 let shuttingDown = false;
 
@@ -65,19 +77,27 @@ export async function main(): Promise<void> {
   registerOverviewTools(server, deps, core, registry);   // xc_overview
   registerTeamTools(server, deps, core, registry);       // xc_team
   registerReviewTools(server, deps, core, registry);     // xc_review
-  registerDoctorTool(server, {                           // xc_doctor（免注册只读体检）
+  registerDoctorTool(server, {                           // xc_doctor（免注册体检；action=repair-team 为唯一写面）
     version: SERVER_VERSION, env: process.env, cwd: process.cwd(),
     // v0.7.2（C9-B6 修复）：PROTOCOL §5 的「xc_overview/xc_doctor 调用时惰性采样」——
     // doctor 这一半此前不成立；传入 stateRoot 即与 overview 同一 capacity 挂载口径
     // （同一 sample.json 缓存 / 同一 XC_MEM_SAMPLE_MIN_MS 窗口 / 同一 judgeCapacity）。
     stateRoot: deps.stateRoot,
+    actionShape: DOCTOR_ACTION_SHAPE,
   });
   // doctor 的 handler 也登记进分发面（alias 层接管 CallTool 后的唯一通路）。
+  // v0.8.1（29 红队 M01 修复）：分发面与注册面同一 handler 形状——缺省只读体检，
+  // `action:"repair-team"` 走 core 的自愈（中毒 team.json 时唯一还能应答的工具）。
   registry.set("xc_doctor", {
-    description: "Read-only self check: plugin version, runtime, auto-detected zcode_exe/zcode_cjs paths and probe attempts, capacity sample (watermark / red rules). Does not require registration.",
-    shape: {},
-    handler: async () => {
-      const { buildDoctorReport, sampleDoctorCapacity, doctorToolResult } = await import("./doctor-tool.js");
+    description:
+      "Read-only self check: plugin version, runtime, auto-detected zcode_exe/zcode_cjs paths and probe attempts, capacity sample (watermark / red rules). Does not require registration. The default call writes nothing; the optional action \"repair-team\" is the one write face — it self-heals a team.json poisoned with duplicate member keys (the M01 aftermath, where every team-axis tool answers \"internal\" and the .bak is poisoned too).",
+    shape: DOCTOR_ACTION_SHAPE,
+    handler: async (args: Record<string, unknown>) => {
+      const { buildDoctorReport, sampleDoctorCapacity, doctorToolResult, runTeamRepair, teamRepairToolResult } =
+        await import("./doctor-tool.js");
+      if (args["action"] === "repair-team") {
+        return teamRepairToolResult(await runTeamRepair(deps.stateRoot));
+      }
       const capacity = await sampleDoctorCapacity({ env: process.env, stateRoot: deps.stateRoot });
       return doctorToolResult(buildDoctorReport({
         version: SERVER_VERSION, env: process.env, cwd: process.cwd(), capacity,

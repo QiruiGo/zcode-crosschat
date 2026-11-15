@@ -16,7 +16,7 @@
  * 5. crosschat：工具表补 handoff/checkpoint/timeline/status + 「交接与压缩防护」小节；
  * 6. 平台缺口如实声明（README/PROTOCOL/skill 含「无 PreCompact，故用提醒+一键」；
  *    且 PreCompact / 压缩钩子只以否定句式出现——不宣称自动压缩钩子）；
- * 7. 五处版本号统一 0.8.0（AC6 的静态面）。
+ * 7. 五处版本号统一 0.8.1（AC6 的静态面）。
  */
 import { describe, expect, it } from 'vitest';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
@@ -326,19 +326,19 @@ describe('A5 文档：无 PreCompact，故用提醒+一键（ACCEPT15-1 文档�
 // 8. 版本五处统一（AC6 静态面）
 // ---------------------------------------------------------------------------
 
-describe('A5 版本五处统一 0.8.0', () => {
-  it('package.json / plugin.json / marketplace.json / server.ts 四处 = 0.8.0', () => {
-    expect(JSON.parse(readRel('plugin/package.json')).version).toBe('0.8.0');
-    expect(JSON.parse(readRel('plugin/.zcode-plugin/plugin.json')).version).toBe('0.8.0');
-    expect(JSON.parse(readRel('marketplace.json')).plugins[0].version).toBe('0.8.0');
-    expect(readRel('plugin/src/mcp/server.ts')).toContain('const SERVER_VERSION = "0.8.0"');
+describe('A5 版本五处统一 0.8.1', () => {
+  it('package.json / plugin.json / marketplace.json / server.ts 四处 = 0.8.1', () => {
+    expect(JSON.parse(readRel('plugin/package.json')).version).toBe('0.8.1');
+    expect(JSON.parse(readRel('plugin/.zcode-plugin/plugin.json')).version).toBe('0.8.1');
+    expect(JSON.parse(readRel('marketplace.json')).plugins[0].version).toBe('0.8.1');
+    expect(readRel('plugin/src/mcp/server.ts')).toContain('const SERVER_VERSION = "0.8.1"');
   });
 
-  it('README 安装段与版本记录指向 0.8.0（第五处）', () => {
+  it('README 安装段与版本记录指向 0.8.1（第五处）', () => {
     const readme = readRel('README.md');
-    expect(readme).toContain('zcode-crosschat-0.8.0-prebuilt-slim.tar.gz');
-    expect(readme).toContain('Installed plugin zcode-crosschat@dev-zcode-crosschat (0.8.0)');
-    expect(readme).toContain('**v0.8.0**（2026-11-15，交接与压缩防护');
+    expect(readme).toContain('zcode-crosschat-0.8.1-prebuilt-slim.tar.gz');
+    expect(readme).toContain('Installed plugin zcode-crosschat@dev-zcode-crosschat (0.8.1)');
+    expect(readme).toContain('**v0.8.1**（2026-11-16，29-v080 能力反向检验 28 项修复');
     expect(readme).toContain('8 个斜杠命令');
   });
 });

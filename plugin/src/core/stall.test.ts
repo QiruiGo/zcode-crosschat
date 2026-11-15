@@ -148,35 +148,41 @@ describe('stalledTasks（停滞旗标，§3.5）', () => {
   });
 });
 
-describe('stallThresholdMs（XC_STALL_MINUTES 可配 + 钳制）', () => {
-  it('缺省 120min（方案 C5「默认 2h，可配」）', () => {
+describe('stallThresholdMs（XC_STALL_MINUTES 可配 + 钳制 + 非法回落披露）', () => {
+  it('缺省 120min（方案 C5「默认 2h，可配」；未设置 = 无需披露）', () => {
     expect(DEFAULT_STALL_MINUTES).toBe(120);
-    expect(stallThresholdMs({}, 30 * MIN)).toEqual({ ms: 120 * MIN, clamped: false });
+    expect(stallThresholdMs({}, 30 * MIN)).toEqual({ ms: 120 * MIN, clamped: false, fellBack: false });
   });
 
-  it('非有限/非正数 env 取缺省（0/负数/NaN/字符串垃圾）', () => {
-    for (const bad of ['0', '-5', 'abc', '']) {
-      expect(stallThresholdMs({ XC_STALL_MINUTES: bad }, 30 * MIN).ms).toBe(120 * MIN);
+  it('非法 env 取缺省且 fellBack:true（v0.8.1 C4-F2：0/负数/NaN/字符串垃圾不再静默）', () => {
+    for (const bad of ['0', '-5', 'abc', 'NaN']) {
+      expect(stallThresholdMs({ XC_STALL_MINUTES: bad }, 30 * MIN)).toEqual({ ms: 120 * MIN, clamped: false, fellBack: true });
     }
-    expect(stallThresholdMs({ XC_STALL_MINUTES: 'NaN' }, 30 * MIN).ms).toBe(120 * MIN);
+    // 空串 = 未设置口径（与 offline 家族一致）：回落缺省但不标记 fellBack
+    expect(stallThresholdMs({ XC_STALL_MINUTES: '' }, 30 * MIN)).toEqual({ ms: 120 * MIN, clamped: false, fellBack: false });
   });
 
   it('合法 env 生效（30min→30min；小数分钟允许）', () => {
-    expect(stallThresholdMs({ XC_STALL_MINUTES: '30' }, 30 * MIN)).toEqual({ ms: 30 * MIN, clamped: false });
+    expect(stallThresholdMs({ XC_STALL_MINUTES: '30' }, 30 * MIN)).toEqual({ ms: 30 * MIN, clamped: false, fellBack: false });
     expect(stallThresholdMs({ XC_STALL_MINUTES: '45.5' }, 30 * MIN).ms).toBe(45.5 * MIN);
   });
 
   it('小于 stale 阈值 → 钳到 stale 阈值并 clamped:true（否则 sweeper 先收走、stall 永不展示）', () => {
-    expect(stallThresholdMs({ XC_STALL_MINUTES: '10' }, 30 * MIN)).toEqual({ ms: 30 * MIN, clamped: true });
-    expect(stallThresholdMs({ XC_STALL_MINUTES: '29.9' }, 30 * MIN)).toEqual({ ms: 30 * MIN, clamped: true });
+    expect(stallThresholdMs({ XC_STALL_MINUTES: '10' }, 30 * MIN)).toEqual({ ms: 30 * MIN, clamped: true, fellBack: false });
+    expect(stallThresholdMs({ XC_STALL_MINUTES: '29.9' }, 30 * MIN)).toEqual({ ms: 30 * MIN, clamped: true, fellBack: false });
   });
 
   it('等于 stale 阈值不钳（剧本③ XC_STALL_MINUTES=30 的口径）', () => {
-    expect(stallThresholdMs({ XC_STALL_MINUTES: '30' }, 30 * MIN)).toEqual({ ms: 30 * MIN, clamped: false });
+    expect(stallThresholdMs({ XC_STALL_MINUTES: '30' }, 30 * MIN)).toEqual({ ms: 30 * MIN, clamped: false, fellBack: false });
   });
 
   it('大于 stale 阈值不钳（产品缺省 120 > stale 缺省 30）', () => {
-    expect(stallThresholdMs({ XC_STALL_MINUTES: '200' }, 30 * MIN)).toEqual({ ms: 200 * MIN, clamped: false });
+    expect(stallThresholdMs({ XC_STALL_MINUTES: '200' }, 30 * MIN)).toEqual({ ms: 200 * MIN, clamped: false, fellBack: false });
+  });
+
+  it('非法值 + 超大 stale：clamped 与 fellBack 两态并存、两条 WARNING 都该出（同 offline 家族）', () => {
+    // 'abc' → 回落 120min；stale=200min → 120 < 200 再钳到 200
+    expect(stallThresholdMs({ XC_STALL_MINUTES: 'abc' }, 200 * MIN)).toEqual({ ms: 200 * MIN, clamped: true, fellBack: true });
   });
 });
 

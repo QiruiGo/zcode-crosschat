@@ -11,7 +11,7 @@
  * - 工具面不新增：注册器只注册 xc_team 一个工具（精确集合 = 恰 10 由 legacy-removal.test.ts 断言）；
  * - 未知 action 走 zod 拒（`action:"checkpoint"` 之外的拼写错值）。
  */
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -306,5 +306,60 @@ describe("xc_team action=checkpoint：模型可见面与工具面", () => {
     expect(registered.map((r) => r.name)).toEqual(["xc_team"]);
     expect(registered[0]!.description).toContain("checkpoint");
     expect(registered[0]!.description).toContain("checkpoints/<you>/");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.8.1（29 红队 M05 / C1-B02 修复）：lead 渲染同源 + .tmp 残留清扫披露。
+// ---------------------------------------------------------------------------
+describe("xc_team action=checkpoint：v0.8.1 修复回归", () => {
+  it("M05：无显式 leadKey → front-matter/身份章的 lead 渲染 founder（与 status/team 同源）", async () => {
+    await seedTeam([task({ id: "t-a1", status: "in_progress" })]);
+    const team = (await readTeam(stateRoot, "default"))!;
+    delete team.leadKey; // 无显式 lead：founder（lead）读作 lead
+    await writeTeam(stateRoot, team);
+    bind("alice", "conn-alice");
+
+    const res = await handleTeam(deps, { action: "checkpoint" }, "conn-alice");
+    expect(res.isError).toBeUndefined();
+    const text = await readFile(String((payloadOf(res) as { path: string }).path), "utf8");
+    expect(text).toContain("lead: lead"); // front-matter + 身份章都不再是 (none)
+    expect(text).not.toContain("lead: (none)");
+  });
+
+  it("C1-B02：残留 .tmp 被清扫且落审计 checkpoint-tmp-swept；.md 与 payload 不受影响", async () => {
+    await seedTeam([task({ id: "t-a1", status: "in_progress" })]);
+    const dir = join(stateRoot, "checkpoints", "alice");
+    await mkdir(dir, { recursive: true });
+    const stale = join(dir, "2026-11-15T17-00-00-000Z.md.999.deadbeef.tmp");
+    await writeFile(stale, "x".repeat(512), "utf8");
+    const old = new Date(Date.now() - 10 * 60_000); // 10min 前 → 超 60s 清扫阈值
+    await utimes(stale, old, old);
+    bind("alice", "conn-alice");
+
+    const res = await handleTeam(deps, { action: "checkpoint" }, "conn-alice");
+    expect(res.isError).toBeUndefined();
+    // payload 冻结形状不增不减（§14.1）——披露走审计事件
+    expect(Object.keys(payloadOf(res) as Record<string, unknown>).sort()).toEqual(
+      ["bytes", "capacity", "createdAt", "path", "pruned", "tasks", "unread"],
+    );
+    const swept = (await engineEvents()).filter((e) => e["event"] === "checkpoint-tmp-swept");
+    expect(swept).toHaveLength(1);
+    expect(swept[0]).toMatchObject({ teamId: "default", agentKey: "alice", removed: 1 });
+    const left = await readdir(dir);
+    expect(left.filter((n) => n.endsWith(".tmp"))).toEqual([]); // 在途/残留 temp 都不剩
+    expect(left.filter((n) => n.endsWith(".md"))).toHaveLength(1); // 本轮检查点在场
+  });
+
+  it("C1-B01：同刻并发 6 次调用各得一份文件（工具层排他落盘，无静默覆写）", async () => {
+    await seedTeam([task({ id: "t-a1", status: "in_progress" })]);
+    bind("alice", "conn-alice");
+    const results = await Promise.all(
+      Array.from({ length: 6 }, () => handleTeam(deps, { action: "checkpoint" }, "conn-alice")),
+    );
+    const paths = results.map((r) => String((payloadOf(r) as { path: string }).path));
+    expect(new Set(paths).size).toBe(6);
+    const dir = join(stateRoot, "checkpoints", "alice");
+    expect((await readdir(dir)).filter((n) => n.endsWith(".md"))).toHaveLength(6);
   });
 });

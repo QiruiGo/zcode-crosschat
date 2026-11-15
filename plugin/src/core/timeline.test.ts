@@ -1,13 +1,17 @@
 /**
- * v0.8.0 A3（DESIGN-V0.8.md §5）：core/timeline.ts 单测——尾部窗口读 + 事件族归一化。
+ * v0.8.0 A3（DESIGN-V0.8.md §5）+ v0.8.1（29-v080 红队 C3-B1…B8 修复）：
+ * core/timeline.ts 单测——尾部窗口读 + 事件族归一化。
  * 覆盖判据（ACCEPT15-3「timeline：事件顺序正确、limit/预算生效、截断披露」）：
  * - 家族映射表逐行（九族 + other；高频噪声事件归 other）；
- * - actor 取值序（agentKey ?? by ?? createdBy ?? assignee ?? to ?? null）；
+ * - actor 取值序（v0.8.1：agentKey>by>createdBy>approvedBy>from>assignee>member>to>null）；
  * - summary 族级模板确定性 + 缺字段退化到事件名（永不为空串）；
- * - newest-first 顺序 + offset 自最新往回跳过；
+ * - ts 降序（v0.8.1 B2）+ offset 自最新往回跳过；
  * - limit 缺省 20 / 钳 100 + limitClamped 披露；
- * - 坏行跳过；尾部窗口丢半行 + olderEventsOmitted 披露；
- * - 预算开窗超限 → truncated + 续读指针；
+ * - 坏行/形状不符行跳过并计数披露 skippedEvents（v0.8.1 B3）；
+ * - 尾部窗口丢半行 + 文件被截断时**每页**披露 olderEventsOmitted（v0.8.1 B6/M04）；
+ * - 预算开窗超限 → truncated + 续读指针（位置游标语义，B7 披露在工具层）；
+ * - taskId 非字符串归一为 null（v0.8.1 B5 文档化规则）；
+ * - 文本视图控制字符清洗（v0.8.1 B4）；
  * - ENOENT → 空结果。
  */
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -18,9 +22,11 @@ import {
   normalizeTimelineEvent,
   readTimeline,
   TAIL_READ_MAX_BYTES,
+  TIMELINE_CONTROL_CHARS_RE,
   TIMELINE_FAMILY_BY_EVENT,
   TIMELINE_MAX_LIMIT,
   timelineFamilyOf,
+  timelineTextField,
 } from "./timeline.js";
 
 let workDir: string;
@@ -87,21 +93,44 @@ describe("timeline: 事件族映射表逐行", () => {
 // ---------------------------------------------------------------------------
 
 describe("timeline: actor 取值序与 summary 模板", () => {
-  it("actor：agentKey > by > createdBy > assignee > to > null", () => {
-    const all = normalizeTimelineEvent({
-      ts: 1, event: "x", agentKey: "a", by: "b", createdBy: "c", assignee: "d", to: "e",
+  it("actor：agentKey > by > createdBy > approvedBy > from > assignee > member > to > null（v0.8.1 冻结链）", () => {
+    // 全键同现：按序取最前者（每步少一键，逐键回退）
+    const chain = [
+      { agentKey: "a", by: "b", createdBy: "c", approvedBy: "d", from: "e", assignee: "f", member: "g", to: "h" },
+      { by: "b", createdBy: "c", approvedBy: "d", from: "e", assignee: "f", member: "g", to: "h" },
+      { createdBy: "c", approvedBy: "d", from: "e", assignee: "f", member: "g", to: "h" },
+      { approvedBy: "d", from: "e", assignee: "f", member: "g", to: "h" },
+      { from: "e", assignee: "f", member: "g", to: "h" },
+      { assignee: "f", member: "g", to: "h" },
+      { member: "g", to: "h" },
+      { to: "h" },
+    ];
+    const expected = ["a", "b", "c", "d", "e", "f", "g", "h"];
+    chain.forEach((rec, i) => {
+      expect(normalizeTimelineEvent({ ts: 1, event: "x", ...rec })?.actor, `step ${i}`).toBe(expected[i]);
     });
-    expect(all?.actor).toBe("a");
-    expect(normalizeTimelineEvent({ ts: 1, event: "x", by: "b", createdBy: "c", assignee: "d", to: "e" })?.actor).toBe("b");
-    expect(normalizeTimelineEvent({ ts: 1, event: "x", createdBy: "c", assignee: "d", to: "e" })?.actor).toBe("c");
-    expect(normalizeTimelineEvent({ ts: 1, event: "x", assignee: "d", to: "e" })?.actor).toBe("d");
-    expect(normalizeTimelineEvent({ ts: 1, event: "x", to: "e" })?.actor).toBe("e");
     expect(normalizeTimelineEvent({ ts: 1, event: "x" })?.actor).toBeNull();
+  });
+
+  it("M03 回归：dispatch/message/tool-executed 取 from，tool-approval 取 approvedBy，task-offline 取 member", () => {
+    // 红队 C3-B1 原样三行（29-v080 证据 b1）
+    expect(normalizeTimelineEvent({ ts: 1, event: "tool-executed", from: "carol", to: "bob" }))
+      .toMatchObject({ actor: "carol", summary: "tool-executed by carol" });
+    expect(normalizeTimelineEvent({ ts: 2, event: "tool-approval", approvedBy: "alice", from: "bob", to: "carol" }))
+      .toMatchObject({ actor: "alice", summary: "tool-approval by alice" });
+    expect(normalizeTimelineEvent({ ts: 3, event: "message", from: "café", to: "naïve" }))
+      .toMatchObject({ actor: "café", family: "other" });
+    expect(normalizeTimelineEvent({ ts: 4, event: "task-offline", member: "grace" }))
+      .toMatchObject({ actor: "grace", family: "offline" });
+    // lead-transfer：行为方是 from（转让者），不再是 to（新 lead）
+    expect(normalizeTimelineEvent({ ts: 5, event: "lead-transfer", from: "alice", to: "carol" }))
+      .toMatchObject({ actor: "alice", summary: "lead → carol" });
   });
 
   it("summary：族级模板；缺字段退化到事件名；永不为空串", () => {
     const s = (rec: Record<string, unknown>): string => normalizeTimelineEvent({ ts: 1, ...rec })!.summary;
     expect(s({ event: "dispatch", to: "bob", createdBy: "alice" })).toBe("dispatch → bob by alice");
+    expect(s({ event: "dispatch", to: "bob", from: "alice" })).toBe("dispatch → bob by alice");
     expect(s({ event: "dispatch-refused", assignee: "bob", by: "alice" })).toBe("dispatch → bob by alice");
     expect(s({ event: "dispatch" })).toBe("dispatch"); // 缺字段 → 事件名
     expect(s({ event: "claim", assignee: "bob", attempt: 2 })).toBe("claim by bob (attempt 2)");
@@ -121,9 +150,34 @@ describe("timeline: actor 取值序与 summary 模板", () => {
     }
   });
 
-  it("taskId：在场取之，缺省 null", () => {
+  it("M03 回归：dispatch-refused 只有 to 时不渲染自指句（v0.8.0 为 'dispatch → carol by carol'）", () => {
+    const e = normalizeTimelineEvent({ ts: 1, event: "dispatch-refused", to: "carol", reason: "member_removed" });
+    expect(e?.summary).toBe("dispatch → carol");
+    expect(e?.actor).toBe("carol");
+  });
+
+  it("B5 回归：taskId 非字符串（数字/布尔/对象/null）一律归一为 null，事件保留", () => {
     expect(normalizeTimelineEvent({ ts: 1, event: "claim", taskId: "t-1" })?.taskId).toBe("t-1");
     expect(normalizeTimelineEvent({ ts: 1, event: "claim" })?.taskId).toBeNull();
+    // 文档化规则（PROTOCOL §14.4）：非字符串类型归一为 null，事件本身不丢
+    expect(normalizeTimelineEvent({ ts: 1, event: "claim", taskId: 12345 })).toMatchObject({ taskId: null, event: "claim" });
+    expect(normalizeTimelineEvent({ ts: 1, event: "claim", taskId: true })?.taskId).toBeNull();
+    expect(normalizeTimelineEvent({ ts: 1, event: "claim", taskId: { id: 1 } })?.taskId).toBeNull();
+    expect(normalizeTimelineEvent({ ts: 1, event: "claim", taskId: null })?.taskId).toBeNull();
+    expect(normalizeTimelineEvent({ ts: 1, event: "claim", taskId: "" })?.taskId).toBeNull(); // 空串按缺省
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 文本视图控制字符清洗（v0.8.1 C3-B4）
+// ---------------------------------------------------------------------------
+
+describe("timeline: 文本视图控制字符清洗（B4）", () => {
+  it("C0/C1 控制字符折空格；普通字符原样", () => {
+    expect(timelineTextField("a\u0000b\u0007c")).toBe("a b c");
+    expect(timelineTextField("line\nbreak\ttab")).toBe("line break tab");
+    expect(timelineTextField("café → naïve")).toBe("café → naïve");
+    expect("a\u0000b".replace(TIMELINE_CONTROL_CHARS_RE, " ")).toBe("a b"); // 全局替换（replace 自带 lastIndex 复位）
   });
 });
 
@@ -132,6 +186,29 @@ describe("timeline: actor 取值序与 summary 模板", () => {
 // ---------------------------------------------------------------------------
 
 describe("timeline: 尾部窗口读与分页", () => {
+  it("B2 回归：按 ts 降序（非单调文件行下 newest-first 仍成立；同 ts 后写者在前）", async () => {
+    // 红队 C3-B2 原样四行：文件序 ts=100/50/90/10
+    await writeLines([
+      line({ ts: 100, event: "claim", taskId: "A-ts100-first-line" }),
+      line({ ts: 50, event: "claim", taskId: "B-ts50-second-line" }),
+      line({ ts: 90, event: "claim", taskId: "C-ts90-third-line" }),
+      line({ ts: 10, event: "claim", taskId: "D-ts10-last-line" }),
+    ]);
+    const r = await readTimeline(file, { budgetChars: 1_000_000, limit: 10 });
+    expect(r.events.map((e) => e.ts)).toEqual([100, 90, 50, 10]);
+    expect(r.events.map((e) => e.taskId)).toEqual(["A-ts100-first-line", "C-ts90-third-line", "B-ts50-second-line", "D-ts10-last-line"]);
+  });
+
+  it("B2 回归：同 ts 稳定——后写者（文件行更后者）在前", async () => {
+    await writeLines([
+      line({ ts: 7, event: "claim", taskId: "first-written" }),
+      line({ ts: 7, event: "claim", taskId: "second-written" }),
+      line({ ts: 9, event: "claim", taskId: "newest" }),
+    ]);
+    const r = await readTimeline(file, { budgetChars: 1_000_000 });
+    expect(r.events.map((e) => e.taskId)).toEqual(["newest", "second-written", "first-written"]);
+  });
+
   it("newest-first；offset 自最新往回跳过；limit 缺省 20", async () => {
     const lines = Array.from({ length: 25 }, (_, i) => line({ ts: 1000 + i, event: "claim", assignee: `a${i}` }));
     await writeLines(lines);
@@ -164,6 +241,37 @@ describe("timeline: 尾部窗口读与分页", () => {
     const r = await readTimeline(file, { budgetChars: 1_000_000 });
     expect(r.total).toBe(2);
     expect(r.events.map((e) => e.event)).toEqual(["report", "claim"]);
+  });
+
+  it("B3 回归：坏行 + 形状不符行计 skippedEvents 披露（13 行文件 → total 3 + skipped 9）", async () => {
+    // 红队 C3-B3 原样 13 行：3 合法 + {} + 缺 ts + 坏 ts + 7 坏行（含空白行）
+    await writeFile(
+      file,
+      [
+        line({ ts: 1, event: "claim", taskId: "legal-1", by: "alice" }),
+        "{}",
+        '{"event":"claim","taskId":"no-ts-task","by":"bob"}',
+        '{"ts":"not-a-number","event":"claim","taskId":"bad-ts","by":"carol"}',
+        "{not json",
+        "[1,2,3]",
+        '"str"',
+        "42",
+        "null",
+        "true",
+        "   ",
+        line({ ts: 2, event: "claim", taskId: "legal-2", by: "dave" }),
+        line({ ts: 3, event: "claim", taskId: "legal-3", by: "erin" }),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+    const r = await readTimeline(file, { budgetChars: 1_000_000 });
+    expect(r.total).toBe(3);
+    expect(r.events.map((e) => e.taskId)).toEqual(["legal-3", "legal-2", "legal-1"]);
+    // 1 坏 JSON 行 + 8 个形状不符值（{}/缺 ts/坏 ts/[1,2,3]/"str"/42/null/true）；空白行按 parseJsonl 纪律不计
+    expect(r.skippedEvents).toBe(9);
+    // 全合法文件 → 不披露该键（可选键纪律）
+    await writeLines([line({ ts: 1, event: "claim" })]);
+    expect((await readTimeline(file, { budgetChars: 1_000_000 })).skippedEvents).toBeUndefined();
   });
 
   it("预算开窗超限 → truncated + 续读指针（offset=shown+offset）", async () => {
@@ -204,11 +312,28 @@ describe("timeline: 尾部窗口读与分页", () => {
     expect(r.tailWindowBytes).toBeGreaterThan(TAIL_READ_MAX_BYTES);
     expect(r.total).toBe(256 - 1); // 窗口 256 行 - 丢弃的首行
     expect(r.events[0]!.ts).toBe(1299); // 最新仍在场
-    // 窗口事件数(255) ≥ limit+offset → 不披露 olderEventsOmitted
-    expect(r.olderEventsOmitted).toBeUndefined();
+    // v0.8.1（C3-B6/M04）：文件被尾窗截断即披露 olderEventsOmitted——**不论页位**
+    // （v0.8.0 只在「窗口内事件 < limit+offset」时披露，默认首页看不到）。
+    expect(r.olderEventsOmitted).toBe(true);
   });
 
-  it("尾部窗口不足（窗口内事件 < limit+offset）→ 披露 olderEventsOmitted，最新事件仍在场", async () => {
+  it("M04 回归：尾窗截断时默认首页（offset 0 / limit=100）也带 olderEventsOmitted", async () => {
+    // 红队 C3-B6 同型：200 行大日志 > 256KiB，窗口内 110 条 ≥ limit(100)
+    const pad = "x".repeat(2400);
+    const lines: string[] = [];
+    for (let i = 0; i < 200; i += 1) {
+      lines.push(JSON.stringify({ ts: 1000 + i, event: "status", pad }) + " ".repeat(0));
+    }
+    await writeLines(lines);
+    const page1 = await readTimeline(file, { budgetChars: 10_000_000, limit: 100 });
+    expect(page1.tailWindowBytes).toBeGreaterThan(TAIL_READ_MAX_BYTES);
+    expect(page1.total).toBeGreaterThan(100); // 窗口内事件 > limit+offset（v0.8.0 的披露条件在此为假）
+    expect(page1.events).toHaveLength(100);
+    expect(page1.olderEventsOmitted).toBe(true); // v0.8.0 此处为 undefined（末页才有）
+    expect(page1.skippedEvents).toBeUndefined(); // 行本身都合法（只是被窗口挡在门外）
+  });
+
+  it("尾部窗口不足（大行只装得下十余条）→ 披露 olderEventsOmitted，最新事件仍在场", async () => {
     // 20KB 大行：256KiB 窗口只装得下十余条 → total < 20（缺省 limit）。
     const pad = line({ ts: 1, event: "status", pad: "x".repeat(20_000) });
     const lines: string[] = [];

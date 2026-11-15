@@ -294,10 +294,34 @@ describe("handoff: 基础帽生效时文本内披露", () => {
     expect(text).toContain("（待领池共 13 个，列前 10）");
     expect(text).toContain("（另有 3 条未读，xc_read({scope:\"inbox\"}) 消费）");
     expect(text).toContain("（另有 3 条建议略去）"); // 7 条 stalled 建议 + 1 条单在途规则提示 = 8 → 5 + 披露
-    // 未超 4000 → truncated 不出现，基础帽只在文本披露
+    // v0.8.1（C2-B5）：基础帽对 JSON 消费方不再隐身——只要任一章被裁，truncated 就在场，
+    // 且 cappedItems.shown 恒等于 payload 数组长度（文本与机器面同一组 shown 数）。
+    expect(payload.truncated).toBeDefined();
+    expect(payload.truncated!.droppedSections).toEqual([]);
+    expect(payload.truncated!.cappedItems).toEqual({
+      tasks: { shown: 5, total: 7 },
+      pool: { shown: 10, total: 13 },
+      unreadTop: { shown: 5, total: 8 },
+      suggestions: { shown: 5, total: 8 },
+    });
+    expect(payload.tasks).toHaveLength(payload.truncated!.cappedItems.tasks!.shown);
+    expect(payload.pool).toHaveLength(payload.truncated!.cappedItems.pool!.shown);
+    expect(payload.unread.top).toHaveLength(payload.truncated!.cappedItems.unreadTop!.shown);
+    expect(payload.suggestions).toHaveLength(payload.truncated!.cappedItems.suggestions!.shown);
+  });
+
+  it("未触任何帽 → truncated 不出现（形状不增不减）", () => {
+    const tasks = [task({ taskId: "t-0" }), task({ taskId: "t-1" })];
+    const pool = [poolItem({ taskId: "p-0" })];
+    const { payload } = assembleHandoff(baseInput({
+      tasks,
+      pool,
+      poolTotal: 1,
+      unread: { count: 1, urgentCount: 0, top: [{ msgId: "m-0", from: "bob", subject: "s", urgent: false }] },
+    }));
     expect(payload.truncated).toBeUndefined();
-    // payload 机器面仍给全量 tasks（文本才被基础帽裁）
-    expect(payload.tasks).toHaveLength(7);
+    expect(payload.tasks).toHaveLength(2);
+    expect(payload.pool).toHaveLength(1);
   });
 });
 
@@ -329,8 +353,10 @@ describe("handoff: 4000 字符预算降级序列", () => {
     expect(text).toContain("## 2. 我的任务");
     expect(text).toContain("## 4. 未读");
     expect(text).toContain("## 7. 建议下一步");
-    // payload 机器面仍带 pool（预算只作用于文本）
-    expect(payload.pool).toHaveLength(10);
+    // v0.8.1（C2-B5）：payload 与文本面同一级裁切——pool 章被降级，payload.pool 也是空数组，
+    // cappedItems.shown === payload 数组长度恒成立（旧实现这里留 10 条，JSON 消费方误判「没丢」）。
+    expect(payload.pool).toHaveLength(0);
+    expect(payload.truncated!.cappedItems.pool).toEqual({ shown: 0, total: 10 });
   });
 
   it("更大 → 级联 pool+unread+tasks（顺序固定，逐级留名）", () => {
@@ -452,5 +478,161 @@ describe("handoff: 建议下一步可达性", () => {
     expect(stalled.payload.suggestions[0]).toContain("relay 催办 / cancel / 重派（转交）");
     const none = assembleHandoff(baseInput({ tasks: [task({ taskId: "t-a1" })] }));
     expect(none.payload.suggestions).toEqual(["（暂无：按 journal 指针继续）"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.8.1 红队二十九番修复回归（本组：M02 渲染判据 / C2-B5 口径 / C2-B8 形状 / C2-B9 成员视角）
+// ---------------------------------------------------------------------------
+
+describe("handoff v0.8.1: 身份章判据 = 花名册成员身份（M02）", () => {
+  it("在册成员（memberState=ready，identify 入册不落 state 字段时的访问器值）→ state: ready", () => {
+    // 根因回放：xc_identify 入册的成员记录本就不落 state 字段；工具层旧实现直取
+    // member?.state ?? null，使在册成员恒报 (not on roster)/memberState:null，
+    // 与 team.json / status / identify roster / checkpoint 身份章（state: ready）相反。
+    const { text, payload } = assembleHandoff(baseInput({
+      identity: { agentKey: "alice", teamId: "default", leadKey: null, role: "peer", memberState: "ready", isLead: true },
+    }));
+    expect(text).toContain("state: ready");
+    expect(text).not.toContain("(not on roster)");
+    expect(payload.identity.memberState).toBe("ready");
+  });
+
+  it("不在册（role/memberState 均 null）→ 才报 (not on roster)（§14.1 语义）", () => {
+    const { text, payload } = assembleHandoff(baseInput({
+      identity: { agentKey: "ghost", teamId: "default", leadKey: null, role: null, memberState: null, isLead: false },
+    }));
+    expect(text).toContain("role: (not on roster)");
+    expect(text).toContain("state: (not on roster)");
+    expect(payload.identity.memberState).toBeNull();
+  });
+});
+
+describe("handoff v0.8.1: cappedItems 与 payload 口径一致（C2-B5）", () => {
+  it("L2 降级：unread 章降为计数行 → payload.unread.top 空数组 + cappedItems.unreadTop={0,total}", () => {
+    const tasks = [task({ taskId: "t-a1", title: "x".repeat(1500) })];
+    const pool = Array.from({ length: 10 }, (_, i) => poolItem({ taskId: `p-${i}`, title: "y".repeat(300) }));
+    const top = Array.from({ length: 5 }, (_, i) => ({ msgId: `m-${i}`, from: "bob", subject: "z".repeat(800), urgent: false }));
+    const { payload } = assembleHandoff(baseInput({
+      tasks, pool, poolTotal: 10,
+      unread: { count: 5, urgentCount: 0, top },
+    }));
+    const dropped = payload.truncated!.droppedSections;
+    expect(dropped).toContain("unread");
+    // 旧实现：文本 shown:0 而 payload.top 保留 5 条 → 只读 JSON 消费方误判「没丢」。
+    expect(payload.unread.top).toHaveLength(0);
+    expect(payload.truncated!.cappedItems.unreadTop).toEqual({ shown: 0, total: 5 });
+    expect(payload.truncated!.cappedItems.pool).toEqual({ shown: 0, total: 10 });
+    expect(payload.pool).toHaveLength(0);
+    // 不变量：每个 cappedItems 项的 shown === 对应 payload 数组长度
+    expect(payload.pool.length).toBe(payload.truncated!.cappedItems.pool!.shown);
+    expect(payload.unread.top.length).toBe(payload.truncated!.cappedItems.unreadTop!.shown);
+  });
+
+  it("L3 降级：tasks 只留首条 → payload.tasks 同步只 1 条 + cappedItems.tasks", () => {
+    const tasks = Array.from({ length: 6 }, (_, i) => task({ taskId: `t-${i}`, title: "x".repeat(700) }));
+    const { text, payload } = assembleHandoff(baseInput({
+      tasks, pool: [], poolTotal: 0,
+      unread: { count: 0, urgentCount: 0, top: [] },
+    }));
+    expect(text).toContain("（另有 5 条任务略去）");
+    expect(payload.tasks).toHaveLength(1);
+    expect(payload.truncated!.cappedItems.tasks).toEqual({ shown: 1, total: 6 });
+  });
+
+  it("L4 降级：suggestions 只留首条 → payload.suggestions 同步 1 条", () => {
+    // 尺寸标定：L3（tasks 首条 3200 字符 + 5 条建议）≈4080 > 4000；L4（只留 1 条建议）≈3840 ≤ 4000。
+    const tasks = Array.from({ length: 5 }, (_, i) => task({ taskId: `t-${i}`, title: i === 0 ? "x".repeat(3200) : "短" }));
+    const pool = Array.from({ length: 10 }, (_, i) => poolItem({ taskId: `p-${i}`, title: "y".repeat(300) }));
+    const { payload } = assembleHandoff(baseInput({
+      tasks, pool, poolTotal: 10,
+      unread: { count: 5, urgentCount: 0, top: Array.from({ length: 5 }, (_, i) => ({ msgId: `m-${i}`, from: "bob", subject: "z".repeat(300), urgent: false })) },
+      stalled: tasks.map((t) => ({ taskId: t.taskId, title: t.title, status: "in_progress" as const, assignee: "alice", idleForMin: 300, kind: "stalled" as const })),
+    }));
+    expect(payload.truncated!.droppedSections).toEqual(["pool", "unread", "tasks", "suggestions"]);
+    expect(payload.suggestions).toHaveLength(1);
+    expect(payload.truncated!.cappedItems.suggestions!.shown).toBe(1);
+  });
+});
+
+describe("handoff v0.8.1: pool 冻结形状 priority 恒在（C2-B8）", () => {
+  it("priority 缺省（旧记录 normal）→ payload 键集恰五键且 priority='normal'（不丢键）", () => {
+    // 根因回放：JSON.stringify 丢弃 value 为 undefined 的键——旧实现直传
+    // p.priority（undefined），normal 项在 JSON 面缺 priority 键，而 §14.3
+    // 冻结形状 [{taskId,title,priority,dependsOn,unmetDependsOn}] 要求恒在。
+    const { payload } = assembleHandoff(baseInput({
+      pool: [poolItem({ taskId: "p-0", priority: undefined }), poolItem({ taskId: "p-1", priority: "low" })],
+      poolTotal: 2,
+    }));
+    expect(Object.keys(payload.pool[0]!).sort()).toEqual(
+      ["dependsOn", "priority", "taskId", "title", "unmetDependsOn"].sort(),
+    );
+    expect(payload.pool[0]!.priority).toBe("normal");
+    expect(payload.pool[1]!.priority).toBe("low");
+    // 文本面同口径（缺省渲染 normal）
+    const { text } = assembleHandoff(baseInput({ pool: [poolItem({ taskId: "p-0", priority: undefined })], poolTotal: 1 }));
+    expect(text).toContain("- p-0 | normal |");
+  });
+});
+
+describe("handoff v0.8.1: member 视角补单在途任务规则（C2-B9）", () => {
+  it("该成员有在途 + 池有可认领 → 第三人称单在途规则（self 视角同规则不缺席）", () => {
+    const memberView = assembleHandoff(baseInput({
+      filter: { kind: "member", id: "bob" },
+      tasks: [task({ taskId: "t-bobs", assignee: "bob" })],
+      pool: [poolItem({ taskId: "p-1" }), poolItem({ taskId: "p-2", unmetDependsOn: ["t-x"] })],
+      poolTotal: 2,
+      myOpenTaskId: null, // 调用方（alice）无在途——规则仍须在场（旧实现此处退化成「暂无」）
+    }));
+    const joined = memberView.payload.suggestions.join("\n");
+    expect(joined).toContain("单在途任务规则");
+    expect(joined).toContain("bob 需先 xc_report 收尾当前任务（t-bobs）再认领 p-1");
+    // 走不开的指令纪律（C9-B5）：member 视角不得对调用方下「你替 bob 收尾」的祈使句
+    expect(joined).not.toMatch(/^先 xc_report/m);
+    const selfView = assembleHandoff(baseInput({
+      tasks: [task({ taskId: "t-mine" })],
+      pool: [poolItem({ taskId: "p-1" })],
+      poolTotal: 1,
+      myOpenTaskId: "t-mine",
+    }));
+    expect(selfView.payload.suggestions.join("\n")).toContain("单在途任务规则：先 xc_report 收尾当前任务（t-mine）再认领 p-1");
+  });
+
+  it("member 视角：可认领项按该成员视角算（受领指定给 bob 的池项对 bob 可达）", () => {
+    const { payload } = assembleHandoff(baseInput({
+      filter: { kind: "member", id: "bob" },
+      tasks: [task({ taskId: "t-bobs", assignee: "bob" })],
+      pool: [poolItem({ taskId: "p-for-bob", to: "bob" }), poolItem({ taskId: "p-for-carol", to: "carol" })],
+      poolTotal: 2,
+      myOpenTaskId: null,
+    }));
+    const joined = payload.suggestions.join("\n");
+    expect(joined).toContain("再认领 p-for-bob");
+    expect(joined).not.toContain("p-for-carol");
+  });
+
+  it("member 视角无开放任务 → 仍记「（该成员无开放任务）」（既有冻结语义不回归）", () => {
+    const { payload } = assembleHandoff(baseInput({
+      filter: { kind: "member", id: "bob" },
+      tasks: [],
+      pool: [poolItem({ taskId: "p-1" })],
+      poolTotal: 1,
+    }));
+    expect(payload.suggestions).toEqual(["（该成员无开放任务）"]);
+  });
+});
+
+describe("handoff v0.8.1: member 视角 withhold 不进 cappedItems（防把隐私披露误读成截断）", () => {
+  it("member 视角有未读计数但 top 为空（§4.4）→ 无 unreadTop 帽、无 truncated（未被裁）", () => {
+    const { text, payload } = assembleHandoff(baseInput({
+      filter: { kind: "member", id: "bob" },
+      tasks: [task({ taskId: "t-bobs", assignee: "bob" })],
+      unread: { count: 3, urgentCount: 1, top: [], withheld: "subjects" },
+    }));
+    expect(payload.unread).toEqual({ count: 3, urgentCount: 1, top: [] });
+    expect(payload.unreadWithheld).toBe("subjects");
+    expect(text).toContain("（主题不跨成员披露）");
+    expect(text).not.toContain("另有");
+    expect(payload.truncated).toBeUndefined();
   });
 });

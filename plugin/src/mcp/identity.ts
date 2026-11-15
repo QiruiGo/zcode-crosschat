@@ -305,11 +305,19 @@ export async function xcRegister(
     const names = await readNames(stateRoot);
     const existingBinding = names[agentKey];
     if (existingBinding && existingBinding.sessionId !== sessionId && via !== "wake") {
+      // v0.8.1（C2-B7 修复）：文案补 takeover 指引——「≤3 次工具调用接手」的第 1 步
+      // （同名接管）必须自带 takeover:true，而旧文案只报「已被绑定」，调用方无从
+      // 知道下一步；未注册时 handoff 又读不到（not_registered），错误文案是唯一
+      // 的在途指引面。takeover 语义以 README「接管语义」为准（死会话才该接管；
+      // 活持有者被 takeover_live_holder 拒）。
       throw new ToolError({
         error: "name_taken",
         name: agentKey,
         boundSessionId: existingBinding.sessionId,
-        message: `name "${agentKey}" is already bound to session "${existingBinding.sessionId}"`,
+        message:
+          `name "${agentKey}" is already bound to session "${existingBinding.sessionId}" — `
+          + "if that session is dead (crashed), re-run xc_identify with takeover:true to take the name over "
+          + "(its open tasks are requeued with receipts; a live holder is refused with takeover_live_holder)",
       });
     }
     const conflicting = Object.entries(names).find(

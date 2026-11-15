@@ -25,6 +25,7 @@ import {
   memSampleMinMsFromEnv,
   memSessionLimitBytesFromEnv,
   memWarnWatermarkFromEnv,
+  memWarnWatermarkInfoFromEnv,
   parseCimRows,
   sampleCapacityWithSampler,
   takeFreshSample,
@@ -217,6 +218,21 @@ describe('env 阈值解析（防御口径）', () => {
     // 场景⑥制造预警的手段：调低到 0.999 → 常态即红
     const v = judgeCapacity(sample(), { XC_MEM_WARN_WATERMARK: '0.999' });
     expect(v.violated).toEqual(['watermark']);
+  });
+
+  it('v0.8.1（C4-O1）：memWarnWatermarkInfoFromEnv 分辨「越界已回落」与「未设置」', () => {
+    // 合法域 (0,1) 内精细生效，不标记回落
+    expect(memWarnWatermarkInfoFromEnv({ XC_MEM_WARN_WATERMARK: '0.3' })).toEqual({ watermark: 0.3, fellBack: false });
+    expect(memWarnWatermarkInfoFromEnv({ XC_MEM_WARN_WATERMARK: '0.999' })).toEqual({ watermark: 0.999, fellBack: false });
+    // 越界（≥1 全部值 + 0/负数/非数字）→ 回落缺省 0.15 且 fellBack:true（挂载面两级披露）
+    for (const bad of ['1', '1.5', '2', '0', '-5', 'abc']) {
+      expect(memWarnWatermarkInfoFromEnv({ XC_MEM_WARN_WATERMARK: bad })).toEqual({ watermark: 0.15, fellBack: true });
+    }
+    // 未设置/空串 = 就是缺省，无需披露
+    expect(memWarnWatermarkInfoFromEnv({})).toEqual({ watermark: 0.15, fellBack: false });
+    expect(memWarnWatermarkInfoFromEnv({ XC_MEM_WARN_WATERMARK: '' })).toEqual({ watermark: 0.15, fellBack: false });
+    // 数值版保持兼容（红队 O1 子 claim：越界值按缺省判定，比较连续不钳）
+    expect(memWarnWatermarkFromEnv({ XC_MEM_WARN_WATERMARK: '2' })).toBe(0.15);
   });
 
   it('XC_MEM_SESSION_LIMIT_BYTES / XC_TURN_ESTIMATE_BYTES：合法覆盖、非法回缺省', () => {

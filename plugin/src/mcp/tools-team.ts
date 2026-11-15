@@ -1023,7 +1023,11 @@ export function createLeadToolCore(deps: ToolDepsLike): LeadToolCore {
             throw new ToolError({
               error: "not_lead",
               taskId: task.id,
-              leadKey: team.leadKey ?? null,
+              // v0.8.1（M05 收口）：与 isLead 门闸、message 文案、其余 lead 闸错误信封
+              // （member-add/stop/transfer 等均用 leadKeyOf）同源——直读 team.leadKey
+              // 会在无显式 lead 时给 null，而同一报文里门闸按 founder 兜底判 isLead、
+              // message 也展示 founder，payload 键自相矛盾。
+              leadKey: leadKeyOf(team) ?? null,
               message: `only the team lead ("${team.leadKey ?? team.founderKey}") or the task creator ("${task.createdBy}") can cancel task ${task.id} (§7.3.3)`,
             });
           }
@@ -1342,7 +1346,12 @@ export async function handleTeamCheckpoint(deps: ToolDeps, args: { note?: string
       result = await writeCheckpoint(deps.stateRoot, {
         agentKey: me.agentKey,
         teamId: me.teamId,
-        leadKey: team.leadKey ?? null,
+        // v0.8.1（29 红队 M05 修复）：lead 渲染跨面同源——team.leadKey 缺省时 founder
+        // 读作 lead（core/teamstate.ts leadKeyOf；types.ts 的 TeamState.leadKey 注释
+        // 与 DESIGN-V0.2 §6.1 的公开口径）。此前直读 team.leadKey ?? null，无显式 lead
+        // 时 front-matter/身份章渲染 `(none)`，而 status/team 视图展示 founder——
+        // 同一团队两个答案（且 handoff 同时 isLead:true 自相矛盾）。
+        leadKey: leadKeyOf(team) ?? null,
         member: member === undefined
           ? null
           : { role: member.role, state: memberState(member), sessionId: member.sessionId, lastSeen: member.lastSeen },
@@ -1401,6 +1410,35 @@ export async function handleTeamCheckpoint(deps: ToolDeps, args: { note?: string
         pruneError: result.pruneError,
       });
     }
+    // v0.8.1（C1-B01）：排他落盘实际撞名进位——同毫秒并发的可见信号（payload 不加键：
+    // §14.1 冻结形状不增不减，披露走审计事件）。
+    if (result.stampCollisions !== undefined && result.stampCollisions > 0) {
+      await logEngineEvent(deps.stateRoot, {
+        event: "checkpoint-stamp-collision",
+        teamId: me.teamId,
+        agentKey: me.agentKey,
+        path: result.path,
+        stamp: result.stamp,
+        bumped: result.stampCollisions,
+      });
+    }
+    // v0.8.1（C1-B02）：被杀进程残留 .tmp 的清扫披露（清到才记；失败同样只审计）。
+    if (result.tmpRemoved !== undefined && result.tmpRemoved > 0) {
+      await logEngineEvent(deps.stateRoot, {
+        event: "checkpoint-tmp-swept",
+        teamId: me.teamId,
+        agentKey: me.agentKey,
+        removed: result.tmpRemoved,
+      });
+    }
+    if (result.tmpSweepError !== undefined) {
+      await logEngineEvent(deps.stateRoot, {
+        event: "checkpoint-tmp-sweep-failed",
+        teamId: me.teamId,
+        agentKey: me.agentKey,
+        error: result.tmpSweepError,
+      });
+    }
     const level = result.capacity?.level ?? "UNKNOWN";
     return okResult(
       `Checkpoint written: ${result.path} (${result.bytes} bytes, ${result.openTasks} open task(s), ${result.unread} unread, capacity ${level}).`,
@@ -1443,7 +1481,9 @@ export async function handleTeamUnblock(deps: ToolDeps, args: { taskId: string; 
         throw new ToolError({
           error: "not_authorized",
           taskId: task.id,
-          leadKey: team.leadKey ?? null,
+          // v0.8.1（M05 收口）：同 cancel 闸——payload leadKey 与 isLead 门闸（founder
+          // 兜底）及 message 文案同源，不再无显式 lead 时给 null 而门闸认 founder。
+          leadKey: leadKeyOf(team) ?? null,
           createdBy: task.createdBy,
           assignee: task.assignee,
           message: `unblock is allowed for the lead ("${team.leadKey ?? team.founderKey}"), the task creator ("${task.createdBy}") or the claimant ("${task.assignee ?? "none"}") only`,

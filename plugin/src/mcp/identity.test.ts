@@ -121,6 +121,11 @@ describe("identity: hook 路径（§2.3-1/3）", () => {
       xcRegister(stateRoot, { name: "a", sessionId: "sess-b" }, nextConn()),
     );
     expect(nameTaken.error).toBe("name_taken");
+    // v0.8.1（C2-B7 修复）：文案必须自带 takeover 指引——「≤3 次工具调用接手」的第 1 步
+    // （同名接管）要 takeover:true，而旧文案只报「已被绑定」；未注册时 handoff 又读不到
+    // （not_registered），错误文案是唯一在途指引面。
+    expect(String(nameTaken.message)).toContain("takeover:true");
+    expect(String(nameTaken.boundSessionId)).toBe("sess-a");
 
     const sidTaken = await errorPayload(() =>
       xcRegister(stateRoot, { name: "b", sessionId: "sess-a" }, nextConn()),

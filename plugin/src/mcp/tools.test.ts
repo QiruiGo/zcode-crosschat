@@ -446,7 +446,10 @@ describe("tools v0.5: xc_status isLead/history + 任务字段观测面截断（R
     };
     expect(st0.members.find((m) => m.key === "a")?.isLead).toBe(true);
     expect(st0.members.find((m) => m.key === "b")?.isLead).toBe(false);
-    expect(st0.leadKey).toBeNull();
+    // v0.8.1（29 红队 M05 收口）：history:true payload 的 leadKey 与同一 payload 的
+    // members[].isLead 同源——无显式 leadKey 时 founder（a）读作 lead。v0.8.0 此处给
+    // null，而两行之上刚断言 a.isLead===true，同一块自相矛盾。
+    expect(st0.leadKey).toBe("a");
     expect(st0.leadHistory).toEqual([]);
 
     // 显式 leadKey=b（写盘）→ isLead 翻转 + history 附史

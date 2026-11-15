@@ -204,7 +204,11 @@ describe("红队四番战 边界-1（P1）：lead/founder 改名 key 随动", ()
     expect(res.isError).toBe(true);
     expect(payload["error"]).toBe("team_rename_blocked");
     expect((payload["renamed"] as Record<string, unknown>)).toEqual({ peer: false, team: false });
-    expect(String(payload["reason"])).toContain("task references");
+    // v0.8.1（29 红队 C6-BUG-6 修复）：挡路理由具体到任务 id（不再是笼统的
+    // "task references (assignee/createdBy) exist on the board"）——错误指引要可执行。
+    expect(String(payload["reason"])).toContain("open task(s) you created:");
+    // v0.8.1：挡路明细进 payload（开放任务/指定受领 pending/未读数/终态引用数）。
+    expect(Array.isArray(payload["openTaskIds"])).toBe(true);
     expect(String(res.content[0]?.text)).toContain("BOTH axes");
     // 队内轴未换绑：花名册与 lead/founder 全部保持旧键。
     const team = (await readTeam(stateRoot, "default"))!;

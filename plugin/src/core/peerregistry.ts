@@ -425,6 +425,29 @@ export async function findPeerByName(root: string, name: string, now: number = D
 }
 
 /**
+ * v0.8.1（29-v080 M01 修复）：改名前的 peer 轴花名**只读预检**。
+ *
+ * 与 {@link findPeerByName} 同判定，两处刻意差异：
+ * 1. **只读扫描**（`sweep:false`）——默认扫描会惰性删除死记录文件，而 pid-dead
+ *    记录是 C8 离线判据（core/offline.ts memberLiveness）唯一的「进程死」硬证据，
+ *    预检不得顺手抹掉别的会话的崩溃残留（v0.7.2 F-02/C8-B1 同款纪律）；
+ * 2. **本进程记录豁免**（`pid !== process.pid`）——同一连接的幂等重认领不构成冲突。
+ *
+ * 用途：xc_identify 改名的两轴前置校验——队内轴花名换绑落地前先问 peer 轴
+ * 「这个名有没有被别的活会话占着」，占了就两轴都不改（显式拒、零副作用），
+ * 不再重演 M01「队内先落地 → peer name_taken → 回滚读不了损坏的 team.json」。
+ */
+export async function findLivePeerByName(
+  root: string,
+  name: string,
+  now: number = Date.now(),
+): Promise<PeerRecord | undefined> {
+  if (name.trim() === '') return undefined;
+  const scan = await scanPeers(root, now, { sweep: false });
+  return scan.active.find((record) => record.name === name && record.pid !== process.pid);
+}
+
+/**
  * v0.5.2（二番战 SEC-1 / SEC-2 修复）：查找「已被别的活进程持有的 sid」的注册记录。
  *
  * 机器全局注册表按 pid 存文件（sessions/<pid>.json），同一 sessionId 出现在两条

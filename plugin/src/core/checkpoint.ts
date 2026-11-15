@@ -34,9 +34,9 @@
  *
  * @module core/checkpoint
  */
-import { mkdir, readdir, readFile, rm, stat } from 'node:fs/promises';
+import { mkdir, readdir, readFile, rename, rm, stat } from 'node:fs/promises';
 import { join, relative } from 'node:path';
-import { writeFileAtomic } from './atomic.js';
+import { writeFileAtomic, writeFileExclusive } from './atomic.js';
 import { sanitizeKey } from './sanitize.js';
 import { taskJournalPath } from './archive.js';
 import { memberOpenTasks, readTeam, unsatisfiedDependencies } from './teamstate.js';
@@ -87,6 +87,20 @@ export const CHECKPOINT_STAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z$
 
 /** stamp 同毫秒撞名时的最大进位次数（稳健措施；进位后仍是合法 stamp）。 */
 export const CHECKPOINT_STAMP_COLLISION_MAX = 1000;
+
+/**
+ * .tmp 残留的清扫年龄阈值（v0.8.1 C1-B02 修复）：被杀进程会在检查点目录留下
+ * `<ISO>.md.<pid>.<uuid>.tmp`（SIGKILL 落在「temp 已写、rename/link 未成」之间；
+ * 红队 10 次击杀 6 次残留，且旧实现永不清扫、无披露）。在途写的生命周期是毫秒级
+ * （写 temp → link → rm temp 同回合完成），60s 之外的 `.tmp` 不可能是活写在途——
+ * 阈值同时保证**并发写者的 temp 不被误删**（那是竞态自杀）。
+ */
+export const CHECKPOINT_TMP_MAX_AGE_MS = 60_000;
+
+/** front-matter 块（文件开头的首个 `---` 与第二个 `---` 之间；§3.3 冻结格式）。 */
+const FRONT_MATTER_BLOCK_RE = /^---\r?\n([\s\S]*?)\r?\n---/;
+/** front-matter `createdAt:` 行（§3.3 冻结 7 键之一；年龄取数以此为准）。 */
+const FRONT_MATTER_CREATED_AT_RE = /^createdAt:\s*(\S+)\s*$/m;
 
 // --- 段闸（防御纵深：sanitizeKey + 断言级复核；调用方禁止自行 join）------------
 
@@ -243,6 +257,15 @@ export interface CheckpointWriteResult {
   pruned: number;
   /** 滚动删除失败原因（写盘事实保持成功）。 */
   pruneError?: string;
+  /**
+   * v0.8.1（C1-B01）：排他落盘实际撞名并进位重选的轮次（0 = 无碰撞）。同毫秒并发
+   * 下 >0——工具层审计 `checkpoint-stamp-collision`，调用方与运维都能看见。
+   */
+  stampCollisions?: number;
+  /** v0.8.1（C1-B02）：本次清扫掉的残留 `.tmp` 份数（0 = 无残留）。 */
+  tmpRemoved?: number;
+  /** v0.8.1（C1-B02）：.tmp 清扫失败原因（写盘事实保持成功；best-effort 卫生）。 */
+  tmpSweepError?: string;
 }
 
 // --- 小工具 -------------------------------------------------------------------
@@ -499,6 +522,48 @@ export async function pruneCheckpointFiles(
   return firstError === undefined ? { pruned } : { pruned, error: firstError };
 }
 
+/**
+ * v0.8.1（C1-B02 修复）：清扫检查点目录里的**残留** `.tmp` 文件。
+ *
+ * 产物原子写（core/atomic.ts）的临时文件命名 = `<目标>.<pid>.<uuid>.tmp`；进程在
+ * 「temp 已写、rename/link 未成」之间被杀（SIGKILL/断电）就会留下它，而旧实现只删
+ * 超帽的 `*.md`，残留无限积存、无披露（红队：击杀 10 次 6 次残留；手工放入的
+ * `*.md.tmp` 原样永存）。本函数按**年龄**清：`now - mtime > maxAgeMs`（缺省 60s）
+ * 才删——在途写是毫秒级生命周期，60s 外的 `.tmp` 不可能是活写在途，并发写者的
+ * temp 因此不会被误删。`.nudge` 与非 `.tmp` 文件不在清扫域（20 帽另按 `*.md` 口径）。
+ *
+ * best-effort：任何单文件失败不阻断其余（首个错误记入 `error`，由调用方只审计）。
+ */
+export async function sweepCheckpointTmpFiles(
+  dir: string,
+  now: number = Date.now(),
+  maxAgeMs: number = CHECKPOINT_TMP_MAX_AGE_MS,
+): Promise<{ removed: number; error?: string }> {
+  let names: string[];
+  try {
+    names = await readdir(dir);
+  } catch (error) {
+    return { removed: 0, error: error instanceof Error ? error.message : String(error) };
+  }
+  let removed = 0;
+  let firstError: string | undefined;
+  for (const name of names) {
+    if (!name.endsWith('.tmp')) continue;
+    try {
+      const info = await stat(join(dir, name));
+      if (!info.isFile()) continue;
+      if (now - info.mtimeMs <= maxAgeMs) continue; // 可能是另一进程的在途写——不碰
+      await rm(join(dir, name), { force: true });
+      removed += 1;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT') continue; // 并发清扫/竞争删除已拿走——不算失败
+      if (firstError === undefined) firstError = error instanceof Error ? error.message : String(error);
+    }
+  }
+  return firstError === undefined ? { removed } : { removed, error: firstError };
+}
+
 // --- 落盘 ---------------------------------------------------------------------
 
 /** 读一个任务 journal 的末 N 个非空行（缺失/失败都在场——不得静默跳过）。 */
@@ -529,37 +594,59 @@ export async function readTaskJournalTail(
 /**
  * 写检查点（服务端落盘，§3.2/§3.4）。
  *
- * 顺序：段闸 → mkdir → 聚合（journal 尾部按需读盘）→ 原子写 → 滚动删除。
+ * 顺序：段闸 → mkdir → 读 journal 尾部 → 选 stamp + **排他落盘** → 滚动删除 → .tmp 清扫。
  * 写失败向上抛（调用方映射 `checkpoint_write_failed`，不返回成功——不得假装落盘）；
- * 滚动删除失败**不阻断**已成功的写入（结果附 `pruneError`，审计 checkpoint-prune-failed）。
+ * 滚动删除/.tmp 清扫失败**不阻断**已成功的写入（结果附 `pruneError`/`tmpSweepError`，
+ * 分别审计 checkpoint-prune-failed / checkpoint-tmp-sweep-failed）。
+ *
+ * v0.8.1（29 能力反向检验 C1-B01 修复）：同毫秒并发的**静默覆写**根因是「stat 预检
+ * →  rename 落盘」两步之间的竞态——两个同刻调用都看到候选位不存在，随后都写同一
+ * 路径，先发者的快照被吞掉且双方均报成功（红队同刻探针 6/10 + 11/25 轮稳定复现，
+ * 20 次成功调用只落 14 文件）。现在占位改为**单次原子操作**：`writeFileExclusive`
+ * （temp + link，EEXIST 即让位）——输家换 stamp 进位重试，「一次调用一份文件」
+ * 的不变量成立；候选位全部占满（同毫秒并发上限 1000）才抛错，绝不静默覆写。
+ * 实际撞名的轮次记入 `stampCollisions`（工具层审计 checkpoint-stamp-collision）。
  */
 export async function writeCheckpoint(stateRoot: string, data: CheckpointData): Promise<CheckpointWriteResult> {
   const key = safeCheckpointSegment(data.agentKey);
   const dir = checkpointDir(stateRoot, key);
   await mkdir(dir, { recursive: true });
 
-  // stamp 防同毫秒撞名（稳健措施，非设计项）：两次调用落在同一毫秒时按毫秒进位取
-  // 第一个空位——字典序仍是时间序，且「一次调用一份文件」的不变量成立（滚动 20 才有
-  // 确定含义）；进位不改 stamp 形态（仍是折叠 ISO）。
-  let effectiveNow = Number.isFinite(data.now) && data.now >= 0 ? Math.floor(data.now) : Date.now();
-  let stamp = checkpointStamp(effectiveNow);
-  for (let i = 0; i < CHECKPOINT_STAMP_COLLISION_MAX; i += 1) {
-    if (!(await fileExists(checkpointFile(stateRoot, key, stamp)))) break;
-    effectiveNow += 1;
-    stamp = checkpointStamp(effectiveNow);
-  }
-
   const journalTails = data.journalTails
     ?? await Promise.all(
       data.openTasks.slice(0, CHECKPOINT_JOURNAL_MAX_TASKS).map((t) => readTaskJournalTail(stateRoot, t.id)),
     );
 
-  const markdown = buildCheckpointMarkdown({ ...data, now: effectiveNow, journalTails });
-  const path = checkpointFile(stateRoot, key, stamp);
+  // stamp 选择 + 排他落盘：存在性预检是快路径（顺序同毫秒调用即够），排他写是竞态
+  // 防线（并发同毫秒调用）；进位不改 stamp 形态（仍是折叠 ISO，字典序=时间序）。
+  let effectiveNow = Number.isFinite(data.now) && data.now >= 0 ? Math.floor(data.now) : Date.now();
+  let stamp = checkpointStamp(effectiveNow);
+  let path = checkpointFile(stateRoot, key, stamp);
+  let markdown = '';
+  let created = false;
+  let collisions = 0;
+  for (let i = 0; i < CHECKPOINT_STAMP_COLLISION_MAX; i += 1) {
+    if (!(await fileExists(path))) {
+      markdown = buildCheckpointMarkdown({ ...data, now: effectiveNow, journalTails });
+      created = await writeFileExclusive(path, markdown); // EEXIST → false（让位重选）
+      if (created) break;
+      collisions += 1;
+    }
+    effectiveNow += 1;
+    stamp = checkpointStamp(effectiveNow);
+    path = checkpointFile(stateRoot, key, stamp);
+  }
+  if (!created) {
+    throw new Error(
+      `checkpoint_stamp_collision: ${CHECKPOINT_STAMP_COLLISION_MAX} 个候选 stamp 全部被占`
+      + '（同毫秒并发上限）——重试即可，绝不静默覆写',
+    );
+  }
   const bytes = Buffer.byteLength(markdown, 'utf8');
-  await writeFileAtomic(path, markdown);
 
   const prune = await pruneCheckpointFiles(dir, CHECKPOINT_KEEP_MAX);
+  // v0.8.1（C1-B02）：被杀进程残留的 .tmp 按年龄清扫（在途写只毫秒级，60s 阈值安全）。
+  const tmp = await sweepCheckpointTmpFiles(dir);
   return {
     path,
     createdAt: effectiveNow,
@@ -570,6 +657,9 @@ export async function writeCheckpoint(stateRoot: string, data: CheckpointData): 
     capacity: data.capacity,
     pruned: prune.pruned,
     ...(prune.error !== undefined ? { pruneError: prune.error } : {}),
+    ...(collisions > 0 ? { stampCollisions: collisions } : {}),
+    ...(tmp.removed > 0 ? { tmpRemoved: tmp.removed } : {}),
+    ...(tmp.error !== undefined ? { tmpSweepError: tmp.error } : {}),
   };
 }
 
@@ -584,7 +674,34 @@ async function fileExists(path: string): Promise<boolean> {
 
 // --- 读取（handoff/status/提醒共用；纯读无锁）----------------------------------
 
-/** 最新一份检查点的 stat 快照（无 → null）。文件名升序取最新（stamp 字典序=时间序）。 */
+/**
+ * 检查点年龄取数（v0.8.1 修复 C2-B4）：**front-matter `createdAt` 优先**，缺失/不可解析
+ * 才回退文件 mtime。
+ *
+ * 根因：旧实现只取 stat 的 mtime，而 mtime 是「文件最后一次被写」的机器事实，不是
+ * 「这份检查点声称自己写于何时」的产品事实——外部拷贝/还原/同步工具重置 mtime 后，
+ * 一份 26h 前的检查点会读成 0min 前（handoff/status/提醒三面同时失真）。front-matter
+ * 的 `createdAt` 由 writeCheckpoint 自己写入（stamp 同源），拷贝不改变它。
+ *
+ * 只在**开头的 front-matter 块**（首个 `---` 与第二个 `---` 之间）里认 `createdAt:` 行——
+ * 正文章节里的同名词（journal 摘录等外来内容）不冒领。纯函数（文本进、epoch ms 出）
+ * 便于单测钉死两种输入；无法解析时返回 mtimeMs，由调用方按「无 front-matter 的老文件」
+ * 宽容处理（不升级成「无检查点」）。
+ */
+export function checkpointCreatedAtFromMarkdown(text: string, mtimeMs: number): number {
+  const block = FRONT_MATTER_BLOCK_RE.exec(text);
+  if (block !== null) {
+    const match = FRONT_MATTER_CREATED_AT_RE.exec(block[1]!);
+    if (match !== null) {
+      const parsed = Date.parse(match[1]!);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+  }
+  return mtimeMs;
+}
+
+/** 最新一份检查点的 stat 快照（无 → null）。文件名升序取最新（stamp 字典序=时间序）。
+ *  `createdAt` = front-matter createdAt（回退 mtime，见 checkpointCreatedAtFromMarkdown）。 */
 export async function latestCheckpoint(
   stateRoot: string,
   agentKey: string,
@@ -608,10 +725,74 @@ export async function latestCheckpoint(
   const path = checkpointFile(stateRoot, key, latest);
   try {
     const info = await stat(path);
-    const createdAt = info.mtimeMs;
+    let createdAt = info.mtimeMs;
+    try {
+      createdAt = checkpointCreatedAtFromMarkdown(await readFile(path, 'utf8'), info.mtimeMs);
+    } catch {
+      // 读失败（权限/竞态删除）→ 保持 mtime 口径，不把「取数失败」升级成「无检查点」。
+    }
     return { path, stamp: latest, createdAt, ageMin: relMinutes(now, createdAt), bytes: info.size };
   } catch {
     return null;
+  }
+}
+
+/**
+ * v0.8.1（29 红队 C2-B3 修复）：改名时把检查点目录**随花名搬过去**
+ * （`checkpoints/<旧名>/` → `checkpoints/<新名>/`，含 `.nudge` 节流标记）。
+ *
+ * 根因：改名只换 roster 成员键，检查点目录原地成孤儿——默认 self 接手包七要素
+ * 之一「最近检查点」静默变 null（旧目录不再被任何工具面引用；红队 adj-b3 实测
+ * 改名前后 handoff checkpoint present→null 且无 warning）。改名守卫已保证板面
+ * 干净、邮箱为空，检查点目录是该成员仅存的每名状态，搬过去即「要素不丢」。
+ *
+ * best-effort：整目录 rename 失败（目标已存在/权限）时逐文件搬迁；仍失败只返回
+ * error 由调用方披露（改名本身已成功，不阻断、不谎报）。无旧目录 = 无可搬
+ * （`carried:false` 且无 error——不是失败）。
+ */
+export async function carryCheckpointDir(
+  stateRoot: string,
+  fromKey: string,
+  toKey: string,
+): Promise<{ carried: boolean; error?: string }> {
+  const from = checkpointDir(stateRoot, safeCheckpointSegment(fromKey));
+  const to = checkpointDir(stateRoot, safeCheckpointSegment(toKey));
+  let entries: string[];
+  try {
+    entries = await readdir(from);
+  } catch {
+    return { carried: false }; // 无旧目录 = 没有检查点可搬
+  }
+  if (entries.length === 0) return { carried: false };
+  try {
+    await rename(from, to);
+    return { carried: true };
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') return { carried: false };
+    // 目标已存在（旧名曾搬回过/并发）等：逐文件搬迁，目标已存在则保留新方的文件。
+    try {
+      await mkdir(to, { recursive: true });
+      let moved = 0;
+      const failures: string[] = [];
+      for (const entry of entries) {
+        try {
+          await rename(join(from, entry), join(to, entry));
+          moved += 1;
+        } catch (entryError) {
+          failures.push(`${entry}: ${entryError instanceof Error ? entryError.message : String(entryError)}`);
+        }
+      }
+      if (moved === 0) {
+        return { carried: false, error: failures.join("; ") || String(error) };
+      }
+      return failures.length > 0 ? { carried: true, error: failures.join("; ") } : { carried: true };
+    } catch (fallbackError) {
+      return {
+        carried: false,
+        error: fallbackError instanceof Error ? fallbackError.message : String(fallbackError),
+      };
+    }
   }
 }
 
@@ -648,7 +829,7 @@ export interface NudgeDecisionInput {
   env: NodeJS.ProcessEnv;
   /** 我的 OPEN_TASK_STATUSES 任务数。 */
   openTaskCount: number;
-  /** 该 agent 目录内最新 *.md 的 mtime（无则 null）。 */
+  /** 该 agent 目录内最新检查点的 createdAt（front-matter 优先，回退 mtime；无则 null）。 */
   lastCheckpointAt: number | null;
   /** .nudge 内容解析值（无则 null）。 */
   lastNudgeAt: number | null;
@@ -700,7 +881,7 @@ export function checkpointNudgeDecision(input: NudgeDecisionInput): NudgeDecisio
 
 /**
  * 钩子侧取数（纯读无锁，与 hooks/shared.ts unreadSummary 同纪律）：数我的开放任务
- * + 列最新 `*.md` 的 mtime + 读 `.nudge`。team.json 不存在 → 无活跃任务（负例方向）。
+ * + 列最新 `*.md` 的 createdAt（front-matter 优先，回退 mtime）+ 读 `.nudge`。team.json 不存在 → 无活跃任务（负例方向）。
  *
  * env 形参预留给未来阈值 env 化（当前提醒阈值是代码常量 CHECKPOINT_NUDGE_MINUTES，
  * 只有一个可关 env，不新增必填配置）。

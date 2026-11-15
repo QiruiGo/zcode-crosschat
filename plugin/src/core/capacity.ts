@@ -60,11 +60,39 @@ function envNumber(env: NodeJS.ProcessEnv, key: string): number | undefined {
   return Number.isFinite(n) ? n : undefined;
 }
 
-/** red1 阈值：XC_MEM_WARN_WATERMARK，合法域 (0,1)，非法/未设 → 0.15。 */
-export function memWarnWatermarkFromEnv(env: NodeJS.ProcessEnv = process.env): number {
-  const n = envNumber(env, 'XC_MEM_WARN_WATERMARK');
-  return n !== undefined && n > 0 && n < 1 ? n : MEM_WARN_WATERMARK_DEFAULT;
+/**
+ * red1 阈值信息（v0.8.1，29 能力反向检验 C4-O1 修复）：`XC_MEM_WARN_WATERMARK` 合法域
+ * **(0,1)**——红队实测越界值（`1`/`1.5`/`2`/`0`/`-5`/非数字）此前全部**静默**按缺省
+ * 0.15 判定（字面执行 `watermark < 2` 应恒 RED），运维无法分辨「我没配」与「我配了
+ * 但值被拒」。现在显式分辨：`fellBack` = env 有值但越界 → 回落内置缺省并由挂载面
+ * （capacityMount / doctor）附 WARNING + payload `memWarnWatermarkFallback:true`；
+ * 两者皆否（未设/空串）= 就是缺省 0.15，无需披露。合法域内取值精细生效（不钳）。
+ */
+export interface MemWarnWatermarkInfo {
+  watermark: number;
+  fellBack: boolean;
 }
+
+export function memWarnWatermarkInfoFromEnv(env: NodeJS.ProcessEnv = process.env): MemWarnWatermarkInfo {
+  const raw = env['XC_MEM_WARN_WATERMARK'];
+  const provided = typeof raw === 'string' && raw.trim() !== '';
+  const n = provided ? Number(raw) : Number.NaN;
+  const valid = Number.isFinite(n) && n > 0 && n < 1;
+  return { watermark: valid ? n : MEM_WARN_WATERMARK_DEFAULT, fellBack: provided && !valid };
+}
+
+/** red1 阈值：XC_MEM_WARN_WATERMARK，合法域 (0,1)，非法/未设 → 0.15（披露见 info 版）。 */
+export function memWarnWatermarkFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+  return memWarnWatermarkInfoFromEnv(env).watermark;
+}
+
+/**
+ * red1 阈值越界时的挂载面 WARNING（v0.8.1 C4-O1 修复；capacityMount/doctor/status
+ * 三处同一句——与 offline/stall 家族的回落 WARNING 同款两级披露口径）。
+ */
+export const MEM_WATERMARK_FALLBACK_WARNING =
+  'WARNING XC_MEM_WARN_WATERMARK 越界（须为 (0,1) 内的有限数；0/负数/≥1/非数字不被接受）'
+  + `——已回落内置缺省 ${MEM_WARN_WATERMARK_DEFAULT}（可用内存占比预警线）；如只想用缺省值请取消该 env 设置`;
 
 /** red2 上限：XC_MEM_SESSION_LIMIT_BYTES（字节），>0 合法，非法/未设 → 800MB。 */
 export function memSessionLimitBytesFromEnv(env: NodeJS.ProcessEnv = process.env): number {

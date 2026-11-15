@@ -105,15 +105,33 @@ export const DEFAULT_STALL_MINUTES = 120;
  * task-edges.staleThresholdMsFromEnv）——否则 sweeper 先把无在途唤醒的死任务收走，
  * stall 永远轮不到展示；钳制时返回 clamped:true，由挂载面在 payload 附 WARNING。
  *
- * @param env 进程环境（XC_STALL_MINUTES，分钟；非有限正数取缺省 120）。
+ * v0.8.1（29 能力反向检验 C4-F2 修复）：**0/负数/非数字不再静默回落**——与
+ * core/offline.ts 的 offlineThresholdMsFromEnv 同款两级披露（红队实测：
+ * `XC_STALL_MINUTES=0/abc/-5` 全部静默按 120 生效，而钳制通道反而有披露，跨阈值
+ * 家族口径分裂）。现在显式分辨三态：
+ * - `clamped`：有效正值但低于 stale → 按 stale 钳制（原有披露）；
+ * - `fellBack`：env 有值但非法（非有限/≤0/不可解析）→ 回落**内置缺省** 120min，
+ *   由挂载面附 WARNING + payload `stalledThresholdFallback:true`；
+ * - 两者皆 false = 未设置（或缺省空串）→ 就是缺省 120min，无需披露。
+ *
+ * @param env 进程环境（XC_STALL_MINUTES，分钟；非有限正数取缺省 120 并 fellBack）。
  * @param staleThresholdMs 僵尸清扫阈值（毫秒，调用方从 staleThresholdMsFromEnv 取）。
  */
-export function stallThresholdMs(env: NodeJS.ProcessEnv, staleThresholdMs: number): { ms: number; clamped: boolean } {
-  const raw = Number(env['XC_STALL_MINUTES']);
-  const minutes = Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_STALL_MINUTES;
+export function stallThresholdMs(
+  env: NodeJS.ProcessEnv,
+  staleThresholdMs: number,
+): { ms: number; clamped: boolean; fellBack: boolean } {
+  const raw = env['XC_STALL_MINUTES'];
+  const provided = typeof raw === 'string' && raw.trim() !== '';
+  const n = provided ? Number(raw) : Number.NaN;
+  const valid = Number.isFinite(n) && n > 0;
+  const minutes = valid ? n : DEFAULT_STALL_MINUTES;
+  const fellBack = provided && !valid;
   const staleMinutes = Math.round(staleThresholdMs / 60_000);
-  if (minutes < staleMinutes) return { ms: staleThresholdMs, clamped: true };
-  return { ms: minutes * 60_000, clamped: false };
+  // 两态可并存：非法值回落 120 后仍可能低于 stale（超大 stale 阈值）——钳制与
+  // 回落各自披露，挂载面两条 WARNING 都出（同 offline 家族口径）。
+  if (minutes < staleMinutes) return { ms: staleThresholdMs, clamped: true, fellBack };
+  return { ms: minutes * 60_000, clamped: false, fellBack };
 }
 
 /** 停滞建议行（§3.5 呈现；挂载面直接拼进 overview 行）。 */

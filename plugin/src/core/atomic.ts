@@ -15,7 +15,7 @@
  * @module core/atomic
  */
 import { randomUUID } from 'node:crypto';
-import { rename, rm, writeFile } from 'node:fs/promises';
+import { link, rename, rm, writeFile } from 'node:fs/promises';
 
 /** Rename attempts before falling back to a direct overwrite. */
 export const ATOMIC_RENAME_RETRIES = 3;
@@ -99,6 +99,42 @@ export async function writeFileAtomic(file: string, content: string): Promise<vo
 /** Remove the optional UTF-8 BOM some editors prepend to JSON text. */
 export function stripLeadingBom(value: string): string {
   return value.charCodeAt(0) === 0xfeff ? value.slice(1) : value;
+}
+
+/**
+ * Atomically **create** `file` with `content`, failing when it already exists.
+ *
+ * v0.8.1（29 能力反向检验 C1-B01 修复）：checkpoint 的同毫秒并发覆写根因是
+ * 「stat 预检 → 原子写」两步之间的竞态——两个同刻调用都看到候选位不存在，随后
+ * 都 rename 过去，先发者的内容被静默吞掉（双方均报成功、同一路径）。排他创建把
+ * 「占位」变成**单次原子操作**：同目录 temp（flag 'wx'）落内容后 `link` 到目标
+ * ——`link` 在目标已存在时以 EEXIST 失败（CreateHardLink 语义），输家拿不到
+ * 「写了个寂寞还报成功」的结果，改由调用方换 stamp 重试。
+ *
+ * 为什么不直接 `open(target,'wx')` 写正文：被杀进程会在目标留下**半截 .md**
+ * （产品「0 半截 .md」的原子写纪律破功）；temp+link 下被杀只留 .tmp 残留
+ * （由 checkpoint 侧的 sweepCheckpointTmpFiles 按年龄清理）。
+ *
+ * 返回 false = 目标已存在（什么都没写，temp 已清）；抛错 = 真失败（含卷不支持
+ * 硬链的非 EEXIST 错误——由调用方映射为结构化失败，不假装落盘）。
+ */
+export async function writeFileExclusive(file: string, content: string): Promise<boolean> {
+  const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(temporary, content, { encoding: 'utf8', flag: 'wx' });
+  } catch (error) {
+    await rm(temporary, { force: true }).catch(() => undefined);
+    throw error;
+  }
+  try {
+    await link(temporary, file);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    return false;
+  } finally {
+    await rm(temporary, { force: true }).catch(() => undefined);
+  }
 }
 
 /** Alias of writeFileAtomic (module-3 call name). */

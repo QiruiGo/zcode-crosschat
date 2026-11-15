@@ -198,7 +198,12 @@ async function main(): Promise<void> {
   }
 
   // 一次 emit、一次输出（stdout 严格单键单行，hooks/shared.ts 契约）。
-  if (blocks.length > 0) emitAdditionalContext(blocks.join('\n\n'));
+  // v0.8.1（29 红队 C1-B03 修复）：零注入块时也输出一行 JSON（additionalContext=""）
+  // ——§14.2/§11.3 的 stdout 契约是「恰一行 JSON、恰一个 additionalContext 键」，
+  // 旧实现零块时 stdout 为空串（连 JSON.parse 都失败），形状随内容有无而变；
+  // 空串 additionalContext 对宿主是无注入语义（strict schema 认可该键的字符串值），
+  // 形状却恒定可解析。stop 钩子「零 stdout」是另一事件的既有契约，不随本改动。
+  emitAdditionalContext(blocks.join("\n\n"));
 }
 
 main().catch(async (error: unknown) => {

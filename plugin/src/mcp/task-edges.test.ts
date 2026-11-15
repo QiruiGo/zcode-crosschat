@@ -715,7 +715,7 @@ describe("withTaskEdges/sweeper：C8 边界（空闲 ≠ 离线）", () => {
     expect(t1rec.status).toBe("in_progress"); // 原样保留（豁免）
   });
 
-  it("离线属主就是 lead 自己 → 任务照常回池，但不给 lead 发「你没了」通知", async () => {
+  it("离线属主就是 lead 自己 → 任务照常回池，不给自己发「你没了」，但转交通知改投队友 + 审计落地（v0.8.1 C6-BUG-4）", async () => {
     const { core, deps, peerRoot } = makeC8Core();
     await hookRegister(core, "conn-a", "a", "sess_a");
     await hookRegister(core, "conn-m1", "m1", "sess_m1");
@@ -735,12 +735,67 @@ describe("withTaskEdges/sweeper：C8 边界（空闲 ≠ 离线）", () => {
 
     const summary = await sweepStaleTasksOnce(deps);
     expect(summary).toMatchObject({ swept: 1, offline: 1 }); // 判据命中（成员级）
-    // 但没有 offline-handover 通知（不自我惊动）；createdBy=a 自己的 stale 回执仍在。
+    // 崩溃 lead 自己的箱：只有 createdBy=a 的 stale 回执，没有「你没了」自我惊动。
     const box = await mailboxOf("a");
     expect(box.some((m) => m.content.includes("offline-handover"))).toBe(false);
     expect(box.some((m) => m.content.includes("stale-swept"))).toBe(true);
+    // v0.8.1（C6-BUG-4 修复）：转交通知改投**其他在册成员**（m1）——队友才能认领
+    // 回池的任务；此前整体跳过通知+审计，「lead 崩溃」零 task-offline 信号。
+    const m1box = await mailboxOf("m1");
+    const notices = m1box.filter((m) => m.content.includes("offline-handover"));
+    expect(notices).toHaveLength(1);
+    const frame = JSON.parse(notices[0]!.content) as Record<string, unknown>;
+    expect((frame["offline"] as Record<string, unknown>)).toMatchObject({
+      member: "a", evidence: "process-dead", liveness: "pid-dead",
+    });
+    expect((frame["offline"] as Record<string, unknown>)["taskIds"]).toEqual([t1]);
+    // task-offline 审计恒定落地（noticeTo 记实际收件人）。
+    const rows = offlineAuditRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ member: "a", evidence: "process-dead", liveness: "pid-dead", noticeTo: "m1" });
     const t1rec = (await readTeam(stateRoot, "default"))!.tasks.find((t) => t.id === t1)!;
     expect(t1rec.status).toBe("pending"); // 任务照常回池（信息不丢）
+  });
+
+  it("lead 崩溃且无其他在册成员 → 只落审计（noticeTo:null），不抛、不回退（C6-BUG-4 边界）", async () => {
+    const { core, deps, peerRoot } = makeC8Core();
+    await hookRegister(core, "conn-a", "a", "sess_a"); // 单人团队：a 即 founder 即 lead
+    // 无派单对象（dispatch 需要活成员收件）——直接置态构造「lead 认领了共享待领单」。
+    const now = Date.now();
+    const team = await mutateTeam((t) => {
+      t.tasks.push({
+        id: "t-lead-solo",
+        title: "T1",
+        prompt: "P",
+        dependsOn: [],
+        status: "in_progress",
+        assignee: "a",
+        attempt: 1,
+        attemptId: "att-lead",
+        createdBy: "a",
+        createdAt: now - 60 * 60_000,
+        updatedAt: now - 60 * 60_000,
+        lastProgressTs: now - 60 * 60_000,
+        result: null,
+        error: null,
+        evidence: [],
+        history: [{ ts: now - 60 * 60_000, event: "claim", by: "a" }],
+      });
+    });
+    await writeTeam(stateRoot, team);
+    writePeerRecordFor(peerRoot, "sess_a", C8_DEAD_PID, Date.now() - 3_600_000);
+    await backdateOpenTask("a", 40 * 60_000);
+
+    const summary = await sweepStaleTasksOnce(deps);
+    expect(summary).toMatchObject({ swept: 1, offline: 1 });
+    const rows = offlineAuditRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ member: "a", evidence: "process-dead" });
+    expect(rows[0]!["noticeTo"]).toBeNull(); // 无人可通知——审计仍在（信息不丢）
+    // 崩溃 lead 自己的箱只有 createdBy 回执，无离线帧（不自我惊动的口径不变）。
+    const box = await mailboxOf("a");
+    expect(box.some((m) => m.content.includes("offline-handover"))).toBe(false);
+    expect(box.some((m) => m.content.includes("stale-swept"))).toBe(true);
   });
 
   it("removed 成员不判离线（「不在册」不是「离线」；其任务已由 xc_member_stop 回池）", async () => {

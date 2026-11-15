@@ -206,9 +206,10 @@ interface WakePlanItem {
  * v0.7（C8，DESIGN-V0.7.md §4.1/§4.2）：`opts.scan` 给出时（调用方锁外做好的**只读**
  * peer 扫描）对本轮被扫任务逐条算 offlineVerdict——`process-dead`（进程死硬证据，
  * 免空闲阈值）或 `idle-timeout`（240min 兜底）命中的属主，除 createdBy 回执外**额外
- * 通知 lead**（一条成员级转交通知 + 唤醒计划），并进 `offline` 返回面 / `task-offline`
- * 审计。回池路径本身不新开：仍是 stale sweeper 的 revokeAttempt（§4.2「复用 sweeper」）。
- * `opts` 缺省 = 不产离线判定（旧调用点零行为变化）。
+ * 发转交通知**（属主非 lead → 通知 lead；属主即 lead → 通知其他在册成员，v0.8.1
+ * C6-BUG-4 修复）+ 唤醒计划，并进 `offline` 返回面 / `task-offline` 审计（两种属主
+ * 身份都恒定落审计）。回池路径本身不新开：仍是 stale sweeper 的 revokeAttempt
+ * （§4.2「复用 sweeper」）。`opts` 缺省 = 不产离线判定（旧调用点零行为变化）。
  */
 async function sweepStaleTasksLocked(
   stateRoot: string,
@@ -314,7 +315,7 @@ async function sweepStaleTasksLocked(
 }
 
 /**
- * C8（§4.2）：离线属主的 lead 转交通知（调用方持团队锁；邮箱帧 + 唤醒计划项）。
+ * C8（§4.2）：离线属主的转交通知（调用方持团队锁；邮箱帧 + 唤醒计划项）。
  *
  * 帧型 = `task-receipt`（W5 白名单既有成员，任务域引擎回执；**不新添帧型**——帧型属
  * M1 的 mailbox.ts，且 C6/C7 的四个新帧型都是转办/审批语义，与离线转交无关）。载荷在
@@ -322,10 +323,16 @@ async function sweepStaleTasksLocked(
  * status 仍为 "failed"——不触发 mailbox.staleCompletedReceiptTaskIds 的
  * 「completed 回执 vs 未完成任务板矛盾」检测（该检测只认 completed）。
  *
- * 两条跳过规则（保守，避免惊动与自娱）：
- * 1. 离线属主**就是 lead 自己**——通知 lead「你没了」没有行动意义（其任务照常回池 +
- *    createdBy 回执 + overview 行仍在，信息不丢）；
- * 2. 该属主本轮没有被扫任务（无 offlineHits 条目）——本函数只被命中路径调用。
+ * 收件人规则（v0.8.1，29 红队 C6-BUG-4 修复）：
+ * - 离线属主**不是** lead → 通知 lead（原口径：lead 用 xc_dispatch 重派）；
+ * - 离线属主**就是** lead 自己（ founder 兜底同判）→ 原实现整体跳过「通知 + 审计」，
+ *   而「lead 崩溃」恰是 C8 最该留信号的场景（红队 lane-b4：presweep status 已能检出
+ *   pid-dead，sweep 却零 task-offline；lane-b4c 对照组非 lead 崩溃五件套齐全）。
+ *   通知崩溃者自己的邮箱无接收意义（C6 裁决原话），故改投**其他在册成员**（有
+ *   sessionId 的可寻址队友）——队友才能认领回池的任务 / 接手指引；无人可通知时
+ *   只落审计（noticeTo:null）。
+ * - `task-offline` 审计**恒定落地**（两种属主身份都不再缺席），noticeTo 记实际收件人
+ *   （多个 = 逗号连接；无 = null）。
  *
  * 通知按**成员**聚合：一名成员名下多任务只发一条（任务 id 全列在帧里），
  * 唤醒计划同一形态（reason "task-offline"，非守则场景）。
@@ -356,7 +363,12 @@ async function notifyOfflineLeadLocked(
       idleForMin,
       tasks: hit.tasks,
     });
-    if (key === leadKey) continue; // 规则 1：不通知 lead 关于它自己
+    // 收件人：属主非 lead → lead 本人；属主即 lead → 其他在册成员（可寻址队友）。
+    const recipients: Array<{ key: string; sessionId: string | null }> = key === leadKey
+      ? team.members
+        .filter((m) => m.key !== leadKey && typeof m.sessionId === 'string' && m.sessionId !== '')
+        .map((m) => ({ key: m.key, sessionId: m.sessionId ?? null }))
+      : [{ key: leadKey, sessionId: team.members.find((m) => m.key === leadKey)?.sessionId ?? null }];
     const notice = JSON.stringify({
       type: "task-receipt",
       teamId,
@@ -375,15 +387,17 @@ async function notifyOfflineLeadLocked(
         suggestion: offlineSuggestion(hit.evidence),
       },
     });
-    const msg = createMessage("engine", leadKey, notice, { deliveryClaimedAt: now });
-    await appendMailbox(stateRoot, teamId, leadKey, msg);
-    wakePlan.push({
-      to: leadKey,
-      sessionId: team.members.find((m) => m.key === leadKey)?.sessionId ?? null,
-      reason: "task-offline",
-      receiptIds: [msg.id],
-      ticket: notice,
-    });
+    for (const recipient of recipients) {
+      const msg = createMessage("engine", recipient.key, notice, { deliveryClaimedAt: now });
+      await appendMailbox(stateRoot, teamId, recipient.key, msg);
+      wakePlan.push({
+        to: recipient.key,
+        sessionId: recipient.sessionId,
+        reason: "task-offline",
+        receiptIds: [msg.id],
+        ticket: notice,
+      });
+    }
     await logEngineEvent(stateRoot, {
       event: "task-offline",
       teamId,
@@ -392,7 +406,11 @@ async function notifyOfflineLeadLocked(
       liveness: hit.liveness,
       idleForMin,
       taskIds: hit.tasks.map((t) => t.taskId),
-      noticeTo: leadKey,
+      noticeTo: recipients.length === 0
+        ? null
+        : recipients.length === 1
+          ? recipients[0]!.key
+          : recipients.map((r) => r.key).join(","),
     });
   }
   return out;

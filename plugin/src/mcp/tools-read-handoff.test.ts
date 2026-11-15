@@ -10,13 +10,14 @@
  * - 4000 超预算 → truncated 披露 + 文本末行标注（无静默丢）；
  * - ≤3 步彩排：handoff 的 suggestions 指向的 claim 真实可达（identify→handoff→claim）。
  */
-import { mkdir, mkdtemp, readdir, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 import { payloadOf } from "./protocol.js";
 import { handleRead, ReadShape } from "./tools-read.js";
+import { handleTeam } from "./tools-team.js";
 import { createToolCore, type ToolDeps } from "./core.js";
 import { identityStore, type BoundIdentity } from "./identity.js";
 import { appendMailbox, createMessage } from "../core/mailbox.js";
@@ -338,16 +339,27 @@ describe("xc_read scope=handoff：预算与 ≤3 步可达性", () => {
     bind("alice", "conn-alice");
     const res = await handoff({}, "conn-alice");
     const payload = payloadOf(res) as Record<string, unknown>;
-    const truncated = payload["truncated"] as { budgetChars: number; droppedSections: string[] } | undefined;
+    const truncated = payload["truncated"] as {
+      budgetChars: number;
+      droppedSections: string[];
+      cappedItems: Record<string, { shown: number; total: number }>;
+    } | undefined;
     expect(truncated).toBeDefined();
     expect(truncated!.budgetChars).toBe(4000);
     expect(truncated!.droppedSections.length).toBeGreaterThan(0);
-    // 预算只作用于文本面（content[0]）；payload 机器面另计
+    // 4000 字符预算作用于文本面（content[0]）
     expect(renderLineOf(res).length).toBeLessThanOrEqual(4000);
     expect(renderLineOf(res)).toContain("字符预算截断");
-    // payload 机器面仍带全部要素（预算只裁文本）
-    expect((payload["pool"] as unknown[]).length).toBe(10);
+    // v0.8.1（C2-B5）：payload 与文本面同一级裁切——cappedItems.shown === payload 数组长度。
+    // 旧实这里 payload.pool 保留 10 条而 cappedItems.pool.shown=0，只读 JSON 的消费方
+    // 会误判「没丢」；现在被降级的章在 payload 里就是空数组，total 记全量。
+    expect((payload["pool"] as unknown[]).length).toBe(truncated!.cappedItems.pool!.shown);
+    expect((payload["pool"] as unknown[]).length).toBe(0);
+    expect(truncated!.cappedItems.pool!.total).toBe(12);
     expect(payload["tasks"]).toHaveLength(1);
+    // 未读/建议仍按基础帽在场（未被降级的章不丢）
+    expect((payload["unread"] as { top: unknown[] }).top.length)
+      .toBeLessThanOrEqual(truncated!.cappedItems.unreadTop?.shown ?? 5);
   });
 
   it("≤3 步彩排：handoff 的 claim 建议真实可达（identify → handoff → claim）", async () => {
@@ -384,5 +396,154 @@ describe("xc_read scope=handoff：预算与 ≤3 步可达性", () => {
     // 磁盘面：bob 的检查点文件仍在（handoff 是纯读，无副作用）
     const bobDir = await readdir(join(stateRoot, "checkpoints", "bob"));
     expect(bobDir.filter((n) => n.endsWith(".md"))).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.8.1（29 红队 M05 修复）：handoff 身份章的 lead 渲染与 status/team/checkpoint 同源
+// ——team.leadKey 缺省时 founder 读作 lead（types.ts TeamState.leadKey 注释 +
+// DESIGN-V0.2 §6.1 公开口径）。旧实现直读 team.leadKey ?? null：无显式 lead 时
+// 渲染 `lead: (none)`，而 status/team 视图展示 founder、且 isLead 又按 founder
+// 兜底算 true——同一成员同一时刻三个面两个答案。
+// ---------------------------------------------------------------------------
+describe("handoff 身份章：lead 渲染跨面同源（M05）", () => {
+  it("无显式 leadKey → identity.leadKey = founder，文本不再出现 lead: (none)", async () => {
+    await seedTeam();
+    const team = (await readTeam(stateRoot, "default"))!;
+    delete team.leadKey; // 无显式 lead：founder（lead）读作 lead
+    await writeTeam(stateRoot, team);
+    bind("lead", "conn-lead"); // founder 自己的连接
+    const res = await handoff({}, "conn-lead");
+    const payload = payloadOf(res) as Record<string, unknown>;
+    expect((payload["identity"] as Record<string, unknown>)).toMatchObject({
+      agentKey: "lead", leadKey: "lead", isLead: true,
+    });
+    const text = res.content.map((c) => (c as { text?: string }).text ?? "").join("\n");
+    expect(text).toContain("lead: lead");
+    expect(text).not.toContain("lead: (none)");
+  });
+
+  it("有显式 leadKey → 仍按 leadKey 渲染（转移后的 lead 不被 founder 兜底篡改）", async () => {
+    await seedTeam(); // seedTeam 已置 team.leadKey = "lead"
+    bind("alice", "conn-alice");
+    const res = await handoff({}, "conn-alice");
+    const payload = payloadOf(res) as Record<string, unknown>;
+    expect((payload["identity"] as Record<string, unknown>)).toMatchObject({
+      agentKey: "alice", leadKey: "lead", isLead: false,
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.8.1 红队二十九番修复回归（本组：M02 / C2-B4 / C2-B8，工具层端到端）
+// ---------------------------------------------------------------------------
+
+describe("xc_read scope=handoff v0.8.1: 回归（M02 身份章 / B4 年龄取数 / B8 冻结形状）", () => {
+  /** 把 team.json 里的 state 字段抹掉——复现 xc_identify 入册的真实记录形态（不落 state）。 */
+  async function stripMemberStates(): Promise<void> {
+    const team = (await readTeam(stateRoot, "default"))!;
+    for (const m of team.members) delete (m as { state?: string }).state;
+    await writeTeam(stateRoot, team);
+  }
+
+  /** 写一份带 front-matter createdAt 的检查点（mtime 另拨——复现外部拷贝/还原场景）。 */
+  async function writeCheckpointWithFrontMatter(
+    agentKey: string,
+    stamp: string,
+    opts: { frontMatterAgeMin: number; mtimeAgeMin: number },
+  ): Promise<string> {
+    const dir = join(stateRoot, "checkpoints", agentKey);
+    await mkdir(dir, { recursive: true });
+    const path = join(dir, `${stamp}.md`);
+    const createdAt = new Date(Date.now() - opts.frontMatterAgeMin * MIN).toISOString();
+    await writeFile(
+      path,
+      `---\nagent: ${agentKey}\nteam: default\nlead: (none)\ncreatedAt: ${createdAt}\n`
+      + "taskCounts: {claimed:0, in_progress:0, blocked:0}\nunread: 0\n"
+      + "capacity: {watermarkPct: 30.0, freeGb: 9.0, level: GREEN}\n---\n\n## 1. 身份\n",
+      "utf8",
+    );
+    const mtime = new Date(Date.now() - opts.mtimeAgeMin * MIN);
+    await utimes(path, mtime, mtime);
+    return path;
+  }
+
+  it("M02：identify 入册成员（记录无 state 字段）→ 身份章 state: ready，不再恒报 (not on roster)", async () => {
+    await seedTeam([task({ id: "t-a1", status: "in_progress", assignee: "alice" })]);
+    await stripMemberStates();
+    bind("alice", "conn-alice");
+    const res = await handoff({}, "conn-alice");
+    const payload = payloadOf(res) as Record<string, unknown>;
+    // 判据 = 花名册成员身份（memberState 访问器 m.state ?? 'ready'），与 checkpoint 身份章拉齐
+    expect((payload["identity"] as { memberState: string | null }).memberState).toBe("ready");
+    expect((payload["identity"] as { role: string | null }).role).toBe("worker");
+    const identityLine = textOf(res).split("\n").find((l) => l.startsWith("- agent:"))!;
+    expect(identityLine).toContain("state: ready");
+    expect(identityLine).not.toContain("(not on roster)");
+    // 同成员同时刻 checkpoint 身份章同口径（不再自相矛盾）
+    const cp = await handleTeam(deps, { action: "checkpoint" }, "conn-alice");
+    const md = await readFile(String((payloadOf(cp) as { path: string }).path), "utf8");
+    expect(md).toContain("state: ready");
+  });
+
+  it("M02：不在花名册的连接 → 才如实报 (not on roster)（成员身份判据不放松）", async () => {
+    await seedTeam([task({ id: "t-a1", status: "in_progress", assignee: "alice" })]);
+    bind("ghost", "conn-ghost"); // 未入册（seedTeam 只含 alice/bob/lead）
+    const res = await handoff({}, "conn-ghost");
+    const identityLine = textOf(res).split("\n").find((l) => l.startsWith("- agent:"))!;
+    expect(identityLine).toContain("role: (not on roster)");
+    expect(identityLine).toContain("state: (not on roster)");
+    expect((payloadOf(res) as { identity: { memberState: null } }).identity.memberState).toBeNull();
+  });
+
+  it("C2-B8：checkpoint payload 恰四键（path/createdAt/ageMin/bytes）——stamp 不再漏进 JSON", async () => {
+    await seedTeam([task({ id: "t-a1", status: "in_progress", assignee: "alice" })]);
+    await writeCheckpoint("alice", "2026-11-15T18-00-00-000Z", 12);
+    bind("alice", "conn-alice");
+    const res = await handoff({}, "conn-alice");
+    const checkpoint = payloadOf(res) as { checkpoint: Record<string, unknown> };
+    expect(Object.keys(checkpoint.checkpoint).sort()).toEqual(["ageMin", "bytes", "createdAt", "path"].sort());
+    expect(checkpoint.checkpoint["stamp"]).toBeUndefined();
+  });
+
+  it("C2-B8：pool 项恰五键且 priority 恒在（normal 缺省也归一，不丢键）", async () => {
+    await seedTeam([
+      task({ id: "t-p1", status: "pending", assignee: null }), // 无 priority 字段 = normal
+      task({ id: "t-p2", status: "pending", assignee: null, priority: "high" }),
+    ]);
+    bind("alice", "conn-alice");
+    const res = await handoff({}, "conn-alice");
+    const pool = (payloadOf(res) as { pool: Array<Record<string, unknown>> }).pool;
+    expect(pool).toHaveLength(2);
+    for (const item of pool) {
+      expect(Object.keys(item).sort()).toEqual(
+        ["dependsOn", "priority", "taskId", "title", "unmetDependsOn"].sort(),
+      );
+    }
+    expect(pool.find((p) => p["taskId"] === "t-p1")!["priority"]).toBe("normal");
+    expect(pool.find((p) => p["taskId"] === "t-p2")!["priority"]).toBe("high");
+  });
+
+  it("C2-B4：front-matter createdAt 优先——mtime 被拨新也不把 26h 前的检查点读成 0min", async () => {
+    await seedTeam([task({ id: "t-a1", status: "in_progress", assignee: "alice" })]);
+    await writeCheckpointWithFrontMatter("alice", "2026-11-14T13-00-00-000Z", {
+      frontMatterAgeMin: 26 * 60,
+      mtimeAgeMin: 0, // 外部拷贝/还原：mtime 重置为现在
+    });
+    bind("alice", "conn-alice");
+    const res = await handoff({}, "conn-alice");
+    const checkpoint = (payloadOf(res) as { checkpoint: { ageMin: number; createdAt: number } }).checkpoint;
+    expect(checkpoint.ageMin).toBeGreaterThanOrEqual(26 * 60 - 2);
+    expect(checkpoint.ageMin).toBeLessThanOrEqual(26 * 60 + 2);
+    // 文本面同源（不再与 payload 分歧）
+    expect(textOf(res)).toMatch(/（15[0-9]{2}|16[0-9]{2}min 前/);
+  });
+
+  it("C2-B4：无 front-matter 的老文件仍按 mtime 宽容取数（不升级成无检查点）", async () => {
+    await seedTeam([task({ id: "t-a1", status: "in_progress", assignee: "alice" })]);
+    await writeCheckpoint("alice", "2026-11-15T18-00-00-000Z", 12); // 无 createdAt 行的裸文件
+    bind("alice", "conn-alice");
+    const res = await handoff({}, "conn-alice");
+    expect((payloadOf(res) as { checkpoint: { ageMin: number } }).checkpoint.ageMin).toBe(12);
   });
 });

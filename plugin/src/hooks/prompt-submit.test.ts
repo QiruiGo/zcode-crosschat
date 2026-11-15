@@ -328,3 +328,40 @@ describe("UserPromptSubmit 钩子：v0.8.0 检查点提醒", () => {
     expect(checkpointMocks.writeNudgeMarker).not.toHaveBeenCalled();
   });
 });
+
+// ---------------------------------------------------------------------------
+// v0.8.1（29 红队 C1-B03 修复）：零注入块时 stdout 也必须是协议形状——恰一行 JSON、
+// 恰一个 additionalContext 键（空串 = 无注入语义；strict schema 认可）。旧实现零块时
+// stdout 为空字符串（JSON.parse 直接失败），形状随内容有无而变。
+// ---------------------------------------------------------------------------
+describe("UserPromptSubmit 钩子：零注入块的 stdout 形状（C1-B03）", () => {
+  it("无未读、无 peer 信封、无提醒 → 仍输出一行 JSON 单键（additionalContext 为空串）", async () => {
+    sharedMocks.unreadSummary.mockResolvedValue({ count: 0, senders: [], messages: [] });
+    peerMocks.drainPeerQueue.mockResolvedValue([]);
+    checkpointMocks.checkpointNudgeState.mockResolvedValue({ openTaskCount: 0, lastCheckpointAt: null, lastNudgeAt: null });
+    checkpointMocks.checkpointNudgeDecision.mockReturnValue({ nudge: false, reason: "no-active-task" });
+
+    const captured = await runHook();
+    expect(captured).toHaveLength(1); // 恰好一次 write
+    const text = captured[0]!;
+    expect(text.endsWith("\n")).toBe(true);
+    expect(text.trimEnd().split("\n")).toHaveLength(1); // 恰一行
+    const parsed = JSON.parse(text) as Record<string, unknown>; // 旧实现：空串 → parse 抛错
+    expect(Object.keys(parsed)).toEqual(["additionalContext"]); // 恰一个键
+    expect(parsed["additionalContext"]).toBe(""); // 空注入（宿主无副作用语义）
+    // 负例审计纪律不变：无提醒就不写标记/不审计
+    expect(checkpointMocks.writeNudgeMarker).not.toHaveBeenCalled();
+  });
+
+  it("有任一注入块时形状不变（一行 JSON 单键，内容非空）——与零块路径同契约", async () => {
+    sharedMocks.unreadSummary.mockResolvedValue({ count: 2, senders: ["bob"], messages: [] });
+    peerMocks.drainPeerQueue.mockResolvedValue([]);
+    checkpointMocks.checkpointNudgeDecision.mockReturnValue({ nudge: false, reason: "disabled" });
+
+    const captured = await runHook();
+    expect(captured).toHaveLength(1);
+    const parsed = JSON.parse(captured[0]!) as Record<string, unknown>;
+    expect(Object.keys(parsed)).toEqual(["additionalContext"]);
+    expect(String(parsed["additionalContext"])).toContain("未读协作消息");
+  });
+});

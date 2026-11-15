@@ -37,6 +37,8 @@ import {
   type TeamState,
 } from './types.js';
 import { logEngineEvent } from './log.js';
+import { withTeamLock } from './lock.js';
+import { readNames } from './registry.js';
 
 export { DEFAULT_TEAM_ID } from './types.js';
 
@@ -250,8 +252,173 @@ export async function readTeam(stateRoot: string, teamId: string): Promise<TeamS
   });
   throw new Error(
     `team state file "${file}" is corrupt (${primary.defect}); ` +
-    `no usable backup at "${backupPath}" — restore it manually or delete the team directory to reset`,
+    `no usable backup at "${backupPath}" — restore it manually or delete the team directory to reset` +
+    (primary.defect === 'duplicate member keys'
+      ? `, or run xc_doctor({action:"repair-team"}) to dedupe the member keys in place`
+      : ''),
   );
+}
+
+// ---------------------------------------------------------------------------
+// v0.8.1（29-v080 M01 修复）：中毒 team.json 的工具面自愈（双重复员键）。
+//
+// M01 的持久伤害：xc_identify 改名把 roster 成员键换成**他人已占**的花名 →
+// team.json 出现 duplicate member keys（readTeam 拒读）→ .bak 被同一份坏内容
+// 镜像中毒 → 全队 team-axis 工具（identify/overview/handoff/claim/…）持续
+// internal，人工修复只能删/改文件。v0.8.1 起改名路径不再能制造这个形态
+// （两轴前置校验，tools-identify.ts）；本函数兜住**已经中毒**的存量状态：
+//
+// 修复判据（确定性，不猜）：
+// - 只修 `duplicate member keys` 这一种缺陷——JSON 本身合法，仅是 members
+//   数组同键多行；其余缺陷（非 JSON/缺字段/坏任务记录）一律不猜，交还原人工
+//   恢复路径（fail-closed 不变）。
+// - 同键多行保留哪行：names.json（name→sid 权威索引）绑定的那行；无绑定或无
+//   匹配时保留首行并在披露里注明用了兜底规则。M01 的残留行正是「改名方那行」
+//   （其 sid 在 names.json 里没有该花名的绑定——改名路径的冲突保护就是不覆盖
+//   别人的索引行），故权威索引恰好指向原持有者。
+// - 残损字节先保全到 `team.json.corrupt`（与 v0.5.1 备份恢复同纪律），再
+//   writeTeam 整文件替换——真源与 .bak 一并治好。
+// - 全程 team 锁内 + 锁内重读重判（并发安全；别的进程可能刚修好）。
+// ---------------------------------------------------------------------------
+
+/** 一次 team.json 自愈的结果（工具面原样披露）。 */
+export interface TeamRepairResult {
+  /** true = 真源已被本调用修好并落盘。 */
+  repaired: boolean;
+  /** not-corrupt = 真源本来就健康（幂等调用）；duplicate-member-keys = 已修；unrepairable = 缺陷不在可修范围。 */
+  reason: 'repaired' | 'not-corrupt' | 'unrepairable';
+  /** unrepairable 时的缺陷描述（parseTeamText 口径）。 */
+  defect?: string;
+  /** 每个重复键保留/丢弃的行（审计与披露用）。 */
+  kept: Array<{ key: string; sessionId: string }>;
+  dropped: Array<{ key: string; sessionId: string }>;
+  /** 兜底规则（names.json 无权威绑定）命中的键——披露用。 */
+  fallbackKeys: string[];
+  /** 残损字节保全路径（team.json.corrupt）。 */
+  preserved?: string;
+}
+
+/**
+ * 自愈 duplicate member keys 中毒的 team.json（工具面入口：xc_doctor 的
+ * `action:"repair-team"`）。幂等：健康状态调用 = no-op（reason:'not-corrupt'）。
+ * 缺陷不在可修范围时不写任何字节，返回 reason:'unrepairable' + defect。
+ */
+export async function repairTeamState(
+  stateRoot: string,
+  teamId: string,
+  now: number = Date.now(),
+): Promise<TeamRepairResult> {
+  const file = teamFile(stateRoot, teamId);
+  let raw: string;
+  try {
+    raw = await readFile(file, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return { repaired: false, reason: 'not-corrupt', kept: [], dropped: [], fallbackKeys: [] };
+    }
+    throw error;
+  }
+  const primary = parseTeamText(raw, teamId);
+  if (primary.state !== undefined) {
+    return { repaired: false, reason: 'not-corrupt', kept: [], dropped: [], fallbackKeys: [] };
+  }
+  if (primary.defect !== 'duplicate member keys') {
+    await logEngineEvent(stateRoot, { event: 'team-state-repair-refused', teamId, defect: primary.defect });
+    return { repaired: false, reason: 'unrepairable', defect: primary.defect, kept: [], dropped: [], fallbackKeys: [] };
+  }
+
+  return await withTeamLock(stateRoot, teamId, async (): Promise<TeamRepairResult> => {
+    // 锁内重读重判：等锁期间别的进程可能已修好（或写入了新缺陷）。
+    let current: string;
+    try {
+      current = await readFile(file, 'utf8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        return { repaired: false, reason: 'not-corrupt', kept: [], dropped: [], fallbackKeys: [] };
+      }
+      throw error;
+    }
+    const parsed = parseTeamText(current, teamId);
+    if (parsed.state !== undefined) {
+      return { repaired: false, reason: 'not-corrupt', kept: [], dropped: [], fallbackKeys: [] };
+    }
+    if (parsed.defect !== 'duplicate member keys') {
+      await logEngineEvent(stateRoot, { event: 'team-state-repair-refused', teamId, defect: parsed.defect });
+      return { repaired: false, reason: 'unrepairable', defect: parsed.defect, kept: [], dropped: [], fallbackKeys: [] };
+    }
+    let value: unknown;
+    try {
+      value = JSON.parse(current);
+    } catch {
+      // parseTeamText 已判定缺陷是 duplicate member keys，JSON 必然可解析；防御分支。
+      await logEngineEvent(stateRoot, { event: 'team-state-repair-refused', teamId, defect: 'unparseable' });
+      return { repaired: false, reason: 'unrepairable', defect: 'unparseable', kept: [], dropped: [], fallbackKeys: [] };
+    }
+    const membersRaw = (value as { members?: unknown }).members;
+    if (!Array.isArray(membersRaw)) {
+      await logEngineEvent(stateRoot, { event: 'team-state-repair-refused', teamId, defect: 'members not an array' });
+      return { repaired: false, reason: 'unrepairable', defect: 'members not an array', kept: [], dropped: [], fallbackKeys: [] };
+    }
+    // names.json 权威索引：同键多行时保留它绑定的那行（M01 残留行没有绑定）。
+    const names = await readNames(stateRoot);
+    const kept: Array<{ key: string; sessionId: string }> = [];
+    const dropped: Array<{ key: string; sessionId: string }> = [];
+    const fallbackKeys: string[] = [];
+    const seen = new Set<string>();
+    const deduped: unknown[] = [];
+    for (const entry of membersRaw) {
+      const key = typeof (entry as { key?: unknown })?.key === 'string' ? (entry as { key: string }).key : undefined;
+      const sessionId = typeof (entry as { sessionId?: unknown })?.sessionId === 'string'
+        ? (entry as { sessionId: string }).sessionId
+        : '';
+      if (key === undefined || !seen.has(key)) {
+        if (key !== undefined) seen.add(key);
+        deduped.push(entry);
+        if (key !== undefined) kept.push({ key, sessionId });
+        continue;
+      }
+      // 重复键三选一（确定性，不猜）：
+      // ① names.json 绑定指向**先到行** → 丢弃后到行（M01 主形态：改名残留行在索引里
+      //    没有绑定——改名路径的冲突保护不覆盖别人的索引行）；
+      // ② 绑定指向**后到行** → 保留后到行、丢弃先到行（索引是权威）；
+      // ③ 无绑定/绑定指向第三方 → 兜底保留**先到行**（残留行是失败操作的产物，后写），
+      //    记 fallbackKeys 披露。
+      const bound = names[key]?.sessionId;
+      const firstIdx = deduped.findIndex((e) => (e as { key?: unknown }).key === key);
+      const first = deduped[firstIdx] as { sessionId?: unknown } | undefined;
+      const firstSessionId = typeof first?.sessionId === 'string' ? first.sessionId : '';
+      if (bound !== undefined && bound === firstSessionId) {
+        dropped.push({ key, sessionId });
+        continue;
+      }
+      if (bound !== undefined && bound === sessionId) {
+        dropped.push({ key, sessionId: firstSessionId });
+        deduped[firstIdx] = entry;
+        const keptIdx = kept.findIndex((k) => k.key === key && k.sessionId === firstSessionId);
+        if (keptIdx >= 0) kept[keptIdx] = { key, sessionId };
+        continue;
+      }
+      fallbackKeys.push(key);
+      dropped.push({ key, sessionId });
+    }
+    const repairedValue = { ...(value as Record<string, unknown>), members: deduped };
+    const check = coerceTeamState(repairedValue, teamId);
+    if (!check.ok) {
+      await logEngineEvent(stateRoot, { event: 'team-state-repair-refused', teamId, defect: check.defect });
+      return { repaired: false, reason: 'unrepairable', defect: check.defect, kept: [], dropped: [], fallbackKeys: [] };
+    }
+    await preserveCorruptTeamFile(stateRoot, teamId, current);
+    await writeTeam(stateRoot, check.state);
+    await logEngineEvent(stateRoot, {
+      event: 'team-state-repaired',
+      teamId,
+      defect: 'duplicate member keys',
+      kept,
+      dropped,
+      ...(fallbackKeys.length > 0 ? { fallbackKeys } : {}),
+    });
+    return { repaired: true, reason: 'repaired', kept, dropped, fallbackKeys, preserved: teamCorruptFile(stateRoot, teamId) };
+  });
 }
 
 /**

@@ -26,6 +26,7 @@ import { identityStore } from "./identity.js";
 import { withTeamLock } from "../core/lock.js";
 import { sanitizeKey } from "../core/sanitize.js";
 import { getTask, leadKeyOf, memberOpenTasks, readTeam, sortTasksForBoard, unsatisfiedDependencies } from "../core/teamstate.js";
+import { memberState } from "../core/types.js";
 import { lastProgressTs, stallThresholdMs, stalledTasks } from "../core/stall.js";
 import { staleThresholdMsFromEnv } from "./task-edges.js";
 import { capacityCacheFile, judgeCapacity, sampleCapacity } from "../core/capacity.js";
@@ -75,7 +76,7 @@ import {
 } from "../core/peerenvelope.js";
 import { sha256Of } from "../core/msgstore.js";
 import { peerRootFromEnv } from "../core/peerdir.js";
-import { logPeerEvent } from "../core/peerregistry.js";
+import { logPeerEvent, scanPeers } from "../core/peerregistry.js";
 import { archiveJournalPath, taskJournalPath } from "../core/archive.js";
 import { getPeerServices } from "./peer-services.js";
 import type { ToolDeps } from "./core.js";
@@ -519,7 +520,9 @@ async function readJournalScope(deps: ToolDeps, args: ReadArgs): Promise<ToolRes
 // scope=handoff（v0.8.0 A2）：30 秒接手包（DESIGN-V0.8.md §4）
 // ---------------------------------------------------------------------------
 
-/** latestCheckpoint 的安全包装：段闸抛错（agentKey 清洗后仍不安全）按「无检查点」降级 + 披露。 */
+/** latestCheckpoint 的安全包装：段闸抛错（agentKey 清洗后仍不安全）按「无检查点」降级 + 披露。
+ *  v0.8.1（C2-B8 修复）：只回冻结形状的四键（path/createdAt/ageMin/bytes）——latestCheckpoint
+ *  额外带的 `stamp` 是读取面内部字段，漏进 payload 会多出冻结形状外的键。 */
 async function latestCheckpointSafe(
   stateRoot: string,
   agentKey: string,
@@ -527,11 +530,69 @@ async function latestCheckpointSafe(
   warnings: string[],
 ): Promise<HandoffCheckpoint | null> {
   try {
-    return await latestCheckpoint(stateRoot, agentKey, now);
+    const latest = await latestCheckpoint(stateRoot, agentKey, now);
+    return latest === null ? null : { path: latest.path, createdAt: latest.createdAt, ageMin: latest.ageMin, bytes: latest.bytes };
   } catch (error) {
     warnings.push(`checkpoint lookup failed for ${JSON.stringify(agentKey)}: ${error instanceof Error ? error.message : String(error)}`);
     return null;
   }
+}
+
+/** 连续性指针最多点几个不在场成员（建议行长度有界；其余只计数）。 */
+const HANDOFF_CONTINUITY_HOLDERS_MAX = 3;
+
+/** 一位「不在场但持有状态」的花名册成员（连续性指针的一行）。 */
+interface AbsentStateHolder {
+  key: string;
+  openTasks: number;
+  unread: number;
+  hasCheckpoint: boolean;
+}
+
+/**
+ * v0.8.1（29 红队 C2-B3 修复）：找出「会话已不在场、却持有开放任务/未读/检查点」的
+ * 花名册成员（≠ 调用方）。默认 self 接手包三要素全空时，这些正是「本会话可能在延续
+ * 的前任」——数据仍可经成员视角寻址，但默认面必须给指针，不得静默白纸。
+ *
+ * 活性判据 = **只读** peer 扫描（`sweep:false`——死记录是 C8 离线判据的进程死硬证据，
+ * 查询不得惰性清扫）：成员的 roster sessionId 或其花名都不在活记录里 = 不在场。
+ * peer 根取不到/扫描失败按「无法判定」处理（保守方向：仍披露，不静默）。
+ */
+async function absentStateHolders(
+  deps: ToolDeps,
+  team: TeamState,
+  meKey: string,
+  now: number,
+): Promise<AbsentStateHolder[]> {
+  let liveSids: Set<string> | null = null;
+  let liveNames: Set<string> | null = null;
+  try {
+    const scan = await scanPeers(peerRootFromEnv(deps.env), now, { sweep: false });
+    liveSids = new Set(scan.active.map((r) => r.sessionId));
+    liveNames = new Set(scan.active.map((r) => r.name).filter((n): n is string => typeof n === "string"));
+  } catch {
+    liveSids = null; // 无法判定活性 → 下面按「不在场」处理（保守披露）
+    liveNames = null;
+  }
+  const holders: AbsentStateHolder[] = [];
+  for (const m of team.members) {
+    if (m.key === meKey) continue;
+    const openTasks = memberOpenTasks(team.tasks, m.key).length;
+    const box = await readMailbox(deps.stateRoot, team.teamId, m.key);
+    const unread = countUnread(
+      team,
+      box.filter((msg) => msg.readAt === undefined && msg.discardedAt === undefined),
+    );
+    const hasCheckpoint = (await latestCheckpointSafe(deps.stateRoot, m.key, now, [])) !== null;
+    if (openTasks === 0 && unread === 0 && !hasCheckpoint) continue; // 无状态可继承
+    const present = liveSids !== null
+      && (liveSids.has(m.sessionId) || (liveNames !== null && liveNames.has(m.key)));
+    if (present) continue; // 会话还在场——它的活它自己干，不需要指针
+    holders.push({ key: m.key, openTasks, unread, hasCheckpoint });
+  }
+  // 确定性排序：开放任务多者优先，其次未读，最后花名（跨调用稳定）。
+  holders.sort((a, b) => b.openTasks - a.openTasks || b.unread - a.unread || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+  return holders;
 }
 
 /**
@@ -565,13 +626,24 @@ async function readHandoffScope(deps: ToolDeps, args: ReadArgs, connectionKey: s
   const warnings: string[] = [];
 
   // 1. 身份（三视角都是调用方自己；受领人信息在 tasks[].assignee）
+  // v0.8.1（M02 修复）：memberState 走 teamstate 的 W2 访问器（m.state ?? 'ready'，
+  // DESIGN-V0.2 §6.5）——identify 入册的成员记录本就不落 state 字段，旧实现直接
+  // 取 member?.state ?? null，使 identity 章对**在册**成员恒报 (not on roster)/
+  // memberState:null，与 team.json / status / identify roster / checkpoint 身份章
+  // （同一成员同时刻报 state: ready）四面真源相反。判据改为花名册成员身份：
+  // 在册 → 访问器给出的生命周期态（缺省 ready）；不在册 → null（如实 not on roster）。
   const member = team.members.find((m) => m.key === me.agentKey);
   const identity = {
     agentKey: me.agentKey,
     teamId: team.teamId,
-    leadKey: team.leadKey ?? null,
+    // v0.8.1（29 红队 M05 修复）：lead 渲染跨面同源——team.leadKey 缺省时 founder
+    // 读作 lead（core/teamstate.ts leadKeyOf；types.ts 的 TeamState.leadKey 注释与
+    // DESIGN-V0.2 §6.1 公开口径）。此前直读 team.leadKey ?? null：无显式 lead 时
+    // handoff 渲染 `lead: (none)` 而 status/team 视图展示 founder（leadKey=bob），
+    // 且同一 payload 的 isLead 又按 founder 兜底算成 true——自相矛盾。
+    leadKey: leadKeyOf(team) ?? null,
     role: member?.role ?? null,
-    memberState: member?.state ?? null,
+    memberState: member === undefined ? null : memberState(member),
     isLead: me.agentKey === leadKeyOf(team),
   };
 
@@ -649,6 +721,41 @@ async function readHandoffScope(deps: ToolDeps, args: ReadArgs, connectionKey: s
     ? null
     : (memberOpenTasks(team.tasks, me.agentKey)[0]?.id ?? null);
 
+  // v0.8.1（29 红队 C2-B3 修复）：**连续性指针**——默认 self 包三要素全空
+  // （无我的任务/无未读/无检查点）而花名册里有成员的会话已不在场、却持有这三类
+  // 状态时，旧实现给一张静默的白纸（`（暂无：按 journal 指针继续）`）：按 README
+  // 恢复路径「新花名 identify 接手」落地的会话，接手包对其旧身份的任务/未读/
+  // 检查点零提示（数据仍可经成员视角寻址，但默认面不指路）。此处补一条置顶
+  // 建议（文本面可见）+ payload warning。活性判据用只读 peer 扫描（不惰性清扫
+  // ——死记录是 C8 离线判据的进程死证据）；取不到 peer 根时按「无法判定活性」
+  // 处理（保守方向：照常披露，不静默）。
+  let continuityHint: string | undefined;
+  if (
+    filter.kind === "self"
+    && tasks.length === 0
+    && unread.count === 0
+    && checkpoint === null
+  ) {
+    const holders = await absentStateHolders(deps, team, me.agentKey, now);
+    if (holders.length > 0) {
+      const shown = holders.slice(0, HANDOFF_CONTINUITY_HOLDERS_MAX);
+      const more = holders.length - shown.length;
+      const detail = shown
+        .map((h) => `${h.key}（${h.openTasks} 开放任务/${h.unread} 未读/${h.hasCheckpoint ? "有检查点" : "无检查点"}）`)
+        .join("、");
+      continuityHint =
+        `continuity: 你的接手包为空，但花名册有不在场成员持有状态：${detail}`
+        + (more > 0 ? ` 等 ${holders.length} 人` : "")
+        + `——若本会话是其中某位的延续，先 xc_read({scope:"handoff", id:"<该成员名>"}) 寻回其任务/未读/检查点`
+        + `（其开放任务可按 xc_overview 板面建议重派或等 stale 清扫回池后再 claim；花名册清理由 lead xc_team member-stop）`;
+      warnings.push(
+        `handoff self packet is empty while absent roster member(s) hold state: ${detail}`
+        + (more > 0 ? ` (+${more} more)` : "")
+        + " — read the member view xc_read({scope:\"handoff\", id:\"<member>\"}) for continuity",
+      );
+    }
+  }
+
   const assembled = assembleHandoff({
     now,
     filter,
@@ -661,6 +768,7 @@ async function readHandoffScope(deps: ToolDeps, args: ReadArgs, connectionKey: s
     checkpoint,
     stalled,
     myOpenTaskId,
+    ...(continuityHint !== undefined ? { continuityHint } : {}),
     ...(warnings.length > 0 ? { warnings } : {}),
   });
   return okResult(assembled.text, assembled.payload);
