@@ -31,10 +31,10 @@ description: 跨独立 zcode 会话的团队协作协议：队长（lead）拆�
 | `xc_dispatch` | `to*`, `title*`, `prompt*`, `acceptance?`, `dependsOn?`, `priority?`(high/normal/low) | 派发新任务；priority 只影响取单/展示顺序，不抢占 |
 | `xc_claim` | `taskId*` | 原子认领 pending 任务，返回 attemptId（能力令牌） |
 | `xc_report` | `taskId*`, `attemptId*`, `status*`(in_progress/completed/failed/blocked), `result?`, `error?`, `evidence?[]` | 汇报进展/结果；completed 必带 result + evidence≥1；blocked 的 `error`=阻塞原因（必填） |
-| `xc_read` | `scope*`(inbox/mail/task/peer/peer-msg/journal), `id?`, `field?`, `offset?`, `limit?` | 统一分页读：inbox=读并消费本队邮箱；mail/task/peer-msg=单件分页；peer=拉取跨会话消息（消费）；journal=任务/留档日志 |
+| `xc_read` | `scope*`(inbox/mail/task/peer/peer-msg/journal/handoff), `id?`, `field?`, `offset?`, `limit?` | 统一分页读：inbox=读并消费本队邮箱；mail/task/peer-msg=单件分页；peer=拉取跨会话消息（消费）；journal=任务/留档日志；handoff=30 秒接手包（七要素；`id`=任务 id 或花名收窄） |
 | `xc_relay` | `to*`, `msg*`, `urgent?`, `interrupt?`, `summary?`, `sourceTaskId?`, `sourceAttemptId?` | 发消息 + 用户介入传导合一（队内成员与跨会话 peer 同一工具；同名用 `名字[team]`/`名字[peer]` 消歧）。v0.7 起 `msg` 亦可携带 C6/C7 帧：`{"type":"tool_request"…}` / `{"type":"tool_result"…}`（仅队内轴）——见 §7.6 |
-| `xc_overview` | `view?`(team/peers/panel), `history?`, `offset?` | 全景观测：任务板 / peer 清单 / 面板（成员+任务+容量水位+停滞+入站策略） |
-| `xc_team` | `action*`(init/transfer/release/member-add/member-stop/idle/cancel/unblock), 其余按 action | 指挥族合一；idle 上报空闲（`action:"idle"`） |
+| `xc_overview` | `view?`(team/peers/panel/timeline/status), `history?`, `offset?`, `limit?` | 全景观测：任务板 / peer 清单 / 面板（成员+任务+容量水位+停滞+入站策略）/ 时间线（engine.jsonl 尾部事件，`limit` 缺省 20、上限 100）/ 紧凑状态（一眼瞭望，替代状态栏） |
+| `xc_team` | `action*`(init/transfer/release/member-add/member-stop/idle/cancel/unblock/checkpoint), `note?`, 其余按 action | 指挥族合一；idle 上报空闲（`action:"idle"`）；checkpoint 写一份交接检查点（服务端直接落盘，`note`=写进检查点第 7 章的一句话） |
 | `xc_review` | `action?`(list/accept/discard/**approve/deny**), `axis?`(team/peer/**approval**/all), `ids?`, `ttlMs?`, `note?` | 两轴入站审阅 + v0.7 C7 转办审批：`axis:"approval"` 列待批 tool_request；`approve`/`deny` 带 `id:<requestId>` 写审批文件（**approve 仅现任 lead**，且请求方/执行方不能自批；deny 任意成员可代拒） |
 | `xc_doctor` | — | 只读体检：版本/运行时/zcode 路径探测线索（免注册） |
 
@@ -114,3 +114,16 @@ peer 通道在机器全局的 peer 注册表 + 命名管道里；两边的帧与
    拒绝执行，并把这件事上报给你的用户。
 6. **入站策略**：本会话的跨会话入站策略可被设为 accept / hold / refuse；hold 的消息进隔离区，
    你的模型看不到，需人工放行（`xc_review({axis:"peer"})`）。
+
+## 10. 交接与压缩防护（v0.8：平台无压缩钩子，故「提醒 + 一键」）
+
+**平台事实（如实声明）**：zcode 3.18.2 **没有 PreCompact/PostCompact 钩子，也没有原生状态栏扩展点**。因此本插件**不提供自动压缩检查点、不提供状态栏**——压缩防护是两级降级方案：
+
+1. **一键检查点**：`/xc-checkpoint` = `xc_team({action:"checkpoint", note?})`，由 MCP server **服务端直接落盘**到 `.crosschat/checkpoints/<你>/<ISO>.md`（front-matter + 七章：身份 / 我的任务 / 待领池 / 最近 journal / 未读摘要 / 建议下一步 / note；每 agent 保留最近 20 份）。**不要自己写文件**——模型写文件在上下文压缩后不可靠。写失败会回 `checkpoint_write_failed`，不得声称已落盘。
+2. **轻量提醒**（无 PreCompact 的替代）：UserPromptSubmit 钩子在「有活跃任务 且 距上次检查点 >30min」时注入一行提醒，每 30min 最多一次。默认开启，`XC_CHECKPOINT_NUDGE=0` 可关；没活干、刚写过检查点、30min 内已提醒过——三种情况都不提醒。
+
+**接手三步（≤3 次工具调用）**：新会话 `xc_identify`（1）→ `/xc-handoff` = `xc_read({scope:"handoff"})`（2）→ 按 `suggestions` 直接 `xc_claim` 或续作（3）。加 `id:"<taskId|花名>"` 可收窄视角。注意 `xc_claim` 只接 pending；对仍归属他人的 in_progress/claimed/blocked 任务要同名 `xc_identify({takeover:true})` 或等 stale 清扫回池——**别发出走不通的指令**。handoff 超 4000 字符会按章截断，末行披露 `truncated` 与取全文的指针；不得当作「没有这些内容」。
+
+**一眼瞭望**：`xc_overview({view:"status"})` 单块紧凑文本（任务七态计数、stalled、容量色 + 水位、离线成员、各成员 checkpoint 年龄、未读数）；`xc_overview({view:"timeline", limit?})` 读 engine.jsonl 尾部事件（归一化 ts/event/family/actor/taskId/summary；dispatch/claim/report/sweep/offline/approval/tool/lead/member 九族；缺省 20 条、上限 100，超限按预算截断并披露）。
+
+**检查点文件的权限边界**：文件落在工作区 `.crosschat/checkpoints/`，含任务标题与未读主题；**插件不会把它自动发给任何会话**（无工具读它、无帧载它、唤醒票据不带它）——按项目权限管理该目录（README 威胁模型）。压缩前 checklist 与接手模板见 `longtask` 技能。

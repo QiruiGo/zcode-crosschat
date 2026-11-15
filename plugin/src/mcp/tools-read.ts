@@ -10,6 +10,8 @@
  * | peer      | 消费   | 跨会话队列排空；count=本次真实呈现数；urgent 优先 |
  * | peer-msg  | 只读   | 跨会话单件分页 |
  * | journal   | （新，C4）       | 只读   | id=<taskId> → tasks/<taskId>/journal.md；id="archive:<name>" → archive/<name>/journal.md |
+ * | handoff   | （新，v0.8.0 A2） | 只读   | 30 秒接手包（七要素：身份/我的任务/待领池/未读/容量/最近检查点/建议下一步）；
+ *            文本 + JSON 双层，4000 字符预算按章截断并披露；id=<taskId|花名> 收窄视角 |
  *
  * core 层方法名保留 v0.5.3 内部形态（旧测试直接驱动，非 MCP 工具名，不在 v0.7
  * 旧名移除范围）；v0.6 变化仅两处：邮箱哈希链校验砍除（§2.2 行 1）与 inbox
@@ -23,7 +25,23 @@ import { renderInbox } from "./render.js";
 import { identityStore } from "./identity.js";
 import { withTeamLock } from "../core/lock.js";
 import { sanitizeKey } from "../core/sanitize.js";
-import { getTask, readTeam } from "../core/teamstate.js";
+import { getTask, leadKeyOf, memberOpenTasks, readTeam, sortTasksForBoard, unsatisfiedDependencies } from "../core/teamstate.js";
+import { lastProgressTs, stallThresholdMs, stalledTasks } from "../core/stall.js";
+import { staleThresholdMsFromEnv } from "./task-edges.js";
+import { capacityCacheFile, judgeCapacity, sampleCapacity } from "../core/capacity.js";
+import { capacityViewOf, latestCheckpoint } from "../core/checkpoint.js";
+import {
+  assembleHandoff,
+  handoffIdCandidates,
+  handoffUnreadView,
+  resolveHandoffFilter,
+  selectHandoffTasks,
+  HANDOFF_POOL_MAX,
+  type HandoffCapacity,
+  type HandoffCheckpoint,
+  type HandoffPoolItem,
+  type HandoffTask,
+} from "../core/handoff.js";
 import {
   acknowledgeMailbox,
   classifyFrame,
@@ -68,16 +86,16 @@ import { runCore } from "./core.js";
 // ---------------------------------------------------------------------------
 
 export const ReadShape = {
-  scope: z.enum(["inbox", "mail", "task", "peer", "peer-msg", "journal"])
-    .describe("inbox=读并消费本队邮箱；mail=邮箱历史单件分页；task=任务字段分页；peer=拉取跨会话消息（消费）；peer-msg=跨会话单件分页；journal=任务/留档日志"),
-  id: z.string().optional().describe("mail/peer-msg=消息 id；task=任务 id；journal=任务 id 或 \"archive:<成员名>\""),
+  scope: z.enum(["inbox", "mail", "task", "peer", "peer-msg", "journal", "handoff"])
+    .describe("inbox=读并消费本队邮箱；mail=邮箱历史单件分页；task=任务字段分页；peer=拉取跨会话消息（消费）；peer-msg=跨会话单件分页；journal=任务/留档日志；handoff=30 秒接手包（七要素，id 可收窄为任务 id 或花名）"),
+  id: z.string().optional().describe("mail/peer-msg=消息 id；task=任务 id；journal=任务 id 或 \"archive:<成员名>\"；handoff=任务 id 或花名（缺省=我自己的接手包）"),
   field: z.enum(["result", "error", "prompt", "acceptance"]).optional().describe("仅 scope=task：要分页读的字段"),
   offset: z.number().int().min(0).optional().describe("起始偏移/条"),
   limit: z.number().int().min(1).optional().describe("本次返回上限（字符或条，随 scope）"),
 } as const;
 
 export type ReadArgs = {
-  scope: "inbox" | "mail" | "task" | "peer" | "peer-msg" | "journal";
+  scope: "inbox" | "mail" | "task" | "peer" | "peer-msg" | "journal" | "handoff";
   id?: string;
   field?: "result" | "error" | "prompt" | "acceptance";
   offset?: number;
@@ -405,6 +423,8 @@ export async function handleRead(deps: ToolDeps, args: ReadArgs, connectionKey: 
       return readPeerMsgScope(deps, args, connectionKey);
     case "journal":
       return readJournalScope(deps, args);
+    case "handoff":
+      return readHandoffScope(deps, args, connectionKey);
   }
 }
 
@@ -495,6 +515,158 @@ async function readJournalScope(deps: ToolDeps, args: ReadArgs): Promise<ToolRes
   );
 }
 
+// ---------------------------------------------------------------------------
+// scope=handoff（v0.8.0 A2）：30 秒接手包（DESIGN-V0.8.md §4）
+// ---------------------------------------------------------------------------
+
+/** latestCheckpoint 的安全包装：段闸抛错（agentKey 清洗后仍不安全）按「无检查点」降级 + 披露。 */
+async function latestCheckpointSafe(
+  stateRoot: string,
+  agentKey: string,
+  now: number,
+  warnings: string[],
+): Promise<HandoffCheckpoint | null> {
+  try {
+    return await latestCheckpoint(stateRoot, agentKey, now);
+  } catch (error) {
+    warnings.push(`checkpoint lookup failed for ${JSON.stringify(agentKey)}: ${error instanceof Error ? error.message : String(error)}`);
+    return null;
+  }
+}
+
+/**
+ * scope:"handoff"：七要素接手包（身份/我的任务/待领池/未读/容量/最近检查点/建议下一步），
+ * 文本 + JSON 双层，4000 字符预算按章截断并披露（core/handoff.ts 纯函数组装）。
+ *
+ * id 三视角（§4.1 冻结表，resolveHandoffFilter 解析）：
+ * - 缺省 self：我的开放任务 + 我的箱未读 + 我的检查点目录；
+ * - id=<taskId>：仅该任务一条（不限 assignee/状态，供复盘）+ 我的箱里该任务的件 +
+ *   该任务受领人的检查点目录；
+ * - id=<花名>：该成员的开放任务 + 该成员箱的未读**计数**（主题不跨成员披露，§4.4）+
+ *   该成员的检查点目录（花名清洗后与原文不同 → null + warnings，不猜路径）。
+ */
+async function readHandoffScope(deps: ToolDeps, args: ReadArgs, connectionKey: string): Promise<ToolResult> {
+  // 与 core 层方法同纪律：整面包 runCore——not_registered / no_team / invalid_params
+  // 都映射为结构化错误信封（而非裸抛），审计降级告警同链路内联。
+  return runCore(deps.stateRoot, async () => {
+    const me = identityStore.require(connectionKey);
+  const now = Date.now();
+  const team = await readTeam(deps.stateRoot, me.teamId);
+  if (team === undefined) throw new ToolError({ error: "no_team", message: "no team on disk yet" });
+  const filter = resolveHandoffFilter(args.id, team);
+  if (filter === undefined) {
+    const candidates = handoffIdCandidates(team);
+    throw invalidParamsError(
+      `handoff id ${JSON.stringify(args.id)} matches no task id and no member key; `
+      + `valid forms: a task id or a member key `
+      + `(task ids: ${candidates.taskIds.join(", ") || "(none)"}; member keys: ${candidates.memberKeys.join(", ") || "(none)"})`,
+    );
+  }
+  const warnings: string[] = [];
+
+  // 1. 身份（三视角都是调用方自己；受领人信息在 tasks[].assignee）
+  const member = team.members.find((m) => m.key === me.agentKey);
+  const identity = {
+    agentKey: me.agentKey,
+    teamId: team.teamId,
+    leadKey: team.leadKey ?? null,
+    role: member?.role ?? null,
+    memberState: member?.state ?? null,
+    isLead: me.agentKey === leadKeyOf(team),
+  };
+
+  // 2. 任务（视角内；unmetDependsOn/to 为 input-only，不进 payload）
+  const selected = selectHandoffTasks(filter, team, me.agentKey);
+  const tasks: HandoffTask[] = selected.map((t) => ({
+    taskId: t.id,
+    title: t.title,
+    status: t.status,
+    attempt: t.attempt,
+    assignee: t.assignee,
+    lastProgressTs: lastProgressTs(t),
+    ...(t.blockedReason !== undefined ? { blockedReason: t.blockedReason } : {}),
+    unmetDependsOn: unsatisfiedDependencies(team.tasks, t.dependsOn),
+    ...(t.to !== undefined ? { to: t.to } : {}),
+  }));
+
+  // 3. 待领池（pending ∧ sortTasksForBoard 前 10；三视角同源——接手决策需要备选池）
+  const pendingAll = team.tasks.filter((t) => t.status === "pending");
+  const pool: HandoffPoolItem[] = sortTasksForBoard(pendingAll)
+    .slice(0, HANDOFF_POOL_MAX)
+    .map((t) => ({
+      taskId: t.id,
+      title: t.title,
+      priority: t.priority,
+      dependsOn: t.dependsOn,
+      unmetDependsOn: unsatisfiedDependencies(team.tasks, t.dependsOn),
+      ...(t.to !== undefined ? { to: t.to } : {}),
+    }));
+
+  // 4. 未读（分视角；freshness 裁决与 overview 板面同口径：未读 ∧ 未丢弃 ∧ isCurrentMail）
+  const unreadBoxKey = filter.kind === "member" ? sanitizeKey(filter.id) : me.agentKey;
+  const boxMessages = await readMailbox(deps.stateRoot, me.teamId, unreadBoxKey);
+  const current = boxMessages.filter(
+    (m) => m.readAt === undefined && m.discardedAt === undefined && isCurrentMail(team, m),
+  );
+  const unread = handoffUnreadView(filter, current);
+
+  // 5. 容量（C9 采样/判定原样复用；level 由 core/checkpoint.ts 推导助手产出——三视图同口径）
+  let capacity: HandoffCapacity | null = null;
+  try {
+    const sample = await sampleCapacity(deps.env, capacityCacheFile(deps.stateRoot), now);
+    const view = capacityViewOf(sample, judgeCapacity(sample, deps.env));
+    capacity = view === null ? null : { ...view, sampledAt: sample.sampledAt };
+  } catch {
+    capacity = null;
+  }
+  if (capacity === null) {
+    warnings.push(
+      "capacity sampling failed — capacity reported as null (not GREEN; xc_overview view:status 同口径记 UNKNOWN)",
+    );
+  }
+
+  // 6. 最近检查点（视角内目标目录最新一份 *.md 的 stat）
+  let checkpoint: HandoffCheckpoint | null = null;
+  if (filter.kind === "member") {
+    const cleaned = sanitizeKey(filter.id);
+    if (cleaned !== filter.id) {
+      warnings.push(
+        `member id ${JSON.stringify(filter.id)} sanitizes to ${JSON.stringify(cleaned)} — checkpoint lookup refused (path drift; 不猜路径)`,
+      );
+    } else {
+      checkpoint = await latestCheckpointSafe(deps.stateRoot, cleaned, now, warnings);
+    }
+  } else if (filter.kind === "task") {
+    const assignee = tasks[0]?.assignee ?? null;
+    checkpoint = assignee === null ? null : await latestCheckpointSafe(deps.stateRoot, assignee, now, warnings);
+  } else {
+    checkpoint = await latestCheckpointSafe(deps.stateRoot, me.agentKey, now, warnings);
+  }
+
+  // 7. 建议下一步的数据面：视角内任务按 C5 停滞阈值算旗标 + 我的在途任务（单在途规则提示）
+  const stalled = stalledTasks(selected, now, stallThresholdMs(deps.env, staleThresholdMsFromEnv(deps.env)).ms);
+  const myOpenTaskId = filter.kind === "member"
+    ? null
+    : (memberOpenTasks(team.tasks, me.agentKey)[0]?.id ?? null);
+
+  const assembled = assembleHandoff({
+    now,
+    filter,
+    identity,
+    tasks,
+    pool,
+    poolTotal: pendingAll.length,
+    unread,
+    capacity,
+    checkpoint,
+    stalled,
+    myOpenTaskId,
+    ...(warnings.length > 0 ? { warnings } : {}),
+  });
+  return okResult(assembled.text, assembled.payload);
+  });
+}
+
 // 局部助手（与旧 peer-tools 面等价的最小形态）。
 function renderPeerEnvelopeText(item: Parameters<typeof renderPeerEnvelope>[0]): string {
   return renderPeerEnvelope(item);
@@ -526,11 +698,12 @@ export function registerReadTools(
   registry: PrimaryRegistry,
 ): void {
   const description =
-    "Unified paged reader (scopes: inbox/mail/task/peer/peer-msg/journal). " +
+    "Unified paged reader (scopes: inbox/mail/task/peer/peer-msg/journal/handoff). " +
     "scope=inbox reads and consumes your team mailbox (urgent messages first, budgeted batches, leftover stays unread); " +
     "scope=mail pages one mailbox history item; scope=task pages one team.json task field (field defaults to result); " +
     "scope=peer drains cross-session messages (count = what this response actually presents; leftover stays queued and remaining tells you to poll again); scope=peer-msg pages one cross-session item; " +
-    'scope=journal reads a task journal (.crosschat/tasks/<id>/journal.md) or a member handover archive (id="archive:<name>").';
+    'scope=journal reads a task journal (.crosschat/tasks/<id>/journal.md) or a member handover archive (id="archive:<name>"); ' +
+    "scope=handoff returns the 30-second handoff packet (identity / my tasks / pending pool / unread digest / capacity / latest checkpoint / next-step suggestions, text + JSON, 4000-char budget with per-section truncation disclosure; id narrows the view to one task id or member key, omitted = your own packet).";
   const handler = async (args: Record<string, unknown>, extra: unknown): Promise<ToolResult> =>
     handleRead(deps, args as unknown as ReadArgs, connectionKeyOf(extra));
   server.tool("xc_read", description, ReadShape, handler);

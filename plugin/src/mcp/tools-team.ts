@@ -17,6 +17,11 @@
  *
  * 身份/并发纪律与 tools.ts 完全一致（identityStore.require(connectionKey)；
  * attemptWake 只在团队锁外）。
+ *
+ * v0.8.0（A1，DESIGN-V0.8.md §3）增量：`checkpoint` action——服务端直接落盘 7 章
+ * 交接检查点到 `.crosschat/checkpoints/<me>/<ISO>.md`（core/checkpoint.ts；每 agent
+ * 保留最近 20 份）。平台无 PreCompact 钩子，这是一键落盘的补偿入口；**无 lead 闸**
+ * （每人只写自己的目录），读路径无锁，不碰 team.json/邮箱/锁/任务状态机。
  */
 
 import { randomUUID } from "node:crypto";
@@ -26,11 +31,23 @@ import { attemptWake } from "../engine/wake.js";
 import { bootstrapTimeoutFromEnv, provisionMember, ProvisionError } from "../engine/provision.js";
 import { LockBusyError, withRegistryThenTeamLocks, withTeamLock } from "../core/lock.js";
 import { logEngineEvent } from "../core/log.js";
-import { appendMailbox, createMessage, readMailbox, readUnreadMailbox } from "../core/mailbox.js";
+import { appendMailbox, createMessage, readMailbox, readUnreadMailbox, urgentFirst } from "../core/mailbox.js";
 import { bindName, readSession, writeSession } from "../core/registry.js";
 import { sanitizeKey, validateMemberName } from "../core/sanitize.js";
-import { getTask, leadKeyOf, memberOpenTasks, newTeamState, readTeam, transitionTask, unblockTask, writeTeam, provisionStaleAfterMs, sweepStaleProvisioningLocked } from "../core/teamstate.js";
+import { getTask, leadKeyOf, memberOpenTasks, newTeamState, readTeam, sortTasksForBoard, transitionTask, unblockTask, writeTeam, provisionStaleAfterMs, sweepStaleProvisioningLocked } from "../core/teamstate.js";
 import { taskJournalPath, writeArchive } from "../core/archive.js";
+// v0.8.0（A1，DESIGN-V0.8.md §3）：checkpoint 服务端落盘 + 容量水位推导（与 handoff/status 共用同一助手）。
+import {
+  capacityViewOf,
+  checkpointStamp,
+  checkpointUnreadRef,
+  writeCheckpoint,
+  type CapacityView,
+  type CheckpointWriteResult,
+} from "../core/checkpoint.js";
+import { checkpointFile } from "../core/paths.js";
+import { capacityCacheFile, judgeCapacity, sampleCapacity } from "../core/capacity.js";
+import { stallThresholdMs } from "../core/stall.js";
 import {
   DEFAULT_TEAM_ID,
   MAX_LEAD_HISTORY,
@@ -38,9 +55,9 @@ import {
   TERMINAL_TASK_STATUSES,
   memberState,
 } from "../core/types.js";
-import type { LeadHistoryEntry, MemberState, TeamMember, TeamState } from "../core/types.js";
+import type { LeadHistoryEntry, MemberState, TeamMember, TeamMessage, TeamState } from "../core/types.js";
 import { revokeAttempt } from "../core/graph.js";
-import { cascadeDependencyDeadlockLocked } from "./task-edges.js";
+import { cascadeDependencyDeadlockLocked, staleThresholdMsFromEnv } from "./task-edges.js";
 import { errorResult, invalidParamsError, mapToolError, okResult, ToolError, type ToolResult } from "./protocol.js";
 import { identityStore, type BoundIdentity } from "./identity.js";
 import type { ToolDeps } from "./core.js";
@@ -71,13 +88,13 @@ export function blocksWake(provisionState: MemberState): boolean {
 export const IDLE_REASONS = ["no-claimable-task", "inbox-empty", "blocked-only"] as const;
 
 export const TeamShape = {
-  action: z.enum(["init", "transfer", "release", "member-add", "member-stop", "idle", "cancel", "unblock"]),
+  action: z.enum(["init", "transfer", "release", "member-add", "member-stop", "idle", "cancel", "unblock", "checkpoint"]),
   takeover: z.boolean().optional().describe("仅 action=init：接管现任 lead（用户明确指令时；R-1/F-4）"),
   to: z.string().min(1).optional().describe("action=transfer：移交目标"),
   name: z.string().min(1).optional().describe("action=member-add/member-stop：成员名"),
   model: z.string().optional().describe("action=member-add：模型 id"),
   reasoningLevel: z.string().optional().describe("action=member-add：推理档位"),
-  note: z.string().optional().describe("action=member-add：备注（仅审计）"),
+  note: z.string().optional().describe("action=member-add：备注（仅审计）；action=checkpoint：写进检查点第 7 章的一句话"),
   contextChars: z.number().int().positive().optional().describe("action=member-add：该成员上下文字符数声明（预算刻度，R-18；缺省 XC_CONTEXT_CHARS/200k）"),
   reason: z.string().optional().describe("action=transfer/member-stop：原因（入审计）"),
   taskId: z.string().min(1).optional().describe("action=cancel/unblock：任务 id"),
@@ -1256,7 +1273,7 @@ export function createLeadToolCore(deps: ToolDepsLike): LeadToolCore {
 
 /** xc_team 的 action 载荷（按 action 收窄；未用字段忽略）。 */
 export type TeamActionArgs = {
-  action: "init" | "transfer" | "release" | "member-add" | "member-stop" | "idle" | "cancel" | "unblock";
+  action: "init" | "transfer" | "release" | "member-add" | "member-stop" | "idle" | "cancel" | "unblock" | "checkpoint";
   takeover?: boolean;
   to?: string;
   name?: string;
@@ -1275,6 +1292,132 @@ export type TeamActionArgs = {
   archive?: boolean;
   unblockNote?: string;
 };
+
+/**
+ * v0.8.0（A1，DESIGN-V0.8.md §3）：`xc_team({action:"checkpoint", note?})`——服务端
+ * 直接落盘 7 章检查点（front-matter + 身份/我的任务/待领池/journal/未读/建议下一步/note）。
+ *
+ * 权限：`identityStore.require`（未注册连接拒，与所有成员动作一致）；**不设 lead 闸**——
+ * 每个成员只能写自己的 `<root>/checkpoints/<自己>/` 目录，没有越权面。
+ * 前置：team.json 不存在 → `no_team`（tools-read.ts 同族）；成员不在花名册 → 仍可写，
+ * 「身份」章如实记 `(not on roster)`（不阻断——检查点的价值是落盘）。
+ * 副作用面：**只写 `checkpoints/<me>/`**——不写 team.json、不进邮箱、不唤醒、不碰锁、
+ * 不改任务状态机。读路径无锁（§2.7-5 纪律）。
+ * 容量采样失败 → payload `capacity: null` + front-matter `level: UNKNOWN`（不谎报水位）。
+ */
+export async function handleTeamCheckpoint(deps: ToolDeps, args: { note?: string }, connectionKey: string): Promise<ToolResult> {
+  return runTeamTool(async () => {
+    const me = identityStore.require(connectionKey);
+    const team = await readTeam(deps.stateRoot, me.teamId);
+    if (team === undefined) throw new ToolError({ error: "no_team", message: "no team on disk yet" });
+    const now = Date.now();
+    const member = team.members.find((m) => m.key === me.agentKey);
+    const openTasks = memberOpenTasks(team.tasks, me.agentKey);
+    const pool = sortTasksForBoard(team.tasks.filter((t) => t.status === "pending"));
+    // 未读读取失败 → 第 5 章如实记「（未读读取失败）」+ payload warnings[]（§3.6），
+    // 不让邮箱读取问题毁掉整份检查点。
+    const warnings: string[] = [];
+    let unreadMessages: TeamMessage[];
+    let unreadError: string | undefined;
+    try {
+      unreadMessages = urgentFirst(await readUnreadMailbox(deps.stateRoot, me.teamId, me.agentKey));
+    } catch (err) {
+      unreadMessages = [];
+      unreadError = err instanceof Error ? err.message : String(err);
+      warnings.push(`unread read failed: ${unreadError}`);
+    }
+    const unread = unreadMessages.map(checkpointUnreadRef);
+    // C3 容量采样（与 overview 同款惰性采样 + 判定；失败只降级为 UNKNOWN，不阻断写盘）。
+    let capacity: CapacityView | null = null;
+    try {
+      const sample = await sampleCapacity(deps.env, capacityCacheFile(deps.stateRoot), now);
+      capacity = capacityViewOf(sample, judgeCapacity(sample, deps.env));
+    } catch {
+      capacity = null;
+    }
+    const stallMs = stallThresholdMs(deps.env, staleThresholdMsFromEnv(deps.env)).ms;
+
+    let result: CheckpointWriteResult;
+    try {
+      result = await writeCheckpoint(deps.stateRoot, {
+        agentKey: me.agentKey,
+        teamId: me.teamId,
+        leadKey: team.leadKey ?? null,
+        member: member === undefined
+          ? null
+          : { role: member.role, state: memberState(member), sessionId: member.sessionId, lastSeen: member.lastSeen },
+        openTasks,
+        allTasks: team.tasks,
+        pool,
+        unread,
+        unreadTotal: unread.length,
+        ...(unreadError !== undefined ? { unreadError } : {}),
+        capacity,
+        stallThresholdMs: stallMs,
+        ...(args.note !== undefined ? { note: args.note } : {}),
+        now,
+      });
+    } catch (err) {
+      // 写盘失败不得假装成功（§3.6）：结构化错误 + 审计，payload 附 path 与首因错误。
+      const message = err instanceof Error ? err.message : String(err);
+      let path: string | undefined;
+      try {
+        path = checkpointFile(deps.stateRoot, me.agentKey, checkpointStamp(now));
+      } catch {
+        path = undefined; // 段闸拒绝（防御纵深）→ 不带 path
+      }
+      await logEngineEvent(deps.stateRoot, {
+        event: "checkpoint-write-failed",
+        teamId: me.teamId,
+        agentKey: me.agentKey,
+        ...(path !== undefined ? { path } : {}),
+        error: message,
+      });
+      throw new ToolError({
+        error: "checkpoint_write_failed",
+        message,
+        ...(path !== undefined ? { path } : {}),
+      });
+    }
+
+    await logEngineEvent(deps.stateRoot, {
+      event: "checkpoint",
+      teamId: me.teamId,
+      agentKey: me.agentKey,
+      path: result.path,
+      bytes: result.bytes,
+      openTasks: result.openTasks,
+      unread: result.unread,
+      pruned: result.pruned,
+    });
+    if (result.pruneError !== undefined) {
+      // 滚动删除失败不阻断已成功的写入：写盘事实保持成功，删除失败单独审计 + payload 披露。
+      await logEngineEvent(deps.stateRoot, {
+        event: "checkpoint-prune-failed",
+        teamId: me.teamId,
+        agentKey: me.agentKey,
+        path: result.path,
+        pruned: result.pruned,
+        pruneError: result.pruneError,
+      });
+    }
+    const level = result.capacity?.level ?? "UNKNOWN";
+    return okResult(
+      `Checkpoint written: ${result.path} (${result.bytes} bytes, ${result.openTasks} open task(s), ${result.unread} unread, capacity ${level}).`,
+      {
+        path: result.path,
+        createdAt: result.createdAt,
+        tasks: openTasks.map((t) => ({ taskId: t.id, status: t.status })),
+        unread: result.unread,
+        capacity: result.capacity,
+        bytes: result.bytes,
+        pruned: result.pruned,
+        ...(warnings.length > 0 ? { warnings } : {}),
+        ...(result.pruneError !== undefined ? { pruneError: result.pruneError } : {}),
+      },
+    );
+  });
+}
 
 /** unblock 权限闸：lead、任务创建者或该任务认领者（§1.2 T8 权限矩阵）。 */
 export async function handleTeamUnblock(deps: ToolDeps, args: { taskId: string; unblockNote?: string }, connectionKey: string): Promise<ToolResult> {
@@ -1426,6 +1569,8 @@ export async function handleTeam(deps: ToolDeps, args: TeamActionArgs, connectio
     case "unblock":
       if (args.taskId === undefined) throw new ToolError({ error: "invalid_params", message: "action=unblock requires \"taskId\"" });
       return handleTeamUnblock(deps, { taskId: args.taskId, ...(args.unblockNote !== undefined ? { unblockNote: args.unblockNote } : {}) }, connectionKey);
+    case "checkpoint":
+      return handleTeamCheckpoint(deps, { ...(args.note !== undefined ? { note: args.note } : {}) }, connectionKey);
   }
 }
 
@@ -1446,10 +1591,12 @@ export function registerTeamTools(
   registry: PrimaryRegistry,
 ): void {
   const description =
-    "Command family in one tool (actions: init/transfer/release/member-add/member-stop/idle/cancel/unblock). " +
+    "Command family in one tool (actions: init/transfer/release/member-add/member-stop/idle/cancel/unblock/checkpoint). " +
     "action=init becomes lead (takeover:true ONLY on explicit user instruction); transfer/release move/drop the metadata lead role; " +
     "member-add provisions an engine member (lead only); member-stop removes a member, requeues its open tasks with receipts and (default archive:true) writes .crosschat/archive/<name>/ first (C4); " +
-    "idle reports idleness to the lead; cancel cancels a task (lead or creator); unblock releases a blocked task back to its preBlocked status (lead/creator/claimant) with an unblock-notice to the claimant.";
+    "idle reports idleness to the lead; cancel cancels a task (lead or creator); unblock releases a blocked task back to its preBlocked status (lead/creator/claimant) with an unblock-notice to the claimant; " +
+    "checkpoint writes a 7-section handoff checkpoint to .crosschat/checkpoints/<you>/<ISO>.md server-side (keeps the newest 20 per member; note goes into section 7); " +
+    "there is no PreCompact hook on this platform, so use it before accepting compression or handing over.";
   const handler = async (args: Record<string, unknown>, extra: unknown): Promise<ToolResult> =>
     handleTeam(deps, args as unknown as TeamActionArgs, connectionKeyOf(extra));
   server.tool("xc_team", description, TeamShape, handler);

@@ -18,7 +18,7 @@
  * - 扫描器自检：故意植入的旧名在字符串/注释里必须被抓到、在代码标识符/正则里必须放过。
  */
 import { describe, expect, it, beforeAll, afterAll } from 'vitest';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -218,6 +218,16 @@ describe('M6 旧名移除：命令存根与死代码', () => {
     for (const cmd of ['xc-work', 'xc-dispatch', 'xc-inbox', 'xc-status', 'xc-team', 'xc-say']) {
       expect(existsSync(join(PLUGIN_ROOT, 'commands', `${cmd}.md`))).toBe(true);
     }
+  });
+
+  // v0.8.0（AC6「命令 8 个」）：把「命令面恰 8」从文档走查变成硬断言——
+  // v0.7 的 6 个 + v0.8 新增的 /xc-checkpoint、/xc-handoff；多一个存根/少一个都红。
+  it('命令面恰 8 个 .md（v0.8.0 起 6 → 8；不含已删存根）', () => {
+    const files = readdirSync(join(PLUGIN_ROOT, 'commands')).filter((f) => f.endsWith('.md')).sort();
+    expect(files).toEqual([
+      'xc-checkpoint.md', 'xc-dispatch.md', 'xc-handoff.md', 'xc-inbox.md',
+      'xc-say.md', 'xc-status.md', 'xc-team.md', 'xc-work.md',
+    ]);
   });
 
   it('guards.ts 死代码已删：模块无 registerSecurityTools / InboundReviewShape 导出', () => {

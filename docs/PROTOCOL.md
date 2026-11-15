@@ -1,4 +1,4 @@
-# PROTOCOL：zcode-crosschat 协议细则（v0.7.0）
+# PROTOCOL：zcode-crosschat 协议细则（v0.8.0）
 
 > 本文是协议细节的唯一下沉处（主 README 只作导航，不复制正文）。
 > 除特别注明外，路径与常量以 `plugin/src/core/paths.ts`、`peerdir.ts`、`budget.ts`、
@@ -23,6 +23,8 @@
 ├── toolrequests/<requestId>.json        ← v0.7 C6 转办台账（发送时建，状态机真源）
 ├── approvals/<requestId>.json           ← v0.7 C7 审批授权文件（用户/lead 落盘；授权锚点）
 ├── tasks/<taskId>/journal.md            ← 任务日志（成员用文件工具写；xc_read journal scope 读）
+├── checkpoints/<agentKey>/<ISO>.md      ← v0.8 交接检查点（xc_team action:"checkpoint" 服务端落盘；格式见 §14.1）
+├── checkpoints/<agentKey>/.nudge        ← v0.8 检查点提醒节流标记（钩子写；内容=上次提醒 ISO 时间，滚动删除不碰它）
 ├── archive/<name>/journal.md            ← 成员留档日志（C4；member-stop archive 时写）
 ├── archive/<name>/meta.json             ← 留档元数据
 ├── capacity/sample.json                 ← 内存采样缓存（惰性采样，无定时器）
@@ -224,7 +226,7 @@ total = clamp(16000 × scale, 4000, 64000)，且 total ≥ item  # 批次基准�
 | `XC_INJECT_TOTAL_CHARS` | `inject_total_chars` | 空 | 批次预算覆盖（0/非法=自动） |
 | `XC_USERVOICE_TTL_MS` | `uservoice_ttl_ms` | `600000`（10min） | 盖章链匹配窗口；每条原话 ≤3 次 |
 
-仅代码读取、无用户设置项的演练 env：`XC_STALL_MINUTES`（停滞阈值，缺省 120）、`XC_MEM_WARN_WATERMARK`（缺省 0.15）、`XC_MEM_SESSION_LIMIT_BYTES`（缺省 800MB）、`XC_TURN_ESTIMATE_BYTES`（并发 headless 回合单回合瞬时占用预估，缺省 1.5GB=1610612736 字节；>0 合法，非法/未设回落缺省——见 §5 预警规则 3）、`XC_MEM_SAMPLE_MIN_MS`（缺省 60000）、`XC_TOOL_REQUEST_TTL_MS`（v0.7 C6 转办请求缺省有效期，缺省 3600000=1h，硬上限 86400000=24h）、`XC_OFFLINE_MINUTES`（v0.7 C8 离线判定空闲阈值，缺省 240min；低于 `XC_STALE_TASK_MINUTES` 时按 stale 钳制并附 WARNING；v0.7.2 起 0/负数/非数字同样**不静默**——回落内置缺省 240min 并附 WARNING + payload `offlineThresholdFallback:true`，见 §12）。均为高级 env，不进插件设置面。
+仅代码读取、无用户设置项的演练 env：`XC_STALL_MINUTES`（停滞阈值，缺省 120）、`XC_MEM_WARN_WATERMARK`（缺省 0.15）、`XC_MEM_SESSION_LIMIT_BYTES`（缺省 800MB）、`XC_TURN_ESTIMATE_BYTES`（并发 headless 回合单回合瞬时占用预估，缺省 1.5GB=1610612736 字节；>0 合法，非法/未设回落缺省——见 §5 预警规则 3）、`XC_MEM_SAMPLE_MIN_MS`（缺省 60000）、`XC_TOOL_REQUEST_TTL_MS`（v0.7 C6 转办请求缺省有效期，缺省 3600000=1h，硬上限 86400000=24h）、`XC_OFFLINE_MINUTES`（v0.7 C8 离线判定空闲阈值，缺省 240min；低于 `XC_STALE_TASK_MINUTES` 时按 stale 钳制并附 WARNING；v0.7.2 起 0/负数/非数字同样**不静默**——回落内置缺省 240min 并附 WARNING + payload `offlineThresholdFallback:true`，见 §12）、`XC_CHECKPOINT_NUDGE`（v0.8 检查点提醒开关；**`0` = 关闭 UserPromptSubmit 的检查点提醒**，其余值/未设 = 默认开启。判据五态与 30min 阈值/节流见 §14.2；阈值本身不做 env 化）。均为高级 env，不进插件设置面。
 
 ## 10. 身份与安全底线（v0.6 口径）
 
@@ -437,3 +439,202 @@ crosschat 的 MCP server 是宿主外独立 stdio 进程，不持有其他 MCP �
   看到同一种显式失败，不再一个静默丢弃一个有回执（v0.7.0 及以前坏帧 0 字节回执，只能靠超时发现）。
 - 协议层（`onmessage`）抛错不归传输层：SDK Protocol 自己会给请求回错误帧，传输层不再重复回一条。
 - server 进程**永不**因任何帧级失败退出（v0.5.1 CONC-2 纪律不变）。
+
+## 14. 检查点、接手包与观测视图（v0.8）
+
+> **平台事实（本节的由来）**：zcode 3.18.2 **无 PreCompact/PostCompact 钩子、无原生状态栏扩展点**——
+> **无 PreCompact，故用「提醒 + 一键」**：不做自动压缩检查点、不能拦截压缩；压缩防护 = 「一键 `/xc-checkpoint` 服务端落盘 + UserPromptSubmit 轻量提醒」。
+> 状态栏同理：无原生扩展点，「一眼瞭望」降级为 `xc_overview({view:"status"})` 紧凑文本视图（不是 UI）。
+> 全部落在既有 10 工具面内——checkpoint → `xc_team` action；handoff → `xc_read` scope；timeline/status → `xc_overview` view；
+> **0 新增工具、0 新增必填配置**（新阈值走代码常量 + 仅 1 个可关 env `XC_CHECKPOINT_NUDGE`）。
+> 设计依据 [docs/DESIGN-V0.8.md](DESIGN-V0.8.md)；命令与技能口径见 README「工具与命令」与 `crosschat` / `longtask` 技能。
+
+### 14.1 检查点（checkpoint）
+
+API：`xc_team({ action: "checkpoint", note?: "<一句话>" })`——只复用既有入参键 `note`（无新键、无必填项）。
+权限：`identityStore.require`（未注册连接拒，与所有成员动作一致）；**不设 lead 闸**（每个成员只能写自己的目录，没有越权面）。
+前置：team.json 不存在 → `no_team`（与 §4 的读面同族）；成员不在花名册仍可写，「身份」章如实记 `state: (not on roster)`（检查点的价值是落盘，不阻断）。
+副作用面：**只写 `<root>/checkpoints/<me>/`**——不写 team.json、不进邮箱、不唤醒、不碰锁、不改任务状态机。
+
+路径：`.crosschat/checkpoints/<agentKey>/<ISO8601>.md`。stamp = ISO8601，`:` 与 `.` 折成 `-`（Windows 合法且字典序 = 时间序）；
+`<agentKey>` 一律先过 `sanitizeKey` 再过断言级复核（`core/archive.ts` `safeSegment` 同款防御纵深，新模块内自带一份，不修改 archive.ts）；
+调用方只许经路径构建器取路径，禁止自行 join。
+
+**滚动（冻结）**：每 agent 保留最近 **20** 份（`CHECKPOINT_KEEP_MAX = 20`，代码常量，无 env）——列该目录 `*.md`、按文件名升序
+（= 时间升序）、删除最旧的 `len-20` 个。`.nudge` 与非 `.md` 文件不在删除域；`archive/<name>/` 完全不受影响。
+删除失败**不阻断已成功的写入**：审计 `checkpoint-prune-failed`，payload 附 `pruned: 0` 与 `pruneError`（写盘成功这一事实不被删除失败抹掉）。
+
+**文件格式（冻结：front-matter + 7 章）**——单文件、UTF-8、以 `\n` 结尾（`archive.ts` 同款原子写纪律）：
+
+```md
+---
+agent: alice
+team: default
+lead: alice
+createdAt: 2026-11-15T18:00:00.000Z
+taskCounts: {claimed:2, in_progress:1, blocked:1}
+unread: 3
+capacity: {watermarkPct: 23.5, freeGb: 7.2, level: GREEN}
+---
+
+## 1. 身份
+## 2. 我的进行中任务（claimed / in_progress / blocked）
+## 3. 待领池（前 10，priority → createdAt）
+## 4. 最近 journal（每任务末 5 行 + 路径）
+## 5. 未读摘要（urgent 优先，最多 5 条）
+## 6. 建议下一步
+## 7. note
+```
+
+| 面 | 冻结规则 |
+|---|---|
+| front-matter | **7 个键固定且每行必现**：`agent` / `team` / `lead` / `createdAt` / `taskCounts` / `unread` / `capacity`；`taskCounts` 恒含 `claimed`/`in_progress`/`blocked` 三键（0 也写）；值内含换行或 `---` 的入库前折成单行（防 front-matter 被注入撑破） |
+| `lead` | 无 lead 写 `(none)`（不写 null，保持标量） |
+| `capacity` | `{watermarkPct, freeGb, level}`；`level` **不是**采样/判定函数的产物（`capacity.ts` 的 `CapacityVerdict` 只有 `{red, violated, detail}`），由新代码推导：`verdict.red === true` → `RED`、`false` → `GREEN`、挂载返回 null → `UNKNOWN`（并写 `watermarkPct: n/a, freeGb: n/a`，写盘继续）；`watermarkPct` = `watermark*100` 保留 1 位、`freeGb` 保留 2 位。checkpoint / handoff / status 三处共用同一推导助手，不得各写一遍 |
+| 章标题 | `## 1. 身份` … `## 7. note` 七章、顺序固定、编号固定 |
+| 「我的进行中任务」 | `OPEN_TASK_STATUSES`（claimed/in_progress/blocked）∧ `assignee === me`；`最后进展` = `lastProgressTs` 转 ISO + 相对分钟；blocked 追加阻塞原因；无进行中任务记「（无进行中任务）」 |
+| 「待领池」 | `status === "pending"`，按 `sortTasksForBoard`（priority → createdAt）取前 10；依赖列 `-`=无依赖、尾缀 `!`=依赖未终态；池共 M 个时末行记「（待领池共 M 个，列前 10）」 |
+| 「最近 journal」 | 每任务取 `.crosschat/tasks/<taskId>/journal.md` **末 5 个非空行**；最多覆盖 10 个任务（超出记「（另有 N 个任务 journal 未列入）」）；文件缺失记「（无 journal：<path> 不存在）」——**不得静默跳过**；读取失败记「（journal 读取失败：<path>）」不影响其他章 |
+| 「未读摘要」 | `readUnreadMailbox` + `urgentFirst`（C1 读取序）取前 5；每条只记 `[urgent?] <from> | <正文首行截断 80 字符>（<msgId 短 8 位>）`——**只抄索引不搬原文**（与 `ARCHIVE_PREVIEW_MAX_CHARS` 同纪律）；超出记「（另有 N 条未读…）」；读取失败记「（未读读取失败）」并在 payload `warnings[]` 披露 |
+| 「建议下一步」 | 由 `stallSuggestion` + 依赖未满足项 + 单在途任务规则提示 + 容量 RED 建议行拼装；无项时记「（暂无：按 journal 指针继续）」 |
+| 「note」 | 上限 **500 字符**（与 evidence note 的长度钳同口径）；控制字符折空格；缺省「（未提供）」 |
+
+**返回面（文本 + JSON 双层）**：文本一行 `Checkpoint written: <path> (<bytes> bytes, <openTasks> open task(s), <unread> unread, capacity <level>).`；
+payload `{ path, createdAt, tasks, unread, capacity, bytes, pruned?, pruneError? }`（`tasks` = 我的开放任务 `[{taskId, status}]`，
+`capacity` = `{watermarkPct, freeGb, level}` 或 `null`）。
+
+**失败路径**：目录/文件创建或写失败 → `checkpoint_write_failed`，payload 带 `path` + 首因错误，**不返回成功**（不得假装落盘）。
+
+**审计事件**（`core/log.ts`）：`checkpoint`（`{teamId, agentKey, path, bytes, openTasks, unread, pruned}`）、`checkpoint-write-failed`、`checkpoint-prune-failed`。
+
+### 14.2 检查点提醒（无 PreCompact 的替代；UserPromptSubmit 注入）
+
+**注入点**：`hooks/prompt-submit.ts`——在既有未读提醒块之后、单出口 `emitAdditionalContext` 之前追加一支独立 `try/catch`
+（照 peer 块的「失败只审计不阻断」范式）。提醒行进 `blocks[]`，**stdout 契约不变**：仍是一行 JSON、仍只有一个 `additionalContext` 键。
+
+**判据（纯函数 `checkpointNudgeDecision`，先命中先返回，保证负例可逐条单测）**：
+
+| 序 | 条件 | `reason` | 提醒？ |
+|---|---|---|---|
+| 1 | `env.XC_CHECKPOINT_NUDGE === "0"` | `disabled` | 否（开关可关） |
+| 2 | `openTaskCount === 0`（我的 `OPEN_TASK_STATUSES` 任务数） | `no-active-task` | 否（负例：没活干的成员不被提醒） |
+| 3 | `lastCheckpointAt !== null && now - lastCheckpointAt <= 30min` | `within-threshold` | 否（负例：刚写过不重复提醒） |
+| 4 | `lastNudgeAt !== null && now - lastNudgeAt <= 30min` | `rate-limited` | 否（负例：30min 内最多一次） |
+| 5 | 其余 | `emit` | 是 |
+
+- 常量：`CHECKPOINT_NUDGE_MINUTES = 30`（提醒阈值与节流窗同值，代码常量，**不做 env 化**——多一个旋钮就多一份走查面）。
+- `lastCheckpointAt === null`（从未写过）按 age = ∞ 处理 = **该提醒一次**（由第 4 条把噪声钳在每 30min 一次）：
+  功能目的就是「压缩前盘上已有一份」，从不落盘的成员更该被提醒一次。该裁决已写成命名断言（`lastCheckpointAt=null ∧ openTaskCount>0 ∧ lastNudgeAt=null → emit`；
+  以及 `lastCheckpointAt=null ∧ lastNudgeAt=now → rate-limited`，证明它仍受 30min 节流）。
+- **开关**：`XC_CHECKPOINT_NUDGE=0` 关闭（仅此一个 env，不进插件设置面、不是必填项）。
+- **注入文案**（一行）：`[zcode-crosschat] 建议先 /xc-checkpoint（距上次检查点 <ageMin>min）——长期任务随时可能被压缩，先落盘再继续；不需要可设 XC_CHECKPOINT_NUDGE=0。`
+  `lastCheckpointAt === null` 时 `<ageMin>` 渲染为 `从未`，文案改为「尚未落过检查点」。
+- **节流标记**：判为 `emit` 时先把 `now` 写进 `.nudge`（原子写，best-effort）再注入；标记写失败仍注入（提醒比记账重要），只审计 `checkpoint-nudge-marker-failed`。
+- **agentKey 来源**：钩子先 `boundNamesForSession(stateRoot, sessionId)` 取 `names[0]`（与未读提醒同一机制）；取不到（未注册会话）→ 不提醒。
+- 读路径全部无锁（纯读，与 `hooks/shared.ts` 的 unreadSummary 同纪律）；负例**不记审计事件**（避免每回合刷审计）。
+- 钩子侧任何异常 → `auditHookFailure(stateRoot, 'prompt-submit-checkpoint-nudge', error)`，会话永不因钩子失败。
+
+### 14.3 接手包（handoff packet）
+
+API：`xc_read({ scope: "handoff" })` ｜ `xc_read({ scope: "handoff", id: "<taskId|花名>" })`（**不新增入参键**，复用既有 `id`）。
+权限：`identityStore.require`；team.json 不存在 → `no_team`。
+
+**`id` 解析（顺序固定，命中即止）**：① `id` ∈ `team.tasks[].id` → `filter:{kind:"task"}`；
+② `sanitizeKey(id)` ∈ `team.members[].key` → `filter:{kind:"member"}`；③ 都不是 → `invalidParamsError`，文案给合法形态 + 至多 10 个现存 taskId / 花名候选。
+花名查 checkpoint 目录时过 `sanitizeKey` + 断言复核；清洗后与原文不同 → 该成员 `checkpoint` 记 `null` 并在 `warnings[]` 说明。
+
+**七要素（payload 七个键，冻结）**：
+
+| 键 | 形状 | 数据源 |
+|---|---|---|
+| `identity` | `{agentKey, teamId, leadKey, role, memberState, isLead}` | `readTeam` + 成员记录 |
+| `tasks` | `[{taskId, title, status, attempt, assignee, lastProgressTs, blockedReason?}]` | 我的（或 id 过滤后的）`OPEN_TASK_STATUSES` 任务 |
+| `pool` | `[{taskId, title, priority, dependsOn, unmetDependsOn}]` | `pending` ∧ `sortTasksForBoard` 序前 10 |
+| `unread` | `{count, urgentCount, top:[{msgId, from, subject}]}` | 分视角（见下表）；`subject` = 正文首行截 80 字符 |
+| `capacity` | `{watermarkPct, freeGb, level, sampledAt} \| null` | `sampleCapacity` + `judgeCapacity`；`level` 由新代码推导；整体失败 = `null` + `warnings[]` |
+| `checkpoint` | `{path, createdAt, ageMin, bytes} \| null` | 该 agent 目录最新 `*.md` 的 stat；无 = `null` |
+| `suggestions` | `string[]`（≤5） | `stallSuggestion` + 依赖未满足等待项 + 单在途任务规则提示 + 认领建议 + 容量 RED 建议行（同款文案，不造第二套） |
+
+**`id` 三视角下七要素的冻结语义**（视角必须在输出里自明：文本面加一行 `视角：self | task <id> | member <name>`，payload 带 `filter:{kind,id}`）：
+
+| 要素 | `id` 缺省（self） | `id=<taskId>` | `id=<花名>` |
+|---|---|---|---|
+| `identity` | 调用方自己 | 调用方自己（受领人信息在 `tasks[].assignee`） | 调用方自己 |
+| `tasks` | 我的开放任务 | 仅该任务一条（不限 assignee、不限状态，终态也出，供复盘） | 该成员的开放任务 |
+| `pool` | pending 前 10 | 同 self（接手决策需要备选池） | 同 self |
+| `unread` | 我的箱前 5 | 我的箱里该任务的件前 5；0 条时记「（我的箱里没有该任务的未读）」 | 该成员的**计数** `{count, urgentCount, top: []}`，payload 附 `unreadWithheld:"subjects"` |
+| `capacity` | 机器级采样 | 同 self（容量是团队级事实） | 同 self |
+| `checkpoint` | 我的目录最新一份 | 该任务受领人的目录最新一份（无受领人或无检查点 → `null`） | 该成员的目录最新一份 |
+| `suggestions` | 全局（我的任务 + 池 + 容量） | 仅该任务（停滞/阻塞/依赖未满足/单在途规则提示；不含认领池建议） | 该成员名下的任务逐条给建议；无开放任务记「（该成员无开放任务）」 |
+
+**预算与按章截断（不得静默丢要素）**：常量 `HANDOFF_BUDGET_CHARS = 4000`（代码常量，不进配置）。
+先按基础帽渲染七章（tasks ≤5、pool ≤10、unread.top ≤5、suggestions ≤5、subject 80 字符），基础帽本身生效时在文本内披露
+（「（另有 N 条未读…）」「（待领池共 M 个，列前 10）」）。超限 = **固定降级序列**（逐步重算，命中即停）：
+
+1. `pool` 整章降为一行「（待领池按 4000 字符预算略去：xc_overview 看板）」；
+2. `unread` 降为「未读 N 条（urgent M）」计数行；
+3. `tasks` 只留第 1 条 + 「（另有 N 条我的任务略去）」；
+4. `suggestions` 只留第 1 条；
+5. 仍超限 → 整体文本按预算硬截，末行标注。
+
+每级降级都要**留名**：payload `truncated: {budgetChars, shownChars, droppedSections: string[], cappedItems: Record<string,{shown,total}>}`；
+文本末行 `[已按 4000 字符预算截断：略去/缩减 <名称…>；全文用 xc_read(scope:"inbox") / xc_overview / xc_read(scope:"task") 取]`。
+**静默丢弃 = 验收失败**。降级序理由：`identity`/`tasks`/`suggestions` 是「接手」最小集，最后才动。
+
+**审批门一致性**：`tool_request` 帧不得在接手包露出原文——未过门的转办请求帧 subject 渲染为
+`[tool_request 审批门控帧]`（实现冻结值，`core/checkpoint.ts` `checkpointUnreadRef`；观测面包漏原文等于给 §11 的门开侧门）；
+checkpoint 第 5 章同样只出索引（同一遮蔽助手）。
+
+**接手流程口径**：新会话 `xc_identify`（1）→ `xc_read({scope:"handoff"})`（2）→ 按 `suggestions` 直接 `xc_claim` 或续作（3），
+**计数 = 真实 invoke 次数**。前提：`xc_claim` 只接 pending（非 pending 得 `task_not_pending`）；对仍归属他人的
+in_progress/claimed/blocked 任务须同名 `xc_identify({takeover:true})` 或等 stale 清扫回池——`suggestions` 必须按任务真实状态
+给可达指引，**不得给出走不通的指令**。
+
+### 14.4 时间线视图（timeline）
+
+API：`xc_overview({ view: "timeline", limit?: 20, offset?: 0 })`——免注册（overview 豁免纪律）、**不写 snapshot.json**（纯派生视图）。
+读取：尾部窗口读——`stat` 得文件大小；> `TAIL_READ_MAX_BYTES`（256 KiB）时只读末段，否则全读；按 `\n` 切行后**丢弃窗口首行**
+（可能被截断的半行）；解析复用 `core/jsonl.ts` 的 `parseJsonl`（坏行跳过；`jsonl.ts` 零改动）。
+
+归一化字段（冻结）：`{ts, event, family, actor, taskId, summary}`。
+`actor` 取值序：`agentKey ?? by ?? createdBy ?? assignee ?? to ?? null`；`taskId` = `taskId ?? null`；
+`summary` = 每族一个确定性模板，缺字段时退化到事件名本身——**永不为空串**。
+
+| family | event 名 |
+|---|---|
+| `dispatch` | `dispatch`、`dispatch-refused` |
+| `claim` | `claim` |
+| `report` | `report` |
+| `sweep` | `task-swept`、`revoked-stale` |
+| `offline` | `task-offline` |
+| `approval` | `tool-approval-request`、`tool-approval`、`tool-expired` |
+| `tool` | `tool-request`、`tool-executed`、`tool-result-rejected` |
+| `lead` | `lead-set`、`lead-transfer`、`lead-release` |
+| `member` | `member-added`、`member-add-started`、`member-add-failed`、`member-stopped`、`member-archive-written`、`member-archive-failed`、`member-provision-timeout`、`member-takeover` |
+| `other` | 其余全部（含 `status`/`inject-budget`/`inbox-check` 等高频噪声事件） |
+
+`limit` 缺省 20、上限 100；`limit > 100` 钳到 100 并披露 `limitClamped: {requested, applied}`。
+`offset` 语义 = **自最新往回跳过 N 条**（与板面「自头部偏移」不同，工具描述与字段级 describe 都写明，防误用）。
+预算：`receiverInjectBudget` + `batchWindowCount` 对 `JSON.stringify(entry).length` 开窗；超限给
+`truncated: {shown, total, budgetChars}` + 续读指针 `xc_overview({view:"timeline", offset:<shown+offset>})`。
+尾部窗口不足且文件确被窗口截断 → 披露 `tailWindowBytes` + `olderEventsOmitted: true`（不假装看全历史）。
+
+### 14.5 紧凑状态视图（status；替代状态栏）
+
+API：`xc_overview({ view: "status" })`——免注册、不写 snapshot。单块紧凑文本，**行序冻结**：
+
+```text
+team: default | lead: alice | members: 3 (offline 1)
+tasks: pending 2 / claimed 1 / in_progress 2 / blocked 1 / completed 3 / failed 0 / cancelled 0 | stalled 1
+capacity: GREEN | 水位 23.5% 可用 | 并发回合 2 | sampledAt 2026-11-15T18:00:00Z
+checkpoint: alice=12min前, bob=3h前, carol=(none)
+unread: alice=3, bob=0, carol=1
+```
+
+口径（必须与真实状态一致；**复用而非重写**）：任务计数 = 按 `team.tasks[].status` 全量计数（七态一个不漏）；
+`stalled` = `stalledTasks` 计数（阈值钳制披露 `stalledThresholdClamped`）；`offline` = `offlineMembersMount` 成员数
+（阈值钳制/非法回落照旧附 WARNING，复用现有文案不新造）；`capacity` = `capacityMount`——挂载返回 null 时写 `UNKNOWN`
+（不写 GREEN，不谎报水位），RED 时附 `COMPRESS_ADVICE_LINE`（C9 原句复用）；`checkpoint` = 对 `me`（已注册时）与所有有检查点的成员
+列「年龄 min 前」（年龄 = `now - 最新 *.md mtime`），无检查点记 `(none)`；`unread` = 对每个成员 `readMailbox` + `countUnreadFor`
+（与板面同口径——观测面必须自洽）。
+预算：`receiverInjectBudget` + 固定降级序（`unread` 行 → `checkpoint` 行 → `offline`/`stalled` 明细行 → `capacity` 明细行），每级留名披露 `truncated`。

@@ -14,6 +14,12 @@
  * - v0.7（C8，M4 core/offline.ts）：team 视图附 offlineMembers[]（离线成员 + 其名下
  *   待转交任务 + 证据；XC_OFFLINE_MINUTES 缺省 240min，钳制 ≥ stale + WARNING）。
  *   只读 peer 扫描失败 → 不挂载（观测面永不为难任务板，同 capacityMount 纪律）。
+ * - v0.8.0（A3/A4，DESIGN-V0.8.md §5/§6）：view 增 "timeline"（引擎日志时间线，
+ *   core/timeline.ts 尾部窗口读 + 事件族归一化；limit 缺省 20/上限 100，offset =
+ *   自最新往回跳过）与 "status"（替代状态栏的紧凑视图——任务七态计数/stalled/
+ *   容量色+水位/离线成员/checkpoint 年龄/未读数；复用 capacityMount /
+ *   offlineMembersMount / stalledTasks / countUnreadFor / latestCheckpoint，
+ *   零重复实现）。两者都是**纯派生视图**：免注册、不写 snapshot.json。
  * - 无需注册即可调用（只读纪律，SKILL §1 保留）。
  */
 
@@ -30,7 +36,7 @@ import {
   type StatusSnapshot,
 } from "./render.js";
 import { identityStore } from "./identity.js";
-import { isValidTeamId } from "../core/paths.js";
+import { engineLogFile, isValidTeamId } from "../core/paths.js";
 import { readTeam } from "../core/teamstate.js";
 import { sortTasksForBoard } from "../core/teamstate.js";
 import { orphanTaskIds, readMailbox, staleCompletedReceiptTaskIds } from "../core/mailbox.js";
@@ -54,6 +60,9 @@ import {
   type CapacitySample,
   type CapacityVerdict,
 } from "../core/capacity.js";
+// v0.8.0（A3/A4）：时间线尾部窗口读 + 事件族归一化；checkpoint 年龄/容量 level 推导助手。
+import { readTimeline } from "../core/timeline.js";
+import { capacityLevelOf, latestCheckpoint } from "../core/checkpoint.js";
 import type { ToolDeps } from "./core.js";
 import { runCore } from "./core.js";
 
@@ -135,12 +144,24 @@ async function offlineMembersMount(deps: ToolDeps, team: TeamState, now: number)
 }
 
 export const OverviewShape = {
-  view: z.enum(["team", "peers", "panel"]).optional().describe("缺省 team：任务板+成员+未读；peers：本机可寻址 peer 清单；panel：self+peers+members+tasks+入站策略+容量+停滞"),
+  view: z.enum(["team", "peers", "panel", "timeline", "status"]).optional().describe(
+    "缺省 team：任务板+成员+未读；peers：本机可寻址 peer 清单；panel：self+peers+members+tasks+入站策略+容量+停滞；"
+    + "timeline：引擎日志时间线（新→旧；limit 缺省 20 上限 100，offset=自最新往回跳过 N 条，预算截断披露+续读指针）；"
+    + "status：紧凑状态视图（任务七态计数/stalled/容量色+水位/离线成员/checkpoint 年龄/未读数，替代状态栏）",
+  ),
   history: z.boolean().optional().describe("附 lead 角色变更史（R-7）"),
-  offset: z.number().int().min(0).optional().describe("任务板/清单分页起点"),
+  offset: z.number().int().min(0).optional().describe(
+    "分页起点：team=任务板自头部偏移；peers=清单自头部偏移；timeline=自最新往回跳过 N 条（语义不同，防误用）",
+  ),
+  limit: z.number().int().min(1).optional().describe("仅 view=timeline：单页事件条数（缺省 20，上限 100，超限钳制并披露 limitClamped）"),
 } as const;
 
-export type OverviewArgs = { view?: "team" | "peers" | "panel"; history?: boolean; offset?: number };
+export type OverviewArgs = {
+  view?: "team" | "peers" | "panel" | "timeline" | "status";
+  history?: boolean;
+  offset?: number;
+  limit?: number;
+};
 
 export interface TeamOverviewCore {
   /** 队内全景（原任务板核心 1:1 平移；teamId 死参移除；板面按优先级排序）。 */
@@ -399,6 +420,12 @@ export async function handleOverview(deps: ToolDeps, args: OverviewArgs, connect
   if (view === "peers") {
     return overviewPeers(deps, args);
   }
+  if (view === "timeline") {
+    return timelineView(deps, args);
+  }
+  if (view === "status") {
+    return statusView(deps, connectionKey);
+  }
   return overviewPanel(deps);
 }
 
@@ -493,6 +520,306 @@ export type { StallFlag };
 void ToolError;
 
 // ---------------------------------------------------------------------------
+// v0.8.0（A3/A4，DESIGN-V0.8.md §5/§6）：timeline / status 两个纯派生视图
+// （免注册、不写 snapshot.json；timeline 读 engine.jsonl 尾部窗口，status 复用
+//  capacityMount / offlineMembersMount / stalledTasks / countUnreadFor /
+//  latestCheckpoint——C9 采样、C8 活性、C5 停滞判定零重复实现）
+// ---------------------------------------------------------------------------
+
+/**
+ * view:"timeline"：引擎日志时间线（新→旧）。core/timeline.ts 自持尾部窗口读
+ * （256 KiB，窗口首行丢弃防半行；坏行跳过）；limit 缺省 20/上限 100（钳制披露
+ * limitClamped）；offset = 自最新往回跳过 N 条（与板面偏移语义不同，describe 已写明）；
+ * 预算开窗超限给 truncated + 续读指针；窗口不足披露 tailWindowBytes/olderEventsOmitted。
+ */
+export async function timelineView(deps: ToolDeps, args: OverviewArgs): Promise<ToolResult> {
+  return runCore(deps.stateRoot, async () => {
+    const budget = receiverInjectBudget(contextCharsFromEnv(deps.env), deps.env);
+    const result = await readTimeline(engineLogFile(deps.stateRoot), {
+      ...(args.limit !== undefined ? { limit: args.limit } : {}),
+      ...(args.offset !== undefined ? { offset: args.offset } : {}),
+      budgetChars: budget.total,
+    });
+    const lines = result.events.map(
+      (e) =>
+        `${new Date(e.ts).toISOString()} | ${e.event} | ${e.family} | ${e.actor ?? "-"} | ${e.taskId ?? "-"} | ${e.summary}`,
+    );
+    const parts: string[] = [
+      result.total === 0
+        ? "引擎日志暂无事件（engine.jsonl 空或不在尾部窗口内）。"
+        : `引擎事件（窗口内 ${result.total} 条，新→旧；本页 ${result.events.length} 条，offset ${result.offset}）：`,
+    ];
+    if (lines.length > 0) parts.push(lines.join("\n"));
+    if (result.truncated !== undefined) {
+      parts.push(
+        `[时间线已按注入预算（${budget.total} 字符）截断：本页 ${result.truncated.shown}/${result.truncated.total} 条`
+        + `——用 xc_overview({view:"timeline", offset:${result.truncated.shown}}) 续读]`,
+      );
+    }
+    if (result.olderEventsOmitted === true) {
+      parts.push(
+        `[尾部窗口 ${result.tailWindowBytes ?? 0} 字节：更早事件未读入（olderEventsOmitted）`
+        + `——引擎日志无上界，时间线只保最近窗口]`,
+      );
+    }
+    return okResult(parts.join("\n"), {
+      count: result.events.length,
+      events: result.events,
+      total: result.total,
+      offset: result.offset,
+      limit: result.limit,
+      ...(result.limitClamped !== undefined ? { limitClamped: result.limitClamped } : {}),
+      ...(result.truncated !== undefined ? { truncated: result.truncated } : {}),
+      ...(result.tailWindowBytes !== undefined ? { tailWindowBytes: result.tailWindowBytes } : {}),
+      ...(result.olderEventsOmitted !== undefined ? { olderEventsOmitted: result.olderEventsOmitted } : {}),
+    });
+  });
+}
+
+/** latestCheckpoint 的安全包装：段闸抛错按「无检查点」降级（观测面永不为难任务板）。 */
+async function latestCheckpointAgeSafe(
+  stateRoot: string,
+  agentKey: string,
+  now: number,
+): Promise<{ ageMin: number | null; path: string | null }> {
+  try {
+    const latest = await latestCheckpoint(stateRoot, agentKey, now);
+    return latest === null ? { ageMin: null, path: null } : { ageMin: latest.ageMin, path: latest.path };
+  } catch {
+    return { ageMin: null, path: null };
+  }
+}
+
+/** 检查点年龄展示：<60min → Nmin前；<24h → Nh前；否则 Nd前。 */
+function formatCheckpointAge(ageMin: number | null): string {
+  if (ageMin === null) return "(none)";
+  if (ageMin < 60) return `${ageMin}min前`;
+  if (ageMin < 1440) return `${Math.floor(ageMin / 60)}h前`;
+  return `${Math.floor(ageMin / 1440)}d前`;
+}
+
+/** status 视图降级级（0=全量；1=unread 行；2=checkpoint 行；3=offline/stalled 明细；4=容量明细；5=硬截）。 */
+type StatusDegradeLevel = 0 | 1 | 2 | 3 | 4 | 5;
+
+interface StatusRenderInput {
+  team: TeamState;
+  leadKey: string;
+  counts: Record<string, number>;
+  stalledCount: number;
+  /** null = 离线挂载失败（扫描意外）——不猜。 */
+  offlineCount: number | null;
+  /** 容量挂载行（capacityMount.lines[0]）；null = 挂载失败。 */
+  capacityLine: string | null;
+  capacityLevel: string;
+  capacityAdvice: string | null;
+  checkpointEntries: Array<{ key: string; ageMin: number | null }>;
+  unreadEntries: Array<{ key: string; count: number }>;
+  budgetChars: number;
+}
+
+function renderStatusLines(input: StatusRenderInput, level: StatusDegradeLevel): { lines: string[]; dropped: string[] } {
+  const droppedSet = new Set<string>();
+  const lines: string[] = [];
+  const lead = input.leadKey;
+  lines.push(
+    `team: ${input.team.teamId} | lead: ${lead} | members: ${input.team.members.length}`
+    + (level >= 3 || input.offlineCount === null
+      ? ""
+      : ` (offline ${input.offlineCount})`),
+  );
+  if (level >= 3 && input.offlineCount !== null) droppedSet.add("offline");
+  const countsText = ["pending", "claimed", "in_progress", "blocked", "completed", "failed", "cancelled"]
+    .map((s) => `${s} ${input.counts[s] ?? 0}`)
+    .join(" / ");
+  lines.push(
+    `tasks: ${countsText}`
+    + (level >= 3 ? "" : ` | stalled ${input.stalledCount}`),
+  );
+  if (level >= 3 && input.stalledCount > 0) droppedSet.add("stalled");
+  if (level >= 4 || input.capacityLine === null) {
+    const detail = level >= 4 ? "（明细按预算略去）" : " | 采样失败（不按 GREEN 呈现）";
+    lines.push(`capacity: ${input.capacityLevel}${detail}`);
+    if (level >= 4) droppedSet.add("capacity-details");
+  } else {
+    lines.push(input.capacityLine);
+  }
+  if (level >= 2) {
+    lines.push(`checkpoint: （按 ${input.budgetChars} 字符预算略去）`);
+    droppedSet.add("checkpoint");
+  } else {
+    const entries = input.checkpointEntries.map((e) => `${e.key}=${formatCheckpointAge(e.ageMin)}`);
+    lines.push(`checkpoint: ${entries.length > 0 ? entries.join(", ") : "(none)"}`);
+  }
+  if (level >= 1) {
+    lines.push(`unread: （按 ${input.budgetChars} 字符预算略去）`);
+    droppedSet.add("unread");
+  } else {
+    const entries = input.unreadEntries.map((e) => `${e.key}=${e.count}`);
+    lines.push(`unread: ${entries.length > 0 ? entries.join(", ") : "(none)"}`);
+  }
+  if (input.capacityAdvice !== null && level < 4) lines.push(input.capacityAdvice);
+  // droppedSections 按**固定降级序**排列（不是行序）：unread 行 → checkpoint 行 →
+  // offline/stalled 明细 → capacity 明细（DESIGN §6）。
+  const STATUS_DROP_ORDER = ["unread", "checkpoint", "offline", "stalled", "capacity-details"];
+  const dropped = STATUS_DROP_ORDER.filter((name) => droppedSet.has(name));
+  return { lines, dropped };
+}
+
+/**
+ * view:"status"（A4，替代状态栏）：单块紧凑文本，**行序冻结**——
+ *   team / tasks / capacity / checkpoint / unread
+ * 字段口径与真实状态一致（AC4）：七态计数全量；stalled = stalledTasks 计数；
+ * offline = offlineMembersMount 成员数；capacity 复用 capacityMount（挂载 null → UNKNOWN，
+ * 不谎报 GREEN；RED 附 C9 原句 COMPRESS_ADVICE_LINE）；checkpoint 年龄按 mtime；
+ * unread 与板面同口径 countUnreadFor。预算超限走固定降级序（unread 行 → checkpoint 行
+ * → offline/stalled 明细 → capacity 明细），每级留名披露 truncated。
+ */
+export async function statusView(deps: ToolDeps, connectionKey: string): Promise<ToolResult> {
+  return runCore(deps.stateRoot, async () => {
+    const teamId = "default"; // v1 单队固定 default
+    const me = identityStore.get(connectionKey); // 豁免注册：未注册省略个人字段
+    const team = await readTeam(deps.stateRoot, teamId);
+    const now = Date.now();
+    const budget = receiverInjectBudget(contextCharsFromEnv(deps.env), deps.env);
+
+    if (team === undefined) {
+      return okResult("team: (none) — 尚无团队（xc_identify 建队后本视图才有内容）", {
+        teamId,
+        phase: "none",
+        taskCounts: { pending: 0, claimed: 0, in_progress: 0, blocked: 0, completed: 0, failed: 0, cancelled: 0 },
+        members: { total: 0, offline: null },
+        stalled: 0,
+        capacity: null,
+        checkpoints: {},
+        unread: {},
+      });
+    }
+
+    // C3 容量挂载（复用；挂载失败 → UNKNOWN，不写 GREEN）
+    const capacity = await capacityMount(deps);
+    const capacityPayload = capacity?.payload["capacity"] as Record<string, unknown> | undefined;
+    const capacityLevel = capacityLevelOf(
+      capacityPayload === undefined ? null : { red: capacityPayload["red"] === true },
+    );
+    const capacityLine = capacity?.lines[0] ?? null;
+    const capacityAdvice = capacity !== null && capacityPayload?.["red"] === true
+      ? capacity.lines[capacity.lines.length - 1] ?? null
+      : null;
+
+    // C8 离线成员挂载（复用；null = 扫描意外，不猜）
+    const offlineMount = await offlineMembersMount(deps, team, now);
+    const offlineCount = offlineMount === null ? null : offlineMount.members.length;
+
+    // C5 停滞（复用 stalledTasks；钳制披露）
+    const stall = stallThresholdMs(deps.env, staleThresholdMsFromEnv(deps.env));
+    const stalled = stalledTasks(team.tasks, now, stall.ms);
+
+    // 七态计数（一个不漏）
+    const counts: Record<string, number> = {
+      pending: 0, claimed: 0, in_progress: 0, blocked: 0, completed: 0, failed: 0, cancelled: 0,
+    };
+    for (const t of team.tasks) counts[t.status] = (counts[t.status] ?? 0) + 1;
+
+    // 未读（与板面同口径 countUnreadFor——观测面自洽）
+    const unreadEntries: Array<{ key: string; count: number }> = [];
+    const unreadMap: Record<string, number> = {};
+    for (const m of team.members) {
+      const msgs = await readMailbox(deps.stateRoot, teamId, m.key);
+      const count = countUnreadFor(team, msgs);
+      unreadMap[m.key] = count;
+      unreadEntries.push({ key: m.key, count });
+    }
+
+    // 检查点年龄：me（已注册时）+ 全部花名册成员（无检查点记 (none)）
+    const checkpointKeys: string[] = [];
+    if (me !== undefined && !team.members.some((m) => m.key === me.agentKey)) checkpointKeys.push(me.agentKey);
+    for (const m of team.members) checkpointKeys.push(m.key);
+    const checkpointEntries: Array<{ key: string; ageMin: number | null }> = [];
+    const checkpointMap: Record<string, { ageMin: number | null; path: string | null }> = {};
+    for (const key of checkpointKeys) {
+      const entry = await latestCheckpointAgeSafe(deps.stateRoot, key, now);
+      checkpointMap[key] = entry;
+      checkpointEntries.push({ key, ageMin: entry.ageMin });
+    }
+
+    const renderInput: StatusRenderInput = {
+      team,
+      leadKey: leadKeyOf(team),
+      counts,
+      stalledCount: stalled.length,
+      offlineCount,
+      capacityLine,
+      capacityLevel,
+      capacityAdvice,
+      checkpointEntries,
+      unreadEntries,
+      budgetChars: budget.total,
+    };
+    // 预算降级序列：逐步重算、命中即停（L5 硬截必然命中）。
+    const levels: StatusDegradeLevel[] = [0, 1, 2, 3, 4, 5];
+    let chosen: { level: StatusDegradeLevel; text: string; dropped: string[] } | undefined;
+    for (const level of levels) {
+      const { lines, dropped } = renderStatusLines(renderInput, level);
+      let text = lines.join("\n");
+      if (level >= 1) {
+        const names = level === 5 ? [...dropped, "正文"] : dropped;
+        const marker =
+          `[已按 ${budget.total} 字符预算截断：略去/缩减 ${names.join("、")}；`
+          + "全文用 xc_overview({view:\"team\"}) / xc_read({scope:\"inbox\"}) 取]";
+        if (level === 5) {
+          const keep = Math.max(0, budget.total - marker.length - 1);
+          text = `${text.slice(0, keep)}\n${marker}`;
+        } else {
+          text = `${text}\n${marker}`;
+        }
+      }
+      if (text.length <= budget.total || level === 5) {
+        chosen = { level, text, dropped };
+        break;
+      }
+    }
+    const final = chosen!;
+
+    const extraWarnings: string[] = [];
+    if (offlineMount !== null && offlineMount.clamped) {
+      extraWarnings.push(
+        "WARNING XC_OFFLINE_MINUTES 低于僵尸清扫阈值（XC_STALE_TASK_MINUTES）——离线阈值已按 stale 阈值钳制（无进展任务会先被 stale 回收，idle-timeout 分支轮不到展示）",
+      );
+    }
+    if (offlineMount !== null && offlineMount.fellBack) {
+      extraWarnings.push(
+        "WARNING XC_OFFLINE_MINUTES 非法（须为有限正数；0/负数/非数字不被接受）——已回落内置缺省 240min（安全方向：取最保守的离线阈值）；如只想用缺省值请取消该 env 设置",
+      );
+    }
+    if (extraWarnings.length > 0) final.text = `${final.text}\n${extraWarnings.join("\n")}`;
+
+    return okResult(final.text, {
+      teamId,
+      phase: team.phase,
+      leadKey: renderInput.leadKey,
+      members: { total: team.members.length, offline: offlineCount },
+      taskCounts: counts,
+      stalled: stalled.length,
+      ...(stall.clamped ? { stalledThresholdClamped: true } : {}),
+      capacity: capacityPayload === undefined
+        ? null
+        : { ...capacityPayload, level: capacityLevel },
+      checkpoints: checkpointMap,
+      unread: unreadMap,
+      ...(final.level >= 1
+        ? {
+            truncated: {
+              budgetChars: budget.total,
+              shownChars: final.text.length,
+              droppedSections: final.level === 5 ? [...final.dropped, "正文"] : [...final.dropped],
+            },
+          }
+        : {}),
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
 // SDK 接线（FamilyRegistrar 形态；server.ts 持有 PrimaryRegistry）
 // ---------------------------------------------------------------------------
 
@@ -511,7 +838,9 @@ export function registerOverviewTools(
   const description =
     "Observation snapshot (task board / members / peers / capacity / stall in one tool). view=team (default): members with isLead, priority-ordered task board (budget-windowed with boardTruncated pointer), unread counts, orphan/stale-receipt warnings, stalled flags (C5); " +
     "history:true appends leadHistory; view=peers: addressable cross-session peers (self/member/session rows, rowsTruncated pointer); " +
-    "view=panel: self + peers + members + task counts + inbound policy. Does not require registration; writes snapshot.json (always the full board).";
+    "view=panel: self + peers + members + task counts + inbound policy; " +
+    "view=timeline: engine.jsonl timeline newest-first (limit defaults 20, max 100 with limitClamped disclosure; offset skips back N from the newest event; budget window with truncated pointer); " +
+    "view=status: compact status block (task counts by status / stalled / capacity level + watermark / offline members / checkpoint ages / unread counts — the no-statusline substitute). Does not require registration; writes snapshot.json (always the full board) only for view=team.";
   const handler = async (args: Record<string, unknown>, extra: unknown): Promise<ToolResult> =>
     handleOverview(deps, args as unknown as OverviewArgs, connectionKeyOf(extra));
   server.tool("xc_overview", description, OverviewShape, handler);

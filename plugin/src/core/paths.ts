@@ -132,6 +132,37 @@ export function approvalsFile(root: string, requestId: string): string {
   return join(root, 'approvals', `${requestId}.json`);
 }
 
+// --- v0.8.0 A1：交接检查点（状态根级，不随 teamId） --------------------------
+
+/**
+ * 检查点根目录（`.crosschat/checkpoints/`；DESIGN-V0.8.md §3.2）。
+ *
+ * 与 `teams/<teamId>/` 无交集：checkpoint 只写调用方自己的
+ * `checkpoints/<agentKey>/`，不碰 team.json、不碰任务状态机——「不改任务
+ * 状态机」纪律的结构性保证。目录名与 `<agentKey>` 段的合法性由
+ * core/checkpoint.ts 的段闸（sanitizeKey + 断言复核，archive.ts safeSegment
+ * 同款防御纵深）负责；本构建器与 paths.ts 其余构建器一样只做 join，
+ * 调用方（core/checkpoint.ts）必须经段闸后才准取路径。
+ */
+export function checkpointsDir(root: string): string {
+  return join(root, 'checkpoints');
+}
+
+/** 单成员检查点目录：`<.crosschat>/checkpoints/<agentKey>/`（agentKey 已过段闸）。 */
+export function checkpointDir(root: string, agentKey: string): string {
+  return join(root, 'checkpoints', agentKey);
+}
+
+/** 单个检查点文件：`<.crosschat>/checkpoints/<agentKey>/<stamp>.md`（stamp 见 checkpointStamp）。 */
+export function checkpointFile(root: string, agentKey: string, stamp: string): string {
+  return join(checkpointDir(root, agentKey), `${stamp}.md`);
+}
+
+/** 提醒节流标记：`<.crosschat>/checkpoints/<agentKey>/.nudge`（滚动删除只认 `*.md`，两者互不干扰）。 */
+export function checkpointNudgeFile(root: string, agentKey: string): string {
+  return join(checkpointDir(root, agentKey), '.nudge');
+}
+
 // --- locks & logs -----------------------------------------------------------
 
 export function locksDir(root: string): string {

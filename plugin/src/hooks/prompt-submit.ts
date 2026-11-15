@@ -10,6 +10,11 @@
  * - 顺带刷新 peers/base/<sid>.json 的 permissionMode（载荷现成）。
  * - **一次调用一次输出**：队内提示与 peer 信封块合并成一段文本后 emit 一次。
  *
+ * v0.8.0 增量（A1，DESIGN-V0.8.md §3.5）：检查点提醒——平台无 PreCompact 钩子，
+ * 压缩防护是「一键 /xc-checkpoint + 本钩子轻量提醒」两级降级。判据（有活跃任务 ∧
+ * 距上次检查点 >30min ∧ 30min 内没提醒过 ∧ 未设 XC_CHECKPOINT_NUDGE=0）在
+ * core/checkpoint.ts 的纯函数里，钩子只取数/判据/拼一行；读路径无锁、失败只审计。
+ *
  * Build entry: dist/hooks/prompt-submit.mjs (scripts/build.mjs).
  */
 import {
@@ -35,6 +40,13 @@ import { queueItemToInjectBlock, renderPeerEnvelope } from '../core/peerenvelope
 import { uservoiceWrite } from '../core/uservoice.js';
 // v0.5（R-23 面 A）：接收方注入预算与排布（属主 core/budget.ts，M1）。
 import { contextCharsFromEnv, layoutInjectBlocks, receiverInjectBudget } from '../core/budget.js';
+// v0.8.0（A1，DESIGN-V0.8.md §3.5）：检查点提醒（判据/取数/文案属主 core/checkpoint.ts）。
+import {
+  checkpointNudgeDecision,
+  checkpointNudgeState,
+  renderCheckpointNudgeLine,
+  writeNudgeMarker,
+} from '../core/checkpoint.js';
 
 async function main(): Promise<void> {
   const stdin = readStdinPayload();
@@ -144,6 +156,44 @@ async function main(): Promise<void> {
       }
     } catch (error) {
       await auditHookFailure(ctx.stateRoot, 'prompt-submit-inbox', error);
+    }
+  }
+
+  // --- v0.8.0（A1，DESIGN-V0.8.md §3.5）：检查点提醒（无 PreCompact 的降级替代）---
+  // 判据（core/checkpoint.ts 纯函数，负例在 core/checkpoint.test.ts 逐条覆盖）：
+  // XC_CHECKPOINT_NUDGE=0 关；无活跃任务不提醒；距上次检查点 ≤30min 不提醒；
+  // 距上次提醒 ≤30min 不提醒（每 agent 30min 最多一次）；其余才注入。
+  // 读路径无锁（与 unreadSummary 同纪律：纯读、不判定新鲜度、不丢弃）；
+  // agentKey 沿用未读提醒的现成机制（boundNamesForSession 取 names[0]）——取不到
+  // （未注册会话）就没有「我的任务/我的检查点目录」可言，不提醒。
+  // 任何异常只审计不阻断（钩子永不失败会话）。
+  if (names.length > 0) {
+    const agentKey = names[0]!;
+    try {
+      const now = Date.now();
+      const decision = checkpointNudgeDecision({
+        env: process.env,
+        ...(await checkpointNudgeState(ctx.stateRoot, agentKey, process.env, now)),
+        now,
+      });
+      if (decision.nudge) {
+        // 先把本回合记进节流标记（best-effort）再注入：标记写失败仍注入（提醒比记账重要）。
+        try {
+          await writeNudgeMarker(ctx.stateRoot, agentKey, now);
+        } catch (error) {
+          await auditHookFailure(ctx.stateRoot, 'checkpoint-nudge-marker-failed', error);
+        }
+        blocks.push(renderCheckpointNudgeLine(decision.ageMin));
+        await logHookEvent(ctx.stateRoot, {
+          event: 'hook-checkpoint-nudge',
+          sessionId: ctx.sessionId,
+          agentKey,
+          reason: decision.reason,
+          ...(decision.ageMin !== undefined ? { ageMin: decision.ageMin } : {}),
+        });
+      }
+    } catch (error) {
+      await auditHookFailure(ctx.stateRoot, 'prompt-submit-checkpoint-nudge', error);
     }
   }
 
