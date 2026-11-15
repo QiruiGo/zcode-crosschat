@@ -77,6 +77,28 @@ describe('names.json', () => {
     writeFileSync(namesFile(dir), '[1,2,3]', 'utf8');
     await expect(readNames(dir)).rejects.toThrow(/invalid names\.json/);
   });
+
+  // v0.7.1（红队四番战 故障注-2 修复）：不可解析字节（红队 fi26 同款
+  // 'corrupt names \x00\x01'）此前裸抛 SyntaxError——无路径、无恢复指引。
+  // 现在必须带文件绝对路径 + 可执行恢复动作（删文件重置 / 从备份恢复）。
+  it('unparseable names.json throws with the file path + recovery guidance (fault-injection 2)', async () => {
+    const { namesFile, sessionsDir } = await import('./paths.js');
+    mkdirSync(sessionsDir(dir), { recursive: true });
+    writeFileSync(namesFile(dir), 'corrupt names \x00\x01', 'utf8');
+    await expect(readNames(dir)).rejects.toThrow(/invalid names\.json/);
+    const err = await readNames(dir).catch((e: Error) => e);
+    expect(err).toBeInstanceOf(Error);
+    const message = (err as Error).message;
+    expect(message).toContain(namesFile(dir));                 // 文件路径（运维能定位）
+    expect(message).toMatch(/not valid JSON/);                 // 损坏原因（不再是裸 token 错）
+    expect(message).toMatch(/delete the file to reset/);       // 恢复动作 1
+    expect(message).toMatch(/xc_identify|member-add/);         // 恢复动作 2（重建入口）
+    // 形状非法（可解析但结构错）同样带路径 + 指引（与 team.json 文案同族）
+    writeFileSync(namesFile(dir), '{"a": {"sessionId": 5}}', 'utf8');
+    const err2 = await readNames(dir).catch((e: Error) => e);
+    expect((err2 as Error).message).toContain(namesFile(dir));
+    expect((err2 as Error).message).toMatch(/delete the file to reset/);
+  });
 });
 
 describe('wake nonces (一次性唤醒 nonce, DESIGN §2.3-4 / §2.5-3)', () => {

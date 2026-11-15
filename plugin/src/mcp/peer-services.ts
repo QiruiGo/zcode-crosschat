@@ -39,6 +39,7 @@ import {
   readPeerBaseRecord,
 } from "../core/peerdir.js";
 import {
+  describeSessionIdConflict,
   findLiveSessionIdHolder,
   logPeerEvent,
   peerRegistryLockName,
@@ -80,7 +81,7 @@ import {
   admitPeerMessage,
   appendPeerQueue,
   createRateBuckets,
-  drainPeerQueue,
+  drainPeerQueueDetailed,
   PEER_MAX_HOP_DEPTH,
   PEER_RATE_LIMIT,
   PEER_RATE_WINDOW_MS,
@@ -100,7 +101,7 @@ import {
   receiverInjectBudget,
   type InjectBudget,
 } from "../core/budget.js";
-import { resolvePeerMessage, storePeerMessageFull } from "../core/msgstore.js";
+import { resolvePeerMessage, storedMessageCorruptFile, storePeerMessageFull } from "../core/msgstore.js";
 import { uservoiceMatchAndConsume, verifyUservoiceStampAuthority } from "../core/uservoice.js";
 import { RESERVED_MEMBER_KEYS } from "../core/types.js";
 import { leadKeyOf } from "./tools-team.js";
@@ -263,7 +264,7 @@ export interface PeerServices {
    * 「注入成本 ≤ 批次预算」的到达序窗口，窗口外消息留在队列（消费面不再
    * 「消费即省略」）。注入的假服务可忽略该参数。
    */
-  inbox(limit: number, budget?: InjectBudget): Promise<{ items: PeerQueueItem[]; rendered: string[]; remaining: number }>;
+  inbox(limit: number, budget?: InjectBudget): Promise<{ items: PeerQueueItem[]; rendered: string[]; remaining: number; malformed?: number }>;
   review(input: { action: 'list' | 'accept' | 'discard'; ids?: string[] }): Promise<PeerReviewResult>;
   rename(name: string): Promise<PeerRenameResult>;
   agents(): Promise<PeerAgentsPanel>;
@@ -429,18 +430,12 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
       const scannedOnce = await scanPeers(r);
       const sidHolder = await findLiveSessionIdHolder(r, input.sessionId, scannedOnce);
       if (sidHolder !== undefined) {
-        throw new ToolError(
-          {
-            error: "session_id_in_use",
-            sessionId: input.sessionId,
-            boundName: sidHolder.name ?? `pid-${sidHolder.pid}`,
-            boundPid: sidHolder.pid,
-            message: `sessionId "${input.sessionId}" is already registered by another live session ` +
-              `(name "${sidHolder.name ?? `pid-${sidHolder.pid}`}"); register with this session's own id ` +
-              "(the hook-injected sessionId), not another session's",
-          },
-          `sessionId "${input.sessionId}" is already registered by another live session`,
-        );
+        // v0.7.1（红队四番战 并发与-1 修复）：文案经 describeSessionIdConflict
+        // 分流——冲突对象持有**同一个** sid（同一会话被两个活进程重复拉起）时
+        // 不再误述 "another live session … use your own id"，payload 增
+        // sameSessionId 供程序化判断（与队内轴 identity.ts 同一道闸同一口径）。
+        const conflict = describeSessionIdConflict(sidHolder, input.sessionId);
+        throw new ToolError(conflict.payload, conflict.text);
       }
 
       // v0.5.3（二番战 peer-1 幂等豁免的同类面）：本进程已注册同一 sid ⇒ 同一连接的
@@ -812,6 +807,32 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
       }
       const resolved = await resolvePeerMessage(r, self.sessionId, input.msgId);
       if (resolved === undefined) {
+        // v0.7.1（红队四番战 故障注-3 修复）：查找落空先分辨「从没收到」与
+        // 「存储损坏」——store 文件存在但不可解析时，unknown msgId 是把存储
+        // 损坏误述成身份问题（fi3：恢复路径被阻断）。显式 corrupt 错误带
+        // 文件路径与恢复动作（删/修该文件清障；重发得到新 msgId）。
+        const corruptFile = await storedMessageCorruptFile(r, input.msgId);
+        if (corruptFile !== undefined) {
+          const reason =
+            `peer message "${input.msgId}" cannot be read: its stored copy at "${corruptFile}" is corrupt ` +
+            "(unparseable or missing text) — this is storage damage, not an unknown msgId; " +
+            "the message text is not recoverable from this file (ask the sender to resend, which mints a new msgId), " +
+            "and deleting or repairing the file clears the error; messages still queued locally are unaffected";
+          await logPeerEvent(r, {
+            event: "peer-msg-read-corrupt",
+            msgId: input.msgId,
+            file: corruptFile,
+          });
+          throw new ToolError(
+            {
+              error: "message_corrupt",
+              msgId: input.msgId,
+              path: corruptFile,
+              message: reason,
+            },
+            reason,
+          );
+        }
         throw new ToolError(
           {
             error: "invalid_params",
@@ -849,7 +870,7 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
     async inbox(
       limit: number,
       budget?: InjectBudget,
-    ): Promise<{ items: PeerQueueItem[]; rendered: string[]; remaining: number }> {
+    ): Promise<{ items: PeerQueueItem[]; rendered: string[]; remaining: number; malformed?: number }> {
       const r = root();
       if (self === undefined) {
         throw new ToolError(
@@ -867,13 +888,19 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
       const windowCount = batchWindowCount(costs, effective.total);
       // 只消费窗口内条目；窗口外留在队列文件里（drain 的 rename 换出 + 半行写回
       // 语义不变，leftover 原样写回）。
-      const items = windowCount > 0 ? await drainPeerQueue(r, self.sessionId, windowCount) : [];
+      // v0.7.1（故障注-4 修复）：改走带坏行计数的排空变体——坏行条数随结果返回，
+      // 读取面据此披露（与队内 inbox malformedLines、held corrupted 同口径）；
+      // 无坏行时不带 malformed 键（响应形状与 v0.7.0 逐字节一致）。
+      const drained = windowCount > 0
+        ? await drainPeerQueueDetailed(r, self.sessionId, windowCount)
+        : { items: [] as PeerQueueItem[], malformed: 0 };
+      const items = drained.items;
       const shownRendered = items.map((item, i) =>
         candidates[i]?.msgId === item.msgId ? rendered[i]! : renderPeerEnvelope(item));
       // v0.5.1（P3 count 口径修复）：排空后的剩余深度随结果返回，调用面据此给
       // 「再拉一次」指针（窗口外消息留在 queue 不丢）。
       const remaining = await peerQueueDepth(r, self.sessionId);
-      return { items, rendered: shownRendered, remaining };
+      return { items, rendered: shownRendered, remaining, ...(drained.malformed > 0 ? { malformed: drained.malformed } : {}) };
     },
 
     async review(input: { action: 'list' | 'accept' | 'discard'; ids?: string[] }): Promise<PeerReviewResult> {

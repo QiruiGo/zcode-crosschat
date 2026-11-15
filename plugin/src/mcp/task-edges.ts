@@ -87,7 +87,18 @@ import { buildApprovalResult, buildRefusedToolResult } from "../core/toolrelay.j
 
 const DEFAULT_STALE_TASK_MINUTES = 30;
 
-/** XC_STALE_TASK_MINUTES → 毫秒；非有限正数取默认 30min（§5.4 / plugin.json §10.1）。 */
+/**
+ * XC_STALE_TASK_MINUTES → 毫秒；非有限正数取默认 30min（§5.4 / plugin.json §10.1）。
+ *
+ * v0.7.1（红队四番战 边界-10 修复）：`0` 的语义**显式化**。红队实测（`b10.mjs`）：
+ * `=1` 时 claimed 任务 ~64s 被清扫回 pending；`=0` 时 104s 仍 claimed——因为 0 走到
+ * 这里和非数字/负数同路，一律回落缺省 30min，而这个回落此前**没有任何文档说过**
+ * （对照 `XC_PEER_MAX_QUEUE_DEPTH` 的 PROTOCOL §9「0=内置 1024」）。本版不改变
+ * 该行为（0 = 缺省 30min，与 peer 队列深度的「0=默认」口径一致；把 0 当成「立即
+ * 清扫」会让所有在途任务瞬间回池，当成「关闭清扫」又会违背 README L215 的清扫
+ * 承诺），只把口径写进代码注释、PROTOCOL §9 的 env 表与 README，并配防回归单测
+ * 锁死 `0 / -1 / 空串 / 非数字` 全部回落 30min。
+ */
 export function staleThresholdMsFromEnv(env: NodeJS.ProcessEnv): number {
   const raw = env["XC_STALE_TASK_MINUTES"];
   const n = typeof raw === "string" && raw.trim() !== "" ? Number(raw) : Number.NaN;

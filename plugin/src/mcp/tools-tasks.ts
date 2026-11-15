@@ -5,15 +5,18 @@
  * ① dispatch 增 `priority`（high/normal/low，缺省 normal；排序建议非抢占，§3.2）；
  * ② report status 增 `blocked`（认领者显式申报暂停；attempt 保留；core 层
  *    applyReport/applyReportBlocked 落 preBlockedStatus/blockedReason/blockedAt）；
- * ③ evidence 砍 sha256 现算复核（方案 §1-B「文件+摘要」）——保留文件存在门
- *    （evidence_file_missing）与工作区遏制门（evidence_path_outside_workspace，
- *    v0.5.2 bug-05 修复不回退）；旧调用方携带的 evidence[].sha256 忽略并在
- *    payload 以 `ignored:["evidence[].sha256"]` 披露（§1.3 迁移表行 xc_report）。
+ * ③ evidence 的 sha256 由工具现算并与调用方声明值复核（v0.7.1 边界-7 恢复 v0.5 语义：
+ *    v0.6 砍复核后 `ignored` 披露 + 回执 sha256=null 使 DEMO 文档化的核对流程无法完成）；
+ *    文件存在门（evidence_file_missing）、工作区遏制门（evidence_path_outside_workspace，
+ *    v0.5.2 bug-05 修复不回退）与「必须是普通文件」门（evidence_not_a_file，v0.7.1 边界-8）
+ *    三道并存。
  *
  * 身份 = 连接绑定；并发纪律（§2.7）与 tools.ts 完全一致；attemptWake 只在锁外。
  */
 
 import { z } from "zod";
+import { createHash } from "node:crypto";
+import { createReadStream } from "node:fs";
 import { resolve, sep } from "node:path";
 import { stat } from "node:fs/promises";
 import {
@@ -92,15 +95,16 @@ export const ReportShape = {
   evidence: z
     .array(
       z.object({
-        path: z.string().min(1).describe("证据文件绝对路径"),
-        // v0.6（DESIGN-V0.6.md §1.2 T4）：sha256 复核已砍——字段仅为旧调用方兼容
-        // 保留，值忽略并在 payload 以 ignored 披露。
-        sha256: z.string().nullable().optional().describe("v0.6 起忽略（哈希复核已砍）；文件存在门与工作区内路径门不变"),
-        note: z.string().optional().describe("一句话说明（文件+摘要，方案 §1-B）"),
+        path: z.string().min(1).describe("证据文件路径（绝对或相对工作区；必须在工作区内）"),
+        // v0.7.1（边界-7）：恢复 v0.5 复核语义——缺省或 null = 未声明（工具现算后落库）；
+        // 提供时必须与工具现算的 sha256 一致，不符整单拒绝（evidence_checksum_mismatch）。
+        sha256: z.string().nullable().optional().describe("可选：调用方自算的 sha256（hex，大小写不敏感）；缺省/null=由工具现算，提供时必须与现算值一致否则 evidence_checksum_mismatch"),
+        // v0.7.1（边界-8）：note 可选性显式——省略按空串入库；控制字符清洗为空格、超长截断。
+        note: z.string().optional().describe("可选的一句话摘要；省略按空串入库，控制字符会被清洗为空格"),
       }),
     )
     .optional()
-    .describe("completed 必须至少 1 条；每条文件必须真实存在且位于工作区内（evidence_file_missing / evidence_path_outside_workspace）"),
+    .describe("completed 必须至少 1 条；每条必须是工作区内真实存在的普通文件（evidence_not_a_file / evidence_file_missing / evidence_path_outside_workspace），sha256 由工具现算复核"),
 } as const;
 
 export type DispatchArgs = { to: string; title: string; prompt: string; acceptance?: string; dependsOn?: string[]; priority?: (typeof TASK_PRIORITIES)[number] };
@@ -115,6 +119,47 @@ export type ReportArgs = {
 };
 
 // ---------------------------------------------------------------------------
+// 证据门纯函数（v0.7.1 边界-7/边界-8；锁外现算，导出供单测）
+// ---------------------------------------------------------------------------
+
+/** evidence note 的最大入库长度（超长截断；防 JSONL 真源被单条摘要撑爆）。 */
+export const EVIDENCE_NOTE_MAX_LENGTH = 500;
+
+/** 控制字符清洗（与 tools-team.ts sanitizeLeadReason 同口径：C0/DEL → 空格）。 */
+const EVIDENCE_NOTE_CONTROL_RE = /[\u0000-\u001f\u007f]/g;
+
+/**
+ * v0.7.1（边界-8）：note 清洗——可选性显式化 + 控制字符不原样入库。
+ *
+ * `undefined`/空串按「未写摘要」处理返回 `""`（note 仍是可选的，省略不等于拒绝）；
+ * 其余值先剥控制字符（含 `\n` `\t` `\u0000`，一律降为空格）、去首尾空白、再钳长度。
+ */
+export function sanitizeEvidenceNote(note: string | undefined): string {
+  if (typeof note !== "string") return "";
+  return note
+    .replace(EVIDENCE_NOTE_CONTROL_RE, " ")
+    .trim()
+    .slice(0, EVIDENCE_NOTE_MAX_LENGTH);
+}
+
+/**
+ * v0.7.1（边界-7）：证据文件 sha256 现算（流式，不整文件读进内存）。
+ * 不可读/不是普通文件 → `null`（调用方转 evidence_file_missing / evidence_not_a_file）。
+ */
+export async function sha256File(path: string): Promise<string | null> {
+  try {
+    const stats = await stat(path);
+    if (!stats.isFile()) return null;
+    const hash = createHash("sha256");
+    const stream = createReadStream(path);
+    for await (const chunk of stream) hash.update(chunk);
+    return hash.digest("hex");
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 核心实现（SDK 无关；原 tools.ts 平移 + 三处 v0.6 增量）
 // ---------------------------------------------------------------------------
 
@@ -127,6 +172,18 @@ function ticketText(args: DispatchArgs): string {
     prompt: args.prompt,
     acceptance: args.acceptance?.trim() || "",
   });
+}
+
+/**
+ * v0.7.1（规模压-B3）：派发幂等去重键的唯一定义（工具面、回执披露、单测共用）。
+ *
+ * 键 = `to=<受领成员键>|ticket=<任务票文本 sha256 前 16 hex>`。
+ * **不含发送方**、不含 taskId（新 taskId 不可预知）、不含 attempt 快照：
+ * 「同一张票、同一个收方、还没被读过」即视为重复派发。完整定义见
+ * README「重复派发幂等」与 docs/PROTOCOL.md §4。
+ */
+export function dispatchDedupKey(toKey: string, ticket: string): string {
+  return `to=${toKey}|ticket=${sha256Of(ticket).slice(0, 16)}`;
 }
 
 /** 回执消息内容：机器可解析 JSON，attempt 关联保留在此（见 xc_report 内注释）。 */
@@ -198,17 +255,22 @@ export function createTaskCore(deps: ToolDeps): TaskCore {
           }
 
           const ticket = ticketText(args);
-          // duplicate 幂等判定（移植 dsh tools.js:2088-2093）。
+          // duplicate 幂等判定（v0.7.1 规模压-B3：去重键**不含发送方**）。
+          //
+          // 去重键（文档化口径，README/PROTOCOL §dispatch 幂等）：
+          //   duplicateKey = (to, ticket) ∧ 该派发信封未被读过 ∧ isCurrentMail
+          // 即「收方邮箱里是否已有一条同票、未读、仍现行的派发信封」——谁派的无关。
+          // 旧实现把 `m.from === me.agentKey` 与「发送方当前开放 attempt 快照」也算进键，
+          // 于是两个会话把同一张票派给同一目标各建一单、各投一条（红队 b3scale 实测
+          // team.json 2 单 / inbox 2 行）；同发送方换一条在途任务重派也会漏判。
           const existing = await readMailbox(stateRoot, me.teamId, toKey);
+          // 发送方当前开放 attempt 快照（source 字段透传；**不参与**去重键——见上）。
           const myOpen = memberOpenTasks(team.tasks, me.agentKey)[0];
           const dup = existing.find(
             (m) =>
-              m.from === me.agentKey &&
               m.to === toKey &&
               m.content === ticket &&
               m.attemptId === undefined &&
-              m.sourceTaskId === myOpen?.id &&
-              m.sourceAttemptId === myOpen?.attemptId &&
               isCurrentMail(team, m) &&
               m.readAt === undefined,
           );
@@ -218,6 +280,8 @@ export function createTaskCore(deps: ToolDeps): TaskCore {
               kind: "duplicate" as const,
               taskId: dup.taskId ?? "",
               status: task?.status ?? "pending",
+              duplicateKey: dispatchDedupKey(toKey, ticket),
+              originalCreatedBy: task?.createdBy,
             };
           }
 
@@ -259,9 +323,19 @@ export function createTaskCore(deps: ToolDeps): TaskCore {
         });
 
         if (prepared.kind === "duplicate") {
+          // v0.7.1（规模压-B3）：回执披露去重键与首派方——键不含发送方，命中时调用方
+          // 看到的可能是**别人**派的那一单，必须能看出「这一单已经有人派过了」。
+          const by = prepared.originalCreatedBy;
           return okResult(
-            `Task ${prepared.taskId} already dispatched (duplicate); no new task created.`,
-            { taskId: prepared.taskId, status: prepared.status, delivered: "duplicate" },
+            `Task ${prepared.taskId} already dispatched (duplicate); no new task created.`
+              + (by !== undefined && by !== me.agentKey ? ` (first dispatched by "${by}")` : ""),
+            {
+              taskId: prepared.taskId,
+              status: prepared.status,
+              delivered: "duplicate",
+              duplicateKey: prepared.duplicateKey,
+              ...(by !== undefined ? { originalCreatedBy: by } : {}),
+            },
           );
         }
 
@@ -414,11 +488,13 @@ export function createTaskCore(deps: ToolDeps): TaskCore {
     async xc_report(args, connectionKey) {
       return runCore(stateRoot, async () => {
         const me = identityRequire(connectionKey);
-        // 慢操作在锁外：证据门（§1.2 T4）。v0.6 砍 sha256 现算复核；保留两道门：
-        // 文件存在（evidence_file_missing）与工作区内路径（evidence_path_outside_workspace，
-        // v0.5.2 bug-05 修复不回退——round1 #03/#16 重放面）。
+        // 慢操作在锁外：证据门（§1.2 T4）。三道门全在锁外现算/现查：
+        // ① 工作区内路径（evidence_path_outside_workspace，v0.5.2 bug-05 修复不回退）；
+        // ② 必须是**普通文件**（evidence_not_a_file，v0.7.1 边界-8：目录/设备文件不得充证据）；
+        // ③ sha256 由工具现算并与调用方声明值复核（evidence_checksum_mismatch，v0.7.1 边界-7
+        //    恢复 v0.5 语义——v0.6 砍复核后 `ignored` 披露与回执 sha256=null 使 DEMO 文档化的
+        //    「回执含 sha256 → 与文件核对一致」流程无法完成）。缺省/显式 null = 未声明，落库存现算值。
         const evidence: EvidenceItem[] = [];
-        const ignoredEvidenceSha256 = (args.evidence ?? []).some((e) => e.sha256 != null);
         const wsRoot = resolve(workspace);
         const wsPrefix = wsRoot.endsWith(sep) ? wsRoot : wsRoot + sep;
         const samePath = (a: string, b: string): boolean =>
@@ -439,8 +515,9 @@ export function createTaskCore(deps: ToolDeps): TaskCore {
                 `evidence must live inside the shared workspace (§2.6 evidence gate, v0.5.2 containment)`,
             });
           }
+          let stats;
           try {
-            await stat(abs);
+            stats = await stat(abs);
           } catch {
             throw new ToolError({
               error: "evidence_file_missing",
@@ -448,8 +525,37 @@ export function createTaskCore(deps: ToolDeps): TaskCore {
               message: `evidence file "${e.path}" does not exist or is unreadable; the evidence gate requires a real file (§2.6)`,
             });
           }
-          // v0.6：sha256 不再计算/复核（EvidenceItem.sha256 落 null，非文件证据同款）。
-          evidence.push({ path: e.path, sha256: null, note: e.note ?? "" });
+          // v0.7.1（边界-8）：目录/套接字/设备文件不得作证据——`stat` 存在≠是文件。
+          if (!stats.isFile()) {
+            throw new ToolError({
+              error: "evidence_not_a_file",
+              path: e.path,
+              message: `evidence "${e.path}" is not a regular file (${stats.isDirectory() ? "directory" : "non-regular file"}); ` +
+                `the evidence gate requires a real file inside the workspace (§2.6)`,
+            });
+          }
+          const computed = await sha256File(abs);
+          if (computed === null) {
+            throw new ToolError({
+              error: "evidence_file_missing",
+              path: e.path,
+              message: `evidence file "${e.path}" does not exist or is unreadable; the evidence gate requires a real file (§2.6)`,
+            });
+          }
+          // 声明值（非 null）与现算值不符 → 整单拒绝（hex 大小写不敏感、首尾空白忽略）。
+          const claimed = typeof e.sha256 === "string" ? e.sha256.trim().toLowerCase() : "";
+          if (claimed !== "" && claimed !== computed.toLowerCase()) {
+            throw new ToolError({
+              error: "evidence_checksum_mismatch",
+              path: e.path,
+              claimed: e.sha256 as string,
+              computed,
+              message: `evidence sha256 mismatch for "${e.path}": claimed ${e.sha256}, computed ${computed}`,
+            });
+          }
+          // v0.7.1（边界-8）：note 可选性显式化——省略按空串入库；控制字符一律清洗为空格
+          // （与 sanitizeLeadReason 同口径），长度钳制，防原样入库污染 JSONL 真源。
+          evidence.push({ path: e.path, sha256: computed, note: sanitizeEvidenceNote(e.note) });
         }
 
         const out = await withTeamLock(stateRoot, me.teamId, async () => {
@@ -557,7 +663,9 @@ export function createTaskCore(deps: ToolDeps): TaskCore {
           status: out.status,
           reportedAt: out.reportedAt,
           wakeBack,
-          ...(ignoredEvidenceSha256 ? { ignored: ["evidence[].sha256"] } : {}),
+          ...(evidence.length > 0
+            ? { evidenceSha256: evidence.map((e) => ({ path: e.path, sha256: e.sha256 })) }
+            : {}),
         });
       });
     },
@@ -634,7 +742,7 @@ export function registerTaskTools(
   );
   reg(
     "xc_report",
-    "Report task progress/completion/failure/blocked with the current attempt token; completion requires result and >=1 evidence (file must exist inside the workspace; the v0.5 sha256 re-check was removed - a carried evidence[].sha256 is ignored and disclosed). status=blocked pauses the task keeping the attempt alive and requires a non-blank error as the blocking reason.",
+    "Report task progress/completion/failure/blocked with the current attempt token; completion requires result and >=1 evidence (each entry must be a real regular file inside the workspace; the tool computes its sha256 and rejects a carried evidence[].sha256 that does not match - evidence_checksum_mismatch). status=blocked pauses the task keeping the attempt alive and requires a non-blank error as the blocking reason.",
     ReportShape,
     async (args, extra) => taskCore.xc_report(args as unknown as ReportArgs, connectionKeyOf(extra)),
   );

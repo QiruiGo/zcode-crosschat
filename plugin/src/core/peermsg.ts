@@ -280,10 +280,28 @@ export async function drainPeerQueue(root: string, sessionId: string, limit?: nu
   return result.items;
 }
 
+/**
+ * v0.7.1（红队四番战 故障注-4 修复）：带坏行计数的投递级队列排空。
+ *
+ * `drainPeerFile` 一直统计 `malformed`（坏行条数），但旧 `drainPeerQueue`
+ * 只回传 items 把计数丢了——读取面因此无法披露（队内 inbox 有 malformedLines、
+ * held 有 corrupted，peer 队列三方不一致；红队 fi4：乱码行 + 半行 JSON 追加进
+ * 队列后 xc_read({scope:"peer"}) 只报 count:1，零提示）。本函数保留计数，
+ * 供 PeerServices.inbox → xc_read peer scope 披露（口径与 inbox 一致）。
+ */
+export async function drainPeerQueueDetailed(root: string, sessionId: string, limit?: number): Promise<PeerDrainResult> {
+  return drainPeerFile(peerQueueFile(root, sessionId), limit);
+}
+
 /** Drain the transport-level inbox of one session. */
 export async function drainPeerInbox(root: string, sessionId: string, limit?: number): Promise<PeerQueueItem[]> {
   const result = await drainPeerFile(peerInboxFile(root, sessionId), limit);
   return result.items;
+}
+
+/** v0.7.1（故障注-4）：传输级收件箱的带坏行计数排空（同 drainPeerQueueDetailed 口径）。 */
+export async function drainPeerInboxDetailed(root: string, sessionId: string, limit?: number): Promise<PeerDrainResult> {
+  return drainPeerFile(peerInboxFile(root, sessionId), limit);
 }
 
 /** Read the queue without consuming it (observation only).

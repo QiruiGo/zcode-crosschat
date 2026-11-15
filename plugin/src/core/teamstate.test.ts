@@ -6,6 +6,7 @@ import {
   allowedTransitions,
   applyReport,
   beginTaskAttempt,
+  bootstrapTimeoutFromEnv,
   canTransition,
   getTask,
   makeTask,
@@ -13,9 +14,12 @@ import {
   newTeamState,
   nextTaskId,
   priorityRank,
+  provisionStaleAfterMs,
+  provisionTimeoutError,
   readTeam,
   reportTransitionError,
   sortTasksForBoard,
+  sweepStaleProvisioningLocked,
   unblockTask,
   unsatisfiedDependencies,
   writeTeam,
@@ -416,5 +420,60 @@ describe('v0.6 C2 优先级（makeTask 落盘 + 任务板排序）', () => {
     expect(priorityRank(undefined)).toBe(priorityRank('normal'));
     expect(priorityRank('high')).toBeLessThan(priorityRank(undefined));
     expect(priorityRank('low')).toBeGreaterThan(priorityRank('normal'));
+  });
+});
+
+describe('v0.7.1 provisioning deadline 清扫（红队四番战 故障注-1）', () => {
+  function member(overrides: Partial<import('./types.js').TeamMember>): import('./types.js').TeamMember {
+    return { key: 'm', sessionId: '', role: 'worker', joinedAt: 1, lastSeen: 1, ...overrides };
+  }
+
+  it('provisionStaleAfterMs = 超时 + 60s 宽限（与 resolveReprovision 同口径）', () => {
+    expect(provisionStaleAfterMs(1000)).toBe(61_000);
+    expect(provisionStaleAfterMs(300_000)).toBe(360_000);
+  });
+
+  it('bootstrapTimeoutFromEnv：缺省/空/非有限正数 → 内置默认（V18 防御保留）', () => {
+    expect(bootstrapTimeoutFromEnv({})).toBe(300_000);
+    expect(bootstrapTimeoutFromEnv({ XC_MEMBER_BOOTSTRAP_TIMEOUT_MS: '' })).toBe(300_000);
+    expect(bootstrapTimeoutFromEnv({ XC_MEMBER_BOOTSTRAP_TIMEOUT_MS: '0' })).toBe(300_000);
+    expect(bootstrapTimeoutFromEnv({ XC_MEMBER_BOOTSTRAP_TIMEOUT_MS: 'abc' })).toBe(300_000);
+    expect(bootstrapTimeoutFromEnv({ XC_MEMBER_BOOTSTRAP_TIMEOUT_MS: '45000' })).toBe(45_000);
+  });
+
+  it('过期 provisioning → failed + error + deadline 保留；未过期/其他态不动', () => {
+    const team = setup();
+    team.members.push(
+      member({ key: 'stuck', state: 'provisioning', provisionedAt: 1000, provisionDeadlineAt: 61_000 }),
+      member({ key: 'live', state: 'provisioning', provisionedAt: 1000, provisionDeadlineAt: 100_000 }),
+      member({ key: 'ready', state: 'ready' }),
+      member({ key: 'done', state: 'failed' }),
+    );
+    const swept = sweepStaleProvisioningLocked(team, 61_001, 61_000);
+    expect(swept.map((s) => s.key)).toEqual(['stuck']);
+    const byKey = Object.fromEntries(team.members.map((m) => [m.key, m]));
+    expect(byKey['stuck'].state).toBe('failed');
+    expect(byKey['stuck'].error).toMatch(/provisioning deadline exceeded/);
+    expect(byKey['stuck'].provisionDeadlineAt).toBe(61_000);   // 判定依据保留（审计/复诊）
+    expect(byKey['live'].state).toBe('provisioning');          // 未过期不动
+    expect(byKey['ready'].state).toBe('ready');
+    expect(byKey['done'].state).toBe('failed');
+  });
+
+  it('存量记录（无 deadline 字段）按 provisionedAt/joinedAt + 口径现算兜底', () => {
+    const team = setup();
+    team.members.push(
+      member({ key: 'legacy-p', state: 'provisioning', provisionedAt: 1000 }),
+      member({ key: 'legacy-j', state: 'provisioning', joinedAt: 5000 }),
+    );
+    expect(sweepStaleProvisioningLocked(team, 5000 + 60_000, 61_000).map((s) => s.key)).toEqual(['legacy-p']);
+    expect(sweepStaleProvisioningLocked(team, 5000 + 61_001, 61_000).map((s) => s.key)).toEqual(['legacy-j']);
+  });
+
+  it('error 文案带重试指引且 ≤500 字符（与既有失败文案同族）', () => {
+    const text = provisionTimeoutError(1000, 61_000, 60_000);
+    expect(text.length).toBeLessThanOrEqual(500);
+    expect(text).toMatch(/member-add/);
+    expect(text).toMatch(/idempotent reprovision/);
   });
 });

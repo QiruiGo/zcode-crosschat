@@ -408,7 +408,10 @@ export async function handleRead(deps: ToolDeps, args: ReadArgs, connectionKey: 
   }
 }
 
-/** scope=peer（v0.5.3 peer 排空面 1:1）：排空跨会话队列；count=真实呈现数。 */
+/** scope=peer（v0.5.3 peer 排空面 1:1）：排空跨会话队列；count=真实呈现数。
+ *  v0.7.1（红队四番战 故障注-4 修复）：排空时跳过的坏行条数随结果披露
+ *  （`malformedLines`，与队内 inbox 的 malformedLines、held 的 corrupted
+ *  三方口径一致——此前 peer 队列坏行被静默跳过且不计数）。 */
 async function readPeerScope(deps: ToolDeps, args: ReadArgs): Promise<ToolResult> {
   const services = getPeerServices(deps);
   const budget = receiverInjectBudget(contextCharsFromEnv(deps.env), deps.env);
@@ -422,14 +425,27 @@ async function readPeerScope(deps: ToolDeps, args: ReadArgs): Promise<ToolResult
   if (result.items.length > 0) {
     await logPeerInject(deps, budget.total, layout);
   }
+  // v0.7.1（故障注-4）：坏行计数披露 + 跨会话域审计（与 inbox 的 malformedLines 同口径）。
+  const malformed = result.malformed ?? 0;
+  if (malformed > 0) {
+    await logPeerEvent(peerRootFromEnv(deps.env), {
+      event: "peer-queue-malformed",
+      malformed,
+      consumed: result.items.length,
+    });
+  }
+  const malformedNote = malformed > 0
+    ? `；⚠ ${malformed} 条队列坏行已跳过（不可解析/形状非法——存储损坏痕迹，发送方如需可达请重发）`
+    : "";
   return okResult(
     result.items.length === 0
-      ? "没有待投递的跨会话消息。"
-      : `取到 ${result.items.length} 条跨会话消息（已消费）${result.remaining > 0 ? `；另有 ${result.remaining} 条待投递——再调一次 xc_read({scope:"peer"}) 继续拉取` : ""}。`,
+      ? (malformed > 0 ? `没有待投递的跨会话消息${malformedNote}。` : "没有待投递的跨会话消息。")
+      : `取到 ${result.items.length} 条跨会话消息（已消费）${result.remaining > 0 ? `；另有 ${result.remaining} 条待投递——再调一次 xc_read({scope:"peer"}) 继续拉取` : ""}${malformedNote}。`,
     {
       count: result.items.length,
       envelopes: layout.blocks,
       remaining: result.remaining,
+      ...(malformed > 0 ? { malformedLines: malformed } : {}),
       ...(layout.budgetTruncated ? { budgetTruncated: true } : {}),
     },
   );

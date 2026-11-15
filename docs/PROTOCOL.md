@@ -32,6 +32,8 @@
 
 v0.6 起 inbox 侧不再有 `.jsonl.int` 哈希链 sidecar（防磁盘篡改机制已砍；存量 sidecar 成为无害孤儿，不再读写）。
 
+v0.7.1（故障注-2 修复）：`registry/names.json` 不可解析/形状非法时，读写方抛**带文件绝对路径 + 恢复动作**的显式诊断（与 team.json 损坏文案同族）——`invalid names.json "<path>": <原因> — it is a rebuildable index: delete the file to reset (name bindings re-establish on the next xc_identify / xc_team member-add), or restore it from a backup`。names.json 是**可重建索引**（删文件即重置，会话记录里的 boundName 兼容兜底不受影响），不再裸抛 JSON token 错让运维猜。
+
 ### 1.2 跨会话 peer 轴（机器全局）
 
 peer 根目录解析优先级（`peerdir.ts`）：`XC_MESSAGING_DIR` > `${ZCODE_PLUGIN_DATA}/peers` > `~/.zcode/cli/plugins/data/zcode-crosschat@dev-zcode-crosschat/peers`：
@@ -96,7 +98,7 @@ C6/C7 帧型同样只做通知/回执，**授权只认审批文件**（§11.2）
 | `claimed` | 已认领，持一次性 `attemptId` |
 | `in_progress` | 执行中（report 推进） |
 | `blocked` | 暂停；入口=认领者 `xc_report(status:"blocked")` 且 `error`（阻塞原因）必填；attempt 保留；出口=`xc_team({action:"unblock"})`（回 `preBlockedStatus`）/ 认领者自解 `report(in_progress)` / cancel |
-| `completed` | 终态；必须带 evidence（文件+摘要） |
+| `completed` | 终态；必须带 evidence（工作区内普通文件 + 现算 sha256 + 可选摘要） |
 | `failed` | 终态；依赖闭包内 pending 下游自动解除（置 cancelled + 回执创建者） |
 | `cancelled` | 终态（cancel 或依赖解除联动） |
 
@@ -104,6 +106,32 @@ C6/C7 帧型同样只做通知/回执，**授权只认审批文件**（§11.2）
 `TERMINAL = {completed, failed, cancelled}`；`SWEEPABLE = {claimed, in_progress}`——**blocked 不进僵尸清扫**（合法暂停不得被误回收）。
 attempt 令牌：claim 时铸造一次性 attemptId，report 不匹配即硬拒；接管/停机经 `revokeAttempt` 回池并回执创建者。
 `priority` 只影响呈现与取单建议顺序，**不做抢占**——claim 始终是显式 taskId。
+
+### 4.1 证据门（`xc_report` 的 `evidence`，v0.7.1 边界-7/边界-8）
+
+每条证据 = 工作区内一个**真实普通文件** + 工具现算的 sha256 + 可选一句话摘要。三道硬闸（整单拒绝，真源不动、终态回执不发）：
+
+| 条件 | 错误码 |
+|---|---|
+| resolve 后路径越出工作区（`../` 穿越、绝对路径、同前缀兄弟目录） | `evidence_path_outside_workspace` |
+| 不是普通文件（目录 / 设备文件 / 套接字） | `evidence_not_a_file` |
+| 不存在或不可读 | `evidence_file_missing` |
+
+sha256：**可省略**（省略或显式 `null` = 未声明，工具现算后落库，回执随带）；**带了就必须与文件内容一致**（hex 大小写不敏感、首尾空白忽略），否则 `evidence_checksum_mismatch`（payload 带 `claimed`/`computed`）。报告回执 payload 以 `evidenceSha256:[{path,sha256}]` 披露现算值——DEMO §2 的「读回执 → 与文件核对一致」按此完成。
+`note`：**可选**，省略按空串入库；控制字符（C0/DEL）入库前一律清洗为空格，长度钳 500 字符。
+
+### 4.2 重复派发幂等键（v0.7.1 规模压-B3）
+
+`xc_dispatch` 的去重键（单一事实源 `dispatchDedupKey`，`mcp/tools-tasks.ts`）：
+
+```
+duplicateKey = (to 成员键, 任务票文本) ∧ 该派发信封未被读过(readAt 缺省) ∧ isCurrentMail(team, m)
+```
+
+- **不含发送方**：两个会话把同一张票派给同一收方，第二个不再建单，返回既有 `taskId` + `delivered:"duplicate"`。
+- **不含 taskId / attempt 快照**：新 taskId 不可预知；发送方当前在途任务的快照只作 `source*` 字段透传，不进键。
+- 回执披露 `duplicateKey`（`to=<收方>|ticket=<票面 sha256 前 16 hex>`）与 `originalCreatedBy`（首派方，命中他人派单时据此看出「这一单已经有人派过」）。
+- 收方已读走旧票、或票面（标题/内容/验收标准）不同 → 建新单。
 
 ## 5. 停滞检测（C5）与容量水位（C3）
 
@@ -113,11 +141,34 @@ attempt 令牌：claim 时铸造一次性 attemptId，report 不匹配即硬拒�
 - 预警规则：可用内存 < `XC_MEM_WARN_WATERMARK`（缺省 0.15）或单会话 working set > `XC_MEM_SESSION_LIMIT_BYTES`（缺省 800MB）时 overview 标红并给出 violated 规则明细；CIM 不可用时降级为只报 os 水位 + `degraded:"cim-unavailable"`，进程类数据不虚报。
 - 压缩联动（C9，**建议级非拦截级**）：verdict 标红时 `formatCapacityLines` 追加固定 `compress-advice` 建议行——先按 longtask checklist 落 journal（`.crosschat/tasks/<taskId>/journal.md`）再接受压缩；lead 可 `xc_relay` 要求目标先 `xc_report(status:"in_progress")` 附 journal 路径。平台无宿主压缩钩子接口，插件**不能拦截或触发压缩**，只做「预警 + 建议 + 落盘副本」最小闭环；team/panel 两视图都经 `capacityMount`，改一处两处生效。
 
+### 5.1 建员 provisioning 超时（v0.7.1，故障注-1 修复）
+
+超时判据**落盘**：`member-add` Phase 1 写 provisioning 记录时一并写 `provisionDeadlineAt = provisionedAt + XC_MEMBER_BOOTSTRAP_TIMEOUT_MS + 60s 宽限`（`core/teamstate.ts` 的 `provisionStaleAfterMs` 为单一事实源，与 §6.4 幂等重供给的停滞口径同值）。超时不再只存在于 lead MCP server 进程的内存里——server 中途死亡时成员不再永久卡 provisioning（旧形态：无回执、无审计、还占成员名额）。
+
+清扫（两入口，都置 `state=failed` + error 并落审计 `member-provision-timeout`）：
+- **工具面**：任一 `xc_team({action:"member-add"})` 的 Phase 1（团队锁内）清扫全部过期记录；同名重试随后干净接管（§6.4），成功载荷披露 `recovered:"provision-timeout"`。
+- **钩子面**：任一存活会话的 UserPromptSubmit 回合（`hooks/shared.ts` 的 `sweepStaleProvisioning`，团队锁 2s 预算内 best-effort，锁忙跳过下回合再扫）。
+
+存量记录（无 `provisionDeadlineAt` 字段）按 `provisionedAt/joinedAt + 同一口径`现算兜底；钩子进程无 userConfig env，用内置默认 300s + 60s 宽限（保守方向）。
+
 ## 6. 跨会话投递回执六态
 
 `xc_relay` 对 peer 轴的投递回执（`PeerReceipt`）：`delivered | held | denied | refused | dropped | expired`。
 非送达终态（dropped/expired/refused/denied）在摘要行如实改口为「未投递」并附原因与恢复动作——不自称「已投递」。
 `held` 件进隔离区待 `xc_review({axis:"peer"})` 放行；`expired` 为 hold 超 `XC_HOLD_TTL_MS`（缺省 12h）到期。
+
+**detail 透出（v0.7.1 规模压-B1）**：接收方在管道 `status` 帧里回的 `detail`（入队闸丢弃原因 + 恢复动作，`admissionDropDetail`）由 `xc_relay` 原样透进 payload `detail` 与摘要行（`未投递原因与恢复动作：…`），并写入 `peer-sent` / `relay-peer` 审计。四种丢弃原因的恢复动作：
+
+| reason | 恢复动作 |
+|---|---|
+| `queue-full` | 收方待投递队列已达上限（`XC_PEER_MAX_QUEUE_DEPTH`，缺省 1024）——让收方 `xc_read({scope:"peer"})` 排空，或稍后重试 |
+| `rate-limited` | 每发送方 30 条/10s 限速——放慢发送（约 5s 一条）后重试 |
+| `duplicate` | 该 msgId 已在去重窗口内被接收——无需重试 |
+| `loop-depth` | 转发链深度超限——不要继续转发这一条 |
+
+读取面错误（v0.7.1，故障注-3 修复）：`xc_read({scope:"peer-msg"})` 查找落空时先分辨「从没收到」与「存储损坏」——`messages/<msgId>.json` 存在但不可解析/缺 text → 显式 `message_corrupt`（附文件路径 + 恢复动作：删/修该文件清障、重发得新 msgId；消息未消费时 queue/inbox/held 兜底仍可读回原文），不再把存储损坏误述成 `unknown msgId`（恢复路径阻断）。peer 审计落 `peer-msg-read-corrupt`。
+
+坏行披露（v0.7.1，故障注-4 修复）：`xc_read({scope:"peer"})` 排空时跳过的队列坏行（不可解析/形状非法）随响应披露 `malformedLines` 计数（摘要行同步提示），与队内 inbox 的 `malformedLines`、held 审阅面的 `corrupted` 三方口径一致；peer 审计落 `peer-queue-malformed`。无坏行时不带该键（响应形状不变）。
 
 ## 7. urgent 优先队列（C1）
 
@@ -148,18 +199,18 @@ total = clamp(16000 × scale, 4000, 64000)，且 total ≥ item  # 批次基准�
 | `XC_WAKE_ENABLED` | `wake_enabled` | `false` | 推送唤醒总开关（无人值守时无头回合唤醒目标；失败回落邮箱投递） |
 | `XC_ZCODE_EXE` | `zcode_exe` | 空 | zcode 可执行文件绝对路径；空=自动探测，显式配置后严格校验不回落 |
 | `XC_ZCODE_CJS` | `zcode_cjs` | 空 | CLI 入口脚本；空时从 `zcode_exe` 同目录推导 |
-| `XC_MAX_MEMBERS` | `max_members` | `8` | 活成员上限（lead/failed/removed 不计） |
+| `XC_MAX_MEMBERS` | `max_members` | `8` | 活成员上限（lead/failed/removed 不计）。触顶报 `team_at_member_cap`，payload 分报 `activeMembers`（当前活成员数）与 `activeAfterAdd`（本次写入后） |
 | `XC_MEMBER_MODEL` | `member_model` | 空 | 成员模型 id；空=引擎枚举表选第一个 |
 | `XC_MEMBER_PROVIDER` | `member_provider` | 空 | 成员模型 providerId |
 | `XC_MEMBER_REASONING` | `member_reasoning` | `max` | 成员推理档位 |
-| `XC_MEMBER_BOOTSTRAP_TIMEOUT_MS` | `member_bootstrap_timeout_ms` | `300000` | 建员等待欢迎回合上限（ms） |
+| `XC_MEMBER_BOOTSTRAP_TIMEOUT_MS` | `member_bootstrap_timeout_ms` | `300000` | 建员等待欢迎回合上限（ms）；超时判据随 provisioning 记录落盘（`provisionDeadlineAt`=本值+60s 宽限），lead server 中途死亡也由后续 member-add/钩子清扫为 failed——见 §5.1 |
 | `XC_INBOUND_MODE` | `inbound_mode` | `accept` | 队内自由消息入站裁决：accept/hold/refuse（协议帧不受影响） |
-| `XC_STALE_TASK_MINUTES` | `stale_task_minutes` | `30` | 僵尸任务清扫阈值（分钟；blocked 不在清扫域） |
+| `XC_STALE_TASK_MINUTES` | `stale_task_minutes` | `30` | 僵尸任务清扫阈值（分钟；blocked 不在清扫域）。**`0`/负数/非数字一律回落缺省 30**（v0.7.1 边界-10 显式化）：既不是「立即清扫」（那会让所有在途任务瞬间回池），也不是「关闭清扫」（sweeper 照常按 30min 跑）——与 `XC_PEER_MAX_QUEUE_DEPTH` 的「0=内置值」同口径 |
 | `XC_CROSSCHAT_INBOUND` | `cross_session_inbound` | 空 | peer 入站用户层：accept/hold/refuse；与项目层/会话层取最严，三显式层都未设走 mode-parity 自动档，非法值按 hold |
 | `XC_PEER_RECEIVE` | `peer_receive` | `on` | peer 接收 kill-switch；`off` 一律拒收 |
 | `XC_HOLD_TTL_MS` | `hold_ttl_ms` | `43200000`（12h） | hold 件存活时长，到期回执 `expired` |
 | `XC_MESSAGING_DIR` | `messaging_dir` | 空 | peer 注册表根目录覆盖（绝对路径） |
-| `XC_PEER_MAX_QUEUE_DEPTH` | `peer_max_queue_depth` | `0`（=1024） | 单会话 peer 待投递队列深度上限；超限投递被丢弃并回执 `dropped` |
+| `XC_PEER_MAX_QUEUE_DEPTH` | `peer_max_queue_depth` | `0`（=1024） | 单会话 peer 待投递队列深度上限；超限投递被丢弃并回执 `dropped`（payload `detail` 带原因与恢复动作，见 §6） |
 | `XC_CONTEXT_CHARS` | `context_chars` | `0`（=200000） | 注入预算刻度（声明值） |
 | `XC_INJECT_ITEM_CHARS` | `inject_item_chars` | 空 | 单条预算覆盖（0/非法=自动） |
 | `XC_INJECT_TOTAL_CHARS` | `inject_total_chars` | 空 | 批次预算覆盖（0/非法=自动） |
@@ -173,8 +224,13 @@ total = clamp(16000 × scale, 4000, 64000)，且 total ≥ item  # 批次基准�
 - regToken 硬闸已砍（个人/内部场景无恶意进程模型）：sid 存在性 + 活性软校验；**同名冲突显式拒**（`name_taken`）保留。
 - 成员崩溃后接管：无参同名注册在 lastSeen 新鲜窗口内得 `name_taken`（不猜测死活）；
   `xc_identify({takeover:true})` 立即换绑并回池其未完任务（受在途唤醒活信号闸保护：15min 内有在途回合 → `takeover_inflight` 拒绝）。
-- 证据门（v0.6）：evidence = 文件 + 摘要；文件必须真实存在且位于工作区内（`evidence_path_outside_workspace` / `evidence_file_missing` 硬拒）；**sha256 复核已砍**（旧参忽略并披露）。
-- 底线三不：不崩（大帧守卫/截断有界）、不丢（磁盘真源全文 + 原子写 + .bak 自愈）、不串号（身份锚 = 连接 extra 的 connectionKey，别名路径透传不变）。
+- 证据门（v0.7.1 边界-7/边界-8）：evidence = 工作区内**普通文件** + 现算 sha256 + 可选摘要；三道路径/形态门（`evidence_path_outside_workspace` / `evidence_not_a_file` / `evidence_file_missing`）+ sha256 复核（`evidence_checksum_mismatch`）；调用方声明的 sha256 必须与工具现算值一致，缺省则由工具现算后落库并随回执披露（详见 §4.1）。
+- peers 视图寻址（v0.7.1 边界-9）：`[ref]`（= sessionId 末 8 位）只在**跨会话可寻址行**（self/session）上渲染，且照抄即可作地址（`to="名字 [ref]"`）；`member` 行是队内花名册的只读投影，**不渲染 `[ref]`**，队内寻址用裸名或 `名字 [team]` 后缀。
+- **两轴操作的原子性**（v0.7.1 边界-4/边界-6）：`xc_identify` 的注册与改名都是「队内轴 + peer 轴」一次调用办两件事，任一轴失败都不留半边状态——
+  - 注册：peer 轴失败（`name_taken` / `session_not_anchored` / 锁忙等）→ **队内轴回滚**（names.json 绑定、team.json 成员行、连接绑定全部撤销；本次新建的队伍连 team.json 一起撤），错误信封 `peer_axis_failed` 带 `teamAxis:{registered:false, rolledBack:true}`。调用方可以把错误当「无副作用」直接重试（精确对重绑幂等）。回滚自身失败时如实写 `registered:true, rolledBack:false` + `rollbackError`。
+  - 改名：队内轴被「板面不干净」守卫阻止（名下任务引用/邮箱非空）→ **两轴都不改**，显式 `team_rename_blocked`（payload `renamed:{peer:false,team:false}`）；peer 轴改名失败（`name_taken`）→ 队内轴改名回滚到原键，同样不给「队内新名 + peer 旧名」的半个改名。
+- **同 sid 冲突的文案**（v0.7.1 并发与-1）：`session_id_in_use` 的 payload 增 `sameSessionId`。冲突对象持有**同一个** sessionId（同一会话被两个活进程重复拉起）时文案说清「两个活进程在争一个会话，停掉重复的那个」，不再误述 "another live session … use your own id"（败者用的正是自己的 id）；**异** sid 才是冒用场景，沿用 v0.5.2 起的原文案。
+- 底线三不：不崩（大帧守卫/截断有界 + **畸形帧显式 -32700**，见 §13）、不丢（磁盘真源全文 + 原子写 + .bak 自愈）、不串号（身份锚 = 连接 extra 的 connectionKey，别名路径透传不变）。
 
 ## 11. C6 转办授权与 C7 审批（v0.7）
 
@@ -315,3 +371,20 @@ crosschat 的 MCP server 是宿主外独立 stdio 进程，不持有其他 MCP �
 3. `xc_overview` team 视图挂 `offlineMembers` 块 + 文本行（`offline: <名>(证据, 名下任务 n 个 → 建议 xc_dispatch 重派)`）；
    阈值被钳制时挂 `offlineThresholdClamped` + WARNING。
 4. 并发安全：全部裁决在 `withTeamLock` 内；peer 扫描在锁外只读做。
+
+## 13. MCP stdio 传输层帧级拒收（v0.7.1 边界-5）
+
+协议消息仍走 MCP SDK 的 stdio 传输；产品只在其上覆写**帧边界**行为（`GuardedStdioTransport`），
+协议处理与 stdout 写路径原样沿用 SDK。帧级失败一律「显式 JSON-RPC 错误响应 + 传输不关 + 后续帧继续服务」：
+
+| 帧形态 | 判据 | 回执 |
+|---|---|---|
+| 单帧 ≤ 32MiB 且可解析 | 正常路径 | 正常进协议层 |
+| 单帧 > 32MiB（`MCP_MAX_FRAME_BYTES`） | ReadBuffer 溢出 | `-32700`，`id:null`（帧读不全，规范要求 id 为 null），message 说明上限值 |
+| 行读全但读不懂（裸控制字节入 JSON 字符串 / 裸 `NaN` / 坏 JSON / 帧型不符 schema） | `readMessage()` 抛错 | `-32700`，**尽力取回请求 id**（坏行的 id 段通常完好；取不到才 `null`），message 说明「帧无法解析为 JSON-RPC 消息」 |
+| 半行（尚无 `\n` 行界） | 缓冲里没有完整行 | **无回执**（帧还在途，不能把在途帧误判为坏帧）；行界补全后按合并结果处理 |
+
+- 两类失败用**同一个错误码**（-32700，JSON-RPC 2.0 Parse error）：客户端对「读不动的大帧」与「读不懂的坏帧」
+  看到同一种显式失败，不再一个静默丢弃一个有回执（v0.7.0 及以前坏帧 0 字节回执，只能靠超时发现）。
+- 协议层（`onmessage`）抛错不归传输层：SDK Protocol 自己会给请求回错误帧，传输层不再重复回一条。
+- server 进程**永不**因任何帧级失败退出（v0.5.1 CONC-2 纪律不变）。

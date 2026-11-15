@@ -9,7 +9,10 @@
  *
  * 修复（tools-identify.ts 改名路径）：成员 key 换绑时 leadKey/founderKey 同步
  * 改写为 newKey（角色跟随会话本人，不改变 lead 归属语义）；改名被「板面不干净」
- * 守卫阻止时（team_rename_blocked，边界-6 既有语义）一律不动键。
+ * 守卫阻止时一律不动键。
+ *
+ * v0.7.1（红队四番战 边界-6 修复）：板面不干净时不再做「队内拒 + peer 改名」的
+ * 半边改名，改为两轴原子的显式 `team_rename_blocked`（见下方该用例）。
  *
  * 驱动方式：白盒播种 team.json + identityStore（lead-tools.test.ts 同模式），
  * 改名走 handleIdentify 真路径（peer 轴无会话上下文 → 只改队内轴），角色操作走
@@ -100,7 +103,12 @@ async function rename(conn: string, from: string, to: string) {
 }
 
 async function engineEvents(): Promise<Array<Record<string, unknown>>> {
-  const raw = await readFile(engineLogFile(stateRoot), "utf8");
+  let raw: string;
+  try {
+    raw = await readFile(engineLogFile(stateRoot), "utf8");
+  } catch {
+    return []; // 一条审计都没落（例：改名被守卫阻止、零副作用路径）
+  }
   return raw.split("\n").filter((l) => l.trim() !== "").map((l) => JSON.parse(l) as Record<string, unknown>);
 }
 
@@ -182,19 +190,47 @@ describe("红队四番战 边界-1（P1）：lead/founder 改名 key 随动", ()
     expect(team.founderKey).toBe("a");
   });
 
-  it("板面不干净（task 引用）→ 队内改名被既有守卫阻止，键一律不动（边界-6 不回退）", async () => {
+  // v0.7.1（红队四番战 边界-6 修复）：语义变更——板面不干净时改名**两轴原子**：
+  // 显式 team_rename_blocked 错误、peer 轴也不改名（修复前是成功回执
+  // `renamed:{peer:true,team:false}`，同一会话留下队内旧名 + peer 新名两个身份，
+  // 红队 b678/g3-b6 复放：`xc_dispatch{to:"tm-b2"}` → not_a_member）。
+  it("板面不干净（task 引用）→ team_rename_blocked，两轴都不动、键一律不动（边界-6）", async () => {
     await seedTeam({ leadKey: "a", members: [member("b")], withTaskFromA: true });
     const connA = bind("a");
 
     const res = await rename(connA, "a", "a2");
     const payload = payloadOf(res);
-    // 队内轴未换绑（peer 轴标记的既有口径不在本修复范围，只锁 team:false）。
-    expect((payload["renamed"] as Record<string, unknown>)["team"]).toBe(false);
-    expect(String(payload["teamRenameBlocked"])).toContain("task references");
+    // 显式错误而非「半边改名」的成功回执。
+    expect(res.isError).toBe(true);
+    expect(payload["error"]).toBe("team_rename_blocked");
+    expect((payload["renamed"] as Record<string, unknown>)).toEqual({ peer: false, team: false });
+    expect(String(payload["reason"])).toContain("task references");
+    expect(String(res.content[0]?.text)).toContain("BOTH axes");
+    // 队内轴未换绑：花名册与 lead/founder 全部保持旧键。
     const team = (await readTeam(stateRoot, "default"))!;
     expect(team.members.map((m) => m.key)).toEqual(["a", "b"]);
     expect(team.leadKey).toBe("a");
     expect(team.founderKey).toBe("a");
+    // 连接身份也没被改写（修复前 identityStore 已换成新键）。
+    expect(identityStore.get(connA)?.agentKey).toBe("a");
+    // 没有任何 register-renamed 审计（没发生改名）。
+    expect((await engineEvents()).some((e) => e["event"] === "register-renamed")).toBe(false);
+  });
+
+  it("邮箱非空同样触发 team_rename_blocked（另一条守卫理由，同原子语义）", async () => {
+    await seedTeam({ leadKey: "a", members: [member("b")] });
+    const connA = bind("a");
+    // 给 a 的邮箱写一条消息（readMailbox 非空 → 板面不干净）。
+    const { appendMailbox, createMessage } = await import("../core/mailbox.js");
+    await appendMailbox(stateRoot, "default", "a", createMessage("b", "a", "hello", {}));
+
+    const res = await rename(connA, "a", "a2");
+    expect(res.isError).toBe(true);
+    expect(payloadOf(res)["error"]).toBe("team_rename_blocked");
+    expect(String(payloadOf(res)["reason"])).toContain("mailbox");
+    const team = (await readTeam(stateRoot, "default"))!;
+    expect(team.members.map((m) => m.key)).toEqual(["a", "b"]);
+    expect(team.leadKey).toBe("a");
   });
 
   it("审计面：register-renamed 披露 leadKeyFollowed/founderKeyFollowed", async () => {

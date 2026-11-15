@@ -23,6 +23,7 @@ import {
   refreshPeerBaseRecord,
   refreshSessionRegistration,
   resolveHookContext,
+  sweepStaleProvisioning,
   unreadSummary,
 } from './shared.js';
 import { drainPeerQueue } from '../core/peermsg.js';
@@ -48,6 +49,18 @@ async function main(): Promise<void> {
   }
 
   if (ctx.sessionId === undefined) return;
+
+  // --- v0.7.1（红队四番战 故障注-1）：provisioning 超时清扫（钩子面）---
+  // lead 的 MCP server 中途死亡时，建员欢迎回合的超时只存在于那个进程的内存里
+  // （红队 fi1：成员永久卡 provisioning、无回执、无审计、还占名额）。v0.7.1 起
+  // deadline 随 provisioning 记录落盘，任一存活会话的回合（本钩子）都能把过期
+  // 记录清扫成 failed + 审计。best-effort：锁忙（2s 预算）跳过，下回合再扫；
+  // 任何失败只审计不阻断（钩子永不失败会话）。
+  try {
+    await sweepStaleProvisioning(ctx.stateRoot);
+  } catch (error) {
+    await auditHookFailure(ctx.stateRoot, 'prompt-submit-provision-sweep', error);
+  }
 
   const blocks: string[] = [];
 

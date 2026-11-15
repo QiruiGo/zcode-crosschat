@@ -36,9 +36,10 @@ import { connectionKeyOf, identityStore, xcRegister } from "./identity.js";
 import { withTeamLock, withRegistryThenTeamLocks } from "../core/lock.js";
 import { appendMailbox, createMessage, readMailbox } from "../core/mailbox.js";
 import { logEngineEvent } from "../core/log.js";
-import { readNames, unbindName, findInflightWakeNonce, WAKE_INFLIGHT_MS } from "../core/registry.js";
+import { readNames, unbindName, bindName, findInflightWakeNonce, WAKE_INFLIGHT_MS } from "../core/registry.js";
 import { sanitizeKey, validateMemberName } from "../core/sanitize.js";
 import { DEFAULT_TEAM_ID } from "../core/types.js";
+import type { MemberRole } from "../core/types.js";
 import { memberOpenTasks, readTeam, writeTeam } from "../core/teamstate.js";
 import { revokeAttempt } from "../core/graph.js";
 import { peerRootFromEnv } from "../core/peerdir.js";
@@ -139,6 +140,76 @@ async function teamMemberCleanForRename(
     return { clean: false, reason: "mailbox still holds message(s)" };
   }
   return { clean: true };
+}
+
+/**
+ * v0.7.1（红队四番战 边界-6 修复）：把「已落地的队内改名」逆回原名。
+ *
+ * 改名是两轴合一操作：队内轴换键（unbind 旧名 → member key 换绑）之后才做 peer
+ * 轴改名。v0.7.0 及以前 peer 轴改名失败（典型：新花名在 peer 轴被另一个活会话
+ * 占着 → name_taken）时，队内轴已经换成新键而 peer 轴还是旧名——同一会话两个
+ * 身份，正是边界-6 在另一个方向上的同一根因（多轴操作不原子）。本函数与改名路径
+ * 里的队内正操作一一对应（unbind 新名 → 重绑旧名 → member key 换回 → leadKey/
+ * founderKey 换回 → 连接绑定换回），把队内轴改回原状。
+ *
+ * 永不抛：内部 IO 失败只审计并返回 `{ok:false,error}`，由调用方在错误信封里如实
+ * 披露（`teamAxis.rolledBack:false` + `rollbackError`）。
+ */
+async function undoTeamRename(
+  deps: ToolDeps,
+  connectionKey: string,
+  from: { teamId: string; agentKey: string; sessionId: string; name: string; role: MemberRole },
+  to: { agentKey: string; name: string },
+  followed: { leadKey: boolean; founderKey: boolean },
+): Promise<{ ok: boolean; error?: string }> {
+  try {
+    await withRegistryThenTeamLocks(deps.stateRoot, from.teamId, async () => {
+      await unbindName(deps.stateRoot, to.agentKey, from.sessionId);
+      await bindName(deps.stateRoot, from.agentKey, {
+        sessionId: from.sessionId,
+        role: from.role,
+        registeredAt: Date.now(),
+      });
+      const team = await readTeam(deps.stateRoot, from.teamId);
+      if (team === undefined) return;
+      const idx = team.members.findIndex((m) => m.key === to.agentKey);
+      if (idx >= 0) {
+        team.members[idx] = { ...team.members[idx]!, key: from.agentKey, lastSeen: Date.now() };
+        if (followed.leadKey && team.leadKey === to.agentKey) team.leadKey = from.agentKey;
+        if (followed.founderKey && team.founderKey === to.agentKey) team.founderKey = from.agentKey;
+        await writeTeam(deps.stateRoot, team);
+      }
+    });
+    identityStore.bind(connectionKey, {
+      sessionKey: `xc:${from.teamId}:${from.agentKey}`,
+      teamId: from.teamId,
+      name: from.name,
+      agentKey: from.agentKey,
+      sessionId: from.sessionId,
+      role: from.role,
+      boundAt: Date.now(),
+    });
+    await logEngineEvent(deps.stateRoot, {
+      event: "register-rename-rolled-back",
+      teamId: from.teamId,
+      from: to.agentKey,
+      to: from.agentKey,
+      sessionId: from.sessionId,
+      reason: "peer-axis-rename-failed",
+    });
+    return { ok: true };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await logEngineEvent(deps.stateRoot, {
+      event: "register-rename-rollback-failed",
+      teamId: from.teamId,
+      from: to.agentKey,
+      to: from.agentKey,
+      sessionId: from.sessionId,
+      error: message,
+    });
+    return { ok: false, error: message };
+  }
 }
 
 /**
@@ -310,8 +381,35 @@ export async function handleIdentify(deps: ToolDeps, rawArgs: IdentifyArgs, conn
       // 边界-1 修复（P1）：本次队内 key 换绑是否带动了 leadKey/founderKey（审计/回显用）。
       let leadKeyFollowed = false;
       let founderKeyFollowed = false;
-      if (teamRename.clean) {
-        // 队内花名换绑（registry 锁内：unbind 旧名 → bind 新名 → member key 换绑）。
+      // v0.7.1（红队四番战 边界-6 修复）：改名两轴**原子**。
+      // v0.7.0 及以前：队内轴被守卫阻止（板面不干净）时仍继续做 peer 轴改名，
+      // 回执还是成功（`renamed:{peer:true,team:false}`）——同一会话于是有两个
+      // 身份：队内旧名（派单/读箱照旧认它）+ peer 新名（寻址认它）。红队 b678
+      // 复放：`xc_dispatch{to:"tm-b2"}` → not_a_member，而 `to:"tm-b"` 照常投递。
+      // 修复 = 队内轴拒了就**两轴都不动**（显式错误、零副作用），不再给「半边
+      // 改名」的成功回执。
+      if (!teamRename.clean) {
+        throw new ToolError(
+          {
+            error: "team_rename_blocked",
+            agentKey: existing.agentKey,
+            requestedName: rawArgs.name,
+            reason: teamRename.reason,
+            renamed: { peer: false, team: false },
+            message:
+              `rename refused on BOTH axes: the team axis blocks the rename (${teamRename.reason}), ` +
+              `so the peer axis was left unchanged too — this session keeps its single identity ` +
+              `"${existing.agentKey}". Clear the board references (finish/cancel the tasks, drain the ` +
+              `mailbox) and re-run xc_identify, or ask the lead to run xc_team member-stop/transfer ` +
+              `if the identity must move now.`,
+          },
+          `rename refused on both axes: team-axis rename blocked (${teamRename.reason}); peer axis unchanged`,
+        );
+      }
+      {
+        // 队内花名换绑（registry 锁内：unbind 旧名 → member key 换绑）。
+        // 注意：v0.7.0 起队内改名只解绑旧名、不为新名写 names.json 绑定（既有
+        // 语义，本版不改）；undoTeamRename 与之严格互逆（解绑新名 + 重绑旧名）。
         await withRegistryThenTeamLocks(deps.stateRoot, existing.teamId, async () => {
           await unbindName(deps.stateRoot, existing.agentKey, existing.sessionId);
           const team = await readTeam(deps.stateRoot, existing.teamId);
@@ -354,22 +452,51 @@ export async function handleIdentify(deps: ToolDeps, rawArgs: IdentifyArgs, conn
       // peer 轴改名（已注册时）：formerNames + control:rename 通知（peer 轴改名现状行为）。
       const peerContext = getPeerSessionContext();
       if (peerContext !== undefined) {
-        peerRename = await services.rename(rawArgs.name);
-        formerName = peerRename.formerName;
-      }
-      if (!teamRename.clean) {
-        // 队内轴板面不干净：不换绑（不串号不丢信），如实披露；peer 轴改名照常。
-        return okResult(
-          `Renamed (peer axis) to ${rawArgs.name}${formerName !== undefined ? ` (former: ${formerName})` : ""}; ` +
-            `team-axis rename blocked: ${teamRename.reason} — board identity stays "${existing.agentKey}".`,
-          {
-            renamed: { peer: true, team: false },
-            teamRenameBlocked: teamRename.reason,
-            ...(peerRename !== undefined ? { peer: peerRename } : {}),
-            teamId: existing.teamId,
-            agentKey: existing.agentKey,
-          },
-        );
+        try {
+          peerRename = await services.rename(rawArgs.name);
+          formerName = peerRename.formerName;
+        } catch (err) {
+          // v0.7.1（边界-6 同根因的反方向）：队内轴已换键而 peer 轴改名失败
+          // （典型：新花名在 peer 轴被另一个活会话占着 → name_taken）——不留下
+          // 「队内新名 + peer 旧名」的半个改名，把队内轴逆回原键后如实报错。
+          const peerError = err instanceof ToolError
+            ? { error: String(err.payload["error"] ?? "peer_rename_failed"), message: err.message }
+            : { error: "peer_rename_failed", message: err instanceof Error ? err.message : String(err) };
+          const undo = await undoTeamRename(
+            deps,
+            connectionKey,
+            {
+              teamId: existing.teamId,
+              agentKey: existing.agentKey,
+              sessionId: existing.sessionId,
+              name: existing.name,
+              role: existing.role,
+            },
+            { agentKey: newKey, name: rawArgs.name },
+            { leadKey: leadKeyFollowed, founderKey: founderKeyFollowed },
+          );
+          throw new ToolError(
+            {
+              error: "peer_axis_failed",
+              peer: peerError,
+              teamAxis: {
+                registered: !undo.ok,
+                rolledBack: undo.ok,
+                ...(undo.error !== undefined ? { rollbackError: undo.error } : {}),
+                agentKey: undo.ok ? existing.agentKey : newKey,
+                teamId: existing.teamId,
+              },
+              renamed: { peer: false, team: !undo.ok },
+              message:
+                `team-axis rename landed but peer-axis rename failed: ${peerError.error} — ${peerError.message}. ` +
+                (undo.ok
+                  ? `The team-axis rename was rolled back to "${existing.agentKey}" (no identity split; both axes still say "${existing.agentKey}"). `
+                  : `The team-axis rollback FAILED (${undo.error ?? "unknown"}): the board now says "${newKey}" while the peer axis still says "${existing.agentKey}" — resolve the peer-axis conflict, then re-run xc_identify. `) +
+                `Resolve the peer-axis conflict (rename or reclaim) and re-run xc_identify.`,
+            },
+            `peer-axis rename failed (${peerError.error}); team-axis rename ${undo.ok ? "rolled back" : "rollback failed"}`,
+          );
+        }
       }
       const roleFollowed = leadKeyFollowed || founderKeyFollowed;
       return okResult(
@@ -450,26 +577,52 @@ export async function handleIdentify(deps: ToolDeps, rawArgs: IdentifyArgs, conn
         ...(rawArgs.contextChars !== undefined ? { contextChars: rawArgs.contextChars } : {}),
       });
     } catch (err) {
-      // peer 轴失败不回滚队内轴（两轴存储独立；与旧两步调用「先注册成功后失败」
-      // 的中间态一致），错误如实透出、队内注册事实在 payload 披露。
+      // v0.7.1（红队四番战 边界-4 修复）：peer 轴失败**回滚队内轴**。
+      // v0.7.0 及以前这里只透出错误，队内轴的 names.json 绑定 / team.json 成员行
+      // / 连接绑定全部留在盘上，回执还写着 `teamAxis.registered:true`——调用方
+      // 不能把错误当「无副作用」，且重跑会撞上自己刚建的状态（红队 g3-b4 复放：
+      // 一次 peer name_taken 的 identify 之后，names.json 已绑、roster 已入、
+      // 甚至当上 founderKey）。回滚后错误信封如实报告 `teamAxis.registered:false`
+      // + `rolledBack:true`；回滚自身失败也如实（registered 仍 true）。
       peerError = err instanceof ToolError
         ? { error: String(err.payload["error"] ?? "peer_register_failed"), message: err.message }
         : { error: "peer_register_failed", message: err instanceof Error ? err.message : String(err) };
-    }
-    if (peerError !== undefined) {
-      throw new ToolError({
-        error: "peer_axis_failed",
-        peer: peerError,
-        teamAxis: {
-          registered: true,
-          sessionKey: teamOutcome.sessionKey,
+      const undo = await teamOutcome.rollback();
+      if (!undo.ok) {
+        // 回滚自身失败：状态仍在，payload 必须如实（不能把没回滚成的说成回滚了）。
+        await logEngineEvent(deps.stateRoot, {
+          event: "identify-peer-axis-rollback-failed",
           teamId: teamOutcome.teamId,
-          via: teamOutcome.via,
-        },
-        message: `team-axis registration succeeded (${teamOutcome.sessionKey}) but peer-axis registration failed: ` +
-          `${peerError.error} — ${peerError.message}. Resolve the peer-axis conflict (rename or reclaim) and re-run xc_identify.`,
-      });
+          agentKey: newKey,
+          sessionId: rawArgs.sessionId,
+          error: undo.error ?? "unknown",
+        });
+      }
+      if (peerError !== undefined) {
+        throw new ToolError({
+          error: "peer_axis_failed",
+          peer: peerError,
+          teamAxis: {
+            registered: !undo.ok,
+            rolledBack: undo.ok,
+            ...(undo.error !== undefined ? { rollbackError: undo.error } : {}),
+            sessionKey: teamOutcome.sessionKey,
+            teamId: teamOutcome.teamId,
+            via: teamOutcome.via,
+          },
+          message: `peer-axis registration failed: ${peerError.error} — ${peerError.message}. ` +
+            (undo.ok
+              ? `The team-axis registration was rolled back (no team-side identity was left behind: ` +
+                `${teamOutcome.sessionKey} unbound, roster entry removed), so this call had no lasting ` +
+                `side effect. `
+              : `The team-axis rollback FAILED (${undo.error ?? "unknown"}): the team-side registration ` +
+                `is still in place (${teamOutcome.sessionKey}); resolve the peer-axis conflict and re-run ` +
+                `xc_identify (the exact-pair rebind is idempotent). `) +
+            `Resolve the peer-axis conflict (rename or reclaim) and re-run xc_identify.`,
+        });
+      }
     }
+    // peer 轴注册成功：两轴身份都在场（catch 分支已在上面抛错，走到这里即成功路径）。
     return okResult(
       renderRegister(newKey, rawArgs.sessionId, teamOutcome.teamId, teamOutcome.roster, teamOutcome.warnings) +
         ` Peer axis registered: ${peerOutcome!.name} (pid=${peerOutcome!.pid}, endpoint=${peerOutcome!.socketPath}).`,
@@ -505,8 +658,9 @@ export function registerIdentifyTools(
 ): void {
   const description =
     "Register/rebind/rename/take over this session's identity on BOTH axes in one call (team axis and peer axis unified). " +
-    "The name is the address on each axis; sessionId comes from the SessionStart hook (interactive) or the wake prompt (headless) - never invent it: a sessionId already held by another live session is refused (session_id_in_use, team axis included). " +
+    "The name is the address on each axis; sessionId comes from the SessionStart hook (interactive) or the wake prompt (headless) - never invent it: a sessionId already held by another live session is refused (session_id_in_use, team axis included; the payload's sameSessionId flag tells a duplicate process claiming the SAME id apart from someone else's id). " +
     "Names must already be in canonical key form (letters/digits/single dashes, ≤48 chars); silently-normalizing spellings (fullwidth, homoglyphs, path/control characters, spaces, underscores) are refused - same strict grammar as the peer axis. " +
+    "Both-axis atomicity: if the peer axis fails (register or rename), the team axis is rolled back and the error receipt reports teamAxis.rolledBack - a failed call leaves no half-applied identity, so you can retry directly; a rename blocked by the team-axis board guard (open task references / a non-empty mailbox) is refused on BOTH axes (team_rename_blocked) instead of renaming only the peer axis. " +
     "takeover:true (explicit) rebinds a dead holder's name and requeues its open tasks with receipts; it refuses while an in-flight wake round exists or the old holder is still live (takeover_live_holder). " +
     "Soft validation only: name_taken on live conflicts, session_id_in_use on live sid clashes, idempotent exact-pair rebind. No regToken (removed in v0.6).";
   const handler = async (args: Record<string, unknown>, extra: unknown): Promise<ToolResult> =>

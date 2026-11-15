@@ -29,7 +29,7 @@ import { logEngineEvent } from "../core/log.js";
 import { appendMailbox, createMessage, readMailbox, readUnreadMailbox } from "../core/mailbox.js";
 import { bindName, readSession, writeSession } from "../core/registry.js";
 import { sanitizeKey, validateMemberName } from "../core/sanitize.js";
-import { getTask, leadKeyOf, memberOpenTasks, newTeamState, readTeam, transitionTask, unblockTask, writeTeam } from "../core/teamstate.js";
+import { getTask, leadKeyOf, memberOpenTasks, newTeamState, readTeam, transitionTask, unblockTask, writeTeam, provisionStaleAfterMs, sweepStaleProvisioningLocked } from "../core/teamstate.js";
 import { taskJournalPath, writeArchive } from "../core/archive.js";
 import {
   DEFAULT_TEAM_ID,
@@ -174,6 +174,9 @@ export { leadKeyOf };
 
 /**
  * 同名重调的分流（§6.4/§6.1）。
+ *
+ * v0.7.1（故障注-1 修复）：停滞口径改走 core 的 `provisionStaleAfterMs`
+ * 单一事实源（与 provisioning deadline 清扫同值：超时 + 60s 宽限）。
  */
 export function resolveReprovision(
   existing: TeamMember | undefined,
@@ -185,7 +188,7 @@ export function resolveReprovision(
   if (state === "ready") return { kind: "ready" };
   if (state === "removed") return { kind: "fresh" };
   if (state === "failed") return { kind: "auto" };
-  const staleAfterMs = bootstrapTimeoutMs + 60_000;
+  const staleAfterMs = provisionStaleAfterMs(bootstrapTimeoutMs);
   const startedAt = existing.provisionedAt ?? existing.joinedAt;
   return now - startedAt > staleAfterMs ? { kind: "auto" } : { kind: "in-progress" };
 }
@@ -268,6 +271,8 @@ function truncate(text: string, budget = 400): string {
 interface MemberAddPlan {
   key: string;
   mode: "fresh" | "auto";
+  /** v0.7.1（故障注-1）：本次 Phase 1 清扫（超期 provisioning → failed）的成员键。 */
+  swept: string[];
 }
 
 async function memberAdd(deps: ToolDeps, args: { name: string; model?: string; reasoningLevel?: string; note?: string; contextChars?: number }, me: BoundIdentity): Promise<ToolResult> {
@@ -289,6 +294,7 @@ async function memberAdd(deps: ToolDeps, args: { name: string; model?: string; r
   const now = Date.now();
 
   // ---- Phase 1（团队锁内）：lead 校验 + 名额 + 写 provisioning 记录（§6.1 step 1-4）----
+  // v0.7.1（故障注-1 修复）：provisioning 超时的落盘 deadline 与锁内清扫。
   const plan = await withTeamLock(stateRoot, me.teamId, async (): Promise<MemberAddPlan> => {
     const team = await readTeam(stateRoot, me.teamId);
     if (team === undefined) {
@@ -306,6 +312,9 @@ async function memberAdd(deps: ToolDeps, args: { name: string; model?: string; r
         message: `only the team lead ("${leadKeyOf(team)}") can add members`,
       });
     }
+    // 锁内清扫：lead server 曾中途死亡（或欢迎回合从未完成）的 provisioning
+    // 记录超期置 failed——释放名额并留下审计/回执，不再无限期卡死占位。
+    const swept = sweepStaleProvisioningLocked(team, now, provisionStaleAfterMs(bootstrapTimeoutMs));
     const existing = team.members.find((m) => m.key === key);
     const reprovision = resolveReprovision(existing, now, bootstrapTimeoutMs);
     if (reprovision.kind === "ready") {
@@ -322,12 +331,21 @@ async function memberAdd(deps: ToolDeps, args: { name: string; model?: string; r
     }
     const activeAfter = activeMembersAfterUpsert(team, existing);
     if (activeAfter > maxMembers) {
+      // v0.7.1（规模压-B2）：报文自洽化。旧文案 `(max, active=activeAfter; lead/failed/removed 不计入)`
+      // 把「本次写入后的名额数」报成 activeMembers——实际活成员只有 activeNow 个，读者
+      // 按同句的「lead 不计入」反推只能得出「lead 被算进去了」的矛盾结论。
+      // 现在两个数分开报：activeMembers = 当前活成员，activeAfterAdd = 本次写入后。
+      const activeNow = countActiveMembers(team);
       throw new ToolError({
         error: "team_at_member_cap",
         teamId: team.teamId,
         maxMembers,
-        activeMembers: activeAfter,
-        message: `team "${team.teamId}" is at its member cap (${maxMembers}, active=${activeAfter}; lead/failed/removed 不计入) (dsh tools.js:1214-1215 同语义)`,
+        activeMembers: activeNow,
+        activeAfterAdd: activeAfter,
+        name: key,
+        message: `team "${team.teamId}" is at its member cap (max=${maxMembers}): adding "${key}" would make `
+          + `${activeAfter} active members, over the cap (${activeNow} active now; lead/failed/removed 不计入) `
+          + `(dsh tools.js:1214-1215 同语义)`,
       });
     }
     const record: TeamMember = existing !== undefined
@@ -338,6 +356,9 @@ async function memberAdd(deps: ToolDeps, args: { name: string; model?: string; r
           state: "provisioning",
           identity: "engine",
           provisionedAt: now,
+          // v0.7.1（故障注-1）：超时判据落盘——不依赖本进程存活（红队 fi1：
+          // lead server 中途死亡时内存 deadline 随之蒸发，成员永久卡 provisioning）。
+          provisionDeadlineAt: now + provisionStaleAfterMs(bootstrapTimeoutMs),
           lastSeen: now,
           error: undefined,
           stopReason: undefined,
@@ -350,6 +371,7 @@ async function memberAdd(deps: ToolDeps, args: { name: string; model?: string; r
           state: "provisioning",
           identity: "engine",
           provisionedAt: now,
+          provisionDeadlineAt: now + provisionStaleAfterMs(bootstrapTimeoutMs),
           joinedAt: now,
           lastSeen: now,
           ...(args.contextChars === undefined ? {} : { contextChars: args.contextChars }),
@@ -359,13 +381,25 @@ async function memberAdd(deps: ToolDeps, args: { name: string; model?: string; r
     // 隐式成为 lead（§3.1）：leadKey 未设置时，本次建员动作把 founder 材料化为 leadKey。
     if (team.leadKey === undefined) team.leadKey = me.agentKey;
     await writeTeam(stateRoot, team);
-    return { key, mode: reprovision.kind === "auto" ? "auto" : "fresh" };
+    return {
+      key,
+      mode: reprovision.kind === "auto" ? "auto" : "fresh",
+      // 本次调用把哪个（些）卡的 provisioning 记录清扫成了 failed（回执披露用）。
+      swept: swept.map((s) => s.key),
+    };
   });
 
   await logEngineEvent(stateRoot, {
     event: "member-add-started", teamId: me.teamId, name: plan.key, mode: plan.mode,
     note: args.note, by: me.agentKey,
   });
+  // v0.7.1（故障注-1）：锁内清扫的逐条审计（「谁在何时因超时被置 failed」）。
+  for (const sweptKey of plan.swept) {
+    await logEngineEvent(stateRoot, {
+      event: "member-provision-timeout", teamId: me.teamId, name: sweptKey, by: me.agentKey,
+      via: "member-add",
+    });
+  }
 
   // ---- Phase 2（锁外）：供给四步（§6.1 step 5；失败 → state=failed + error）----
   try {
@@ -445,10 +479,14 @@ async function memberAdd(deps: ToolDeps, args: { name: string; model?: string; r
       });
     }
 
+    // v0.7.1（故障注-1）：本次供给接手了一个超期卡死的 provisioning 记录
+    // （如 lead server 曾中途死亡）——回执如实披露，调用方知道旧尝试的结局。
+    const recoveredFromTimeout = plan.swept.includes(plan.key);
     return okResult(
       `Member "${plan.key}" ready (session ${result.sessionId}, ` +
         `${result.providerId}/${result.modelId} reasoning ${result.reasoningLevel}` +
-        `${result.reprovisioned ? ", reprovisioned" : ""})` +
+        `${result.reprovisioned ? ", reprovisioned" : ""}` +
+        `${recoveredFromTimeout ? ", previous provisioning attempt had timed out (swept to failed)" : ""})` +
         `${backlog.length > 0 ? `; backlog ${backlog.length} message(s) → ${delivered}` : ""}.`,
       {
         name: plan.key,
@@ -457,6 +495,7 @@ async function memberAdd(deps: ToolDeps, args: { name: string; model?: string; r
         identity: "engine",
         model: { providerId: result.providerId, modelId: result.modelId, reasoningLevel: result.reasoningLevel },
         reprovisioned: result.reprovisioned,
+        ...(recoveredFromTimeout ? { recovered: "provision-timeout" as const } : {}),
         welcomeResponse: truncate(result.welcomeResponse),
         ...(result.turnModelId === undefined ? {} : { turnModelId: result.turnModelId }),
         ...(result.turnProviderId === undefined ? {} : { turnProviderId: result.turnProviderId }),

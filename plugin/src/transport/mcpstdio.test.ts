@@ -9,12 +9,14 @@
  * 本文件在传输层锁死修复行为：
  * - ≤32MiB 帧正常解析（红队实测档位 12/24MiB 不再杀进程，README「队内无此闸」）；
  * - >32MiB 帧显式 JSON-RPC 拒收（code -32700），传输**不关闭**、后续帧继续服务；
- * - 常规坏帧（JSON 解析失败）不杀传输（SDK 原语义保持）。
+ * - v0.7.1（边界-5）：**畸形帧**（裸控制字节/NaN/坏 JSON/帧型不符）同样显式拒收
+ *   （-32700，尽力取回请求 id），与超大帧对称——旧行为是 0 字节静默丢弃。
  */
 import { EventEmitter } from "node:events";
 import { describe, expect, it } from "vitest";
 import {
   GuardedStdioTransport,
+  MALFORMED_FRAME_RPC_CODE,
   MCP_MAX_FRAME_BYTES,
   OVERSIZE_FRAME_RPC_CODE,
 } from "./mcpstdio.js";
@@ -167,14 +169,69 @@ describe("transport/mcpstdio（CONC-2）: 超限帧显式拒收、server 存活"
   });
 });
 
-describe("transport/mcpstdio（CONC-2）: 常规坏帧不杀传输（SDK 原语义回归锁定）", () => {
-  it("JSON 解析失败的行 → onerror（processReadBuffer 内捕获），传输不关、后续帧正常", async () => {
+describe("transport/mcpstdio（边界-5）：畸形帧显式拒收、与超大帧对称", () => {
+  it("裸 NUL 入 JSON 字符串 → 恰一条 code=-32700（id 取回）、传输不关、后续帧正常", async () => {
     const h = await harness();
-    h.feed("{not-json");
+    h.feed(`{"jsonrpc":"2.0","id":9001,"method":"tools/call","params":{"name":"xc_identify","arguments":{"name":"a\u0000b","sessionId":"s"}}}`);
     expect(h.errors).toHaveLength(1);
+    expect(h.messages).toHaveLength(0);
     expect(h.closed.value).toBe(false);
-    expect(h.stdout.lines).toHaveLength(0); // 与 SDK 原行为一致：坏 JSON 不产生响应帧
+    expect(h.stdout.lines).toHaveLength(1); // 不再是 0 字节静默丢弃
+    const rejection = JSON.parse(h.stdout.lines[0]!) as { id: unknown; error: { code: number; message: string } };
+    expect(rejection.error.code).toBe(MALFORMED_FRAME_RPC_CODE);
+    expect(rejection.error.code).toBe(OVERSIZE_FRAME_RPC_CODE); // 与超大帧同一个码
+    expect(rejection.error.message).toContain("could not be parsed");
+    expect(rejection.id).toBe(9001); // 坏行的 id 段完好：按 id 配对，客户端立刻失败
     h.feed(validRequest);
     expect(h.messages).toHaveLength(1);
+  });
+
+  it("裸 TAB / 裸 NaN / 坏 JSON / 帧型不符 → 全部 -32700（红队 b5c 四例原样）", async () => {
+    const h = await harness();
+    const cases = [
+      `{"jsonrpc":"2.0","id":9002,"method":"tools/call","params":{"name":"xc_identify","arguments":{"name":"a\tb","sessionId":"s"}}}`,
+      `{"jsonrpc":"2.0","id":9003,"method":"tools/call","params":{"name":"xc_identify","arguments":{"name":"x","contextChars":NaN}}}`,
+      `{"jsonrpc":"2.0","id":9004,"method":"tools/call","params":{"name":"xc_iden`,
+      JSON.stringify({ jsonrpc: "2.0", id: 9005, method: 42, params: {} }),
+    ];
+    for (const frame of cases) h.feed(frame);
+    expect(h.stdout.lines).toHaveLength(cases.length);
+    for (const line of h.stdout.lines) {
+      const rejection = JSON.parse(line) as { error: { code: number } };
+      expect(rejection.error.code).toBe(OVERSIZE_FRAME_RPC_CODE);
+    }
+    expect(h.closed.value).toBe(false);
+    h.feed(validRequest);
+    expect(h.messages).toHaveLength(1); // 坏帧之后连接照常服务
+  });
+
+  it("id 段也坏了的帧 → id 为 null（JSON-RPC 2.0 Parse error 规范）", async () => {
+    const h = await harness();
+    h.feed(`{"jsonrpc":"2.0","id":,"method":"tools/call"}`);
+    expect(h.stdout.lines).toHaveLength(1);
+    const rejection = JSON.parse(h.stdout.lines[0]!) as { id: unknown };
+    expect(rejection.id).toBeNull();
+    expect(h.closed.value).toBe(false);
+  });
+
+  it("半行（无行界）不拒收：等行界补全后按合并结果处理（不能把在途帧误判为坏帧）", async () => {
+    const h = await harness();
+    h.stdin.write(Buffer.from(`{"jsonrpc":"2.0","id":9006,"method":"tools/call","params":{"name":"xc_iden`, "utf8"));
+    expect(h.stdout.lines).toHaveLength(0); // 帧还没读全：无可拒收
+    h.feed(`tify"}}`);
+    expect(h.messages).toHaveLength(1); // 合并后是合法帧，正常进协议层
+    expect(h.stdout.lines).toHaveLength(0);
+  });
+
+  it("协议层抛错不再由传输层重复回帧（onmessage 抛错只走 onerror）", async () => {
+    const h = await harness();
+    h.transport.onmessage = (): void => {
+      throw new Error("protocol-layer blew up");
+    };
+    h.feed(validRequest);
+    expect(h.errors).toHaveLength(1);
+    expect(h.stdout.lines).toHaveLength(0); // 协议层错误由 Protocol 自己回，不由传输层回
+    h.feed(validRequest);
+    expect(h.errors).toHaveLength(2); // 后续帧继续被投递
   });
 });

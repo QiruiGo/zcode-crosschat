@@ -80,6 +80,41 @@ export async function readStored(root: string, msgId: string): Promise<StoredMes
   }
 }
 
+/**
+ * v0.7.1（红队四番战 故障注-3 修复）：store 文件**存在但不可用**（不可解析 /
+ * 形状非法 → 读不出 text）时返回其绝对路径；缺失或可读时返回 undefined。
+ *
+ * 用途：只读披露。`resolvePeerMessage` 对「文件在但坏」与「文件不在」过去都
+ * 返回 undefined，读取面因此只能报 `unknown msgId`——把**存储损坏**误述成
+ * 「本会话没收到过该消息」（fi3 实测：300KB 大消息落盘后被外部改写为乱码，
+ * xc_peer_read / xc_read peer-msg 均得误导性 unknown msgId，README「被截消息
+ * 带分页指针、会话不卡死」的恢复路径被阻断）。读取面在查找全部落空时调用
+ * 本函数，把「损坏 + 文件路径 + 恢复动作」显式披露给运维。
+ *
+ * 判定口径与 {@link readStored} 的宽容读取一致（对象 ∧ msgId/text 均为字符串）；
+ * 写路径（storePeerMessageFull 的幂等探测）仍走 readStored 的宽容语义——
+ * 坏文件在同 msgId 重写时被自然修复，不受本函数影响。
+ */
+export async function storedMessageCorruptFile(root: string, msgId: string): Promise<string | undefined> {
+  const file = peerMessagesFile(root, msgId);
+  let raw: string;
+  try {
+    raw = await readFile(file, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    return file; // 存在性之外的其他 IO 错（如 EACCES/EISDIR）也按不可用披露
+  }
+  try {
+    const parsed: unknown = JSON.parse(stripLeadingBom(raw));
+    if (typeof parsed !== 'object' || parsed === null) return file;
+    const r = parsed as Record<string, unknown>;
+    if (typeof r['msgId'] !== 'string' || typeof r['text'] !== 'string') return file;
+    return undefined;
+  } catch {
+    return file;
+  }
+}
+
 /** 扫描 JSONL 队列/收件箱文件尾部的消息记录（msgId → 记录）；cap 行数防大文件全读。 */
 async function scanJsonlForMsgId(file: string, msgId: string, tailLines = 2048): Promise<Record<string, unknown> | undefined> {
   let raw: string;

@@ -98,17 +98,45 @@ export async function refreshSessionLastSeen(
 // names.json
 // ---------------------------------------------------------------------------
 
-/** Read the whole name-binding map; ENOENT -> {}. Corrupt data throws. */
+/**
+ * Read the whole name-binding map; ENOENT -> {}. Corrupt data throws a
+ * diagnostic carrying the file path + recovery guidance.
+ *
+ * v0.7.1（红队四番战 故障注-2 修复）：不可解析的 names.json 此前裸抛
+ * `SyntaxError`（`Unexpected token 'c', "corrupt names \x00\x01" is not valid
+ * JSON`）——无文件路径、无恢复指引，与 team.json 损坏时「带路径 + 修复指引」
+ * 的友好文案不一致（fi26 实测：注册硬失败 internal，运维只能猜）。现在与
+ * readTeam 同族：显式诊断 = 文件绝对路径 + 损坏原因 + 恢复动作（names.json
+ * 是**可重建索引**：删文件即重置，下次 xc_identify / xc_team member-add
+ * 自然重建；会话记录里的 boundName 兼容兜底不受影响）。
+ */
 export async function readNames(stateRoot: string): Promise<NameBindings> {
+  const file = namesFile(stateRoot);
   let raw: string;
   try {
-    raw = await readFile(namesFile(stateRoot), 'utf8');
+    raw = await readFile(file, 'utf8');
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return {};
     throw error;
   }
-  const parsed = coerceNameBindings(JSON.parse(raw));
-  if (!parsed.ok) throw new Error(`invalid names.json: ${parsed.defect}`);
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch (error) {
+    throw new Error(
+      `invalid names.json "${file}": not valid JSON (${error instanceof Error ? error.message : String(error)}) — ` +
+        'it is a rebuildable index: delete the file to reset (name bindings re-establish on the next ' +
+        'xc_identify / xc_team member-add), or restore it from a backup',
+    );
+  }
+  const parsed = coerceNameBindings(value);
+  if (!parsed.ok) {
+    throw new Error(
+      `invalid names.json "${file}": ${parsed.defect} — ` +
+        'it is a rebuildable index: delete the file to reset (name bindings re-establish on the next ' +
+        'xc_identify / xc_team member-add), or restore it from a backup',
+    );
+  }
   return parsed.bindings;
 }
 

@@ -231,7 +231,8 @@ offlineThresholdMsFromEnv(env, staleThresholdMs): { ms, clamped }  // XC_OFFLINE
   1. sweeper 内对每个被扫任务算 `offlineVerdict`；`evidence:'process-dead'` 或 idle-timeout 命中的，除 createdBy 回执外**额外通知 lead**（邮箱消息 + 同一 `wakePlan` 机制现成扩展），消息体带转交建议（`xc_dispatch` 重派给指定成员=现有能力组合，不新增工具/动作——方案 C8「选择：回池/转交指定成员」由 lead 用 dispatch 完成）；
   2. `TaskEdgeOutcome` 增 `offline: OfflineMember[]`（进工具 payload 与 engine 审计 `task-offline` 事件）。
 - **边界**：stale（30min，任务级，不论会话活否）保持不动——它是「在途 attempt 死了」的快刀；C8（240min/进程死）是「这个成员没了」的升级信号（实际由 process-dead 证据产生，见 §4.1 可达性声明）。30 < 240 保证 stale 先动，C8 永不抢先、无双闸竞态。豁免条件（在途 wake nonce，task-edges.ts:178-181）不动——进程死证据不绕过豁免（nonce 有 TTL，保守优先）。
-- **「活着但空闲不被误回收」的前提（验收必读，P2 修复）**：该判据在**判定层**成立（offlineVerdict 不把 heartbeat-stale/no-record 判离线），但在**回收层**，缺省配置下活跃但空闲成员名下的 claimed/in_progress 任务**仍会被 30min stale 快刀回收**——`staleTasks` 不查会话活性（graph.ts:255-260），豁免仅限在途 wake nonce（task-edges.ts:178-181）。这是 v0.5.3 起的既有设计（「无进展 attempt 回收」），本版不改。故验收剧本若要验「alive-idle 任务超 30min 仍在」，必须显式把 `XC_STALE_TASK_MINUTES` 调到大于测试窗口（**别用 0**——已知问题边界-10：`=0` 反而不清扫）或依赖 nonce 豁免制造在途；否则该判据在缺省配置下有被判失败的风险——设计在此写明前提，不留暗礁。
+- **「活着但空闲不被误回收」的前提（验收必读，P2 修复）**：该判据在**判定层**成立（offlineVerdict 不把 heartbeat-stale/no-record 判离线），但在**回收层**，缺省配置下活跃但空闲成员名下的 claimed/in_progress 任务**仍会被 30min stale 快刀回收**——`staleTasks` 不查会话活性（graph.ts:255-260），豁免仅限在途 wake nonce（task-edges.ts:178-181）。这是 v0.5.3 起的既有设计（「无进展 attempt 回收」），本版不改。故验收剧本若要验「alive-idle 任务超 30min 仍在」，必须显式把 `XC_STALE_TASK_MINUTES` 调到大于测试窗口（**别用 0**——v0.7.0 时 `=0` 反而不清扫，即红队四番战已知问题边界-10）或依赖 nonce 豁免制造在途；否则该判据在缺省配置下有被判失败的风险——设计在此写明前提，不留暗礁。
+  > **v0.7.1 更正（边界-10 已修）**：`XC_STALE_TASK_MINUTES=0`（含负数/非数字）现**明确回落缺省 30min**——既非「立即清扫」也非「关闭清扫」，与 `XC_PEER_MAX_QUEUE_DEPTH` 的「0=内置值」同口径；「调到大于测试窗口」的验收操作序仍然成立（用正值，如 `1`），只是 `0` 不再是「设了却不生效」的暗礁。见 README/PROTOCOL §9 env 表与 `staleThresholdMsFromEnv`（mcp/task-edges.ts）。
 - **并发安全**：全部裁决在 `withTeamLock` 内（sweeper 现有机制）；台账/审批清扫同锁外顺带（best-effort，失败不影响回池）。
 
 ### 4.3 观测挂载
@@ -443,6 +444,7 @@ M1 C6 帧与载体（mailbox/toolrelay/tools-relay 帧 hunk/render 渲染分支�
 3. 桌面/交互会话作为 A 或 B 未测（全部无头回合）；
 4. 并发多转办、A 多请求排队、审批竞态（同一 requestId 双重批准）未测——v0.7 实现时补「双重批准后写者胜/后者拒」单测，集成竞态留待验收剧本；
 5. 红队四番战 P2/P3 共 16 项（adjudication.md 确认不修）不在本版范围；
+   > **v0.7.1 收口（2026-11-15）**：其中 **15 项（P2×3 + P3×12）已由 v0.7.1 修复并清零**（见 README 版本记录 v0.7.1 条目与 `.scratch-release/notes-v0.7.1.md`）；仅剩「同形字残余（U+212A 类）」一项仍维持已知——它落在 README 威胁模型已声明的「同形字归一防御已移除」边界内，不在本批 15 项清单中，故未修。
 6. 同形字残余（U+212A 类）与改名撞名（22-v061验收.md §9.2）维持已知，本版不碰。
 
 ### 10.3.1 C8 可达性边界（P2 复核补充，如实声明）

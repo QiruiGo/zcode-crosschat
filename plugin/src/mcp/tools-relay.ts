@@ -913,6 +913,11 @@ export async function relayPeerSend(
   }
 
   const receipt = result.reply?.type === "status" ? result.reply.state : "delivered";
+  // v0.7.1（规模压-B1）：非送达终态必须把**原因与恢复动作**透出到工具响应。接收方
+  // 已在管道 status 回复里带上 admissionDropDetail（上限值/限速窗口/重试建议），
+  // 此前这里只取 state 丢掉 detail，发送方只看到 `receipt:"dropped"`——README §7
+  // 「附原因与恢复动作」的承诺在工具面落空，模型极易把静默丢件当成已投递。
+  const detail = result.reply?.type === "status" ? result.reply.detail : undefined;
   await logPeerEvent(root, {
     event: "peer-sent",
     to: row.name,
@@ -921,6 +926,7 @@ export async function relayPeerSend(
     via: result.via,
     ...(urgent ? { urgent: true } : {}),
     ...(interruptRequested ? { interruptRequested: true } : {}),
+    ...(detail !== undefined ? { detail } : {}),
   });
   await logEngineEvent(stateRoot, {
     event: "relay-peer",
@@ -932,18 +938,21 @@ export async function relayPeerSend(
     via: result.via,
     ...(urgent ? { urgent: true } : {}),
     ...(interruptRequested ? { interruptRequested: true } : {}),
+    ...(detail !== undefined ? { detail } : {}),
   });
   const urgentNote = urgent && result.via === "pipe"
     ? "；注意：peer 管道帧不携带 urgent 标记（wire 白名单冻结），插队排序仅对文件退化件与队内轴生效"
     : "";
+  const detailNote = detail !== undefined ? `；未投递原因与恢复动作：${detail}` : "";
   return okResult(
-    `Peer message ${msgId.slice(0, 8)} → ${row.name}: receipt=${receipt}, via=${result.via}${urgentNote}`,
+    `Peer message ${msgId.slice(0, 8)} → ${row.name}: receipt=${receipt}, via=${result.via}${urgentNote}${detailNote}`,
     {
       msgId,
       to: row.name,
       receipt,
       via: result.via,
       axis: "peer",
+      ...(detail !== undefined ? { detail } : {}),
       ...(urgent ? { urgent: true } : {}),
       ...(interruptRequested ? { interrupt: interruptBlock() } : {}),
     },

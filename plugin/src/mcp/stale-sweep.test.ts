@@ -258,4 +258,28 @@ describe("配置解析", () => {
     expect(staleThresholdMsFromEnv({ XC_STALE_TASK_MINUTES: "0" })).toBe(30 * 60_000);
     expect(staleThresholdMsFromEnv({ XC_STALE_TASK_MINUTES: "-3" })).toBe(30 * 60_000);
   });
+
+  // v0.7.1（红队四番战 边界-10 修复）：`=0` 的语义显式化并锁死。
+  // 红队 b10 复放：`=1` → claimed 任务 ~64s 被清扫回 pending；`=0` → 104s 仍
+  // claimed。根因不是「0 关掉了清扫」，而是 0 与非数字/负数同路**回落缺省
+  // 30min**（PROTOCOL §9 此前没写这个口径，`XC_PEER_MAX_QUEUE_DEPTH` 却写了
+  // 「0=内置 1024」——两处不一致才是 finding）。本版行为不改、口径写进文档，
+  // 这里把三种可能被误读的语义全部钉死：
+  //   ① 0 ≠ 「立即清扫」（否则阈值 0 会让所有在途任务瞬间回池）；
+  //   ② 0 ≠ 「关闭清扫」（README 的清扫承诺不因此失效，sweeper 照常按 30min 跑）；
+  //   ③ 0 = 「回落缺省 30min」，与空串/非数字/负数完全同路。
+  it("边界-10：XC_STALE_TASK_MINUTES=0 的语义 = 回落缺省 30min（非立即清扫、非关闭）", () => {
+    const fallback = staleThresholdMsFromEnv({});
+    for (const raw of ["0", "-3", "abc", "", "  ", "NaN", "Infinity", "-0"]) {
+      expect(staleThresholdMsFromEnv({ XC_STALE_TASK_MINUTES: raw })).toBe(fallback);
+    }
+    expect(fallback).toBe(30 * 60_000);
+    // 不是 0（=立即清扫）：一个刚 claim 的任务在阈值下绝不是僵尸。
+    expect(staleThresholdMsFromEnv({ XC_STALE_TASK_MINUTES: "0" })).toBeGreaterThan(0);
+    // 不是「关闭」：清扫节拍仍由同一阈值推导，定时器照常起（30min → 60s 节拍）。
+    expect(sweepTickMsFromThreshold(staleThresholdMsFromEnv({ XC_STALE_TASK_MINUTES: "0" })))
+      .toBe(sweepTickMsFromThreshold(30 * 60_000));
+    // 显式正值仍然可配（=0 不妨碍调小窗口，红队/验收剧本的 1min 档照旧）。
+    expect(staleThresholdMsFromEnv({ XC_STALE_TASK_MINUTES: "2" })).toBe(120_000);
+  });
 });

@@ -29,25 +29,20 @@
 
 import { DEFAULT_TEAM_ID } from "../core/types.js";
 import { createWakeNonce, readNames } from "../core/registry.js";
+// v0.7.1（故障注-1 修复）：超时默认值与 env 解析迁入 core/teamstate.ts（provisioning
+// deadline 的清扫方含钩子，钩子只能 import M1）；此处 import 自用并按原路径转出，
+// 既有导入方（tools-team.ts 等）不变。
+import { bootstrapTimeoutFromEnv } from "../core/teamstate.js";
+export {
+  DEFAULT_MEMBER_BOOTSTRAP_TIMEOUT_MS,
+  bootstrapTimeoutFromEnv,
+} from "../core/teamstate.js";
 import type { ToolDeps } from "../mcp/core.js";
 import { AppServerKeeper, type ModelRef } from "./appserver.js";
 import { resolveZcodeSpawnConfig } from "./zcode-locate.js";
 // 守则 v2 全文由 W3 交付于 wake.ts（DESIGN-V0.2.md §9.2 钉死导出 MEMBER_RULES_V2）；
 // 这是设计依赖表「provision import wake 场景常量」的落点（§9.1）。
 import { MEMBER_RULES_V2 } from "./wake.js";
-
-/** 成员供给超时默认值（§6.2 步骤④；userConfig member_bootstrap_timeout_ms 同默认）。 */
-export const DEFAULT_MEMBER_BOOTSTRAP_TIMEOUT_MS = 300_000;
-
-/**
- * XC_MEMBER_BOOTSTRAP_TIMEOUT_MS 解析（V18 同款防御：非有限正数的一律取默认值）。
- */
-export function bootstrapTimeoutFromEnv(env: NodeJS.ProcessEnv = process.env): number {
-  const raw = env["XC_MEMBER_BOOTSTRAP_TIMEOUT_MS"];
-  if (raw === undefined || raw.trim() === "") return DEFAULT_MEMBER_BOOTSTRAP_TIMEOUT_MS;
-  const parsed = Number(raw);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_MEMBER_BOOTSTRAP_TIMEOUT_MS;
-}
 
 /**
  * 供给模式（§6.4 的实现入口）：

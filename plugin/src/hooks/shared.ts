@@ -33,9 +33,15 @@ import { readFileSync } from 'node:fs';
 import { resolveStateRoot, workspaceFromEnv } from '../core/paths.js';
 import { readNames, namesBoundToSession, readSession, refreshSessionLastSeen } from '../core/registry.js';
 import { readUnreadMailbox, urgentFirst } from '../core/mailbox.js';
-import { withRegistryLock } from '../core/lock.js';
+import { withRegistryLock, withTeamLock, LockBusyError } from '../core/lock.js';
 import { logEngineEvent, type EngineEvent } from '../core/log.js';
 import { DEFAULT_TEAM_ID, type NameBindings, type SessionRecord, type TeamMessage } from '../core/types.js';
+import {
+  provisionStaleAfterMsFromEnv,
+  readTeam,
+  sweepStaleProvisioningLocked,
+  writeTeam,
+} from '../core/teamstate.js';
 import {
   peerRootFromEnv as resolvePeerRoot,
   readPeerBaseRecord,
@@ -221,6 +227,54 @@ export async function unreadSummary(stateRoot: string, name: string): Promise<Un
   }
   const urgentCount = messages.filter((message) => message.urgent === true).length;
   return { count: messages.length, senders, messages, urgentCount };
+}
+
+/**
+ * v0.7.1（红队四番战 故障注-1 修复）：provisioning 超时清扫（钩子面）。
+ *
+ * 背景：建员欢迎回合的超时原只存在于 lead MCP server 进程的内存里——server
+ * 中途死亡则成员 roster 永久卡 provisioning（无回执/无审计/占名额，红队 fi1）。
+ * v0.7.1 起 deadline 随记录落盘（member-add Phase 1 写 `provisionDeadlineAt`），
+ * 本函数让任一存活会话的 UserPromptSubmit 回合都能把过期记录清扫成 failed：
+ *   锁内 read-modify-write（团队锁，HOOK_LOCK_WAIT_MS 预算；锁忙即跳过——
+ *   丢失一次清扫无害，下回合再扫）+ engine.jsonl `member-provision-timeout` 审计。
+ * 存量记录（无 deadline 字段）按 `provisionedAt/joinedAt + 超时口径` 现算兜底
+ * （钩子进程无 userConfig env，用内置默认 300s + 60s 宽限——保守方向）。
+ *
+ * M4 → M1 纪律：只 import core（teamstate/lock/log），不碰 engine/MCP。
+ * @returns 本次清扫掉的成员键（空 = 无可清扫或锁忙跳过）。
+ */
+export async function sweepStaleProvisioning(stateRoot: string): Promise<string[]> {
+  const sweptKeys: string[] = [];
+  try {
+    await withTeamLock(
+      stateRoot,
+      DEFAULT_TEAM_ID,
+      async () => {
+        const team = await readTeam(stateRoot, DEFAULT_TEAM_ID);
+        if (team === undefined) return;
+        const swept = sweepStaleProvisioningLocked(team, Date.now(), provisionStaleAfterMsFromEnv(process.env));
+        if (swept.length === 0) return;
+        await writeTeam(stateRoot, team);
+        for (const entry of swept) {
+          sweptKeys.push(entry.key);
+          await logEngineEvent(stateRoot, {
+            event: 'member-provision-timeout',
+            teamId: DEFAULT_TEAM_ID,
+            name: entry.key,
+            deadline: entry.deadline,
+            via: 'hook',
+          });
+        }
+      },
+      { waitMs: HOOK_LOCK_WAIT_MS },
+    );
+  } catch (error) {
+    // 锁忙：跳过本次清扫（下回合再试），不当错误上抛。
+    if (error instanceof LockBusyError) return [];
+    throw error;
+  }
+  return sweptKeys;
 }
 
 /**

@@ -275,13 +275,19 @@ export function peerRowKindLabel(row: PeerRow): string {
  * (CC `@8463662`): the caller passes `ambiguous` computed over the whole
  * row set. The structured payload always carries `ref` separately.
  *
+ * v0.7.1（边界-9）：`[ref]` 只在**跨会话可寻址行**（self/session）上渲染。
+ * 队内成员行（kind='member'）是队内花名册的只读投影，`名字 [ref]` 在跨会话域
+ * 解析不到它（`resolvePeerTarget` 只认 self/session 行）——渲染一个不可作地址的
+ * `[ref]` 会让调用方照着抄却得 target_not_found。成员行的消歧走队内轴：裸名或
+ * `名字 [team]` 后缀（README/DEMO 已同步）。
+ *
  * v0.5.2（peer-5 修复）：接管行追加 ` (接管自已离会会话 <ref>)`——死会话占用的
  * 花名被 reclaim 时，旧记录已被惰性清扫、旧名不会进任何 formerNames，行文本是
  * 「这个地址换过人」的唯一可见信号（另有审计 peer-name-reclaimed）。
  */
 export function formatPeerRowText(row: PeerRow, ambiguous: boolean, now: number = Date.now()): string {
   const head = `${row.name} [${peerRowKindLabel(row)}]`;
-  const ref = ambiguous ? ` [${row.ref}]` : '';
+  const ref = ambiguous && row.kind !== 'member' ? ` [${row.ref}]` : '';
   const cwd = row.cwd ? ` cwd=${row.cwd}` : '';
   const status = row.status ? ` status=${row.status}` : '';
   const seen = ` seen=${relativeAge(row.lastSeenMs, now)}`;

@@ -2,7 +2,8 @@
  * M3→v0.6 tools 单测（M1 家族化）：core 层方法名保留 v0.5.3 形态
  * （xc_register/xc_dispatch/xc_claim/xc_report/xc_check_inbox/xc_status/xc_message），
  * schema 校验迁到家族文件（IdentifyShape/DispatchShape/ReportShape/ReadShape）。
- * v0.6 断言变化：evidence 砍 sha256 现算复核（receipt.evidence[0].sha256 恒 null）。
+ * v0.7.1 断言变化（边界-7）：evidence sha256 恢复现算复核——receipt.evidence[0].sha256
+ * 是工具现算值（v0.6 的恒 null 已回退），调用方声明值不符即整单拒绝。
  * （DESIGN §7 M3 产出判据）。
  *
  * 依赖：需 M1（core）与 M2（engine）真实模块在场才能运行——本测试直接对临时
@@ -160,7 +161,8 @@ describe("tools: 闭环主流程（register→dispatch→claim→report→inbox�
     const prog = await core.xc_report({ taskId, attemptId: claim.attemptId, status: "in_progress" }, "conn-b");
     expect(prog.isError).toBeUndefined();
 
-    // 完成 + 证据（v0.6：sha256 现算复核已砍——文件存在门与工作区内路径门保留）
+    // 完成 + 证据（v0.7.1 边界-7：sha256 由工具现算——文件存在门、工作区内路径门
+    // 与「必须是普通文件」门保留，且调用方声明值与现算值不符即整单拒绝）
     await writeFile(join(workDir, "result-a2b.txt"), "391", "utf8");
     const rep = payloadOf(await core.xc_report(
       {
@@ -171,9 +173,12 @@ describe("tools: 闭环主流程（register→dispatch→claim→report→inbox�
         evidence: [{ path: join(workDir, "result-a2b.txt"), note: "结果文件" }],
       },
       "conn-b",
-    )) as { status: string; wakeBack: string };
+    )) as { status: string; wakeBack: string; evidenceSha256?: Array<{ path: string; sha256: string }> };
     expect(rep.status).toBe("completed");
     expect(rep.wakeBack).toBe("mailbox");
+    // 回执披露现算摘要（DEMO 文档化的「回执含 sha256 → 与文件核对一致」可照做）。
+    const expected = sha256Of("391");
+    expect(rep.evidenceSha256?.[0]?.sha256).toBe(expected);
 
     // 派发方收回执
     const aInbox = payloadOf(await core.xc_check_inbox({}, "conn-a")) as {
@@ -182,8 +187,8 @@ describe("tools: 闭环主流程（register→dispatch→claim→report→inbox�
     expect(aInbox.messages).toHaveLength(1);
     expect(aInbox.messages[0]?.sourceTaskId).toBe(taskId);
     const receipt = JSON.parse(aInbox.messages[0]?.content ?? "{}") as { evidence: Array<{ sha256: string | null }> };
-    // v0.6（方案 §1-B）：哈希复核砍除——工具不再现算，落库存 null（非文件证据同款）。
-    expect(receipt.evidence[0]?.sha256).toBeNull();
+    // v0.7.1（边界-7）：现算值随回执分发（v0.6 的恒 null 已回退）。
+    expect(receipt.evidence[0]?.sha256).toBe(expected);
 
     // xc_status 快照落盘
     const st = await core.xc_status({}, "conn-a");

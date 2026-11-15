@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, existsSync, appendFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -13,7 +13,9 @@ import {
   countHeldPeerMessages,
   createRateBuckets,
   drainPeerInbox,
+  drainPeerInboxDetailed,
   drainPeerQueue,
+  drainPeerQueueDetailed,
   expireHeldPeerMessages,
   listHeldPeerMessages,
   peerQueueDepth,
@@ -113,6 +115,48 @@ describe('queue io', () => {
     writeFileSync(file, `not json\n${JSON.stringify(item({ msgId: 'm1' }))}\n`, 'utf8');
     const drained = await drainPeerQueue(dir, 'sess_a');
     expect(drained.map((entry) => entry.msgId)).toEqual(['m1']);
+  });
+
+  // v0.7.1（红队四番战 故障注-4 修复）：坏行计数经 Detailed 变体透出——
+  // 旧 drainPeerQueue 只回 items，读取面对坏行零披露（与 inbox malformedLines、
+  // held corrupted 三方不一致；红队 fi4 重放见 mcp/fault-injection-r4-v071.test.ts）。
+  it('drainPeerQueueDetailed 透出坏行条数（完整坏行计、半行写回不计）', async () => {
+    const file = peerQueueFile(dir, 'sess_a');
+    mkdirSync(join(dir, 'queue'), { recursive: true });
+    writeFileSync(
+      file,
+      `THIS_IS_GARBAGE_NOT_JSON\x00\x01\n${JSON.stringify(item({ msgId: 'm1' }))}\n{"msgId":"half","from":"pa","text":"trunc`,
+      'utf8',
+    );
+    const result = await drainPeerQueueDetailed(dir, 'sess_a');
+    expect(result.items.map((entry) => entry.msgId)).toEqual(['m1']);
+    expect(result.malformed).toBe(1); // 乱码行；半行写回不计
+    // 半行写回后仍是无终结符的 fragment：下一次 drain 既不投递也不计坏行
+    // （T4 F4 语义——半行 straddle 两次 drain 不可恢复，但也不是「完整坏行」）
+    const second = await drainPeerQueueDetailed(dir, 'sess_a');
+    expect(second.items).toHaveLength(0);
+    expect(second.malformed).toBe(0);
+    // 被换行终结后才作为一条坏行计数
+    appendFileSync(file, '\n');
+    const third = await drainPeerQueueDetailed(dir, 'sess_a');
+    expect(third.items).toHaveLength(0);
+    expect(third.malformed).toBe(1);
+  });
+
+  it('drainPeerQueueDetailed：无坏行时 malformed=0（响应形状不变）', async () => {
+    await appendPeerQueue(dir, 'sess_a', item({ msgId: 'm1' }));
+    const result = await drainPeerQueueDetailed(dir, 'sess_a');
+    expect(result.items).toHaveLength(1);
+    expect(result.malformed).toBe(0);
+  });
+
+  it('drainPeerInboxDetailed：传输级收件箱同口径', async () => {
+    const file = peerInboxFile(dir, 'sess_a');
+    mkdirSync(join(dir, 'inbox'), { recursive: true });
+    writeFileSync(file, `garbage\n${JSON.stringify(item({ msgId: 'i1', via: 'file' }))}\n`, 'utf8');
+    const result = await drainPeerInboxDetailed(dir, 'sess_a');
+    expect(result.items.map((entry) => entry.msgId)).toEqual(['i1']);
+    expect(result.malformed).toBe(1);
   });
 });
 

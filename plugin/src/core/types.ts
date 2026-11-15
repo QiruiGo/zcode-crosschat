@@ -150,11 +150,18 @@ export const DEFAULT_TEAM_ID = 'default';
 
 /** One evidence entry attached to a completion report (DESIGN.md §2.8). */
 export interface EvidenceItem {
-  /** Absolute path of the evidence file, or any evidence locator. */
+  /** Evidence file path as supplied by the caller (resolved by the gate). */
   path: string;
-  /** sha256 hex digest computed by the tool layer, or `null` for non-file evidence. */
+  /**
+   * sha256 hex digest computed by the tool layer over the file content.
+   * v0.7.1（边界-7）：v0.6 的「恒 null」已回退——现算值一律落库，调用方声明的
+   * 值与现算值不符时整单拒绝（`evidence_checksum_mismatch`）。
+   */
   sha256: string | null;
-  /** Human-readable note. */
+  /**
+   * Human-readable note (optional on input; `""` when omitted).
+   * v0.7.1（边界-8）：控制字符入库前已清洗为空格，长度钳制在 500 字符内。
+   */
   note: string;
 }
 
@@ -228,6 +235,14 @@ export interface TeamMember {
   identity?: MemberIdentity;
   /** Provisioning bookkeeping timestamp (start of the current supply / last success). */
   provisionedAt?: number;
+  /**
+   * v0.7.1（红队四番战 故障注-1 修复）：provisioning 尝试的**落盘 deadline**
+   * （epoch ms；= provisionedAt + XC_MEMBER_BOOTSTRAP_TIMEOUT_MS + 宽限）。
+   * 缺失 = v0.7.1 之前的存量记录，清扫方按 provisionedAt/joinedAt + 同一口径
+   * 现算兜底。超时的 provisioning 记录由后续工具调用/钩子清扫置 failed——
+   * 超时不再只存在于 lead MCP server 进程的内存里（server 中途死亡即永久卡死）。
+   */
+  provisionDeadlineAt?: number;
   /** Reason recorded by xc_member_stop (absent otherwise). */
   stopReason?: string;
   /** Last provisioning failure detail (state=failed only). */
@@ -620,6 +635,9 @@ function coerceMember(value: unknown): TeamMember | undefined {
     return undefined;
   }
   const provisionedAt = optionalFinite(value['provisionedAt']);
+  // v0.7.1（故障注-1 修复）：provisioning deadline 宽容读取（旧记录缺字段/
+  // 非有限值按 absent，清扫方按 startedAt + 超时口径现算兜底）。
+  const provisionDeadlineAt = optionalFinite(value['provisionDeadlineAt']);
   const stopReason = optionalString(value['stopReason']);
   const error = optionalString(value['error']);
   // v0.5（R-18）：contextChars 声明值宽容读取——非正整数视为 absent（按缺省处理）。
@@ -638,6 +656,7 @@ function coerceMember(value: unknown): TeamMember | undefined {
     ...(stateRaw === undefined ? {} : { state: stateRaw as MemberState }),
     ...(identityRaw === undefined ? {} : { identity: identityRaw as MemberIdentity }),
     ...(provisionedAt === undefined ? {} : { provisionedAt }),
+    ...(provisionDeadlineAt === undefined ? {} : { provisionDeadlineAt }),
     ...(stopReason === undefined ? {} : { stopReason }),
     ...(error === undefined ? {} : { error }),
     ...(contextChars === undefined ? {} : { contextChars }),

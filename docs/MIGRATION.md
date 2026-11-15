@@ -68,7 +68,7 @@
 |---|---|---|---|
 | `forwardOf` 转发 | 支持（带 hop-chain 溯源） | **移除**；两个 relay 旧名带 `forwardOf` 显式报错 `forwardOf_removed` | 直接 `xc_relay` 撰写正文；批注另发一条 |
 | `regToken` 锚定 | 重绑必验令牌（硬闸） | 软校验（sid 存在性+活性）；字段忽略并披露 | 停止传 `regToken`；同名冲突仍显式拒（`name_taken`） |
-| evidence 哈希 | sha256 现算复核（不符整单拒） | **砍复核**；保留文件存在门 + 工作区内门 | `sha256` 字段可留（忽略）或删除；`path`+`note` 即可 |
+| evidence 哈希 | sha256 现算复核（不符整单拒） | v0.6.0 砍复核；**v0.7.1 恢复现算复核**（边界-7，PROTOCOL §4.1）：带了必须与文件内容一致（hex 大小写不敏感），不符 `evidence_checksum_mismatch` 整单拒；省略则由工具现算落库并随回执披露 `evidenceSha256` | 显式传 `sha256` 时确保与文件内容一致；省略亦可（工具现算）；`path`+`note` 仍足够（`note` 可选，控制字符入库前清洗为空格、钳 500 字符；目录/设备文件不得作证据 `evidence_not_a_file`） |
 | 任务状态 | 六态 | 七态（+`blocked`，reason 必填） | 长任务暂停用 `xc_report(status:"blocked")`；解除用 `xc_team({action:"unblock"})` |
 | 邮箱哈希链 | `.jsonl.int` sidecar 读写 + 篡改披露 | 删除（存量 sidecar 无害孤儿） | 无动作；磁盘篡改检测不再提供 |
 | 同形字/零宽归一 | 花名归一 + 信封对抗检测 | 删除（README 已知限制声明） | 无动作 |

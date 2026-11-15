@@ -130,11 +130,17 @@ describe("member_add 名额闸（A12 修复重放：max=2，lead+failed 不计�
     // ④ 第 4 个成员被拒：活成员 2 + 1 > 2 → team_at_member_cap（修复不放松真实上限）
     const r4 = await add({ name: "m4" }, extra);
     expect(r4.isError).toBe(true);
-    const p4 = payloadOf(r4) as { error: string; maxMembers: number; activeMembers: number; message: string };
+    const p4 = payloadOf(r4) as { error: string; maxMembers: number; activeMembers: number; activeAfterAdd: number; name: string; message: string };
     expect(p4.error).toBe("team_at_member_cap");
     expect(p4.maxMembers).toBe(2);
-    expect(p4.activeMembers).toBe(3); // 新披露面：m2+m3 ready + 本次写入净 +1
+    // v0.7.1（规模压-B2）：两个数分开报且自洽——activeMembers = 当前活成员（m2+m3，
+    // lead 与 failed 的 m1 不计），activeAfterAdd = 本次写入后（含从未创建的 m4）。
+    expect(p4.activeMembers).toBe(2);
+    expect(p4.activeAfterAdd).toBe(3);
+    expect(p4.name).toBe("m4");
     expect(p4.message).toContain("lead/failed/removed 不计入");
+    expect(p4.message).toContain('adding "m4"');
+    expect(p4.message).toContain("max=2");
 
     // 磁盘真源终态对账（裁决证据形态）：lead + failed + ready×2
     const team = (await readTeam(stateRoot, "default"))!;

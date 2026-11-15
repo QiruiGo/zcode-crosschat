@@ -678,3 +678,106 @@ export async function noteTeamReset(stateRoot: string, teamId: string): Promise<
 }
 
 export type { MemberRole };
+
+// ---------------------------------------------------------------------------
+// v0.7.1（红队四番战 故障注-1 修复）：provisioning 超时的**落盘 deadline + 清扫**。
+//
+// 旧形态：建员欢迎回合的超时只存在于 lead MCP server 进程的内存里
+// （provisionMember 的 for(;;) 轮询 deadline）。lead server 中途死亡 →
+// 成员 roster 永久卡 provisioning：无回执、无审计、还占成员名额
+// （红队 fi1：kill 后 75s 仍 provisioning，engine.jsonl 仅 member-add-started）。
+//
+// 新形态（三段）：
+// ① 落盘 deadline：member-add Phase 1 写 provisioning 记录时一并写
+//    `provisionDeadlineAt = provisionedAt + bootstrapTimeoutMs + 宽限`；
+// ② 清扫：任一后续工具调用（member-add Phase 1，团队锁内）或钩子
+//    （UserPromptSubmit，团队锁 2s 预算内 best-effort）对过期记录置
+//    state=failed + error（释放名额）；
+// ③ 回执/审计：engine.jsonl 落 `member-provision-timeout`；同名重试
+//    member-add 干净接管（§6.4 幂等重供给）并在成功载荷披露 recovered。
+// ---------------------------------------------------------------------------
+
+/** provisioning 超时宽限（与 resolveReprovision 的停滞口径同值：超时 + 60s）。 */
+export const PROVISION_STALE_GRACE_MS = 60_000;
+
+/**
+ * 成员供给超时默认值（§6.2 步骤④；userConfig member_bootstrap_timeout_ms 同默认）。
+ *
+ * v0.7.1（故障注-1 修复）：从 engine/provision.ts 迁入 core——provisioning
+ * deadline 的清扫方（member-add 工具路径 + UserPromptSubmit 钩子）都要读它，
+ * 而钩子按 DESIGN §8.1 规则 1 只能 import M1（core）。engine/provision.ts
+ * 原路径转出，既有导入方不变。
+ */
+export const DEFAULT_MEMBER_BOOTSTRAP_TIMEOUT_MS = 300_000;
+
+/**
+ * XC_MEMBER_BOOTSTRAP_TIMEOUT_MS 解析（V18 同款防御：非有限正数的一律取默认值）。
+ */
+export function bootstrapTimeoutFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env["XC_MEMBER_BOOTSTRAP_TIMEOUT_MS"];
+  if (raw === undefined || raw.trim() === "") return DEFAULT_MEMBER_BOOTSTRAP_TIMEOUT_MS;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_MEMBER_BOOTSTRAP_TIMEOUT_MS;
+}
+
+/**
+ * provisioning 记录的停滞判定口径（ms）：建员欢迎回合还可能在实际超时后
+ * 短暂在途（收尾/落库），故清扫阈值 =  bootstrap 超时 + 宽限。
+ * 单一事实源：resolveReprovision（tools-team.ts）与清扫方共用。
+ */
+export function provisionStaleAfterMs(bootstrapTimeoutMs: number): number {
+  return bootstrapTimeoutMs + PROVISION_STALE_GRACE_MS;
+}
+
+/** env 版的停滞口径（钩子进程无 userConfig env 时回落内置默认——保守方向）。 */
+export function provisionStaleAfterMsFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+  return provisionStaleAfterMs(bootstrapTimeoutFromEnv(env));
+}
+
+/** 一条被清扫的 provisioning 记录（回执/审计用）。 */
+export interface SweptProvision {
+  key: string;
+  /** 记录里的供给开始时刻（缺省时 undefined）。 */
+  provisionedAt: number | undefined;
+  /** 本次清扫使用的 deadline（记录自带或现算兜底）。 */
+  deadline: number;
+}
+
+/** provisioning 超时写入 roster 的 error 文案（≤500 字符，与既有失败文案同族）。 */
+export function provisionTimeoutError(startedAt: number | undefined, deadline: number, staleAfterMs: number): string {
+  const waited = startedAt === undefined ? staleAfterMs : Math.max(0, deadline - startedAt);
+  return (
+    `provisioning deadline exceeded (~${waited} ms after start; XC_MEMBER_BOOTSTRAP_TIMEOUT_MS + `
+    + `${PROVISION_STALE_GRACE_MS} ms grace) — the lead MCP server that started this supply is gone or the `
+    + 'welcome turn never completed; state=failed frees the member slot; retry xc_team '
+    + '{action:"member-add"} with the same name (idempotent reprovision, §6.4)'
+  ).slice(0, 500);
+}
+
+/**
+ * 清扫（纯函数，锁内调用）：把超过 deadline 的 provisioning 记录就地置
+ * state=failed + error，返回被清扫的条目。调用方负责 writeTeam 与审计。
+ *
+ * deadline 取值：记录自带 `provisionDeadlineAt`（v0.7.1 起 Phase 1 落盘，
+ * 用的是**当时** lead server 的超时配置）优先；缺失（存量记录）按
+ * `provisionedAt ?? joinedAt + staleAfterMs` 现算兜底。
+ */
+export function sweepStaleProvisioningLocked(
+  team: TeamState,
+  now: number,
+  staleAfterMs: number,
+): SweptProvision[] {
+  const swept: SweptProvision[] = [];
+  for (const member of team.members) {
+    if ((member.state ?? 'ready') !== 'provisioning') continue;
+    const startedAt = member.provisionedAt ?? member.joinedAt;
+    const deadline = member.provisionDeadlineAt ?? startedAt + staleAfterMs;
+    if (now <= deadline) continue;
+    member.state = 'failed';
+    member.error = provisionTimeoutError(member.provisionedAt, deadline, staleAfterMs);
+    member.lastSeen = now;
+    member.provisionDeadlineAt = deadline; // 保留现场：审计/复诊可见本次判定依据
+    swept.push({ key: member.key, provisionedAt: member.provisionedAt, deadline });
+  }
+  return swept;
+}

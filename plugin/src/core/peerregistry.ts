@@ -456,6 +456,81 @@ export async function findLiveSessionIdHolder(
   return result.active.find((record) => record.sessionId === sessionId && record.pid !== process.pid);
 }
 
+/**
+ * v0.7.1（红队四番战 并发与-1 修复）：`session_id_in_use` 的**文案分流**。
+ *
+ * 红队实测（`con1.mjs`，6 进程同 name+sid 绝对时间栅栏并发 identify）：5 个败者
+ * 拿到 `session_id_in_use`，文案却写 "already registered by **another live
+ * session** … register with this session's **own** hook-injected id, not another
+ * session's"——而败者用的正是**自己的** hook 注入 id，冲突对象持有的是**同一个**
+ * sessionId（同一会话被两个活进程重复拉起/重复连接）。原文案把「同 sid 的重复
+ * 认领」误述成「冒用他人 sid」，操作者按提示换 id 只会离题更远。
+ *
+ * 分流口径（payload 增 `sameSessionId` 布尔，调用方可程序化判断）：
+ * - `holder.sessionId === sessionId`（**同 sid**）→ 明确说「另一个活连接认领了
+ *   同一个 sessionId；两个活进程在争一个会话，只有一个能持有」，恢复动作 =
+ *   停掉重复进程 / 从存活会话重跑 xc_identify；
+ * - 否则（**异 sid**）→ 维持 v0.5.2 起的原文案（"another live session …
+ *   register with this session's own hook-injected id"）——那才是冒用他人 sid
+ *   的场景，文案与恢复动作都对。
+ *
+ * 单一实现放在 core（队内轴 identity.ts、peer 轴 peer-services.ts、takeover 闸
+ * 三处共用）：mcp/peer-services.ts 反向依赖 tools-team.ts → identity.ts，从
+ * identity.ts import peer-services.ts 会成环（findLiveSessionIdHolder 同因移入
+ * 本模块，见上方注释）。
+ */
+export interface SessionIdConflictPayload {
+  error: 'session_id_in_use';
+  sessionId: string;
+  boundName: string;
+  boundPid: number;
+  /** true = 冲突对象持有**同一个** sessionId（重复拉起/重复连接，非冒用）。 */
+  sameSessionId: boolean;
+  message: string;
+  /** ToolError 的 payload 是开放记录（protocol.ts ToolPayload），此处显式声明。 */
+  [key: string]: unknown;
+}
+
+export function describeSessionIdConflict(
+  holder: PeerRecord,
+  sessionId: string,
+): { payload: SessionIdConflictPayload; text: string } {
+  const boundName = holder.name ?? `pid-${holder.pid}`;
+  if (holder.sessionId === sessionId) {
+    const message =
+      `sessionId "${sessionId}" is already registered by another live connection (pid ${holder.pid}, name "${boundName}") ` +
+      `claiming the SAME sessionId — two live processes are claiming one session, so only one of them can hold it ` +
+      `(this is not another session's id; your own hook-injected id is in use by a duplicate process). ` +
+      `Stop the duplicate process, or re-run xc_identify from the surviving session`;
+    return {
+      payload: {
+        error: 'session_id_in_use',
+        sessionId,
+        boundName,
+        boundPid: holder.pid,
+        sameSessionId: true,
+        message,
+      },
+      text: `sessionId "${sessionId}" is already registered by another live connection claiming the same sessionId`,
+    };
+  }
+  const message =
+    `sessionId "${sessionId}" is already registered by another live session (name "${boundName}"); ` +
+    `a sessionId belongs to the session that owns it — register with this session's own ` +
+    `hook-injected id, not another session's`;
+  return {
+    payload: {
+      error: 'session_id_in_use',
+      sessionId,
+      boundName,
+      boundPid: holder.pid,
+      sameSessionId: false,
+      message,
+    },
+    text: `sessionId "${sessionId}" is already registered by another live session`,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // formerNames（R-10）
 // ---------------------------------------------------------------------------

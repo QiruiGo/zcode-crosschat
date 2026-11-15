@@ -12,6 +12,7 @@ import {
   readStored,
   resolvePeerMessage,
   sha256Of,
+  storedMessageCorruptFile,
   storePeerMessageFull,
 } from './msgstore.js';
 import { peerHeldDir, peerInboxFile, peerMessagesDir, peerQueueFile } from './peerdir.js';
@@ -90,6 +91,39 @@ describe('storePeerMessageFull（接收入队即落，F-3）', () => {
     expect(await readStored(dir, 'm-bad')).toBeUndefined();
     writeFileSync(join(peerMessagesDir(dir), 'm-bad2.json'), JSON.stringify({ msgId: 'm-bad2' }), 'utf8');
     expect(await readStored(dir, 'm-bad2')).toBeUndefined();
+  });
+
+  // v0.7.1（红队四番战 故障注-3 修复）：store 文件「存在但不可用」必须与
+  // 「不存在」可区分——读取面据此报 message_corrupt（带路径+恢复指引）而不是
+  // 误导性 unknown msgId（fi3：300KB 消息落盘后被改写为乱码，恢复路径被阻断）。
+  it('storedMessageCorruptFile：可读/缺失 → undefined；坏 JSON/形状非法 → 文件路径', async () => {
+    expect(await storedMessageCorruptFile(dir, 'missing')).toBeUndefined();
+    await storePeerMessageFull(dir, { msgId: 'm-ok', text: 'good' }, 1);
+    expect(await storedMessageCorruptFile(dir, 'm-ok')).toBeUndefined();
+
+    mkdirSync(peerMessagesDir(dir), { recursive: true });
+    writeFileSync(join(peerMessagesDir(dir), 'm-garbage.json'), 'CORRUPTED-GARBAGE-\x00\x01-not-json', 'utf8');
+    expect(await storedMessageCorruptFile(dir, 'm-garbage')).toBe(join(peerMessagesDir(dir), 'm-garbage.json'));
+
+    writeFileSync(join(peerMessagesDir(dir), 'm-notext.json'), JSON.stringify({ msgId: 'm-notext' }), 'utf8');
+    expect(await storedMessageCorruptFile(dir, 'm-notext')).toBe(join(peerMessagesDir(dir), 'm-notext.json'));
+
+    // 可解析但非对象同样算不可用
+    writeFileSync(join(peerMessagesDir(dir), 'm-array.json'), '[1,2,3]', 'utf8');
+    expect(await storedMessageCorruptFile(dir, 'm-array')).toBe(join(peerMessagesDir(dir), 'm-array.json'));
+  });
+
+  it('store 坏件不挡 queue 兜底：消息未消费时 resolvePeerMessage 仍读回原文（恢复路径）', async () => {
+    const queue = peerQueueFile(dir, 'sess-b');
+    mkdirSync(join(dir, 'queue'), { recursive: true });
+    const item = { msgId: 'm-fallback', text: 'queue 兜底正文', from: 'dave', ts: 1, via: 'pipe', hopChain: ['dave'] };
+    writeFileSync(queue, `${JSON.stringify(item)}\n`, 'utf8');
+    // store 里放同一 msgId 的坏件：读取必须落到 queue 兜底而不是报损坏
+    mkdirSync(peerMessagesDir(dir), { recursive: true });
+    writeFileSync(join(peerMessagesDir(dir), 'm-fallback.json'), 'garbage', 'utf8');
+    expect(await resolvePeerMessage(dir, 'sess-b', 'm-fallback')).toMatchObject({ text: 'queue 兜底正文' });
+    // 而读取面的损坏披露探针仍然指向坏件（供「四处皆无」时报 corrupt）
+    expect(await storedMessageCorruptFile(dir, 'm-fallback')).toBe(join(peerMessagesDir(dir), 'm-fallback.json'));
   });
 });
 

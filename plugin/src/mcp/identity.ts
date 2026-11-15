@@ -29,6 +29,7 @@
  */
 
 import { createHash, randomUUID } from "node:crypto";
+import { rm } from "node:fs/promises";
 import { invalidParamsError, notRegisteredError, ToolError } from "./protocol.js";
 import { withRegistryThenTeamLocks } from "../core/lock.js";
 import { validateMemberName } from "../core/sanitize.js";
@@ -43,11 +44,12 @@ import {
   writeSession,
 } from "../core/registry.js";
 import { readPeerBaseRecord, writePeerBaseRecord } from "../core/peerdir.js";
+import { teamFile } from "../core/paths.js";
 import { newTeamState, noteTeamReset, readTeam, writeTeam } from "../core/teamstate.js";
 import { logEngineEvent } from "../core/log.js";
 import { DEFAULT_TEAM_ID, memberState } from "../core/types.js";
 import type { MemberRole, SessionRecord, TeamMember, TeamState } from "../core/types.js";
-import { findLiveSessionIdHolder } from "../core/peerregistry.js";
+import { describeSessionIdConflict, findLiveSessionIdHolder } from "../core/peerregistry.js";
 import type { PeerRecord } from "../core/peerregistry.js";
 
 export { DEFAULT_TEAM_ID };
@@ -101,6 +103,13 @@ export class IdentityStore {
     if (!bound) throw notRegisteredError();
     return bound;
   }
+  /**
+   * v0.7.1（边界-4 修复）：解绑一条连接的持有身份（注册回滚用）。
+   * 连接从未绑定过时是无操作（幂等）。
+   */
+  unbind(connectionKey: string): void {
+    this.#byConnection.delete(connectionKey);
+  }
 }
 
 /** 进程级单例：stdio 下一进程=一连接（见类注释，DESIGN §2.3-2）。 */
@@ -131,6 +140,24 @@ export interface RegisterOutcome {
   protocolDigest: string;
   warnings: string[];
   via: "hook" | "wake";
+  /**
+   * v0.7.1（红队四番战 边界-4 修复）：撤销本次注册的**队内轴**副作用。
+   *
+   * xc_identify 是两轴合一操作（先队内、后 peer）。v0.7.0 及以前 peer 轴失败时
+   * 只把错误透出，队内轴的 names.json 绑定 / team.json 成员行 / 连接绑定全部
+   * 留在盘上（回执还写着 `teamAxis.registered:true`）——调用方不能把错误当
+   * 「无副作用」，重跑又会撞上自己刚建的状态（红队 g3-b4 复放：一次失败的
+   * identify 之后 names.json 已绑、roster 已入、甚至成了 founderKey）。
+   *
+   * 本闭包把注册逆回「从未发生」：
+   * - unbindName（条件删除：仍指向本 sid 才删，registry.ts 的回滚语义）；
+   * - team.json：本次**新增**的成员行删掉（队伍本就空的 → 连 team.json 一起删，
+   *   回到注册前的「无队伍」）；本次**已存在**的成员行恢复原 sid（不删别人的行）；
+   * - identityStore 解绑（连接不再持有已不存在的身份）。
+   * 幂等且**永不抛**：内部 IO 失败吞掉并审计，返回 `{ok:false,error}`——调用方
+   * （peer 轴失败路径）据此在错误信封里如实披露，不把失败的回滚说成成功。
+   */
+  rollback: () => Promise<{ ok: boolean; error?: string }>;
 }
 
 /**
@@ -301,21 +328,12 @@ export async function xcRegister(
     // 放在名字/sid 交叉校验之后：文档化的 name_taken / session_already_bound 先行
     // （保住 v0.6.0 错误码契约），本闸兜住「同花名 + 他人 sid」的零凭据冒名
     // （旧实现在这条路径上完全放行，红队 sec1 即由此得手）。
+    // v0.7.1（红队四番战 并发与-1 修复）：文案经 describeSessionIdConflict 分流——
+    // 冲突对象持有**同一个** sid（同一会话被两个活进程重复拉起）时不再误述
+    // "another live session … use your own id"，payload 增 sameSessionId 供程序化判断。
     if (sidHolder !== undefined) {
-      const boundName = sidHolder.name ?? `pid-${sidHolder.pid}`;
-      throw new ToolError(
-        {
-          error: "session_id_in_use",
-          sessionId,
-          boundName,
-          boundPid: sidHolder.pid,
-          message:
-            `sessionId "${sessionId}" is already registered by another live session (name "${boundName}"); ` +
-            "a sessionId belongs to the session that owns it — register with this session's own " +
-            "hook-injected id, not another session's",
-        },
-        `sessionId "${sessionId}" is already registered by another live session`,
-      );
+      const conflict = describeSessionIdConflict(sidHolder, sessionId);
+      throw new ToolError(conflict.payload, conflict.text);
     }
 
     // ---- v0.6（DESIGN-V0.6.md §2.2 行 2）：重绑属主硬闸（identity_token_required）砍除 ----
@@ -326,8 +344,10 @@ export async function xcRegister(
     // 先绑名（registry），后 team 入队；入队失败经 unbindName 回滚（§2.7-3 原顺序）。
     await bindName(stateRoot, agentKey, { sessionId, role, registeredAt: now });
     let team: TeamState;
+    let join: Awaited<ReturnType<typeof joinTeam>>;
     try {
-      team = await joinTeam(stateRoot, teamId, agentKey, sessionId, role, now, warnings);
+      join = await joinTeam(stateRoot, teamId, agentKey, sessionId, role, now, warnings);
+      team = join.team;
     } catch (err) {
       await unbindName(stateRoot, agentKey, sessionId); // 条件回滚：仍指向本 sid 才删
       throw err;
@@ -395,6 +415,56 @@ export async function xcRegister(
       warnings: warnings.length,
     });
 
+    // v0.7.1（边界-4 修复）：交出「撤销本次队内注册」的闭包。调用方（xc_identify
+    // 常规注册路径）在 peer 轴失败时调它，把队内轴逆回注册前；锁序与注册一致
+    // （registry → team）。永不抛：任何 IO 失败只审计，由调用方如实披露
+    // `teamAxis.rolledBack:false`。
+    const rollback = async (): Promise<{ ok: boolean; error?: string }> => {
+      try {
+        await withRegistryThenTeamLocks(stateRoot, teamId, async () => {
+          await unbindName(stateRoot, agentKey, sessionId);
+          const current = await readTeam(stateRoot, teamId);
+          if (current === undefined) return;
+          if (join.memberExisted) {
+            // 既有成员行：只把 sid 恢复原值（这行可能是别人的在途状态载体）。
+            const idx = current.members.findIndex((m) => m.key === agentKey);
+            if (idx >= 0 && join.previousSessionId !== undefined && join.previousSessionId !== sessionId) {
+              current.members[idx] = { ...current.members[idx]!, sessionId: join.previousSessionId };
+              await writeTeam(stateRoot, current);
+            }
+            return;
+          }
+          current.members = current.members.filter((m) => !(m.key === agentKey && m.sessionId === sessionId));
+          if (current.members.length === 0 && join.created) {
+            // 本次注册把队伍建出来的（本人是首个成员）→ 连 team.json 一起撤，
+            // 回到注册前的「无队伍」。roster 已空而队伍是既有的，不删文件。
+            await rm(teamFile(stateRoot, teamId), { force: true });
+            return;
+          }
+          await writeTeam(stateRoot, current);
+        });
+        identityStore.unbind(connectionKey);
+        await logEngineEvent(stateRoot, {
+          event: "register-rolled-back",
+          teamId,
+          agentKey,
+          sessionId,
+          reason: "peer-axis-registration-failed",
+        });
+        return { ok: true };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        await logEngineEvent(stateRoot, {
+          event: "register-rollback-failed",
+          teamId,
+          agentKey,
+          sessionId,
+          error: message,
+        });
+        return { ok: false, error: message };
+      }
+    };
+
     return {
       sessionKey,
       teamId,
@@ -402,13 +472,17 @@ export async function xcRegister(
       protocolDigest: PROTOCOL_DIGEST,
       warnings,
       via,
+      rollback,
     };
   });
 }
 
 /** team 入队：不存在则建队（首个注册者=founderKey，§2.2）；存在则 upsert 成员。
  *  v0.5.1（故障注-5 修复）：team.json 缺失但有残迹（邮箱/快照）时建队不再静默
- *  ——noteTeamReset 产出告警进注册响应的 warnings 并落 `team-reset-detected` 审计。 */
+ *  ——noteTeamReset 产出告警进注册响应的 warnings 并落 `team-reset-detected` 审计。
+ *  v0.7.1（边界-4 修复）：返回 `memberExisted`/`previousSessionId`——注册回滚
+ *  需要知道「这一行是不是本次新建的、原来绑的是哪个 sid」，才能把 team.json 逆回
+ *  注册前而不动别人的行。 */
 async function joinTeam(
   stateRoot: string,
   teamId: string,
@@ -417,7 +491,7 @@ async function joinTeam(
   role: MemberRole,
   now: number,
   warnings: string[],
-): Promise<TeamState> {
+): Promise<{ team: TeamState; created: boolean; memberExisted: boolean; previousSessionId?: string }> {
   const found = await readTeam(stateRoot, teamId);
   if (found === undefined) {
     const resetWarning = await noteTeamReset(stateRoot, teamId);
@@ -425,15 +499,17 @@ async function joinTeam(
     const member: TeamMember = { key: agentKey, sessionId, role, joinedAt: now, lastSeen: now };
     const created = newTeamState({ teamId, name: teamId, founderKey: agentKey, founder: member, now });
     await writeTeam(stateRoot, created);
-    return created;
+    return { team: created, created: true, memberExisted: false };
   }
   const idx = found.members.findIndex((m) => m.key === agentKey);
   if (idx >= 0) {
     // 重复注册：同名字刷新（会话重启换 sid 也在此更新）。
-    found.members[idx] = { ...found.members[idx], sessionId, role, lastSeen: now };
-  } else {
-    found.members.push({ key: agentKey, sessionId, role, joinedAt: now, lastSeen: now });
+    const previousSessionId = found.members[idx]!.sessionId;
+    found.members[idx] = { ...found.members[idx]!, sessionId, role, lastSeen: now };
+    await writeTeam(stateRoot, found);
+    return { team: found, created: false, memberExisted: true, previousSessionId };
   }
+  found.members.push({ key: agentKey, sessionId, role, joinedAt: now, lastSeen: now });
   await writeTeam(stateRoot, found);
-  return found;
+  return { team: found, created: false, memberExisted: false };
 }
