@@ -73,8 +73,22 @@
 
 ---
 
+## 第二批输入（2026-11-18 晚，主控同步，用户令）——G-4 现场处置 + 三项新增
+
+**G-4 现场处置（用户批准）**：直接改缓存插件 `plugin.json` 的 `userConfig.wake_enabled.default` false→true。监督验证：✅ 修改已落盘；❌ **尚未生效**（改后引擎仍持续输出 wake-skipped raw="false"——userConfig 在插件加载时注入进程环境，需插件重载/桌面重启；生效判据=事件 note 不再含 wake-disabled）。此处置的风险即 G-6。
+
+| # | 新缺口 | 一句话 | 证据 |
+|---|---|---|---|
+| G-6 | userConfig 无文件级配置持久位 | userConfig 值无任何可发现落盘 JSON（APPDATA 全域+~/.zcode 全域搜索零命中），只能 UI 或改缓存（**插件更新即冲掉**） | 全盘搜索零命中 + 本次改缓存处置本身 |
+| G-7 | wake 默认 false 对协作场景是首要摩擦源 | 主控被迫全程 OpenSession+SendToSession 手动踢，绑定频繁掉线（proto.sessionNotFound 需重绑重发），用户多次质问「对话怎么又死了」 | 主控全天实操台账；监督累计 wake-skipped 223+ |
+| G-8 | SendToSession 对已注册 peer 不自动重绑 | sessionNotFound 高频，全靠主控先 OpenSession 再重发，回合制下极易漏 | 主控台账（11-12 L182 即有 sessionNotFound 失效加速案例） |
+
+**当晚战绩背书（主控口径，监督数据印证）**：任务板 50+ 任务零失败（监督：t1~t47，确认 29 单 completed，0 工具失败）；evidence sha256 审计全通过；stale-sweep 心跳规驯化完成（t44~t46 心跳规范零清扫）；双雷达（发版+工单）并入 release_monitor 自持调度。**核心能力实战可靠，改进点集中在配置与通道层。**
+
+---
+
 ## 给升级会话的指引（v0.9.0 输入）
 
-1. **原始数据**：`docs/trial-data/2026-11-18-lims2.0-records.jsonl`（9 轮监督快照，字段说明见 `docs/TRIAL-DATA-2026-11-18-lims2.0.md`）；复现环境为 lims2.0 工作区 `.crosschat/`（生产数据，未随仓库提交）。
-2. **对照阅读**：G-1/G-2 属宿主能力（zcode 平台），需评估「插件可做到什么程度」（如软中断=注入+安全点自检，纯插件可实现）；G-4/G-5 是插件引擎配置/机制，可直接进 v0.9.0；G-3 优先撤回原语。
-3. **正交数据**：7.5h 工具面 0 失败、dispatch→claim→report 全链路 29 任务无丢失——**核心机制不需要动**，v0.9.0 应聚焦本清单而非重构。
+1. **原始数据**：`docs/trial-data/2026-11-18-lims2.0-records.jsonl`（监督快照持续更新，字段说明见 `docs/TRIAL-DATA-2026-11-18-lims2.0.md`）；复现环境为 lims2.0 工作区 `.crosschat/`（生产数据，未随仓库提交）。
+2. **对照阅读**：G-1/G-2 属宿主能力（zcode 平台），需评估「插件可做到什么程度」（如软中断=注入+安全点自检，纯插件可实现）；G-4/G-5/G-7 是插件引擎配置/机制，可直接进 v0.9.0；G-3 优先撤回原语；G-6 建议文件级配置持久位（`.crosschat/config.json` 或 `~/.zcode/cli/config.json` 挂载）；G-8 需宿主 SendToSession 改进或插件侧 peer 注册表联动重绑。
+3. **正交数据**：全天工具面 0 失败、dispatch→claim→report 全链路 47 任务无丢失——**核心机制不需要动**，v0.9.0 应聚焦本清单而非重构。
