@@ -293,6 +293,8 @@ function isoTs(ts: number): string {
   return new Date(ts).toISOString();
 }
 
+/** 未读摘要的 msgId 折叠（8 前缀）——uuid 前缀不撞、且该列无身份寻址职责（V090-15：
+ *  sessionId 身份行 v0.9.2 起改全量渲染，不再用本函数；本函数仅剩 msgId 摘要一处）。 */
 function shortId(id: string): string {
   return id.slice(0, 8);
 }
@@ -341,8 +343,13 @@ export function buildCheckpointMarkdown(data: CheckpointData): string {
   out.push(`- agent: ${key} | role: ${role} | state: ${state} | lead: ${lead} | team: ${foldLine(data.teamId)}`);
   const sid = data.member?.sessionId;
   const lastSeen = data.member?.lastSeen;
+  // v0.9.2（V090-15 P3 修复）：sessionId 恒渲染**全量**——v0.9.1 及以前用
+  // shortId(sid)=slice(0,8)，真实 sid 一律 `sess_dwf-`/`sess_` 前缀时该行恒等退化
+  // （不同成员的检查点文件显示同一串），而 team.json / xc_overview 成员行给全 id、
+  // peers 视图给 slice(-8)——三种口径并存。latestCheckpoint 读回只取元数据（无程序
+  // 消费该行），折叠仅制造展示层矛盾；全量渲染与权威身份面（team.json/overview）对齐。
   out.push(
-    `- sessionId: ${sid === undefined || sid === '' ? '(unknown)' : `${shortId(sid)}`}`
+    `- sessionId: ${sid === undefined || sid === '' ? '(unknown)' : sid}`
     + ` | lastSeen: ${lastSeen === undefined ? '(unknown)' : `${isoTs(lastSeen)}（${relMinutes(now, lastSeen)}min 前）`}`,
   );
   out.push('');

@@ -118,14 +118,21 @@ export function withGuards(core: ToolCore, deps: ToolDeps): ToolCore {
       // v0.7（C6，DESIGN-V0.7 §2.2）：C6/C7 协议帧免入站策略——与文件头注「协议帧
       // 不受策略影响」同口径（队内核心同样豁免，tools-relay.ts）。转办/审批帧的控制
       // 点是审批门；hold 会让请求永远躺隔离区、refuse 会伪造 delivery-refused 语义。
+      // v0.9（G-3）：撤回单与缺 msg 的调用同样直通核心——入站策略只裁决「发送正文」，
+      // 撤回的删除+通知帧语义在核心内（withdrawal-notice 是白名单协议帧，本就免策略），
+      // 缺 msg（且无 withdrawMessageIds）由核心显式 invalid_params。此行之后 a.msg 收窄
+      // 为 string（发送路径）。
+      if (a.withdrawMessageIds !== undefined || a.msg === undefined) return core.xc_message(a, ck);
       if (parseToolFrameType(a.msg) !== undefined) return core.xc_message(a, ck);
       const policy = await readInboundPolicy(stateRoot, me.teamId, env);
       if (policy.mode === "accept") return core.xc_message(a, ck);
 
       if (policy.mode === "hold") {
         // hold 隔离副本保留 urgent 标记（C1：接受审阅后插队不丢）。
+        // v0.9（G-2）：软中断元数据同样保留（接受审阅后信封横幅随读取面渲染不丢）。
         const msg = createMessage(me.agentKey, toKey, a.msg, chatExtrasOf(a));
         if (a.urgent === true) msg.urgent = true;
+        if (a.interrupt === true) msg.interrupt = true;
         await appendHeld(stateRoot, me.teamId, toKey, msg);
         return okResult(
           `Message held by inbound policy (mode=hold, source=${policy.source}): quarantined in ` +

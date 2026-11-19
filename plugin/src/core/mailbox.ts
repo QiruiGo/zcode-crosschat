@@ -30,7 +30,9 @@
  * @module core/mailbox
  */
 import { randomUUID } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import { appendJsonl, readJsonl, rewriteJsonl, type MalformedLine } from './jsonl.js';
+import { writeFileAtomic, stripLeadingBom } from './atomic.js';
 import { sanitizeKey } from './sanitize.js';
 import { isRecord, isTeamMessage, normalizeMessage, TERMINAL_TASK_STATUSES, type TeamMessage, type TeamState } from './types.js';
 import { logEngineEvent } from './log.js';
@@ -52,7 +54,10 @@ import { readTeam } from './teamstate.js';
  * 回投）与 approval_request/approval_result（审批通知/回执）。E4 §7.1 实测：未加白的
  * 具名帧被读取面静默剔除（frame-rejected 审计），「传得到、收不到」——故 C6 帧型
  * 必须进本表。**新帧型只做通知/回执，不带授权语义**（授权只认审批文件，§2.3/C7）；
- * 混合版本降级（v0.6.1 端点收新帧）走 readMailboxDetailed 的剔除+审计路径，不崩。 */
+ * 混合版本降级（v0.6.1 端点收新帧）走 readMailboxDetailed 的剔除+审计路径，不崩。
+ * v0.9（G-3）：再扩 1 值——withdrawal-notice（发送方撤回未读件后给收方的通知帧；
+ * 纯通知，不带授权语义）。软中断（G-2）不走具名帧——它是 TeamMessage.interrupt
+ * 元数据 + 读取面渲染横幅，正文保持原话（uservoice 盖章字节匹配不受影响）。 */
 export const FRAME_TYPES = [
   'task-assignment',
   'task-receipt',
@@ -65,6 +70,7 @@ export const FRAME_TYPES = [
   'tool_result',
   'approval_request',
   'approval_result',
+  'withdrawal-notice',
 ] as const;
 export type FrameType = (typeof FRAME_TYPES)[number];
 
@@ -107,12 +113,14 @@ const RECEIPT_SUFFIX = ']';
  *  v0.5（M3 帧域契约）：extra 白名单扩含 origin/originSessionId（队内盖章写入，R-11/R-12；
  *  只有 'origin' | 'originSessionId' 两个新增键，其余白名单行逐字节不动）。
  *  v0.6（C1，DESIGN-V0.6.md §3.1 数据面）：白名单再扩含 urgent——xc_relay
- *  urgent/interrupt 写入侧唯一新增键，其余白名单行逐字节不动。 */
+ *  urgent/interrupt 写入侧唯一新增键，其余白名单行逐字节不动。
+ *  v0.9（G-2）：白名单再扩含 interrupt——软中断信封元数据唯一新增键，其余白名单行
+ *  逐字节不动。 */
 export function createMessage(
   from: string,
   to: string,
   content: string,
-  extra: Partial<Pick<TeamMessage, 'taskId' | 'attemptId' | 'sourceTaskId' | 'sourceAttemptId' | 'sourceTaskStatus' | 'deliveryClaimedAt' | 'origin' | 'originSessionId' | 'urgent'>> = {},
+  extra: Partial<Pick<TeamMessage, 'taskId' | 'attemptId' | 'sourceTaskId' | 'sourceAttemptId' | 'sourceTaskStatus' | 'deliveryClaimedAt' | 'origin' | 'originSessionId' | 'urgent' | 'interrupt'>> = {},
 ): TeamMessage {
   return { id: randomUUID(), from, to, content, ts: Date.now(), ...extra };
 }
@@ -410,6 +418,46 @@ export async function discardMailboxMessages(
     ...message,
     discardedAt: message.discardedAt ?? now,
   }));
+}
+
+/**
+ * v0.9（G-3 撤回原语）：把选中 id 的消息行从邮箱 JSONL **整行删除**（非打标）——
+ * mutateMailbox 只能改写行、无法删行，撤回的语义是收方永远读不到（连 readAt 历史都不留）。
+ * 原子整文件提交（writeFileAtomic，与 rewriteJsonl 同纪律）：坏行/空行逐字节保留，
+ * 只删「解析为 TeamMessage 且 id 命中」的行；命中数返回给调用方对账。
+ * 调用方必须已持团队锁（与一切邮箱变更同规）。撤回的其余语义（未读校验、整单拒绝、
+ * 给收方投 withdrawal-notice 帧、engine 事件）在 xc_relay 的队内轴核心实现。
+ */
+export async function deleteMailboxMessages(
+  stateRoot: string, teamId: string, agentKey: string, ids: readonly string[],
+): Promise<number> {
+  if (ids.length === 0) return 0;
+  const selected = new Set(ids);
+  const file = mailboxPath(stateRoot, teamId, agentKey);
+  let raw: string;
+  try {
+    raw = await readFile(file, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 0;
+    throw error;
+  }
+  let removed = 0;
+  const lines = raw.split('\n').filter((rawLine) => {
+    const line = stripLeadingBom(rawLine);
+    if (line.trim() === '') return true;
+    try {
+      const value: unknown = JSON.parse(line);
+      if (isTeamMessage(value) && selected.has(value.id)) {
+        removed += 1;
+        return false;
+      }
+    } catch {
+      // 坏行不是撤回对象——逐字节保留（readMailboxDetailed 会在读取面披露）。
+    }
+    return true;
+  });
+  if (removed > 0) await writeFileAtomic(file, lines.join('\n'));
+  return removed;
 }
 
 /**

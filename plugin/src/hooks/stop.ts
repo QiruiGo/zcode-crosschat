@@ -20,9 +20,11 @@
  * Build entry: dist/hooks/stop.mjs (scripts/build.mjs).
  */
 import { refreshSnapshot } from '../core/snapshot.js';
+import { markSessionIdle } from '../core/registry.js';
 import {
   auditHookFailure,
   boundNamesForSession,
+  HOOK_LOCK_WAIT_MS,
   logHookEvent,
   readStdinPayload,
   resolveHookContext,
@@ -42,6 +44,13 @@ export async function runStopHook(): Promise<void> {
     note: 'v1 probe: no continuation output until V3 key names are verified (DESIGN.md §9 V3)',
   });
   if (ctx.sessionId === undefined) return; // unregistered/unanchored session: nothing to refresh for
+  // v0.9（G-9，PROTOCOL §12.4）：回合结束 → 活性标 idle（registry 记录 + 迁移事件；
+  // best-effort——锁忙即放弃，钩子纪律 pull-path 不设闸）。
+  try {
+    await markSessionIdle(ctx.stateRoot, ctx.sessionId, { waitMs: HOOK_LOCK_WAIT_MS });
+  } catch (error) {
+    await auditHookFailure(ctx.stateRoot, 'stop-liveness', error);
+  }
   const names = await boundNamesForSession(ctx.stateRoot, ctx.sessionId);
   if (names.length === 0) return; // not in the roster (neither member nor lead): skip silently
   // W3 refreshSnapshot(stateRoot, teamId?) — teamId omitted = default team.

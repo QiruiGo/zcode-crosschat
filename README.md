@@ -5,7 +5,7 @@
 
 让多个**互相独立**的 zcode 会话协同完成**大型长期任务**（跨天、换会话、人不在是常态）：一个会话把可检验的任务派出去，另一个会话认领、执行、带证据回传；也可以跨会话直接互发消息、插队介入。纯插件形态（技能 + 斜杠命令 + 进程钩子 + MCP server），文件邮箱是唯一持久真源——装好即用，无必填配置。任务状态机与消息协议与开源的 dsh-agent-teams 插件机制等价（机制对照见 [docs/DESIGN.md](docs/DESIGN.md)）。
 
-三种玩法：**两会话任务闭环**（0 配置）、**跨会话 peer 消息**（0 配置）、**lead-成员团队自动开工**（开一个开关即可，zcode 路径自动探测）。长期任务协作约定（任务日志 / 交接 / 压缩前检查点与留档）由内置 `longtask` 技能承载。
+三种玩法：**两会话任务闭环**（0 配置）、**跨会话 peer 消息**（0 配置）、**lead-成员团队自动开工**（引擎成员免开关，交互会话可选开启；zcode 路径自动探测）。长期任务协作约定（任务日志 / 交接 / 压缩前检查点与留档）由内置 `longtask` 技能承载。
 
 ## 环境要求
 
@@ -20,15 +20,15 @@
 
 ### 第 1 步：下载并解包
 
-1. 打开 <https://github.com/QiruiGo/zcode-crosschat/releases>，下载资产 **`zcode-crosschat-0.8.1-prebuilt-slim.tar.gz`**（约 4–5MB）。**保留原文件名**——随包发布的 `.sha256` 校验和按原名录，改名后校验会失败。
-2. （可选）校验完整性：在文件所在目录执行 `sha256sum -c zcode-crosschat-0.8.1-prebuilt-slim.tar.gz.sha256`（PowerShell 可用 `Get-FileHash` 对照 `.sha256` 文件里的值），期望输出 `OK`。
+1. 打开 <https://github.com/QiruiGo/zcode-crosschat/releases>，下载资产 **`zcode-crosschat-0.9.0-prebuilt-slim.tar.gz`**（约 4–5MB）。**保留原文件名**——随包发布的 `.sha256` 校验和按原名录，改名后校验会失败。
+2. （可选）校验完整性：在文件所在目录执行 `sha256sum -c zcode-crosschat-0.9.0-prebuilt-slim.tar.gz.sha256`（PowerShell 可用 `Get-FileHash` 对照 `.sha256` 文件里的值），期望输出 `OK`。
 3. 解包（Windows 10+ 自带 tar，PowerShell / Git Bash 均可）：
 
    ```bash
-   tar -xzf zcode-crosschat-0.8.1-prebuilt-slim.tar.gz
+   tar -xzf zcode-crosschat-0.9.0-prebuilt-slim.tar.gz
    ```
 
-   得到目录 `zcode-crosschat-0.8.1/`（下称「解包目录」，其下应有 `marketplace.json`）。
+   得到目录 `zcode-crosschat-0.9.0/`（下称「解包目录」，其下应有 `marketplace.json`）。
 
 ### 第 2 步：安装
 
@@ -43,11 +43,11 @@ zcode 命令行**不在系统 PATH 里**（它是桌面版内置的入口），�
 ```bash
 ZC() { ELECTRON_RUN_AS_NODE=1 "<安装目录>/ZCode.exe" "<安装目录>/resources/<variant>/zcode.cjs" "$@"; }
 
-ZC plugins marketplace add "<解包目录>/zcode-crosschat-0.8.1"
+ZC plugins marketplace add "<解包目录>/zcode-crosschat-0.9.0"
 # 期望：Added marketplace dev-zcode-crosschat (1 plugins)
 
 ZC plugins install zcode-crosschat@dev-zcode-crosschat
-# 期望：Installed plugin zcode-crosschat@dev-zcode-crosschat (0.8.1) [enabled]
+# 期望：Installed plugin zcode-crosschat@dev-zcode-crosschat (0.9.0) [enabled]
 ```
 
 **PowerShell**：
@@ -55,7 +55,7 @@ ZC plugins install zcode-crosschat@dev-zcode-crosschat
 ```powershell
 function ZC { $env:ELECTRON_RUN_AS_NODE = "1"; & "<安装目录>\ZCode.exe" "<安装目录>\resources\<variant>\zcode.cjs" @args }
 
-ZC plugins marketplace add "<解包目录>/zcode-crosschat-0.8.1"
+ZC plugins marketplace add "<解包目录>/zcode-crosschat-0.9.0"
 ZC plugins install zcode-crosschat@dev-zcode-crosschat
 ```
 
@@ -134,11 +134,10 @@ npm install && npm run build
 
 **可转达用户原话**：想让另一个会话知道「这是**你**说的」，让会话逐字引用你的原话（`/xc-say`）——正文命中用户原始提示时自动带 `origin="user"` 标记，接收方看到的是「发送会话用户的原话」标注；转述/改写不命中，回落为普通会话消息。
 
-### lead-成员团队自动开工（唯一需要配置的玩法）
+### lead-成员团队自动开工（引擎成员免开关；交互会话可选开启）
 
-一个会话当队长：拆任务、程序化建成员（零人工开窗口）、收回执。先在插件设置（桌面端 → 设置 → 插件 → zcode-crosschat → 插件设置）里：
+一个会话当队长：拆任务、程序化建成员（零人工开窗口）、收回执。**v0.9 起唤醒分层（G-4/G-7）**：引擎程序化建的成员**免开关自动唤醒**——派单即开回合，不再需要先开 `wake_enabled`（旧口径「团队自动开工必须开 wake_enabled」自 v0.9 废止）；交互式会话（你正开着窗口用的）默认**不**被自动唤醒，维持防打扰。想让某个工作区的交互会话也参与自动开工时，在该工作区 `.crosschat/config.json` 里一行开启（文件优先级高于插件设置，钩子每回合重读、改文件即生效）。插件设置里可确认的常规项：
 
-- `wake_enabled` 设为 `true`（默认关闭，避免唤醒你正开着窗口使用的会话）；
 - `zcode_exe` / `zcode_cjs`：**通常留空即可**——插件自动探测本机 zcode 安装（自动探测仅在 Windows 上实现）；探测失败时运行 `xc_doctor`（或看报错文案），会告诉你填什么、去哪里找；
 - `member_model`：留空 = 自动选第一个可用模型——它可能是当前账号不可用的模型；若建员因模型失败，失败回执会给出可选模型与填写指引，届时再填本项即可。
 
@@ -200,7 +199,7 @@ npm install && npm run build
 | `xc_claim(taskId)` | 原子认领 pending 任务，返回一次性 attemptId 凭证 |
 | `xc_report(taskId, attemptId, status, {result, error, evidence})` | 回报 in_progress / completed（证据=工作区内普通文件 + 现算 sha256 + 可选摘要）/ failed / blocked（原因必填） |
 | `xc_read(scope, {id, field, offset, limit})` | 统一分页读：inbox / mail / task / peer / peer-msg / journal / **handoff**（30 秒接手包，七要素 + 建议下一步；`id`=任务 id 或花名收窄） |
-| `xc_relay(to, msg, {urgent, interrupt, summary, sourceTaskId, sourceAttemptId})` | 发消息 + 用户介入传导合一；`urgent` 插到所有未读之前并尽力唤醒；`interrupt` 请求打断（平台限制下降级为下一回合必读，payload 如实回报）；非送达回执（dropped/held/…）在 payload `detail` 里附原因与恢复动作 |
+| `xc_relay(to, msg, {urgent, interrupt, summary, sourceTaskId, sourceAttemptId, withdrawMessageIds})` | 发消息 + 用户介入传导合一；`urgent` 插到所有未读之前并尽力唤醒；`interrupt` 发结构化软中断 INTERRUPT 信封（urgent 置顶不变；收方下一回合安全点消费并回确认，payload 如实回报）；`withdrawMessageIds`（仅队内轴）撤回自己发给该目标且仍未读的消息（整单语义，含已读件整单拒绝并逐条报状态）；非送达回执（dropped/held/…）在 payload `detail` 里附原因与恢复动作 |
 | `xc_overview({view, history, offset, limit})` | 全景观测：任务板（team）/ peer 清单（peers）/ 面板（panel：成员+任务+容量+停滞+入站策略）/ 时间线（timeline：engine.jsonl 尾部事件，`limit` 缺省 20、上限 100）/ 紧凑状态（status：任务七态计数+stalled+容量色+离线成员+checkpoint 年龄+未读，一眼瞭望） |
 | `xc_team(action, …)` | 指挥族：init / transfer / release / member-add / member-stop / idle / cancel / unblock / **checkpoint**（服务端落盘一份交接检查点；`note`=写进检查点第 7 章的一句话） |
 | `xc_review({action, axis, ids})` | 入站审阅（队内/跨会话两轴隔离区；`action` 增 approve/deny、`axis` 增 approval 用于转办审批，仅现任 lead 可批） |
@@ -220,7 +219,7 @@ npm install && npm run build
 
 | 配置 | 默认 | 说明 |
 |---|---|---|
-| `wake_enabled` | `false` | 推送唤醒总开关。开启后派发/回传在目标无人值守时用无头回合唤醒（失败回落邮箱投递）。团队自动开工必须开启 |
+| `wake_enabled` | `false` | 推送唤醒总开关（**交互会话**口径）。v0.9 起分层：引擎供给成员免开关自动唤醒；交互式会话维持默认关闭防打扰，需要时在工作区 `.crosschat/config.json` 一行开启（文件优先级高于本项，改文件即生效）。开启后派发/回传在目标无人值守时用无头回合唤醒（失败回落邮箱投递） |
 | `zcode_exe` / `zcode_cjs` | 空 | 留空 = 自动探测本机安装；显式配置后严格校验，无效即报错不静默回落 |
 | `max_members` | `8` | 活成员上限（lead、failed、removed 不计）。触顶时报错 `team_at_member_cap`，payload 分报 `activeMembers`（当前活成员数）与 `activeAfterAdd`（本次写入后的数目） |
 | `member_model` / `member_provider` / `member_reasoning` | 空 / 空 / `max` | 新建成员会话的模型与推理档位 |
@@ -239,23 +238,19 @@ npm install && npm run build
 
 ## 常见问题（FAQ）
 
-**`zcode: command not found`？**
-zcode CLI 不在 PATH，它是桌面版内置入口。按「快速开始第 2 步」的方式调用（可执行文件 + 入口脚本，Git Bash 函数或 PowerShell 函数任选）；安装目录定位法同处（默认 `%LOCALAPPDATA%\Programs\ZCode`，否则用注册表 Uninstall 项反推）。
+**`zcode: command not found`？** zcode CLI 不在 PATH，它是桌面版内置入口。按「快速开始第 2 步」的方式调用（可执行文件 + 入口脚本，Git Bash 函数或 PowerShell 函数任选）；安装目录定位法同处（默认 `%LOCALAPPDATA%\Programs\ZCode`，否则用注册表 Uninstall 项反推）。
 
-**`npm install` 报 esbuild 的 allowScripts 警告？**
-npm 较新版本的安装脚本审批提示，**可忽略**（实测不影响构建）——只有从源码安装的开发者路径会遇到。
+**`npm install` 报 esbuild 的 allowScripts 警告？** npm 较新版本的安装脚本审批提示，**可忽略**（实测不影响构建）——只有从源码安装的开发者路径会遇到。
 
-**装完想更新？**
-解包目录/克隆目录是市场源（添加市场时做快照），**删除后无法更新**，请长期保留。出新版后：下载新 Release 资产 → 解包到新目录 → `plugins marketplace add <新解包目录>`（刷新快照）→ `plugins install zcode-crosschat@dev-zcode-crosschat`（版本递增触发重新物化）。从源码更新则需先递增 `plugin/.zcode-plugin/plugin.json` 与 `marketplace.json` 的 `version` 再重装，否则宿主不会重新物化。
+**装完想更新？** 解包目录/克隆目录是市场源（添加市场时做快照），**删除后无法更新**，请长期保留。出新版后：下载新 Release 资产 → 解包到新目录 → `plugins marketplace add <新解包目录>`（刷新快照）→ `plugins install zcode-crosschat@dev-zcode-crosschat`（版本递增触发重新物化）。从源码更新则需先递增 `plugin/.zcode-plugin/plugin.json` 与 `marketplace.json` 的 `version` 再重装，否则宿主不会重新物化。
 
-**GitHub 访问不畅？**
-Release 资产下载失败可换时间重试；或用实测更稳的源码压缩包兜底：`curl -L -o zcode-crosschat.tar.gz https://codeload.github.com/QiruiGo/zcode-crosschat/tar.gz/refs/heads/main`（解包后按开发者路径先构建再添加）。注意 `plugins marketplace add QiruiGo/zcode-crosschat` 这种让 zcode 内部克隆的形态只认 `ZCODE_HTTP_PROXY` 环境变量。
+**GitHub 访问不畅？** Release 资产下载失败可换时间重试；或用实测更稳的源码压缩包兜底：`curl -L -o zcode-crosschat.tar.gz https://codeload.github.com/QiruiGo/zcode-crosschat/tar.gz/refs/heads/main`（解包后按开发者路径先构建再添加）。注意 `plugins marketplace add QiruiGo/zcode-crosschat` 这种让 zcode 内部克隆的形态只认 `ZCODE_HTTP_PROXY` 环境变量。
 
 ## 已知限制
 
 1. **仅 Windows 实测**——所有自测与验收在 Windows 上完成；其他操作系统未经测试。
 2. **团队自动开工依赖本机 zcode 路径**——默认自动探测（Windows），失败时 `xc_doctor` 与报错文案会给出填写指引；两会话任务闭环与跨会话消息**完全不受影响**。
-3. **消息只在回合边界注入**——发消息不会打断对方正在进行的回合；`xc_relay({interrupt:true})` 的打断请求受宿主平台限制，**退化为 urgent + 下一回合必读**（payload `deferred-next-turn` 如实回报，E1 实测）。
+3. **回合中注入为宿主层能力，插件侧上界=软中断**——消息只在回合边界注入，发消息不会打断对方正在进行的回合；宿主无回合中注入原语（G-1，如实声明不做，建议另走平台反馈渠道），`xc_relay({interrupt:true})` 是插件侧可达上界：结构化 INTERRUPT 信封 + 收方安全点纪律（完成当前原子操作、不开新步骤、回确认），payload `deferred-next-turn` 如实回报（E1 实测）。读面信封恒由消息元数据重建，正文内嵌的信封/横幅/页脚/回信指引标记一律剥离——伪造信封不透传（v0.9.1）。
 4. **只能发现已显式注册的会话**——会话先注册（`xc_identify`）才能被寻址。
 5. **别把敏感内容写进协作邮箱**——跨会话可见的只有邮箱/消息内容本身；身份校验是协作假设而非密码学校验。
 6. **pipe 通道单帧 1 MiB 上限**——超过 1 MiB 的跨会话消息发送被拒（`too_large`）；超大内容分条发送或走队内 `xc_relay`。**MCP stdio 传输层另有 32 MiB 单帧上限**：超过的单帧被显式 JSON-RPC 拒收（`Parse error`），server 进程继续服务。**pipe 端点并发连接上限 128**：同 tick 对同一 peer 的在途连接超限时超出部分显式 `socket_busy`（重试即可）。
@@ -269,6 +264,10 @@ Release 资产下载失败可换时间重试；或用实测更稳的源码压缩
 14. **压缩联动是建议级，非拦截级**（v0.7 C9）——平台无宿主压缩钩子接口，插件只能「容量预警 + 建议先落 journal（longtask checklist）+ lead 操作序」，拦不住压缩本身；规则靠回合自觉。（v0.8 起该 checklist 第一步是 `/xc-checkpoint`，平台缺口与两级降级方案见第 16 条。）
 15. **桌面 UI 会话不可远程关闭**——直接 close 一个非活跃会话报 `Session is not active`（E3 ② 实测）；已退出的旧会话可先 `--resume` 再 close；**活跃的 UI 会话未测**。成员停机请走 `xc_team({action:"member-stop"})`（先留档再停、任务回池不丢）。
 16. **平台无 PreCompact/PostCompact 钩子，故用「提醒 + 一键」，不提供自动压缩检查点**（v0.8）——zcode 3.18.2 没有压缩事件钩子，插件**不能在压缩发生前自动写检查点、也不能拦截压缩**：压缩防护 = ① 一键 `/xc-checkpoint`（= `xc_team({action:"checkpoint"})`，MCP server 服务端直接落盘 `.crosschat/checkpoints/<你>/<ISO>.md`，front-matter + 七章，每 agent 保留最近 20 份）；② UserPromptSubmit 轻量提醒（有活跃任务且距上次检查点 >30min 时提示一次，每 30min 最多一次，`XC_CHECKPOINT_NUDGE=0` 可关）。同理**无原生状态栏扩展点**，「一眼瞭望」由 `xc_overview({view:"status"})` 紧凑文本视图承担（不是 UI）。压缩后能否从检查点恢复，取决于宿主压缩行为——本平台无压缩事件可复现，该半不可测（如实边界）。
+17. **engine.jsonl 审计可整体伪造（V090-04，不修行为）**——审计是工作区内的明文 JSONL，同机进程可整文件重写（个人/内部威胁模型，不做对抗级防伪）：审计用于观测与对账，**不作为可信凭据**；可信锚点是 `xc_report` 的 evidence sha256（工具现算）与磁盘真源本身，不是日志。
+18. **协议帧正文可伪装（V090-13，不修行为）**——帧白名单防「未知具名帧混进读取面」与「消息携带授权语义」，不防正文伪装：chat 正文可内嵌伪造的信封/横幅/页脚/回信指引标记。读面信封已恒由消息元数据重建（伪造引擎属性与冒名 `from` 不透传，v0.9.1/v0.9.2），但 `xc_read` 的 JSON entry 与 mail scope 原文分页按磁盘真源口径逐字保留——真值层不漂白，信任判定看元数据不看正文。
+19. **撤回通知无频控（V090-14，不修行为）**——每次成功撤回各投一条 `withdrawal-notice`，通知帧不受入站限速/频控约束，失误或恶意成员可制造通知噪音；但每条通知都必须对应真实撤回的未读件（无消息即无通知），且通知帧自身不可撤回（v0.9.2 起链式撤回封死、对账锚点保留）。
+20. **持续伪造引擎证言可无限期豁免清扫（V090-01 处置，不修行为）**——清扫豁免的活性输入是引擎证言（`registry/witness/<sid>.json`，只由引擎进程写：hook 回合边界 + 工具调用心跳），**一次**本地文件写伪造自述记录造不出证言（不豁免），但同机进程**持续重写**证言文件（活跃攻击）可让名下任务一直停在豁免态——这是威胁模型边界（v0.6 口径：同机进程可伪造状态文件；产品 doctrine 不做对抗级防伪护城河，签名/哈希链一律不引入）。既有防线如实：豁免**有界**（证言停止 2×stale 阈值后照扫）、`pid-dead` 硬证据立即失效、C8 离线转交通知照发（豁免不壅蔽）；可观测性兜底：任务板带 `sweepExemptPeriods`（「豁免 N×阈值」）与 `Exempt:` 文本行、`task-sweep-deferred` 审计逐周期留痕、成员行 `liveness.witness` 并列展示自述与证言——lead 可见异常长豁免并人工介入（cancel/改派）。
 
 ## 威胁模型（v0.6 口径）
 
@@ -286,6 +285,7 @@ Release 资产下载失败可换时间重试；或用实测更稳的源码压缩
 
 ## 版本记录（摘要）
 
+- **v0.9.0**（2026-11-19，首日生产实测九缺口修复，三组并行；工具面仍恰 10、命令 8、0 新增必填配置；G-3 撤回/G-2 软中断见 [docs/PROTOCOL.md](docs/PROTOCOL.md) §2/§3/§7 冻结示例——文档即测试契约）。**组 C 消息控制与软中断**：撤回原语（G-3）`xc_relay` 增可选 `withdrawMessageIds`（仅队内轴）——只撤自己发给该目标且**仍未读**的消息（整行删除 + 给收方投 `withdrawal-notice` 通知帧 + engine 事件 + 尽力唤醒），含已读/非本人/不存在件整单拒绝并逐条报状态；软中断（G-2）`interrupt:true` 发结构化 INTERRUPT 信封（消息元数据 + 读取面横幅，urgent 置顶语义不变），收方按安全点纪律消费（完成当前原子操作、不开新步骤、回确认），payload 如实回报；平台缺口如实声明（G-1）——回合中注入为宿主层能力，插件侧上界=软中断（已知限制 3）。**并行组增量**：唤醒分层口径变更（组 B，G-4/G-7/G-6/G-8）——旧口径「团队自动开工必须开 wake_enabled」改为「**引擎成员免开关，交互会话可选开启**」，工作区 `.crosschat/config.json` 一行开启（file > env > 默认，改文件即生效），sessionNotFound 投递自动重绑重试一次；活性与清扫联动（组 A，G-9/G-5）——活性状态机（running/idle/dead）进 `xc_overview` 成员行，任务 in_progress 且属主 running 暂停清扫倒计时、引擎事件即心跳代理。
 - **v0.8.1**（2026-11-16，29-v080 能力反向检验 28 项修复；工具面仍恰 10、0 新增工具、0 新增必填配置——`xc_doctor` 多一个可选 `action:"repair-team"` 写面，新旋钮只走既有高级 env 的披露）：
   - **身份重绑与队内真源（P1×1 / P2×3）**：**改名两轴前置拒（M01，P1）**——新花名已是队内花名册另一位成员、或 peer 轴上被另一个活会话占着时，改名在**任何状态变更之前**显式拒（`team_rename_blocked` / `peer_axis_failed`，零副作用）；v0.8.0 会把队内轴先写成重复成员键、team.json 与 .bak 双中毒、全队 team-axis 工具 internal。**中毒 team.json 自愈**——免注册的 `xc_doctor({action:"repair-team"})` 做确定性修复（names 权威索引保留原持有者行、残损字节保全为 `team.json.corrupt`、真源与 .bak 一并重写；其他缺陷形态不猜）。**takeover 失败无副作用（C6-BUG-1）**——`sessionId` 校验（锚定存在性 / 未被别的花名绑定）前置到任何状态变更之前。**改名守卫只挡活引用（C6-BUG-6）**——终态任务引用不再永挡改名，未读（而非全史）才挡邮箱，挡路理由给出具体任务 id。
   - **观测面判据与口径（P2×2 / P3×22）**：**handoff 身份章（M02）**——在册成员恒得生命周期态（缺省 `ready`），不再对在册成员恒报 `(not on roster)`；**lead 渲染跨面同源（M05）**——无显式 leadKey 时 founder 读作 lead，status / handoff / checkpoint / team 视图（含 `history:true` payload 与 `not_lead`/`not_authorized` 错误信封的 `leadKey`）五处同源。**timeline（M03/M04 + C3-B2/B3/B4/B5/B7/B8）**——actor 链补 `approvedBy`/`from`/`member`（派单方/批准者不再落到接收方或置空）、按 `ts` 降序、`skippedEvents` 跳过披露、文本视图控制字符折空格、非字符串 `taskId` 归一 `null`、续读 offset 位置游标语义披露、预算刻度接 identify 的 `contextChars`、尾窗截断**每页**披露 `olderEventsOmitted`。**handoff 截断口径（C2-B5/B8/B9）**——`cappedItems.shown` 恒等于 payload 数组长度、pool 项 `priority` 恒在、checkpoint payload 恰四键（`stamp` 不再漏出）、成员视角也给第三人称单在途任务规则。**年龄取数与粒度（C2-B4 / C5-BUG-C5-02）**——取 front-matter `createdAt`（回退 mtime）、status 文本按精确分钟（26h → `1560min前`，不再 `1d前`）。**阈值披露拉齐（C4-F1/F2/O1）**——`XC_OFFLINE_MINUTES` / `XC_STALL_MINUTES` / `XC_MEM_WARN_WATERMARK` 的钳制 / 非法回落 / 越界在 status 与 team 两视图都给 payload 键 + WARNING。**checkpoint 行列（C4-F3）**——`me`（已注册时）+ 全部花名册成员，无检查点记 `(none)`。**并发与残留（C1-B01/B02）**——同毫秒并发排他创建（一次调用一份文件）、被杀进程残留 `.tmp` 按年龄清扫并披露。**C8 lead 崩溃（C6-BUG-4）**——离线属主即 lead 时转交通知改投其他在册成员，`task-offline` 审计恒定落地。**钩子零块（C1-B03）**——无可注入内容时 stdout 仍是一行 JSON 单键（`additionalContext` 空串）。**3 步接手引导（C2-B7）**——`name_taken` 文案自带 `takeover:true` 指引。

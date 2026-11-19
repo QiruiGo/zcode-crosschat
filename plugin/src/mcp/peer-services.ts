@@ -43,6 +43,7 @@ import {
   findLiveSessionIdHolder,
   logPeerEvent,
   peerRegistryLockName,
+  appendPeerSweepJournal,
   PEER_FORMER_NAMES_MAX,
   readPeerKeyFile,
   readPeerRecord,
@@ -295,7 +296,12 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
   async function rowsOf(kind: 'self' | 'member' | 'session'): Promise<PeerRow[]> {
     const rows: PeerRow[] = [];
     if (kind === 'self' || kind === 'session') {
-      const scanned = await scanPeers(root());
+      // v0.9.1（V090-02）：观测面**只读扫描**——本函数服务 xc_overview view:"peers" /
+      // view:"panel"（查询路径不得有清扫副作用，offline.ts/tools-overview 同款纪律）：
+      // 缺省档扫描会顺手 rm 死记录，而 pid-dead 记录是 C8 进程死判据唯一的硬证据
+      // （PROTOCOL §12.2），被观测面删掉后 memberLiveness 判 no-record、残留 running
+      // 会话记录反成 owner-running 豁免依据——崩溃成员的任务从此永不清扫、零转交。
+      const scanned = await scanPeers(root(), Date.now(), { sweep: false });
       for (const record of scanned.active) {
         const isSelf = record.pid === process.pid;
         if (kind === 'self' && !isSelf) continue;
@@ -388,7 +394,8 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
   /** 按 sessionId 找发方的注册记录（回执用）。 */
   async function recordOfSession(sessionId: string | undefined): Promise<PeerRecord | undefined> {
     if (sessionId === undefined) return undefined;
-    const scanned = await scanPeers(root());
+    // v0.9.1（V090-02）：只读扫描（与 rowsOf 同纪律——回执查找是查询，不清死记录）。
+    const scanned = await scanPeers(root(), Date.now(), { sweep: false });
     return scanned.active.find((record) => record.sessionId === sessionId);
   }
 
@@ -682,7 +689,9 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
       }
 
       // 活性判定（R-4）：注册记录里的 pid 不在活集 → stale_socket。
-      const scanned = await scanPeers(r);
+      // v0.9.1（V090-02）：只读扫描——本处只读 `.active` 做活性判定，死记录的
+      // 回收属定向 GC（claim 路径 peer-name-reclaimed 留痕），发送路径不顺手删。
+      const scanned = await scanPeers(r, Date.now(), { sweep: false });
       if (!scanned.active.some((row) => row.pid === record.pid)) {
         throw new ToolError(
           {
@@ -1354,14 +1363,19 @@ async function reclaimDeadRecordsOfName(
   scanned: PeerScanResult,
   name: string,
 ): Promise<void> {
+  // v0.9.1（V090-02）：定向回收同样逐笔写机器全局清扫日志（与显式清扫同日志——
+  // pid-dead 证据被回收的每一笔都可查；peer-name-reclaimed 审计仍留在队内/peer 轴）。
+  const reclaimed: Array<{ pid: number; sessionId: string | null; reason: PeerDeadReason }> = [];
   for (const row of scanned.dead) {
     if (row.record.name !== name) continue;
     try {
       await removePeerRecord(root, row.record.pid);
+      reclaimed.push({ pid: row.record.pid, sessionId: row.record.sessionId, reason: row.reason ?? 'pid-dead' });
     } catch {
       // ENOENT（另一个扫描器抢先）或权限问题：best-effort，下轮认领再收。
     }
   }
+  await appendPeerSweepJournal(root, reclaimed);
 }
 
 /** 档类来源判定：基记录优先，其次显式兜底（并记审计 peer-mode-class-fallback）。 */

@@ -303,9 +303,10 @@ describe('classifyFrame (frame-type whitelist, DESIGN-V0.2 §7.4-I3)', () => {
   });
 
   // v0.7（C6/C7，DESIGN-V0.7 §2.2 + AC2）：4 个新帧型必须进白名单——E4 §7.1 实测
-  // 未加白具名帧被读取面静默剔除（「传得到、收不到」）。此处锁死精确集合（11 值）
-  // 与 type 键判据；混合版本降级（老端点视角）由下面 frame-rejected 用例覆盖。
-  it('v0.7 C6/C7 frame types are whitelisted (exact 11-value set; type key)', () => {
+  // 未加白具名帧被读取面静默剔除（「传得到、收不到」）。此处锁死精确集合与 type 键
+  // 判据；混合版本降级（老端点视角）由下面 frame-rejected 用例覆盖。
+  // v0.9（G-3）：第 12 值 withdrawal-notice（撤回通知帧，PROTOCOL §2/§7.1 冻结）。
+  it('protocol frame types are whitelisted (exact 12-value set; type key)', () => {
     expect([...FRAME_TYPES]).toEqual([
       'task-assignment',
       'task-receipt',
@@ -318,6 +319,7 @@ describe('classifyFrame (frame-type whitelist, DESIGN-V0.2 §7.4-I3)', () => {
       'tool_result',
       'approval_request',
       'approval_result',
+      'withdrawal-notice',
     ]);
     for (const type of ['tool_request', 'tool_result', 'approval_request', 'approval_result']) {
       expect(classifyFrame(JSON.stringify({ type, requestId: 'r-1' })))

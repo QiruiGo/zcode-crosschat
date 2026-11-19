@@ -378,7 +378,7 @@ describe("安全对-2 / 边界-2（P1/P2）：改名路径花名严格校验（�
 // 修复 = scanPeers 增加只读模式（sweep:false），纯查询路径一律用它。
 // ---------------------------------------------------------------------------
 describe("v0.6.1 复验定位修复：sid 归属闸查询无清扫副作用（接管留痕不回退）", () => {
-  it("scanPeers({sweep:false}) 收死记录但不删文件；默认仍惰性清扫", async () => {
+  it("scanPeers({sweep:false}) 收死记录但不删文件；缺省档同样只读（v0.9.1 V090-02 改契）", async () => {
     const dead = await deadPid();
     await writePeerRecord(peerRoot, peerRecord(dead, "gone", "sess-gone"));
     const file = join(peerRoot, "sessions", `${dead}.json`);
@@ -388,9 +388,17 @@ describe("v0.6.1 复验定位修复：sid 归属闸查询无清扫副作用（�
     expect(readOnly.dead.map((row) => row.record.name)).toContain("gone");
     expect(existsSync(file)).toBe(true); // 只读：文件还在，claim 路径仍看得到前任
 
-    const sweeping = await scanPeers(peerRoot);
+    // v0.9.1（V090-02）：缺省档从「惰性清扫」改为**只读**——pid-dead 记录是 C8
+    // 进程死判据唯一的硬证据，缺省扫描不得顺手抹掉崩溃残留（删除只属显式
+    // {sweep:true}，见 core/peerregistry.ts 与 peerregistry.test.ts 同契约）。
+    const defaultScan = await scanPeers(peerRoot);
+    expect(defaultScan.dead.map((row) => row.record.name)).toContain("gone");
+    expect(existsSync(file)).toBe(true); // 缺省也只读：文件保留
+
+    // 显式清扫档才删（且逐笔写机器全局清扫日志）。
+    const sweeping = await scanPeers(peerRoot, Date.now(), { sweep: true });
     expect(sweeping.dead.map((row) => row.record.name)).toContain("gone");
-    expect(existsSync(file)).toBe(false); // 默认行为不变：惰性清扫
+    expect(existsSync(file)).toBe(false);
   });
 
   it("findLiveSessionIdHolder 是纯查询：问过之后死记录文件仍在（留痕不失明）", async () => {

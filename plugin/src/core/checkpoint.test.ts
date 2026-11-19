@@ -267,9 +267,12 @@ describe('七章标题/顺序/字段（冻结格式）', () => {
     ]);
   });
 
-  it('第 1 章身份：花名/角色/状态/lead/team + sessionId 短 8 位 + lastSeen 相对分钟', () => {
+  it('第 1 章身份：花名/角色/状态/lead/team + sessionId 全量（v0.9.2 V090-15）+ lastSeen 相对分钟', () => {
     expect(md).toContain('- agent: alice | role: worker | state: ready | lead: lead | team: default');
-    expect(md).toContain('- sessionId: sess_ali | lastSeen: 2026-11-15T17:58:00.000Z（2min 前）');
+    // v0.9.2（V090-15 P3）：全量渲染——与 team.json / xc_overview 成员行同口径
+    // （v0.9.1 及以前 slice(0,8) 恒等退化：`sess_`/`sess_dwf-` 前缀下不同成员显示同一串）。
+    expect(md).toContain('- sessionId: sess_alice_0123456789 | lastSeen: 2026-11-15T17:58:00.000Z（2min 前）');
+    expect(md).not.toContain('- sessionId: sess_ali ');
   });
 
   it('第 2 章：ISO+相对分钟；blocked 追加阻塞原因；空态占位', () => {

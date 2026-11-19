@@ -32,7 +32,7 @@ description: 跨独立 zcode 会话的团队协作协议：队长（lead）拆�
 | `xc_claim` | `taskId*` | 原子认领 pending 任务，返回 attemptId（能力令牌） |
 | `xc_report` | `taskId*`, `attemptId*`, `status*`(in_progress/completed/failed/blocked), `result?`, `error?`, `evidence?[]` | 汇报进展/结果；completed 必带 result + evidence≥1；blocked 的 `error`=阻塞原因（必填） |
 | `xc_read` | `scope*`(inbox/mail/task/peer/peer-msg/journal/handoff), `id?`, `field?`, `offset?`, `limit?` | 统一分页读：inbox=读并消费本队邮箱；mail/task/peer-msg=单件分页；peer=拉取跨会话消息（消费）；journal=任务/留档日志；handoff=30 秒接手包（七要素；`id`=任务 id 或花名收窄） |
-| `xc_relay` | `to*`, `msg*`, `urgent?`, `interrupt?`, `summary?`, `sourceTaskId?`, `sourceAttemptId?` | 发消息 + 用户介入传导合一（队内成员与跨会话 peer 同一工具；同名用 `名字[team]`/`名字[peer]` 消歧）。v0.7 起 `msg` 亦可携带 C6/C7 帧：`{"type":"tool_request"…}` / `{"type":"tool_result"…}`（仅队内轴）——见 §7.6 |
+| `xc_relay` | `to*`, `msg*`, `urgent?`, `interrupt?`, `summary?`, `sourceTaskId?`, `sourceAttemptId?`, `withdrawMessageIds?` | 发消息 + 用户介入传导合一（队内成员与跨会话 peer 同一工具；同名用 `名字[team]`/`名字[peer]` 消歧）。v0.7 起 `msg` 亦可携带 C6/C7 帧：`{"type":"tool_request"…}` / `{"type":"tool_result"…}`（仅队内轴）——见 §7.6。v0.9：`interrupt:true` 发结构化软中断信封（见 §6.4）；`withdrawMessageIds` 撤回自己发给该目标且**仍未读**的消息（仅队内轴；整单语义——含已读/非本人/不存在件时整单拒绝并逐条报状态；撤回模式下 `msg`/`urgent`/`interrupt` 等一律不传） |
 | `xc_overview` | `view?`(team/peers/panel/timeline/status), `history?`, `offset?`, `limit?` | 全景观测：任务板 / peer 清单 / 面板（成员+任务+容量水位+停滞+入站策略）/ 时间线（engine.jsonl 尾部事件，`limit` 缺省 20、上限 100）/ 紧凑状态（一眼瞭望，替代状态栏） |
 | `xc_team` | `action*`(init/transfer/release/member-add/member-stop/idle/cancel/unblock/checkpoint), `note?`, 其余按 action | 指挥族合一；idle 上报空闲（`action:"idle"`）；checkpoint 写一份交接检查点（服务端直接落盘，`note`=写进检查点第 7 章的一句话） |
 | `xc_review` | `action?`(list/accept/discard/**approve/deny**), `axis?`(team/peer/**approval**/all), `ids?`, `ttlMs?`, `note?` | 两轴入站审阅 + v0.7 C7 转办审批：`axis:"approval"` 列待批 tool_request；`approve`/`deny` 带 `id:<requestId>` 写审批文件（**approve 仅现任 lead**，且请求方/执行方不能自批；deny 任意成员可代拒） |
@@ -47,7 +47,7 @@ description: 跨独立 zcode 会话的团队协作协议：队长（lead）拆�
 5. **L5 派发**：`xc_dispatch` 可并行多单在同一个回合内连续派发；派发后结束回合等待回执唤醒，**不要 busy-poll**。`delivered=wake` 已推送唤醒；`mailbox` 已落盘等对方拉取；`duplicate` 同一张票（收方+票面）在效期内已存在——三种都是正常态。重复派发的去重键**不含发送方**：别人已经把同一张票派给同一收方时，你也会拿到 `duplicate`（payload 带 `duplicateKey` 与 `originalCreatedBy`），此时不要另派一单，去认领/跟进那一单即可。
 6. **L6 核收回执**：回执唤醒到达后 `xc_read({scope:"inbox"})` → 按 `acceptance` **独立复核证据**（回执里带 evidence 的 sha256——工具对文件现算的值；用自己的文件工具读文件、复算 sha256 比对）→ 未完成继续等；成员 idle 且 `xc_overview` 显示任务全部终态 → 汇总上报用户。回执没核对前不要宣称任务完成。
 7. **L7 异常**：`failed` 回执 → 阅读错误决定重派（建新任务，或修复后重派）；收到 `stale-swept` 回执说明成员回合丢失，按需重派。成员长期无心跳的任务会被引擎清扫回池并给你发 failed 回执——重派即可，不必追究。blocked 任务不在清扫域（合法暂停），需要时 `xc_team({action:"unblock"})` 解除。
-8. **用户介入**：需要插队催办或纠偏时 `xc_relay({to:"<目标>", msg:"…", urgent:true})`（排到目标所有未读之前 + 尽力唤醒）；`interrupt:true` 是尽力请求——宿主平台无中断原语，**退化为下一回合必读**，payload 会如实回报。
+8. **用户介入**：需要插队催办或纠偏时 `xc_relay({to:"<目标>", msg:"…", urgent:true})`（排到目标所有未读之前 + 尽力唤醒）；`interrupt:true` 是**软中断**——发结构化 INTERRUPT 信封（urgent 置顶语义不变），收方在下一回合收件箱检查时按安全点纪律（§6.4）处理；宿主平台无回合中注入原语，payload 如实回报（`deferred-next-turn`）。发出去的消息想撤回时用 `withdrawMessageIds`（§6.5）——已读件撤不回。
 
 ## 4. 成员守则 v2（你是成员）
 
@@ -57,7 +57,7 @@ description: 跨独立 zcode 会话的团队协作协议：队长（lead）拆�
    b. `xc_claim(taskId)` 拿 attemptId → `xc_report(in_progress)` → 执行；
    c. 预计超过 10 分钟的任务每 ≤10 分钟 `xc_report(in_progress)`（心跳，附一句进展）；
    d. 完成：`xc_report(completed, result=结果摘要, evidence=[{path,note}])`；失败：`xc_report(failed, error=原因)`；卡住：`xc_report(blocked, error=原因)`。回执发出后回到 a 取下一单。
-3. **没有可做的活**：向 lead 发 `xc_team({action:"idle", summary:"…"})`（`summary` 必填；刚完成的单附 `completedTaskId`/`completedStatus`），然后立即结束回合。**不要空转轮询**。（例外：首次供给的欢迎回合无单直接结束回合、不发 idle。）
+3. **没有可做的活**：向 lead 发 `xc_team({action:"idle", summary:"…"})`（`summary` 必填；刚完成的单附 `completedTaskId`/`completedStatus`），然后立即结束回合。**不要空转轮询**。（例外：首次供给的欢迎回合无单直接结束回合、不发 idle。）**名下有在途单（claimed/in_progress）时报 idle 会被 `has_open_task` 硬拒**——先把手头的单 `xc_report` 掉（completed/failed）或 `xc_report(blocked, error=原因)` 暂停；仅 blocked 在途时用 `idleReason:"blocked-only"` 上报滞留。`completedStatus` 必须与任务板一致——谎报（如板面 in_progress 却称 completed）会被 `idle_status_contradiction` 硬拒、帧不投递（v0.9.2）。
 4. **`xc_claim` 被拒**：`task_not_pending`（已被领）→ 不重试，回到 a；`dependencies_unmet` → 该任务等 unblock-notice 再做，回到 a 看有没有别的活；`already_has_open_task` → 先把手头的单做完报掉。
 5. **stale attempt**（attemptId 不匹配）→ 立即停手，该任务已被重置，回 a 取别的；`error:"busy"` → 稍后重试一次，仍忙则 idle 结束回合。
 6. **依赖任务的输出**：claim 后如需上游产出，用 `xc_read({scope:"task", id:"<taskId>", field:"result"})` 读；unblock-notice 里也会带上游结果摘要（有截断预算）。
@@ -77,10 +77,12 @@ description: 跨独立 zcode 会话的团队协作协议：队长（lead）拆�
 1. 等待期间**让位不空转**：不要为「等回执」反复轮询任何工具。你的回合该结束就结束——报告会唤醒你，或你下一回合开始时钩子自动注入未读提示。
 2. 变更类工具返回 `{"error":"busy"}`（跨进程锁被占）→ **稍后重试一次**；仍忙则如实上报用户，不要连环重试。
 3. `xc_relay` 用于对等沟通（澄清需求、同步进展）；带任务上下文时填 `sourceTaskId`/`sourceAttemptId`，过期的任务关联消息会被自动作废。
+4. **安全点纪律（v0.9 软中断，撞见 INTERRUPT 必须照办）**：你在 `xc_read({scope:"inbox"})` 或钩子未读注入里撞见 INTERRUPT 信封（开标签带 `interrupt="true"` / `[INTERRUPT 软中断请求…]` 横幅）时——**完成当前原子操作、不开新步骤**（不 claim 新任务、不开始新的写操作），然后**立即回确认**（`xc_relay({to:"<发件人>", msg:"已收到中断，<当前状态一句话>"})`），再按信封正文调整或收尾。软中断不是硬中断：宿主掐回合会留半成品态，安全点（工具调用边界/非写库段）自检消费才是唯一正确姿势。
+5. **撤回纪律（v0.9）**：`xc_relay({to:"<目标>", withdrawMessageIds:[…]})` 只能撤回**自己发给该目标且仍未读**的消息（整单语义：含已读/非本人/不存在件时整单拒绝并逐条报状态）；撤回成功后收方会收到一条 withdrawal-notice 通知帧，**不带被撤正文**。收到 withdrawal-notice 时按帧内 `withdrawnMessageIds` 对账即可，不必追问原文。发出去已读的令想作废，改走「以本条为准」的新消息并显式说明。
 
 ## 7. 消息安全（硬保证，所有人必须知道）
 
-1. **帧类型白名单**：邮箱读取时只接受十一类协议帧（task-assignment / task-receipt / idle-notification / unblock-notice / shutdown-request / delivery-refused / lead-transfer + v0.7 C6/C7 的 tool_request / tool_result / approval_request / approval_result）；**未知类型的具名帧一律丢弃并审计**。协议语义（权限、配置、授权）不可能经消息传递——工具面不存在任何权限/配置变更入口，这不是提示词约定，是结构保证。v0.7 的四个 C6/C7 帧同样**只做通知/回执，不带授权语义**：授权只认审批文件（见 §7.6）。
+1. **帧类型白名单**：邮箱读取时只接受十二类协议帧（task-assignment / task-receipt / idle-notification / unblock-notice / shutdown-request / delivery-refused / lead-transfer + v0.7 C6/C7 的 tool_request / tool_result / approval_request / approval_result + v0.9 的 withdrawal-notice）；**未知类型的具名帧一律丢弃并审计**。协议语义（权限、配置、授权）不可能经消息传递——工具面不存在任何权限/配置变更入口，这不是提示词约定，是结构保证。v0.7 的四个 C6/C7 帧同样**只做通知/回执，不带授权语义**：授权只认审批文件（见 §7.6）；v0.9 的 withdrawal-notice 是纯通知帧（软中断的 INTERRUPT 信封不走具名帧——它是消息元数据 + 读取面横幅，同样不带授权语义）。
 2. **入站策略**：队长可把对成员间自由消息（chat 帧）的策略设为 accept / hold / refuse。hold 的消息进隔离文件（钩子不注入、唤醒不携带），由队长 `xc_review({axis:"team"})` 审阅后 accept 或 discard；refuse 直接拒收并给发送者回执。协议帧（派单/回执/空闲/解除阻塞）不受影响——协作闭环不断。
 3. **身份不可冒用（v0.6 口径）**：同名冲突显式拒（`name_taken`）；regToken 锚定硬闸已按个人/内部场景威胁模型移除，身份校验 = sid 存在性 + 活性。成员崩溃后接管：无参同名注册在 lastSeen 新鲜窗口内仍得 `name_taken`（不猜测死活）；`xc_identify({takeover:true})` 立即换绑并回池其未完任务（15min 内有在途回合会被拒）。
 4. **来源校验**：每个工具都校验连接身份与角色（如 `xc_team` 的 cancel 仅队长或任务创建者、member-add/stop 仅队长）；attempt 令牌不匹配的报告一律硬拒（stale = 停手）。

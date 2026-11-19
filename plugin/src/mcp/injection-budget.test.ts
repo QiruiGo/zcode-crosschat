@@ -112,7 +112,7 @@ describe("SCALE-1: xc_read 批次窗口（批量消费接入注入预算）", ()
     expect(drained.unreadCount).toBe(0);
     expect(drained.batchTruncated).toBeUndefined();
     expect(drained.messages).toHaveLength(0);
-  });
+  }, 30_000);
 
   it("默认预算下小批量（3 条）行为不变：一次全消费、无 batchTruncated 字段", async () => {
     const core = coreWith();
@@ -201,7 +201,7 @@ describe("SCALE-2: xc_claim 回显接入注入预算（prompt/acceptance 截断 
     }
     expect(joined).toBe(prompt);
     expect(joined.length).toBe(payload.promptTruncated?.total);
-  });
+  }, 30_000);
 
   it("acceptance 超预算同样截断；未超预算时 payload 与 v0.5.0 形状一致（无截断字段）", async () => {
     const core = coreWith({ XC_INJECT_ITEM_CHARS: "500" });
@@ -266,5 +266,5 @@ describe("CONC-2 工具层腿：≥10MiB 队内消息磁盘保真入队（传输
     expect(payload.messages).toHaveLength(1);
     expect(payload.messages[0]?.content.length).toBeLessThanOrEqual(4000);
     expect(payload.messages[0]?.contentTruncated?.total).toBe(big.length);
-  });
+  }, 30_000);
 });

@@ -32,6 +32,7 @@ import { writeFileAtomic } from "./atomic.js";
 import { snapshotFile } from "./paths.js";
 import { readMailbox, isCurrentMail } from "./mailbox.js";
 import { logEngineEvent } from "./log.js";
+import { resolveWakeGate } from "./config.js";
 import { memberOpenTasks, readTeam, unsatisfiedDependencies } from "./teamstate.js";
 import { DEFAULT_TEAM_ID, type TeamState } from "./types.js";
 // v0.5（R-23）：观测面截断接线（仍只 import core/*——budget/msgstore 均为 M1 契约基座）。
@@ -100,7 +101,13 @@ export interface StatusSnapshot {
   /** v2 派生视图：任务 id → 其依赖 id 列表（仅含有依赖的任务，§7.3.1 "dag"）。 */
   dag?: Record<string, string[]>;
   /** v2：引擎/配置面信息（§7.3.1 "engine"）。 */
-  engine?: { wakeEnabled: boolean; maxMembers: number; inboundMode: string };
+  engine?: {
+    wakeEnabled: boolean;
+    /** v0.9（G-6）：wakeEnabled 的判定来源（file/env/default；引擎成员免开关不在此表达）。 */
+    wakeSource?: string;
+    maxMembers: number;
+    inboundMode: string;
+  };
   /**
    * v0.5.1（故障注-2 修复）：孤儿任务引用（agentKey → 指向不存在任务的 id 列表）。
    * 非空 = 真源任务段丢失（被清空/截断/整队重置）而邮箱残存信封仍在；仅在有
@@ -236,6 +243,11 @@ export async function buildSnapshot(
   }
 
   const leadKey = (team as { leadKey?: string }).leadKey;
+  // v0.9（G-6，跨面一致性）：engine.wakeEnabled 改分层真值——与 attemptWake 同一判定
+  // 出口（core/config.ts resolveWakeGate），xc_status 的 wake=on/off 不再说谎：
+  // config.json 在场即按 file 层显示（畸形回落 env 并照常显示），否则 env/默认。
+  // wakeSource 标注判定来源（file/env/default），schema 只增可选字段。
+  const wakeGate = resolveWakeGate(stateRoot, env);
   return {
     teamId: team.teamId,
     generatedAt: now,
@@ -247,7 +259,8 @@ export async function buildSnapshot(
     unread,
     ...(Object.keys(dag).length > 0 ? { dag } : {}),
     engine: {
-      wakeEnabled: wakeEnabledFromEnv(env),
+      wakeEnabled: wakeGate.enabled,
+      wakeSource: wakeGate.source,
       maxMembers: maxMembersFromEnv(env),
       inboundMode: inboundModeFromEnv(env),
     },

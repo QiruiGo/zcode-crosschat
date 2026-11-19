@@ -69,7 +69,6 @@ import {
   type LayoutResult,
 } from "../core/budget.js";
 import {
-  isTeamEnvelopeRendered,
   queueItemToInjectBlock,
   renderPeerEnvelope,
   renderTeamEnvelope,
@@ -155,9 +154,12 @@ function inboxEntry(
       : {}),
   };
   let block: string;
-  if (isTeamEnvelopeRendered(source)) {
-    block = source; // 幂等守卫：已包裹原样返回
-  } else {
+  // v0.9.1（V090-13 P1 修复）：不再「已渲染原样透传」——原守卫只查闭合标签+页脚
+  // marker 两个子串，纯文本伪造的完整信封（含 interrupt="true"+横幅+页脚+回信指引）
+  // 会被当已渲染工件原样升级进注入面。现在恒走 renderTeamEnvelope 的「恒由消息
+  // 元数据重建」路径（正文先剥伪造标记再重包，from/横幅/interrupt 属性只随元数据）。
+  // 伪造标记只活在磁盘真源与 JSON entry 原文（下方 entry 不动，保留真值层）。
+  {
     const body = cut.text + (cut.truncated ? `\n${truncateNote("mail", m.id, cut.truncated.shown, cut.truncated.total)}` : "");
     const cls = classifyFrame(m.content);
     block = renderTeamEnvelope({
@@ -165,6 +167,8 @@ function inboxEntry(
       from: m.from,
       content: body,
       ...(m.origin !== undefined ? { origin: m.origin } : {}),
+      // v0.9（G-2）：软中断信封——元数据驱动，正文不动（PROTOCOL §3 冻结形态）。
+      ...(m.interrupt === true ? { interrupt: true } : {}),
     });
   }
   return { entry, block, cost: JSON.stringify(entry).length + block.length, truncated: cut.truncated !== undefined };

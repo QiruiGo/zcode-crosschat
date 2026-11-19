@@ -15,14 +15,24 @@ const sharedMocks = vi.hoisted(() => ({
   logHookEvent: vi.fn(async (_stateRoot: string, _event: Record<string, unknown>) => {}),
   auditHookFailure: vi.fn(async (_stateRoot: string | undefined, _hook: string, _error: unknown) => {}),
   boundNamesForSession: vi.fn<(root: string, sid: string) => Promise<string[]>>(async () => []),
+  // v0.9（G-9）：stop 钩子接活性 idle 标记（core/registry.markSessionIdle）——
+  // 沿用钩子锁预算常量（本测试整体 mock shared.js，须随实现同步补出口）。
+  HOOK_LOCK_WAIT_MS: 2_000,
 }));
 
 const snapshotMocks = vi.hoisted(() => ({
   refreshSnapshot: vi.fn(async () => {}),
 }));
 
+// v0.9（G-9）：registry 的 idle 标记 mock（本测试不触盘；真实状态机行为在
+// core/liveness.test.ts 端到端覆盖）。
+const registryMocks = vi.hoisted(() => ({
+  markSessionIdle: vi.fn(async (_stateRoot: string, _sessionId: string, _options?: { now?: number; waitMs?: number }) => null),
+}));
+
 vi.mock("./shared.js", () => sharedMocks);
 vi.mock("../core/snapshot.js", () => snapshotMocks);
+vi.mock("../core/registry.js", () => registryMocks);
 
 async function importStop(): Promise<typeof import("./stop.js")> {
   return await import("./stop.js");
@@ -38,6 +48,7 @@ beforeEach(() => {
   });
   sharedMocks.boundNamesForSession.mockResolvedValue([]);
   snapshotMocks.refreshSnapshot.mockResolvedValue(undefined);
+  registryMocks.markSessionIdle.mockResolvedValue(null);
 });
 
 describe("stop hook: 回合收尾快照刷新（§7.3.1 机制 2）", () => {
@@ -77,6 +88,26 @@ describe("stop hook: 回合收尾快照刷新（§7.3.1 机制 2）", () => {
     await runStopHook();
     expect(snapshotMocks.refreshSnapshot).toHaveBeenCalledTimes(1);
     expect(snapshotMocks.refreshSnapshot).toHaveBeenCalledWith("<stateRoot>");
+  });
+
+  // v0.9（G-9，PROTOCOL §12.4）：回合结束 → 活性标 idle（best-effort，锁预算随钩子）。
+  it("回合结束（有 sessionId）→ markSessionIdle 恰一次（2s 钩子锁预算）", async () => {
+    const { runStopHook } = await importStop();
+    sharedMocks.resolveHookContext.mockReturnValue({
+      workspace: "ws",
+      stateRoot: "<stateRoot>",
+      sessionId: "sess-a",
+      event: "Stop",
+    });
+    await runStopHook();
+    expect(registryMocks.markSessionIdle).toHaveBeenCalledTimes(1);
+    expect(registryMocks.markSessionIdle).toHaveBeenCalledWith("<stateRoot>", "sess-a", { waitMs: 2_000 });
+  });
+
+  it("无 sessionId（未锚定会话）→ 不做活性标记", async () => {
+    const { runStopHook } = await importStop();
+    await runStopHook();
+    expect(registryMocks.markSessionIdle).not.toHaveBeenCalled();
   });
 
   it("refreshSnapshot 抛错 → runStopHook 向上抛（调用方决定降级）", async () => {
@@ -121,5 +152,20 @@ describe("stop hook: 失败降级（hooks 永不阻断会话）", () => {
     await runStopHookGuarded();
     expect(snapshotMocks.refreshSnapshot).toHaveBeenCalledTimes(1);
     expect(sharedMocks.auditHookFailure).not.toHaveBeenCalled();
+  });
+
+  // v0.9（G-9）：活性标记失败同样降级（hook 永不因 idle 标记失败）。
+  it("markSessionIdle 抛错 → auditHookFailure('stop-liveness') 且钩子不抛", async () => {
+    const { runStopHookGuarded } = await importStop();
+    sharedMocks.resolveHookContext.mockReturnValue({
+      workspace: "ws",
+      stateRoot: "<stateRoot>",
+      sessionId: "sess-a",
+      event: "Stop",
+    });
+    sharedMocks.boundNamesForSession.mockResolvedValue(["a"]);
+    registryMocks.markSessionIdle.mockRejectedValue(new Error("lock busy"));
+    await expect(runStopHookGuarded()).resolves.toBeUndefined();
+    expect(sharedMocks.auditHookFailure).toHaveBeenCalledWith("<stateRoot>", "stop-liveness", expect.any(Error));
   });
 });

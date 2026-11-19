@@ -154,10 +154,21 @@ describe('scanPeers', () => {
     expect(scan.active[0]!.pid).toBe(process.pid);
   });
 
-  it('classifies a dead pid as pid-dead and sweeps the file', async () => {
-    const deadPid = 2147483000; // far above any live pid on this machine
+  // v0.9.1（V090-02 r2）：缺省档只读——死记录进 dead 但文件保留（C8 硬证据不被查询面顺手抹掉）。
+  it('default scan is read-only: dead record classified but file kept', async () => {
+    const deadPid = 2147483000;
     await writePeerRecord(dir, liveRecord({ pid: deadPid }));
     const scan = await scanPeers(dir);
+    expect(scan.active).toHaveLength(0);
+    expect(scan.dead).toHaveLength(1);
+    expect(scan.dead[0]!.reason).toBe('pid-dead');
+    expect(existsSync(peerRecordFile(dir, deadPid))).toBe(true);
+  });
+
+  it('classifies a dead pid as pid-dead and sweeps the file (explicit {sweep:true} only)', async () => {
+    const deadPid = 2147483000; // far above any live pid on this machine
+    await writePeerRecord(dir, liveRecord({ pid: deadPid }));
+    const scan = await scanPeers(dir, Date.now(), { sweep: true });
     expect(scan.active).toHaveLength(0);
     expect(scan.dead).toHaveLength(1);
     expect(scan.dead[0]!.reason).toBe('pid-dead');
@@ -191,7 +202,7 @@ describe('scanPeers', () => {
   it('tolerates two scanners sweeping the same batch', async () => {
     const deadPid = 2147482999;
     await writePeerRecord(dir, liveRecord({ pid: deadPid }));
-    const [a, b] = await Promise.all([scanPeers(dir), scanPeers(dir)]);
+    const [a, b] = await Promise.all([scanPeers(dir, Date.now(), { sweep: true }), scanPeers(dir, Date.now(), { sweep: true })]);
     // Both scanners may observe the record before either deletes it; the point
     // of the check is that the second delete hits ENOENT and is tolerated.
     expect(a.dead.length + b.dead.length).toBeGreaterThanOrEqual(1);

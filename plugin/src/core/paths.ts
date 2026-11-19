@@ -55,6 +55,18 @@ export function sessionsDir(root: string): string {
 export function sessionFile(root: string, sessionId: string): string {
   return join(root, 'registry', 'sessions', `${sessionId}.json`);
 }
+/**
+ * v0.9.1 r3（V090-01）：会话活性**引擎证言**文件（`registry/witness/<sid>.json`）。
+ * 与 sessions/<sid>.json 分路：后者含自述字段（liveness/livenessTs/lastEventTs），
+ * 一次本地文件写即可伪造（裁决 case1r3/case7br3 实证）；本文件只由引擎进程写
+ * （hooks 回合边界 + MCP 工具调用心跳），是清扫豁免的唯一活性输入。
+ */
+export function witnessDir(root: string): string {
+  return join(root, 'registry', 'witness');
+}
+export function witnessFile(root: string, sessionId: string): string {
+  return join(root, 'registry', 'witness', `${sessionId}.json`);
+}
 export function namesFile(root: string): string {
   return join(root, 'registry', 'names.json');
 }

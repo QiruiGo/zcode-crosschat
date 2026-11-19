@@ -184,6 +184,40 @@ describe("findDuplicateMail（移植 tools.js:2088-2093）", () => {
   });
 });
 
+// ─────────────────────── v0.9.1 r3（V090-12）：投递档位差异（同文后发 interrupt/urgent 不判重） ───────────────────────
+
+describe("findDuplicateMail 档位键（V090-12：同文后发 interrupt/urgent 不得判重）", () => {
+  const ticket = "计算 17*23";
+  const team = teamWithTask("at1");
+
+  function msg(overrides: Partial<TeamMessage>): TeamMessage {
+    return {
+      id: "x1", from: "a", to: "b", content: ticket, ts: 1,
+      ...overrides,
+    };
+  }
+
+  it("同文先普通后 interrupt → 不判重（中断语义必须落地可见，不得被 duplicate 吞掉）", () => {
+    const existing = [msg({})]; // 未读普通同文
+    expect(findDuplicateMail(existing, team, { from: "a", content: ticket, interrupt: true })).toBeUndefined();
+    expect(findDuplicateMail(existing, team, { from: "a", content: ticket, urgent: true })).toBeUndefined();
+  });
+
+  it("同文先 interrupt 后 interrupt → 仍判重（重复插队无增量语义）", () => {
+    const existing = [msg({ urgent: true, interrupt: true })];
+    expect(findDuplicateMail(existing, team, {
+      from: "a", content: ticket, urgent: true, interrupt: true,
+    })?.id).toBe("x1");
+  });
+
+  it("调用方未声明档位（undefined，现有 tools-relay 接线形态）→ 判定与旧版逐字节一致", () => {
+    const existing = [msg({})];
+    expect(findDuplicateMail(existing, team, { from: "a", content: ticket })?.id).toBe("x1");
+    const existingUrgent = [msg({ urgent: true })];
+    expect(findDuplicateMail(existingUrgent, team, { from: "a", content: ticket })?.id).toBe("x1");
+  });
+});
+
 // ─────────────────────────── prompt 组装（≤4000） ───────────────────────────
 
 describe("buildWakePrompt", () => {
@@ -660,10 +694,12 @@ describe("attemptWake 失败侦听（FI-7：spawn 成功 ≠ 送达；回执须�
       watchWindowMs: 1500,
       watchPollMs: 20,
       spawn: (opts) => {
-        // 模拟孤儿唤醒子进程：spawn 返回后才把失败写进 wake 日志（父进程无退出码可观察）
+        // 模拟孤儿唤醒子进程：spawn 返回后才把失败写进 wake 日志（父进程无退出码可观察）。
+        // v0.9（G-8）：本用例用非 sessionNotFound 失败——sessionNotFound 自 v0.9 起走
+        // 自动重绑重试（恰一次），其单投/留痕语义在 wake-v090.test.ts 专项覆盖。
         setTimeout(() => {
           mkdirSync(dirname(opts.logFile), { recursive: true });
-          appendFileSync(opts.logFile, "Error: Session not found: sess_b\n");
+          appendFileSync(opts.logFile, "Error: spawn ZCode.exe ENOENT\n");
         }, 40);
         return { pid: 4242, logFile: opts.logFile };
       },
@@ -676,7 +712,9 @@ describe("attemptWake 失败侦听（FI-7：spawn 成功 ≠ 送达；回执须�
     expect(sawFailure).toBe(true);
     const failed = readEngineEvents().find((e) => e["event"] === "wake-failed");
     expect(failed!["where"]).toBe("wake-child");
-    expect(String(failed!["error"])).toContain("Session not found");
+    expect(String(failed!["error"])).toContain("ENOENT");
+    // 非 sessionNotFound 失败不触发自动重试（G-8 只对 sessionNotFound 重绑重试）
+    expect(readEngineEvents().some((e) => e["event"] === "wake-retry")).toBe(false);
 
     // 投递租约已释放：pull 立即可见（deliveryClaimedAt 移除，消息未丢）
     const after = (await readMailbox(root, "default", "b")).find((m) => m.id === message.id);

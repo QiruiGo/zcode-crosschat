@@ -350,9 +350,13 @@ export function peerIsAlive(record: PeerRecord, now: number, staleMs: number = P
  * - only `/^\d+\.json$/` files are considered (CC @3309289);
  * - records of a foreign `pidDomain` are separated into `foreign` and never
  *   enter the discovery set (CC `ne()` @9603429) — they are NOT deleted;
- * - dead records (pid dead, or lastSeen stale) are deleted lazily; a concurrent
- *   scanner that already deleted the file gets ENOENT, which is tolerated
- *   (FEASIBILITY-V0.3 §5.3: two scanners, both `errors: []`).
+ * - v0.9.1（V090-02）：**缺省只读**——死记录（pid 亡 / lastSeen 陈旧）照常进
+ *   `dead` 但**不再删除**。pid-dead 记录是 C8 进程死判据唯一的硬证据（PROTOCOL
+ *   §12.2），v0.9.0 前的「缺省档惰性清扫」让按名寻址（xc_relay 等）顺手抹掉崩溃
+ *   残留：删后 memberLiveness 判 no-record，残留 running 会话记录接管活性 → 任务
+ *   永不清扫、C8 转交永不触发。删除改为**显式选择**（`{sweep:true}`）且逐笔写
+ *   机器全局清扫日志（`peerSweepJournalFile`）；死前任的定向回收仍走 claim 路径
+ *   的 `reclaimDeadRecordsOfName`（peer-name-reclaimed 留痕 + 清扫日志）。
  *
  * v0.6.1（验收员复验后定位修复）：`opts.sweep === false` = **只读扫描**——死记录照常
  * 进 `dead`（调用方据此判定「该花名可被接管」并留痕），但不删文件。纯查询路径（sid
@@ -372,6 +376,8 @@ export async function scanPeers(
   } catch {
     return result;
   }
+  // v0.9.1（V090-02）：本轮被本扫描器实际删除的记录（删除留痕用；rm 成功才算）。
+  const sweptNow: Array<{ pid: number; sessionId: string | null; reason: PeerDeadReason }> = [];
   for (const entry of entries) {
     if (!/^\d+\.json$/.test(entry)) continue;
     const pid = Number.parseInt(entry.slice(0, -'.json'.length), 10);
@@ -391,14 +397,49 @@ export async function scanPeers(
     }
     const reason: PeerDeadReason = pidAlive(record.pid) ? 'lastSeen-stale' : 'pid-dead';
     result.dead.push({ record, reason });
-    if (opts.sweep === false) continue; // 只读扫描：查询不得有清扫副作用
+    // v0.9.1（V090-02）：删除只属于显式 `{sweep:true}` 的清扫扫描（缺省只读）。
+    if (opts.sweep !== true) continue;
     try {
       await rm(peerRecordFile(root, pid), { force: true });
+      sweptNow.push({ pid, sessionId: record.sessionId, reason });
     } catch {
       // ENOENT (another scanner won) is fine; anything else is best effort.
     }
   }
+  // v0.9.1（V090-02）：删除**必须留痕**——pid-dead 记录是 C8 进程死判据唯一的硬证据
+  // （§12.2），被清掉的每一笔都写进机器全局清扫日志（见 appendPeerSweepJournal）。
+  if (sweptNow.length > 0) {
+    await appendPeerSweepJournal(root, sweptNow, now);
+  }
   return result;
+}
+
+/**
+ * v0.9.1（V090-02）：peer 注册表清扫日志（机器全局，`sessions/.sweeps.jsonl`）。
+ * 每次实际删除追加一行 `{ts, sweptCount, swept:[{pid, sessionId, reason}]}`——
+ * pid-dead 证据被谁、何时、按何种死因清除，跨工作区可查（peer 根是机器全局的，
+ * engine.jsonl 只在单个工作区可见）。`.sweeps.jsonl` 不匹配 `/^\d+\.json$/`，
+ * 永不进扫描集。best-effort：日志失败不回滚删除（与 core/log.ts 审计降级同纪律），
+ * 但删除不再无声。
+ */
+export function peerSweepJournalFile(root: string): string {
+  return join(peerSessionsDir(root), '.sweeps.jsonl');
+}
+
+/** 清扫日志追加（scanPeers 的显式清扫与 claim 路径的定向回收共用同一日志）。 */
+export async function appendPeerSweepJournal(
+  root: string,
+  swept: ReadonlyArray<{ pid: number; sessionId: string | null; reason: PeerDeadReason }>,
+  now: number = Date.now(),
+): Promise<void> {
+  if (swept.length === 0) return;
+  try {
+    await appendJsonl(peerSweepJournalFile(root), [
+      JSON.stringify({ ts: now, sweptCount: swept.length, swept }),
+    ]);
+  } catch {
+    /* 审计失败不阻断删除（best-effort；删除本身已完成） */
+  }
 }
 
 /**
@@ -406,7 +447,9 @@ export async function scanPeers(
  *
  * Occupancy is decided by LIVE peers only: a dead peer must not keep its name
  * forever, otherwise a restarted session can never re-register (FEASIBILITY-V0.3
- * §5.4-2, T5 E7). The scan also performs the lazy sweep of dead records.
+ * §5.4-2, T5 E7)。v0.9.1（V090-02）：只读扫描（缺省档已不再删除，删除只属显式
+ * 清扫与 claim 定向回收）——死前任的回收由 claim 路径 reclaimDeadRecordsOfName
+ * 留痕执行，本查询不顺手删。
  */
 export async function isPeerNameFree(root: string, name: string, now: number = Date.now()): Promise<boolean> {
   if (name.trim() === '') return false;
@@ -418,6 +461,7 @@ export async function isPeerNameFree(root: string, name: string, now: number = D
  * Find the live peer holding `name` (exact current-name match), if any.
  * Former names are NOT considered here — the former-name fallback belongs to
  * the addressing layer (W3, `resolvePeerTarget`).
+ * v0.9.1（V090-02）：寻址查询只读（死记录保留给 C8 判据消费）。
  */
 export async function findPeerByName(root: string, name: string, now: number = Date.now()): Promise<PeerRecord | undefined> {
   const scan = await scanPeers(root, now);

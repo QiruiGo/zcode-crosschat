@@ -26,6 +26,31 @@
  *         → 只入箱不唤醒（E-a 派发/E-b unblock/E-c idle 的公共唤醒路径检查点——tools.ts
  *         主体不改（§10.4 唯一缝隙），门控只能落在这里才同时覆盖三条边）。
  *
+ * v0.9 增量（reports/31-v090方案.md §一，组B 配置/唤醒/送达）：
+ * - G-6/G-4/G-7 唤醒分层：开关判定改分层闸（core/config.ts resolveWakeGate）——
+ *   引擎供给成员（identity=engine，headless by design）免全局开关恒可唤醒；
+ *   其余目标 file（.crosschat/config.json，每次投递现读=改文件即热生效）>
+ *   env（XC_WAKE_ENABLED）> 内置默认 false；畸形 config.json 回落次层并披露
+ *   WARNING（config-malformed 事件 + 跳过原因/回执 note）。wake-skipped 原因行
+ *   相应更新（自带来源与一行开启指引）。
+ * - G-8 送达重试：失败侦听命中 sessionNotFound 证据 → 自动重绑重试恰一次
+ *   （wake-retry/wake-retry-failed 事件留痕；不重投邮箱，幂等）。
+ *
+ * v0.9.1 r3 增量（合并裁决 P0/P1 打回，组B 四项）：
+ * - V090-05 唤醒分层×身份接管：引擎免开关增加**持有者校验**——identity:"engine"
+ *   只是 roster 行的粘滞标，交互式会话 takeover 后 joinTeam 保留该标；判据 =
+ *   行当前 sid 的会话记录 boundName（只有 member-add 代写与 wakeToken 注册两条
+ *   引擎路径会写）。接管行回落 file/env/默认层并置 takenOver 披露。
+ * - V090-06 重试绕门：retryOnceAfterSessionNotFound 重试前复检成员状态门 +
+ *   分层闸 + 在途 nonce（不过 → wake-retry-skipped，不 spawn、不重开租约）。
+ * - V090-07 失败侦听窗口外静默：WAKE_WATCH_WINDOW_MS 20s→120s（宿主冷启动实测
+ *   25s 才落盘），回执 note 改为如实的有界承诺（超窗/进程退出 → 邮箱 pull 兜底），
+ *   不再无条件宣称「失败由引擎自动检测」。
+ * - V090-08 畸形 config 披露半通道：放行路径的 wake note 与 spawn-failed note
+ *   均携带 gate.warning（与 wake-skipped 原因行同口径）。
+ * - V090-12（本域部分）去重键档位：findDuplicateMail 纳入 urgent/interrupt
+ *   差异——同文后发的 interrupt/urgent 不得判重（调用方接线在 C 域 tools-relay.ts）。
+ *
  * dsh 原版参照（dsh-agent-teams 0.1.29，lib/ 目录）：
  * - tools.js:2088-2093  duplicate 幂等判定（from+content+taskId/attemptId+source* 全等 ∧
  *   isCurrentMail ∧（有任务绑定 ∨ 未读））——本文件导出 findDuplicateMail 供工具面复用
@@ -55,6 +80,13 @@ import { readFileSync } from "node:fs";
 import { logEngineEvent } from "../core/log";
 import { withTeamLock } from "../core/lock";
 import { wakeLogFile } from "../core/paths";
+import {
+  resolveWakeGate,
+  wakeDisabledReason,
+  wakeGateFromRaw,
+  workspaceConfigFile,
+  type WakeGate,
+} from "../core/config";
 import { readTeam } from "../core/teamstate";
 import {
   consumeWakeNonce,
@@ -63,7 +95,7 @@ import {
   WAKE_INFLIGHT_MS,
 } from "../core/registry";
 import { sanitizeKey } from "../core/sanitize";
-import type { TeamMessage, TeamState } from "../core/types";
+import { memberState, memberIdentity, type TeamMember, type TeamMessage, type TeamState } from "../core/types";
 import { spawnResume, type WakeSpawnConfig } from "./resume-cli";
 import { explicitSpawnConfigError, resolveZcodeSpawnConfig, type ResolvedSpawnConfig } from "./zcode-locate";
 
@@ -125,16 +157,48 @@ export function findWakeFailureEvidence(logText: string): string | undefined {
   return undefined;
 }
 
-/** 失败侦听窗口默认值（从 spawn 成功起算；窗口静默=不表态，不虚报成败）。 */
-export const WAKE_WATCH_WINDOW_MS = 20_000;
+/**
+ * 失败侦听窗口默认值（从 spawn 成功起算；窗口静默=不表态，不虚报成败）。
+ *
+ * v0.9.1 r3（V090-07）：20s → 120s。红队复现实测：宿主 CLI 冷启动（Windows 杀软
+ * 扫描/首次拉起）下失败证据 25s 才落盘，20s 窗口整条错过——wake-failed/wake-retry
+ * 永不出现而回执宣称「自动检测」。120s 覆盖实测冷启动形态；窗口仍**有界**（
+ * unref 定时器，不拖进程），超窗/本进程退出的情形由回执 note 如实声明并以邮箱
+ * pull 兜底（见 attemptWake 返回的 note 文案）。
+ */
+export const WAKE_WATCH_WINDOW_MS = 120_000;
 /** 失败侦听轮询间隔默认值。 */
 export const WAKE_WATCH_POLL_MS = 500;
 
-// ─────────────────────────── 开关判定（V7） ───────────────────────────
+// ─────────────────────────── sessionNotFound 自动重试（v0.9 G-8） ───────────────────────────
+
+/**
+ * v0.9（G-8）：失败证据是否为 sessionNotFound（纯函数，单测直测）。
+ * 宿主 CLI `--resume <已消失的 sid>` 的标准报错即 `Error: Session not found: sess-…`
+ * （adjudication.md #15 实测形态）；大小写不敏感匹配证据文本中的
+ * "session not found"，其余失败证据（ENOENT/超时等）不触发重试。
+ */
+export function isSessionNotFoundEvidence(evidence: string): boolean {
+  return /session not found/i.test(evidence);
+}
+
+/**
+ * v0.9（G-8）：重试再失败时的恢复动作文案（如实回执的一部分，进
+ * wake-retry-failed 事件的 recovery 字段）。重试已把重绑机会用完——剩余
+ * 恢复路径只有「成员重绑新 sid 后重发」与「lead 幂等重供给」两条，如实给指引。
+ */
+export const SESSION_NOT_FOUND_RECOVERY =
+  "目标 sessionId 已失效且自动重绑重试仍失败：若成员已重启会话，请其调用 xc_identify 重绑新 sessionId 后重发；" +
+  "或由 lead 用 xc_team({action:\"member-add\"}) 幂等重供给。消息仍在邮箱（pull 兜底不丢），不会重复投递。";
+
+// ─────────────────────────── 开关判定（V7 + v0.9 分层） ───────────────────────────
 
 /**
  * XC_WAKE_ENABLED 严格判定：**非 "true" 的一律按关闭**（含 undefined、""、"TRUE" 等任何其他
  * 值——模板展开行为未确认，DESIGN §9-V7），原始值由 attemptWake 记入 engine.jsonl。
+ *
+ * v0.9（G-6/G-4，core/config.ts）起本判定只描述 **env 层**：完整判定走分层闸
+ * {@link decideDelivery}（config.json file > env > 内置默认；引擎供给成员免开关）。
  */
 export function isWakeEnabled(raw: string | undefined | null): boolean {
   return raw === "true";
@@ -142,7 +206,12 @@ export function isWakeEnabled(raw: string | undefined | null): boolean {
 
 // ─────────────────────────── duplicate 去重（移植 tools.js:2088-2093） ───────────────────────────
 
-/** 候选消息身份（与 dsh send_message 的判定字段一一对应；收件人邮箱即隐含 to）。 */
+/** 候选消息身份（与 dsh send_message 的判定字段一一对应；收件人邮箱即隐含 to）。
+ * v0.9.1 r3（V090-12）增量：`urgent`/`interrupt` 投递档位（可选）——同文后发的
+ * interrupt/urgent 不得被普通同文判重（否则第二件 delivered:"duplicate" 不落箱，
+ * 收方永远看不到插队/中断语义，而发送方 payload 仍报 interrupt:{requested:true,
+ * result:"deferred-next-turn"}——虚报）。调用方未声明（undefined）时判定与旧版
+ * 逐字节一致：档位键只在调用方显式声明 true 时参与。 */
 export interface MailIdentity {
   from: string;
   content: string;
@@ -152,16 +221,34 @@ export interface MailIdentity {
   sourceTaskId?: string;
   sourceAttemptId?: string;
   sourceTaskStatus?: string;
+  /** 候选消息的 urgent 档位（C1：xc_relay urgent/interrupt 写入侧）。 */
+  urgent?: boolean;
+  /** 候选消息的 interrupt 档位（v0.9 G-2 软中断；蕴含 urgent）。 */
+  interrupt?: boolean;
 }
 
 const eqOpt = (a: string | null | undefined, b: string | null | undefined): boolean =>
   (a ?? undefined) === (b ?? undefined);
 
 /**
+ * v0.9.1 r3（V090-12）：投递档位升级判定——候选显式声明 urgent/interrupt 而邮箱里
+ * 的同文消息没有该档位时，**不判重**（插队/中断语义必须落地可见）。只认「升级」
+ * 方向：候选未声明（undefined，旧调用方）或候选是普通件时行为不变——普通同文仍被
+ * 去重（dsh tools.js:2088-2093 原语义），已 urgent 的同文重复发送也仍被去重。
+ */
+function deliveryClassEscalates(m: TeamMessage, candidate: MailIdentity): boolean {
+  return (
+    (candidate.urgent === true && m.urgent !== true) ||
+    (candidate.interrupt === true && m.interrupt !== true)
+  );
+}
+
+/**
  * 幂等判定：邮箱中已存在"同文且仍在效期"的消息则返回它（调用方应返回 duplicate 态且**不再追加**）。
  * 全等字段：from + content + taskId + attemptId + sourceTaskId/sourceAttemptId/sourceTaskStatus，
  * 且 isCurrentMail（M1 移植 mailbox.js:6-17）为真，且（有任务绑定 ∨ 尚未读过）——与
  * dsh tools.js:2088-2093 逐条件对应。（M3 tools.ts 自带内联判定；本函数是同语义的独立实现，供单测与复用。）
+ * v0.9.1 r3（V090-12）：附加档位条件 {@link deliveryClassEscalates}——见其注释。
  */
 export function findDuplicateMail(
   existing: TeamMessage[],
@@ -178,7 +265,8 @@ export function findDuplicateMail(
       eqOpt(m.sourceAttemptId, candidate.sourceAttemptId) &&
       eqOpt(m.sourceTaskStatus, candidate.sourceTaskStatus) &&
       isCurrentMail(team, m) &&
-      (m.attemptId !== undefined || m.sourceAttemptId !== undefined || m.readAt === undefined),
+      (m.attemptId !== undefined || m.sourceAttemptId !== undefined || m.readAt === undefined) &&
+      !deliveryClassEscalates(m, candidate),
   );
 }
 
@@ -193,8 +281,19 @@ export interface DeliveryDecision {
 export interface DeliveryDecisionInput {
   /** 锁内查重命中（M3 已自判；attemptWake 路径不传）。 */
   duplicate?: boolean;
-  /** XC_WAKE_ENABLED 原始值（V7：非 "true" 即关，原始值落 engine.jsonl）。 */
-  wakeEnabledRaw: string | undefined | null;
+  /**
+   * XC_WAKE_ENABLED 原始值（V7：非 "true" 即关，原始值落 engine.jsonl）。
+   * v0.9 起仅作兼容入口：wakeGate 缺省时按 env 层 shim（core/wakeGateFromRaw）
+   * 判定；attemptWake 恒传分层闸 wakeGate。
+   */
+  wakeEnabledRaw?: string | undefined | null;
+  /**
+   * v0.9（G-6/G-4）分层唤醒闸（core/config.ts resolveWakeGate 的产物）：
+   * 引擎供给成员（identity=engine）恒 enabled（source=engine-member，免开关）；
+   * 其余目标 file（config.json）> env（XC_WAKE_ENABLED）> 内置默认 false。
+   * 畸形 config.json 的 WARNING 随闸携带，进入跳过原因与回执 note。
+   */
+  wakeGate?: WakeGate;
   /**
    * §2.5-2 属主缺席约束（v1 无法检测属主，以约束代替检测）：
    * - `true`  ：调用方断言目标属主缺席（无头/CLI 驱动的会话，DESIGN §6.4 形态）——可推送；
@@ -213,11 +312,11 @@ export function decideDelivery(input: DeliveryDecisionInput): DeliveryDecision {
   if (input.duplicate === true) {
     return { mode: "duplicate", reason: "duplicate: 同文且仍在效期的消息已存在（tools.js:2088-2093 判定）" };
   }
-  if (!isWakeEnabled(input.wakeEnabledRaw)) {
-    return {
-      mode: "mailbox",
-      reason: `wake-disabled: XC_WAKE_ENABLED 非 "true"（raw=${JSON.stringify(input.wakeEnabledRaw ?? null)}）`,
-    };
+  // v0.9（G-4/G-7）：开关判定改分层闸——wakeGate（分层）优先，缺省时按 env 原始值
+  // shim（旧调用方/旧测试语义零变化）。source=engine-member 恒 enabled，不产生本行。
+  const gate = input.wakeGate ?? wakeGateFromRaw(input.wakeEnabledRaw);
+  if (!gate.enabled) {
+    return { mode: "mailbox", reason: wakeDisabledReason(gate) };
   }
   if (input.ownerAbsent === false) {
     return { mode: "mailbox", reason: "owner-present: 目标属主在场，push 明令禁用（§2.5-2/V5，靠 pull 兜底）" };
@@ -407,7 +506,8 @@ export interface WakeRequest {
    * 不改变三态决策（decideDelivery 三重条件对 urgent 不豁免，E1：忙→下一回合）。
    */
   urgent?: boolean;
-  /** 进程 env；XC_WAKE_ENABLED 判定全在 M2（V7）。 */
+  /** 进程 env；v0.9 起开关判定=分层闸（core/config.ts：config.json file > 本 env 层
+   *  XC_WAKE_ENABLED > 内置默认；引擎供给成员免开关）——判定全在 M2（V7 语义保留于 env 层）。 */
   env: NodeJS.ProcessEnv;
   /**
    * 属主缺席断言（§2.5-2；语义见 DeliveryDecisionInput.ownerAbsent）。
@@ -452,20 +552,15 @@ async function withLockBestEffort<T>(stateRoot: string, teamId: string, fn: () =
 }
 
 /**
- * v0.2 成员状态门控（§6.3/§7.3.3）：目标成员的供给态若应挡住唤醒则返回该状态字符串
- * （provisioning/failed/removed），否则 undefined（放行）。团队不存在/成员不在册/
- * 读盘失败 → 放行（与 v0.1.0 行为一致；门控是增量保护，不是新的失败面）。
- * W2 的 state 可选字段按 §6.5 宽容语义读取（缺省 "ready"=放行，旧花名零行为变化）。
+ * v0.9（G-4 分层前置）：读目标成员记录（一次读盘，分层与状态门控共用）。
+ * 团队不存在/成员不在册/读盘失败 → undefined（按交互式语义走分层开关；门控是
+ * 增量保护，不是新的失败面，与 v0.1.0 行为一致）。
  */
-async function memberWakeGateState(stateRoot: string, teamId: string, agentKey: string): Promise<string | undefined> {
+async function readWakeTargetMember(stateRoot: string, teamId: string, agentKey: string): Promise<TeamMember | undefined> {
   try {
     const team = await readTeam(stateRoot, teamId);
     if (team === undefined) return undefined;
-    const member = team.members.find((m) => m.key === agentKey);
-    if (member === undefined) return undefined;
-    const state = (member as { state?: string }).state ?? "ready";
-    if (state === "provisioning" || state === "failed" || state === "removed") return state;
-    return undefined;
+    return team.members.find((m) => m.key === agentKey);
   } catch {
     return undefined; // team.json 损坏等：门控尽力而为，唤醒路径不受阻
   }
@@ -475,18 +570,23 @@ async function memberWakeGateState(stateRoot: string, teamId: string, agentKey: 
  * 推送唤醒编排（DESIGN §2.5；**必须在团队锁外调用**——慢操作 spawn 不持锁，§2.7-4；
  * 本函数内部对邮箱的补盖章会各自短暂重取锁，调用方持锁时调用会死锁）：
  *
- * 1. enabled 判定（V7：非 "true" 关，原始值记 engine.jsonl）；
- * 2. 属主缺席约束（§2.5-2，见 DeliveryDecisionInput.ownerAbsent）；
- * 3. 在途 nonce 去重（M1 registry 扫 registry/wake/，TTL=15min，§2.5-3）；
- * 3.5 v0.2 成员状态门控（§6.3/§7.3.3）：目标 state ∈ {provisioning, failed, removed}
+ * 0. v0.9（G-4/G-6）目标成员读取（一次读盘）+ 分层唤醒闸（core/config.ts）：
+ *    引擎供给成员（identity=engine）免开关恒可唤醒；其余目标 file（config.json，
+ *    每次投递现读=改文件即热生效）> env（XC_WAKE_ENABLED）> 内置默认 false；
+ *    畸形 config.json 回落次层并披露 WARNING（事件与 note 双通道）。
+ * 1. 属主缺席约束（§2.5-2，见 DeliveryDecisionInput.ownerAbsent）；
+ * 2. 在途 nonce 去重（M1 registry 扫 registry/wake/，TTL=15min，§2.5-3）；
+ * 2.5 v0.2 成员状态门控（§6.3/§7.3.3）：目标 state ∈ {provisioning, failed, removed}
  *     → 只入箱不唤醒（nonce 落盘之前判定，跳过路径不留 15min 在途标记）；
- * 4. 写一次性 nonce（M1 createWakeNonce，兼在途标记）→ 盖投递租约（M1 claim，60s，尽力而为）；
- * 5. buildWakePrompt（守则附加按 WAKE_RULES_SCENES 白名单）→ spawnResume（helper 孤儿化，
+ * 3. 写一次性 nonce（M1 createWakeNonce，兼在途标记）→ 盖投递租约（M1 claim，60s，尽力而为）；
+ * 4. buildWakePrompt（守则附加按 WAKE_RULES_SCENES 白名单）→ spawnResume（helper 孤儿化，
  *    W1；stdout/stderr→logs/wake-<to>-<ts>.json）；
- * 6. spawn 成功 → markDelivered（dsh tools.js:2150 对应物）+ engine.jsonl {event:"wake", pid}；
+ * 5. spawn 成功 → markDelivered（dsh tools.js:2150 对应物）+ engine.jsonl {event:"wake", pid}；
  *    helper 汇报唤醒子 pid → engine.jsonl {event:"wake-child", pid}（§4.2 审计）；
  *    spawn 同步失败 → release 租约（state.js:489-496 对应物）+ engine.jsonl wake-failed，
- *    降级 mailbox——消息留邮箱，pull 兜底，租约到期后可重试（§2.5 mailbox 行）。
+ *    降级 mailbox——消息留邮箱，pull 兜底，租约到期后可重试（§2.5 mailbox 行）；
+ *    v0.9（G-8）：spawn 成功后的失败侦听命中 sessionNotFound 证据 → 自动重绑重试
+ *    恰一次（事件 wake-retry/wake-retry-failed 留痕，见 retryOnceAfterSessionNotFound）。
  *
  * 不看唤醒的返回值判定成败（DESIGN §2.5）；异步 spawn 错误经 resume-cli 的 onAsyncError
  * 补记 engine.jsonl 并尽力释放租约，不影响已返回的决策。
@@ -498,20 +598,36 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
   const stateRoot = req.stateRoot;
   const rawFlag = req.env["XC_WAKE_ENABLED"];
 
-  // 1+2. 开关与属主约束（不碰磁盘先判，避免无谓的 registry 扫描）。
-  const pre = decideDelivery({ wakeEnabledRaw: rawFlag, ownerAbsent: req.ownerAbsent, inflight: false });
+  // 0. v0.9（G-4/G-6）分层唤醒闸。目标成员一次读盘（分层与 2.5 状态门控共用）；
+  //    config.json 由 resolveWakeGate 现读（无缓存）——改文件即热生效（G-6 核心）。
+  //    注：旧版「不碰磁盘先判」的优化随分层取消——file 层与成员身份都在盘上，
+  //    这是 G-6「配置跟工作区走」决策的固有代价（小文件、投递频率级读取）。
+  const target = await readWakeTargetMember(stateRoot, req.teamId, toKey);
+  const gate = resolveWakeGate(stateRoot, req.env, target);
+  if (gate.warning !== undefined) {
+    // 畸形 config.json：回落次层（WARNING 披露对齐 env 卫生口径；不阻断本次判定）。
+    await logEngineEvent(stateRoot, {
+      event: "config-malformed", file: workspaceConfigFile(stateRoot), warning: gate.warning,
+      teamId: req.teamId, to: toKey, scene: req.reason,
+    });
+  }
+  const pre = decideDelivery({ wakeGate: gate, ownerAbsent: req.ownerAbsent, inflight: false });
   if (pre.mode !== "wake") {
     await logEngineEvent(stateRoot, {
       event: "wake-skipped", reason: pre.reason, scene: req.reason, teamId: req.teamId, to: toKey,
-      rawWakeEnabled: rawFlag ?? null,
+      rawWakeEnabled: rawFlag ?? null, wakeGateSource: gate.source,
+      // v0.9.1 r3（V090-05）：engine 标行被交互式持有者接管——免开关不适用，
+      // 事件带标，运营面可诊断「引擎成员突然不自动开工」。
+      ...(gate.takenOver === true ? { takenOver: true } : {}),
+      ...(gate.warning !== undefined ? { configWarning: gate.warning } : {}),
     });
     return { delivered: "mailbox", note: pre.reason };
   }
 
-  // 3. 在途 nonce 去重（§2.5-3）。
+  // 2. 在途 nonce 去重（§2.5-3）。
   const inflight = await findInflightWakeNonce(stateRoot, toKey, { teamId: req.teamId, now });
   if (inflight !== undefined) {
-    const d = decideDelivery({ wakeEnabledRaw: rawFlag, ownerAbsent: req.ownerAbsent, inflight: true });
+    const d = decideDelivery({ wakeGate: gate, ownerAbsent: req.ownerAbsent, inflight: true });
     await logEngineEvent(stateRoot, {
       event: "wake-skipped", reason: d.reason, scene: req.reason, teamId: req.teamId, to: toKey,
       inflightNonce: inflight.token,
@@ -519,13 +635,17 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
     return { delivered: "mailbox", note: d.reason };
   }
 
-  // 3.5 v0.2 成员状态门控（DESIGN-V0.2 §6.3 双向门控 + §7.3.3「E-a/E-b/E-c 唤醒路径
+  // 2.5 v0.2 成员状态门控（DESIGN-V0.2 §6.3 双向门控 + §7.3.3「E-a/E-b/E-c 唤醒路径
   // 检查 state」）：provisioning/failed/removed 的成员只入箱、不唤醒——provisioning
   // 期间 resume 会与 app-server 持有并发（V5 未验证区）；removed 成员不再被唤醒。
   // 位置在 createWakeNonce **之前**：跳过路径不落 nonce，避免 15min 在途标记挡住
   // 供给完成后的 E-e 投产唤醒。团队不存在/成员不在册 → 与 v0.1.0 行为一致（放行）；
   // W2 的 state 可选字段以 §6.5 宽容语义读取（缺省 "ready"=放行，旧数据零行为变化）。
-  const gateState = await memberWakeGateState(stateRoot, req.teamId, toKey);
+  // v0.9：成员记录复用步骤 0 的一次读盘（memberState 访问器=旧内联读取同语义）。
+  const gateState = target !== undefined
+    && (memberState(target) === "provisioning" || memberState(target) === "failed" || memberState(target) === "removed")
+    ? memberState(target)
+    : undefined;
   if (gateState !== undefined) {
     const reason = `member-state:${gateState}: 目标成员供给中/失败/已移除，只入箱不唤醒（DESIGN-V0.2 §6.3/§7.3.3）`;
     await logEngineEvent(stateRoot, {
@@ -570,19 +690,31 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
     ...(req.urgent === true ? { urgent: true } : {}),
   });
   const logFile = wakeLogFile(stateRoot, toKey, now);
-  const releaseOnFailure = async (where: string, err: unknown): Promise<void> => {
+  /**
+   * 失败善后（释放投递租约 + 消费 nonce + 审计）。v0.9（G-8）参数化：原始尝试与
+   * sessionNotFound 重试共用一份释放逻辑，事件名与恢复动作由调用方给定——
+   * 原始尝试 event=wake-failed；重试失败 event=wake-retry-failed（附 recovery）。
+   */
+  const releaseOnFailure = async (
+    where: string,
+    err: unknown,
+    lease: { nonce: string; sid: string; ids: readonly string[]; now: number } = { nonce: token, sid: req.toSessionId, ids, now },
+    event = "wake-failed",
+    recovery?: string,
+  ): Promise<void> => {
     await withLockBestEffort(stateRoot, req.teamId, () =>
-      releaseMailboxDelivery(stateRoot, req.teamId, toKey, ids));
+      releaseMailboxDelivery(stateRoot, req.teamId, toKey, [...lease.ids]));
     // 同步/异步 spawn 失败=没有真正的唤醒在途：立即消费 nonce，别让 15min 在途标记
     // 挡住租约（60s）承诺的重试资格（§2.5 mailbox 行"投递租约到期后可重试"）。
     try {
-      await consumeWakeNonce(stateRoot, token, { teamId: req.teamId, agentKey: toKey, sid: req.toSessionId }, now);
+      await consumeWakeNonce(stateRoot, lease.nonce, { teamId: req.teamId, agentKey: toKey, sid: lease.sid }, lease.now);
     } catch {
       /* 尽力而为 */
     }
     await logEngineEvent(stateRoot, {
-      event: "wake-failed", where, error: String(err), scene: req.reason, teamId: req.teamId,
-      to: toKey, nonce: token,
+      event, where, error: String(err), scene: req.reason, teamId: req.teamId,
+      to: toKey, nonce: lease.nonce,
+      ...(recovery !== undefined ? { recovery } : {}),
     });
   };
   let pid: number | undefined;
@@ -620,7 +752,10 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
     await releaseOnFailure("spawn", err);
     return {
       delivered: "mailbox",
-      note: `spawn-failed: ${err instanceof Error ? err.message : String(err)}（消息留邮箱，pull 兜底，租约到期可重试）`,
+      // v0.9.1 r3（V090-08）：降级路径的 note 同样携带畸形 config.json 的 WARNING
+      // （与 wake 态 note、wake-skipped 原因行同一披露口径）。
+      note: `spawn-failed: ${err instanceof Error ? err.message : String(err)}（消息留邮箱，pull 兜底，租约到期可重试）`
+        + (gate.warning !== undefined ? `；${gate.warning}` : ""),
       wakeLog: logFile,
       receiptIds: ids,
     };
@@ -631,46 +766,186 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
     markMailboxDelivered(stateRoot, req.teamId, toKey, ids, now));
   await logEngineEvent(stateRoot, {
     event: "wake", scene: req.reason, teamId: req.teamId, to: toKey, pid, nonce: token,
-    wakeLog: logFile, receiptIds: ids,
+    wakeLog: logFile, receiptIds: ids, wakeGateSource: gate.source,
+    ...(gate.takenOver === true ? { takenOver: true } : {}),
+    ...(gate.warning !== undefined ? { configWarning: gate.warning } : {}),
     ...(req.urgent === true ? { urgent: true } : {}),
   });
+
+  // v0.9（G-8）：sessionNotFound 的单次自动重试（方案 §一 G-8「投递遇 sessionNotFound →
+  // 复用既有唤醒机械（resume/OpenSession 跳板）自动重试恰一次 + engine 事件留痕；
+  // 再失败如实回执附恢复动作；重试幂等（不得双投）」）。
+  //
+  // 插件侧可观察面：宿主 SendToSession 不在本插件内，投递路径的 sessionNotFound
+  // 表现为唤醒子进程 --resume 失败落进 wake 日志的 `Error: Session not found: sess-…`
+  // （FI-7 侦听的证据形态，adjudication.md #15 实测）。重试=复用同一 spawn 机械：
+  // 1) 先按既有失败语义释放租约/消费 nonce（wake-failed 留痕）；
+  // 2) **重绑**：从 team.json 现读目标成员当前 sessionId（xc_identify 重绑后
+  //    joinTeam 已把花名册行刷新到新 sid——重试打向新会话；读不到则沿用原 sid）；
+  // 3) 新 nonce + 重盖租约 + 同一 receiptIds 重新组装 prompt（**不重投邮箱**——
+  //    消息仍在邮箱一次，唤醒 prompt 只是「去收箱」的携带段，天然幂等）；
+  // 4) 恰一次：重试自身只由原始尝试的失败侦听触发一次；重试的失败侦听命中任何
+  //    失败证据 → wake-retry-failed{recovery}（附恢复动作），不再二次重试。
+  const retryOnceAfterSessionNotFound = async (evidence: string): Promise<void> => {
+    const retryNow = Date.now();
+    const rebound = await readWakeTargetMember(stateRoot, req.teamId, toKey);
+    const sid = rebound?.sessionId !== undefined && rebound.sessionId.trim() !== ""
+      ? rebound.sessionId
+      : req.toSessionId;
+    // v0.9.1 r3（V090-06）：重试前**复检**成员状态门 + 分层闸 + 在途 nonce——原始
+    // 投递路径的三道门（§6.3/§7.3.3 状态门、G-4 分层闸、§2.5-3 在途去重）对重试
+    // 同等有效：唤醒在途/失败窗内成员可能被 member-stop（removed）、被交互式会话
+    // takeover、config.json 被改写，或窗内已有另一轮唤醒发起。复检不过 → 不
+    // spawn、不重开租约（原始租约已由调用方释放、nonce 已消费），落
+    // wake-retry-skipped 留痕——消息仍在邮箱，pull 兜底不丢。
+    const retryGateState = rebound !== undefined
+      && (memberState(rebound) === "provisioning" || memberState(rebound) === "failed" || memberState(rebound) === "removed")
+      ? memberState(rebound)
+      : undefined;
+    const retryGate = resolveWakeGate(stateRoot, req.env, rebound);
+    const retryInflight = await findInflightWakeNonce(stateRoot, toKey, { teamId: req.teamId, now: retryNow });
+    if (retryGateState !== undefined || !retryGate.enabled || retryInflight !== undefined) {
+      const reason = retryGateState !== undefined
+        ? `member-state:${retryGateState}: 重试前复检命中成员状态门，不再唤醒（V090-06：removed 成员不被重试唤醒）`
+        : retryInflight !== undefined
+          ? `inflight-nonce: 重试前复检发现已有在途唤醒（${retryInflight.token}），不重复 --resume（§2.5-3）`
+          : `wake-disabled(重试前复检): ${wakeDisabledReason(retryGate)}`;
+      await logEngineEvent(stateRoot, {
+        event: "wake-retry-skipped", reason, scene: req.reason, teamId: req.teamId, to: toKey,
+        attempt: 1, fromSessionId: req.toSessionId, sid, nonce: token, trigger: evidence,
+        ...(retryGateState !== undefined ? { memberState: retryGateState } : {}),
+        wakeGateSource: retryGate.source,
+        ...(retryGate.takenOver === true ? { takenOver: true } : {}),
+        ...(retryInflight !== undefined ? { inflightNonce: retryInflight.token } : {}),
+      });
+      return;
+    }
+    const { token: retryToken } = await createWakeNonce(stateRoot, {
+      teamId: req.teamId, agentKey: toKey, sid, now: retryNow,
+    });
+    const retryIds = [...ids];
+    await withLockBestEffort(stateRoot, req.teamId, () =>
+      claimMailboxDelivery(stateRoot, req.teamId, toKey, retryIds, retryNow));
+    const retryPrompt = buildWakePrompt({
+      teamId: req.teamId,
+      recipientKey: toKey,
+      recipientSessionId: sid,
+      wakeToken: retryToken,
+      receiptIds: retryIds,
+      bodyText: req.ticket,
+      includeMemberRules: includeRulesForScene(req.reason),
+      ...(req.urgent === true ? { urgent: true } : {}),
+    });
+    const retryLogFile = wakeLogFile(stateRoot, toKey, retryNow);
+    let retryPid: number | undefined;
+    try {
+      const spawned = (req.spawn ?? spawnResume)({
+        cfg: isResolvedSpawnConfig(resolvedCfg)
+          ? { zcodeExe: resolvedCfg.zcodeExe, zcodeCjs: resolvedCfg.zcodeCjs }
+          : resolvedCfg,
+        sessionId: sid,
+        prompt: retryPrompt,
+        cwd: req.workspace,
+        logFile: retryLogFile,
+        onAsyncError: (err) => {
+          void releaseOnFailure("retry-async", err,
+            { nonce: retryToken, sid, ids: retryIds, now: retryNow },
+            "wake-retry-failed", SESSION_NOT_FOUND_RECOVERY).catch(() => undefined);
+        },
+        onHelperSpawned: (childPid) => {
+          void logEngineEvent(stateRoot, {
+            event: "wake-child", pid: childPid, scene: req.reason, teamId: req.teamId, to: toKey,
+            nonce: retryToken, retried: true,
+          });
+        },
+      });
+      retryPid = spawned.pid;
+    } catch (err) {
+      await releaseOnFailure("retry-spawn", err,
+        { nonce: retryToken, sid, ids: retryIds, now: retryNow },
+        "wake-retry-failed", SESSION_NOT_FOUND_RECOVERY);
+      return;
+    }
+    await withLockBestEffort(stateRoot, req.teamId, () =>
+      markMailboxDelivered(stateRoot, req.teamId, toKey, retryIds, retryNow));
+    await logEngineEvent(stateRoot, {
+      event: "wake-retry", attempt: 1, scene: req.reason, teamId: req.teamId, to: toKey,
+      fromSessionId: req.toSessionId, sid, pid: retryPid, nonce: retryToken,
+      wakeLog: retryLogFile, receiptIds: retryIds, reason: evidence,
+      ...(req.urgent === true ? { urgent: true } : {}),
+    });
+    startFailureWatch(retryLogFile, true, { nonce: retryToken, sid, ids: retryIds, now: retryNow });
+  };
 
   // v0.5.1（FI-7/故障注-7）：spawn 成功只代表「唤醒已发起」，不代表送达——helper 孤儿化后
   // 本进程拿不到子进程退出码，子进程 --resume 失败（如 Session not found）只会落进 wake
   // 日志。红队实测：回执宣称 delivered=wake「已发起」而唤醒链实际失败，engine.jsonl 无任何
   // 失败标记（adjudication.md #15）。这里对 wake 日志做**有界失败侦听**：窗口内轮询日志，
-  // 只认正向失败证据（findWakeFailureEvidence），命中 → wake-failed{where:"wake-child"} +
-  // 释放投递租约 + 消费 nonce（pull 立即可见消息、重试不被 15min 在途标记挡住）；窗口静默
-  // → 不表态（成功回合可能远超窗口，日志与 pull 仍是真源）。定时器全部 unref，不拖进程。
+  // 只认正向失败证据（findWakeFailureEvidence），命中：
+  // - v0.9（G-8）sessionNotFound 证据 ∧ 尚未重试过 → 先按既有语义释放/留痕，
+  //   再触发 {@link retryOnceAfterSessionNotFound}（恰一次）；
+  // - 其余证据 → wake-failed{where:"wake-child"} + 释放投递租约 + 消费 nonce
+  //   （pull 立即可见消息、重试不被 15min 在途标记挡住）；
+  // 窗口静默 → 不表态（成功回合可能远超窗口，日志与 pull 仍是真源）。定时器全部 unref。
   const watchWindowMs = req.watchWindowMs ?? WAKE_WATCH_WINDOW_MS;
   const watchPollMs = req.watchPollMs ?? WAKE_WATCH_POLL_MS;
-  if (watchWindowMs > 0 && watchPollMs > 0) {
+  /** lease = 该次 spawn 对应的租约身份（原始尝试缺省；重试传自己的 nonce/sid/ids）。 */
+  const startFailureWatch = (
+    targetLogFile: string,
+    retried: boolean,
+    lease?: { nonce: string; sid: string; ids: readonly string[]; now: number },
+  ): void => {
+    if (watchWindowMs <= 0 || watchPollMs <= 0) return;
     const pollTimer = setInterval(() => {
       let text = "";
       try {
-        text = readFileSync(logFile, "utf8");
+        text = readFileSync(targetLogFile, "utf8");
       } catch {
         return; // 日志尚未出现（子进程还没写）→ 继续等
       }
       const evidence = findWakeFailureEvidence(text);
       if (evidence === undefined) return;
       clearInterval(pollTimer);
-      void releaseOnFailure("wake-child", evidence).catch(() => undefined);
+      if (!retried && isSessionNotFoundEvidence(evidence)) {
+        void (async () => {
+          await releaseOnFailure("wake-child", evidence);
+          await retryOnceAfterSessionNotFound(evidence);
+        })().catch(() => undefined);
+        return;
+      }
+      void releaseOnFailure(
+        retried ? "wake-retry-child" : "wake-child",
+        evidence,
+        lease,
+        retried ? "wake-retry-failed" : "wake-failed",
+        retried ? SESSION_NOT_FOUND_RECOVERY : undefined,
+      ).catch(() => undefined);
     }, watchPollMs);
     pollTimer.unref?.();
     const stopTimer = setTimeout(() => clearInterval(pollTimer), watchWindowMs);
     stopTimer.unref?.();
-  }
+  };
+  startFailureWatch(logFile, false);
 
   // v0.5.1（FI-7）：回执语义真实化——delivered:"wake" 是契约态（push 已发起），note 必须
   // 写明「非送达确认」，并标注 zcode 路径的自动探测回落（红队形态：env 配置的 exe/cjs
   // 文件不存在，探测静默改用本机安装——回执只字不提，lead 无从得知唤醒通道已回落）。
+  // v0.9（G-8）：sessionNotFound 的自动重绑重试（恰一次）写入 note，如实声明异步路径。
+  // v0.9.1 r3（V090-07）：失败侦听是**有界窗口**（WAKE_WATCH_WINDOW_MS，从 spawn
+  // 成功起算）且只在本进程存活期间有效——note 必须如实给出边界与超窗后的兜底，
+  // 不许维持「失败由引擎自动检测」的无条件承诺（红队 c6：25s 落盘的失败证据 +
+  // 回执宣称自动检测 = 语义必然背离）。
+  // v0.9.1 r3（V090-08）：畸形 config.json 的 WARNING 随 note 披露（放行路径与
+  // skip 路径同口径——「调用方必须披露：engine.jsonl 事件与工具回执 note」双通道）。
+  const warningNote = gate.warning !== undefined ? `；${gate.warning}` : "";
   return {
     delivered: "wake",
     note:
       "spawned: 无头 --resume 已发起（fire-and-forget，非送达确认；" +
-      "失败由引擎侦听 wake 日志自动检测并记 engine.jsonl wake-failed、释放投递租约，消息以邮箱 pull 兜底）"
-      + wakeFallbackNote(req.env, resolvedCfg),
+      `失败由本进程在 ${Math.round(WAKE_WATCH_WINDOW_MS / 1000)}s 有界窗口内侦听 wake 日志并记 engine.jsonl wake-failed/wake-retry/wake-retry-failed、释放投递租约，` +
+      "sessionNotFound 时自动重绑重试恰一次；超窗或本进程退出则以邮箱 pull 兜底（消息不丢，在途 nonce 最多滞留 15min））"
+      + wakeFallbackNote(req.env, resolvedCfg)
+      + warningNote,
     wakeLog: logFile,
     pid,
     receiptIds: ids,

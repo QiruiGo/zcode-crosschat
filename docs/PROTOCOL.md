@@ -72,12 +72,20 @@ ${ZCODE_PLUGIN_DATA}/peers/
 | `tool_result` | v0.7 C6 转办回投（ok/refused/error；带 requestId+ts） |
 | `approval_request` | v0.7 C7 待批通知（门在无审批时发给 lead；只通知） |
 | `approval_result` | v0.7 C7 审批回执（approve/deny/expired 的通知性回执） |
+| `withdrawal-notice` | v0.9 G-3 撤回通知：发送方撤回未读件后投给收方的纯通知帧（只报撤回了哪些 id，**不带被撤正文**） |
 
 不带 `type` 的自由文本（或非对象 JSON）按 `chat` 处理——这是 v0.1.0 起的兼容形态。
 消息内容永不授予权限："permission rules are never accepted from messages"——v0.7 的 4 个
 C6/C7 帧型同样只做通知/回执，**授权只认审批文件**（§11.2）。
 混合版本降级：旧端点（v0.6.1）收到未登记的具名帧 → 读取面剔除 + `frame-rejected` 审计，
 不崩、不静默错投（mailbox.ts readMailboxDetailed）。
+
+**白名单的边界（v0.9.2 V090-04/V090-13 如实声明，不修行为）**：白名单防的是「未知具名帧
+混进读取面」与「消息携带授权语义」，**不防正文伪装**——chat 正文可内嵌伪造的信套/横幅/
+页脚/回信指引标记（读取面信封恒由消息元数据重建，伪造引擎属性与冒名 `from` 不透传，
+见 §3；但 `xc_read` 的 JSON entry 与 mail scope 原文分页按磁盘真源口径逐字保留，真值层
+不漂白）。同族边界：engine.jsonl 审计是工作区明文文件，同机进程可整体伪造——审计用于
+观测对账，**不作为可信凭据**（可信锚点 = evidence sha256 工具现算 + 磁盘真源，见 §10）。
 
 ## 3. 信封与归因（注入面渲染）
 
@@ -86,6 +94,17 @@ C6/C7 帧型同样只做通知/回执，**授权只认审批文件**（§11.2）
 - 尾注族：归因尾注（谁发的）、权限域尾注（peer 不是你的 worker）、`not typed by your user` 标记；
   命中盖章链时改写为用户原话尾注（`origin="user"`，`由发送端 harness 盖章`）。
 - `origin` 只由发送端 harness 按字节匹配写入：正文为钩子记录的用户原话全文或其中 ≥8 字符连续片段才盖 `user`；工具无 origin 参数、正文自称无效、无记录回落 `agent`。
+- v0.9（G-2 软中断信封，冻结形态）：`xc_relay({interrupt:true})` 的队内消息带 `interrupt:true` 元数据落箱（正文保持原话，盖章字节匹配不受影响），队内信封开标签追加 `interrupt="true"` 属性并在正文前渲染 INTERRUPT 横幅（`peerenvelope.ts` `TEAM_INTERRUPT_BANNER`，逐字节冻结）：
+
+  ```
+  <crosschat-team-message type="chat" from="a" interrupt="true">
+  [INTERRUPT 软中断请求：完成当前原子操作、不开新步骤；先回确认（xc_relay 回发件人）再继续]
+  （正文原话）
+  </crosschat-team-message>
+  ```
+
+  信封是通知性渲染，不带授权语义；安全点纪律（撞见即：完成当前原子操作、不开新步骤、回确认）由 crosschat 技能 §6.4 承载。
+- v0.9.1（V090-13 P1 修复，渲染卫生升级）：读面 team 信封**恒由消息元数据重建**——正文内嵌的信封开/闭标签、INTERRUPT 横幅、归因页脚、回信指引行一律剥离后重包（`peerenvelope.stripForgedTeamEnvelopeMarkup`，逐字/定版式匹配）；v0.9.0 及以前的「已渲染原样透传」守卫（`isTeamEnvelopeRendered` 双子串判定）废除——它让纯文本伪造的完整信封原样升级进注入面、与引擎真实渲染不可区分。`interrupt` 属性与横幅只随消息元数据出现，信封内 `from` 恒为真实发送者（`TeamMessage.from`）；伪造标记只活在磁盘真源与 JSON entry / mail scope 原文（真值层不动，谨慎读方可交叉发现）。
 - v0.6 起信封不再携带 hop-chain 属性（forwardOf/hop 溯源链已砍，见 MIGRATION）；渲染卫生（剥离正文内嵌的伪造信封标签）保留。
 - 威胁模型边界：不做对抗级防伪——同机进程可伪造盖章记录/注册表文件，`origin=user` 是体验性归因而非凭据。
 
@@ -180,12 +199,91 @@ duplicateKey = (to 成员键, 任务票文本) ∧ 该派发信封未被读过(r
 
 坏行披露（v0.7.1，故障注-4 修复）：`xc_read({scope:"peer"})` 排空时跳过的队列坏行（不可解析/形状非法）随响应披露 `malformedLines` 计数（摘要行同步提示），与队内 inbox 的 `malformedLines`、held 审阅面的 `corrupted` 三方口径一致；peer 审计落 `peer-queue-malformed`。无坏行时不带该键（响应形状不变）。
 
-## 7. urgent 优先队列（C1）
+## 7. urgent 优先队列与软中断（C1 / v0.9 G-2）
 
 `xc_relay({urgent:true})`：消息在目标一切读取面排所有未读之前（队内邮箱与 peer 队列同一规则），
-并尽力推送一次 wake。`interrupt:true` 请求打断目标当前回合——宿主 wire 无中断原语（E1 实测），
-**平台限制下降级为 urgent + 下一回合必读**，payload 以 `interrupt:{requested:true,result:"deferred-next-turn",reason}` 如实回报。
-离线目标由 wake 回合响应并复述 urgent 标记。
+并尽力推送一次 wake。离线目标由 wake 回合响应并复述 urgent 标记。
+
+**软中断（v0.9 G-2）**：`interrupt:true` 蕴含 urgent（置顶语义不变），并给队内消息写
+`interrupt:true` 元数据落箱——正文保持原话（uservoice 盖章字节匹配不受影响），读取面信封按
+§3 冻结形态渲染 INTERRUPT 横幅。宿主仍无回合中注入原语（E1 平台事实），不做任何 stop→send
+尝试；收方在下一回合 inbox-check 撞见 INTERRUPT 信封后按安全点纪律处理（crosschat 技能
+§6.4：完成当前原子操作、不开新步骤、回确认）。payload interrupt 块键集冻结：
+
+```json
+{"requested":true,"result":"deferred-next-turn","reason":"<E1 固定文案>","envelope":"team-inbox"}
+```
+
+`envelope` 仅在队内轴消息真实落箱（mailbox/wake 路径）时出现；held/duplicate 不带
+（未进可读邮箱 / 重复的是既有消息）。`result` 恒为
+`deferred-next-turn`——如实口径：打断的不是当前回合，是「下一回合必读 + 安全点自检」。
+
+**peer 轴 interrupt 的如实回报（v0.9.2 V090-12 C 域）**：管道 MsgFrame 白名单冻结（v0.9
+不动 wire），peer 收方**看不到任何 INTERRUPT 痕迹**（不渲染信封、不渲染横幅；文件退化件
+仅带 urgent 排序）。payload 必须把这件事说清——peer 路径 interrupt 块键集冻结：
+
+```json
+{"requested":true,"result":"deferred-next-turn","reason":"<E1 固定文案>","envelope":"none","note":"<peer 轴无痕迹说明>"}
+```
+
+**去重键纳入优先级差异（v0.9.2 V090-12 C 域）**：`findDuplicateMail` 命中后，若既有件与
+本次发送的 `urgent`/`interrupt` 标记不同，**不判 duplicate**——同文后发 interrupt 必须真达
+收方（软中断信封不被 dedup 吞掉）、urgent 重发必须插队（否则 urgent 标记丢在旧件上）；
+优先级相同才去重（防误触双发）。实现在 `mcp/tools-relay.ts` 发送路径（不动
+`engine/wake.ts` 的键函数）。
+
+**平台缺口如实声明（G-1）**：回合中注入（注入的指令在当前回合下一个工具调用边界被消费）
+是宿主层能力，插件无原语、v0.9 不做——软中断信封 + 安全点纪律已是插件侧可达上界；建议另走
+平台反馈渠道。
+
+### 7.1 撤回未读消息（v0.9 G-3，仅队内轴）
+
+`xc_relay({to:"<成员名>", withdrawMessageIds:["<messageId>", …]})` 撤回**自己发给该目标且仍未读**
+的消息。语义（整单原子）：
+
+- 可撤判据（判定次序 not_found → foreign → notice → read → discarded → unread）：消息在收方邮箱、
+  `from === 发送者`、**非 withdrawal-notice 帧**、`readAt` 缺省、`discardedAt` 缺省；逐条状态随
+  响应 `items` 披露。
+- **通知帧不可撤（v0.9.2 V090-10 P2 修复）**：`withdrawal-notice` 帧是撤回对账的锚点（收方靠它
+  知道哪些 id 被撤、原消息已不可见），结构性排除在可撤集外——v0.9.0~v0.9.1 通知帧满足全部撤回
+  判据，发送者可链式撤回通知，收方最终只剩内容=上一条通知 id 的孤儿通知、原始被撤 ids 永久不可见，
+  §7.1 对账契约被架空。现在撤通知 → `withdraw_rejected`（items 状态 `notice`），锚点保留。
+- 全部可撤 → 整行删除（`mailbox.deleteMailboxMessages`，坏行/空行逐字节保留，原子提交）+
+  给收方追加一条 `withdrawal-notice` 通知帧（**不带被撤正文**）+ engine 事件 `message-withdrawn`
+  + 尽力唤醒（不带 urgent——撤回本身不是插队请求）。
+- 任一件不可撤 → `withdraw_rejected` 整单拒绝：一个字节不动，`items` 逐条报状态
+  （审计 `message-withdraw-rejected`）。
+- 撤回模式与 `msg`/`urgent`/`interrupt`/`summary`/`sourceTaskId`/`sourceAttemptId` 互斥（冲突
+  参数显式拒绝 `withdraw_exclusive_params`）；`msg` 仅在撤回模式下可省略；peer 轴显式拒收
+  （`withdraw_peer_axis_unsupported`）。
+- 如实边界：撤回不追回「已在途唤醒票据里携带的正文」——wake prompt 由票据原样携带正文，
+  已在途的唤醒回合可能仍展示被撤正文（收方按 withdrawal-notice 对账）。
+- **通知无频控（v0.9.2 V090-14 如实声明，不修行为）**：每次成功撤回各投一条
+  `withdrawal-notice`，通知帧不受入站限速/频控约束——失误或恶意成员可制造通知噪音；
+  但每条通知都必须对应真实撤回的未读件（无消息即无通知），且通知帧自身不可撤（见上），
+  对账锚点不会被噪音消灭。
+
+通知帧、响应与审计的键集冻结（值为占位；契约测试按 `Object.keys` 对拍）：
+
+```json
+{"type":"withdrawal-notice","withdrawnMessageIds":["<messageId>"],"withdrawnCount":1,"ts":0}
+```
+
+```json
+{"withdrawn":["<messageId>"],"withdrawnCount":1,"noticeMessageId":"<messageId>","to":"<成员名>","delivered":"mailbox"}
+```
+
+```json
+{"error":"withdraw_rejected","to":"<成员名>","items":[{"messageId":"<messageId>","status":"unread"}],"message":"<拒绝原因>"}
+```
+
+```json
+{"event":"message-withdrawn","teamId":"default","from":"a","to":"b","messageIds":["<messageId>"],"count":1,"noticeMessageId":"<messageId>"}
+```
+
+`items[].status` 取值域冻结：`unread`（可撤）/ `read`（已读）/ `not_found`（收方邮箱无此 id，
+含已撤）/ `foreign`（不是发送者发的）/ `discarded`（已作废）/ `notice`（withdrawal-notice 帧，
+v0.9.2 起结构性不可撤）。成功响应 `delivered` ∈ `wake|mailbox`（尽力唤醒，同普通消息）。
 
 ## 8. 注入预算公式（防卡死）
 
@@ -250,6 +348,7 @@ total = clamp(16000 × scale, 4000, 64000)，且 total ≥ item  # 批次基准�
 - **改名后 names.json 写新绑定**（v0.7.2 CB-01 修复）：队内花名换绑在 registry 锁内「解绑旧键 + **写新键绑定**（`{sessionId, role, registeredAt}`）」一次完成——v0.7.0~v0.7.1 只解绑旧名、新键从不写入，names.json 对该 sid 零绑定，而 SessionStart 钩子的「已注册花名」判定（`hooks/shared.ts boundNamesForSession`）就读 names.json，于是改名成功的会话下一轮钩子注入误报「尚未注册跨会话花名」（红队 capbug1 实测；功能路由不受影响、无冒名窗口，但观测面自相矛盾）。**冲突保护**：新键已被**别的 sid** 绑定（陈旧死绑定）时不覆盖——那属于接管语义（takeover/claim 路径），改名面不越权改别人的索引行；改名被守卫整体阻止时两键都不动。
 - **同 sid 冲突的文案**（v0.7.1 并发与-1）：`session_id_in_use` 的 payload 增 `sameSessionId`。冲突对象持有**同一个** sessionId（同一会话被两个活进程重复拉起）时文案说清「两个活进程在争一个会话，停掉重复的那个」，不再误述 "another live session … use your own id"（败者用的正是自己的 id）；**异** sid 才是冒用场景，沿用 v0.5.2 起的原文案。
 - 底线三不：不崩（大帧守卫/截断有界 + **畸形帧显式 -32700**，见 §13）、不丢（磁盘真源全文 + 原子写 + .bak 自愈）、不串号（身份锚 = 连接 extra 的 connectionKey，别名路径透传不变）。
+- **审计与日志不是可信凭据（v0.9.2 V090-04 如实声明）**：engine.jsonl / peer.jsonl 是工作区（或插件数据目录）内的明文文件，同机进程可整体重写——威胁模型口径（个人/内部协作、不做对抗级防伪）下，审计用于观测与对账，**不作为可信凭据**；可信锚点是 `xc_report` evidence 的 sha256（工具对文件现算，§4.1）与磁盘真源本身。
 
 ## 11. C6 转办授权与 C7 审批（v0.7）
 
@@ -435,6 +534,129 @@ crosschat 的 MCP server 是宿主外独立 stdio 进程，不持有其他 MCP �
    `offlineThresholdFallback` + WARNING（v0.7.2 C8-B4 修复，不再静默）。
 4. 并发安全：全部裁决在 `withTeamLock` 内；peer 扫描在锁外只读做。
 
+### 12.4 会话活性状态机与清扫联动（G-9/G-5，v0.9.0）
+
+**活性真源**（`core/liveness.ts` 纯函数 + `core/registry.ts` 落盘属主）：`lastSeen` 是
+「上次见过」，不是「正在运转」——会话状态机三态，其中 `dead` 为派生态不落盘。
+
+**双轨分路（v0.9.1 r3 V090-01，V090-GUIDANCE-R3）**——自述与证言分开，豁免只认证言：
+
+| 轨 | 文件 | 写者 | 用途 |
+|---|---|---|---|
+| 自述（display-only） | `registry/sessions/<sid>.json` 的 `liveness`/`livenessTs`/`lastEventTs` | 引擎进程（hooks + 工具心跳）**同刻写**，但可被一次本地文件写伪造 | **仅展示**（三视图成员行）；**不得作豁免输入** |
+| 引擎证言（exemption input） | `registry/witness/<sid>.json`（paths.ts `witnessFile`） | **只有引擎进程**：hooks 回合边界（`session-running`/`session-idle` 同源）+ `withPeerDrain` 包装层的队内工具调用心跳（30s 节流，dispatch/relay/report/claim 等一切被包装工具） | 清扫豁免（`sweepOwnerGuard`）的**唯一**活性输入 |
+
+证言形状 `{sessionId, kind: "running"|"idle"|"heartbeat", ts}`：`running`/`idle` = hook 三态
+迁移（回合起/止），`heartbeat` = 队内工具调用（引擎亲见）。`coerceSessionWitness` 对
+**未来值整条拒绝且容差为 0**（v0.9.1 r4 V090-02：证言是引擎写入时刻的 Date.now()，与判定
+同机同钟、无时钟漂移场景——r3 误继承自述的 5min 容差使伪造 `ts=now+4min` 的 age 为负、
+恒满足 boundMs，单次写的豁免窗被放大到 skew+2×阈值，实测 360s vs 过去值 120s；5min 容差
+只适用于自述记录）。纯函数 `sweepOwnerGuard` 同款防御（`witness.ts > now` 即不豁免，兜内联
+构造路径）。裁决实证的攻击面（case1r3/case7br3）：成员自有 MCP server 全会话常驻
+（15s 端点心跳），使「端点活性证词」（r2 修法）可被攻击者自己的存活 server 满足——故 r3
+把豁免输入收敛为引擎证言：一次外部写伪造自述记录**造不出证言**，双文件伪造（连证言一起写）
+属活跃攻击（超出「一次本地文件写」的确认缺陷类，且留痕可见）。
+
+**迁移事件**（engine.jsonl 新事件族，family=`liveness`；同态刷新不写事件——每个 prompt
+只刷记录不刷日志）。键名刻意用 `prev`/`state`（不用 `from`/`to`——时间线 actor 取值链
+占用这两个键，状态字符串会被误当行为方渲染）：
+
+```json
+{"ts": 0, "event": "session-running", "sessionId": "sess_6c244439", "prev": "idle", "state": "running", "name": "m3"}
+{"ts": 0, "event": "session-idle", "sessionId": "sess_6c244439", "prev": "running", "state": "idle", "name": "m3"}
+```
+
+`prev` ∈ {`"running"`, `"idle"`, `null`}（null = 记录此前无活性字段）；`name` = boundName
+（未注册省略）。时间线（`xc_overview({view:"timeline"})`）归一化 family=`liveness`，摘要 =
+`<event> <name|sessionId>`。
+
+**引擎证言的心跳语义（G-5）**：证言由 registry 触到的各类引擎事件刷新——钩子回合边界
+（SessionStart / UserPromptSubmit 标 running、Stop 标 idle）+ MCP 工具调用
+（`withPeerDrain` 包装层标 heartbeat，30s 节流；dispatch/relay/report/claim 等一切被包装
+的队内工具）。清扫侧口径：属主在 stale 窗口（`XC_STALE_TASK_MINUTES`，与任务 stale 时钟
+同宽）内有过引擎事件 = 心跳代理，不再要求手动 `xc_report` 打卡（GAP t1「活跃等待裁决被
+误扫」的修复）；他人投给属主的消息（to=member 类事件）**不算**属主心跳——防「反复戳死
+会话」把僵尸任务永久挂在清扫域外。自述记录的 `lastEventTs` 与证言同刻写、仅作展示。
+
+**清扫联动**（G-5，复用既有 sweeper，无新闸；`sweepStaleTasksOnce` 无锁预检 + 锁内重算
+双层）：
+
+1. 属主**引擎证言** `running`（回合执行中）且证言年龄 ≤ 2×阈值 → **暂停 stale 倒计时**
+   （本轮跳过；GAP t17 长任务多轮误扫的修复）；
+2. 属主证言年龄 ≤ 阈值（任何引擎事件：工具调用 / 回合边界）→ 心跳代理豁免，不再要求手动
+   `xc_report` 打卡（GAP t1「活跃等待裁决被误扫」的修复）；他人投给属主的消息
+   （to=member 类事件）**不算**属主心跳——防「反复戳死会话」把僵尸任务永久挂在清扫域外；
+3. **无证言 / 证言年龄 > 2×阈值 → 照扫**（V090-GUIDANCE-R3 的有界条款：连续豁免超过
+   2×stale 阈值仍无任何引擎事件则照扫，防「回合起了但永远不结束」的永久滞留）；
+   `dead`（pid-dead 硬证据）立即失效不等衰减——C8 process-dead 快刀 + 转交通知口径不变；
+   真僵尸（idle 且窗口内无事件）照扫（t19 边界与 v0.8 一致）；
+4. `blocked` 不在 `SWEEPABLE` 清扫域的旧口径不变；
+5. 豁免**必须留痕**（v0.9.1 V090-06）：每任务每超阈周期（epoch = floor(超阈时长/阈值)）
+   一行 `task-sweep-deferred`（family=sweep；`{taskId, assignee, reason: "owner-running"|"heartbeat",
+   peerLiveness, witnessAgeMin, staleMinutes, epoch, note}`）——预检全豁免跳过与锁内豁免同刻度
+   去重（进程内台账），时间线/审计从此能回答「这单为什么一直没被扫」，而非逐 60s 节拍刷日志。
+   `witnessAgeMin` = 证言年龄（豁免新鲜度）；`peerLiveness` 仅展示（端点活性非豁免输入）。
+   **豁免可观测（v0.9.1 r4 V090-01 处置，V090-GUIDANCE-R4）**：连续豁免的累计期数进
+   `xc_overview` 任务板——payload 任务行 `sweepExemptPeriods`（N = floor(超阈时长/阈值)，
+   仅被豁免的超阈 SWEEPABLE 任务带）+ `sweepExemptReason`，team 视图文本增
+   `Exempt: <taskId>(<reason>, 豁免 N×阈值)` 行（status 视图行序冻结、观测只在 payload）；
+   成员行 `liveness.witness` = `{kind, ageMin}|null`（与清扫豁免**同一读取路径**的证言
+   快照——「自述 state」与「豁免真实输入」并列，`state=running ∧ witness=null` 即伪造
+   签名）。持续重写证言的活跃攻击是威胁模型边界（README 已知限制 20，v0.6 口径：不做
+   对抗级防伪），可观测性保证 lead 可见异常长豁免。
+6. **offline 通知文案分流**（v0.9.1 r3 V090-02）：转交通知按任务**是否真回池**分流——
+   真回池（revokeAttempt 已重置回 pending）沿用旧文案「open task(s) requeued to the pending
+   pool」；活性豁免滞留（任务仍在属主名下、未回池）如实写「open task(s) still held by
+   "<成员>" under liveness exemption — NOT requeued; cancel via xc_team({action:"cancel"})
+   or reassign via xc_dispatch」——旧文案对豁免任务是谎报（lead 按通知去待领池找不到任务）。
+   帧载荷 `offline.tasks[]` 逐任务带 `requeued` 布尔（机器可读）；混合属主（部分回池部分
+   滞留）写 split 文案并分别计数。
+7. 豁免**不壅蔽 C8**（v0.9.1 r2 V090-05）：豁免只暂停**回池**，不遮蔽离线信号——豁免任务
+   仍逐节拍算 `offlineVerdict`，命中（process-dead / idle-timeout）即照常 `task-offline`
+   审计 + lead 转交通知；通知持久闸 = `task.offlineNoticeAt`（上次通知时刻；`now -
+   offlineNoticeAt ≥ XC_OFFLINE_MINUTES` 才再通知——豁免任务不被清扫、会跨节拍持续命中，
+   无闸则每 60s 刷一次 lead 邮箱）。字段未来值经 `plausibleLivenessTs` 读盘校验（伪造
+   未来值压制通知在读盘即失效）。
+
+**活性字段的信任规则（v0.9.1 r3 V090-01，durable boundary + 引擎证言）**：
+
+- **未来值校验**（自述记录）：产品自写的活性时刻恒为写入时的 `Date.now()`，未来值只可能
+  来自外部伪造/损坏。`coerceSessionRecord`（types.ts，读盘入口）对 `livenessTs`/
+  `lastEventTs` 施加 `plausibleLivenessTs`：有限正数且 ≤ `now + LIVENESS_TS_FUTURE_SKEW_MS`
+  （5min，同机时钟漂移容差），否则**整字段丢弃**（不整文件拒绝）。纯函数同规则防御纵深：
+  未来 `lastEventTs` 不给心跳、观测面不钳 0 展示（`lastEventAgeMin=null`）；
+- **证言未来值整条拒绝**（registry/witness）：`coerceSessionWitness` 对 `ts > now + 5min`
+  或 `kind` 枚举外**整条拒绝**（读回 undefined = 无证言 → 不豁免）——证言是引擎写入时刻，
+  无时钟漂移场景；
+- **自述 vs 证言不一致审计**（r3）：自述记录声称 `running` 而证言不支持（无证言 / 证言止于
+  `idle`）= 伪造签名——清扫面落 `session-record-anomaly`（family=liveness；`{sessionId,
+  member, field, detail}`，进程内按状态根×会话×字段去重一次）。自述 running + heartbeat
+  证言是引擎正常流（工具调用把记录拉回 running），不算异常；
+- **端点活性仅展示（r3）**：`endpointLive`（peer 注册表 live）不再是豁免输入——成员自有
+  MCP server 全会话常驻（15s 端点心跳），端点活性可被攻击者自己的存活 server 满足
+  （裁决 case1r3/case7br3 实证：伪造自述 + 自有活端点 = 永久 owner-running 豁免）。
+  字段保留供 lead 观测「自述 vs 端点」；`pid-dead` 仍是 C8 immediacy 硬开关（在场即豁免
+  失效，不等证言衰减）。持续重写证言的活跃攻击超出「一次本地文件写」的确认缺陷类，
+  同机进程伪造的完整防线仍在威胁模型边界外（§11.5 uservoice 同款口径）。
+
+**观测口径（三视图统一）**：`xc_overview` 的 team / panel / status 三个视图对每个成员暴露
+同形活性视图（单一实现 `memberLivenessView`）：
+`{state: "running"|"idle"|"dead", stateAgeMin: number|null, lastEventAgeMin: number|null,
+endpointLive: boolean}`（`endpointLive` 仅展示：peer 注册表端点活性，非豁免输入——r3 起
+豁免只认引擎证言；`state` 取自述记录，`state=running` 而无对应证言时审计面留痕）。
+- team / panel：payload `members[].liveness`（成员行暴露）+ 顶层 `liveness:{running,idle,dead}`
+  计数 + 文本行 `liveness: running X / idle Y / dead Z`；
+- status：文本行序冻结不加行，活性在 payload 顶层 `liveness:{running,idle,dead,byMember}`
+  （`byMember` = 成员行等价物，值形状与 team/panel 的 `members[].liveness` 完全一致）；
+- **peer 注册记录的删除一律显式**（v0.9.1 r2 V090-02）：`scanPeers` 缺省只读（死记录进
+  `dead` 不删文件），删除仅限显式 `{sweep:true}` 与 claim 路径的定向回收
+  （`reclaimDeadRecordsOfName`），**每一笔实际删除写机器全局清扫日志**
+  `sessions/.sweeps.jsonl`（`{ts, sweptCount, swept:[{pid, sessionId, reason}]}`，
+  core/peerregistry.ts `peerSweepJournalFile`/`appendPeerSweepJournal`——pid-dead 证据被
+  谁/何时/按何死因清除，跨工作区可查；文件名不以数字开头，永不进 `/^\d+\.json$/` 扫描集）。
+  按名寻址（xc_relay）/观测面/花名占用查询全部只读——崩溃残留不再被自家工具顺手抹掉。
+  扫描不可用时降级为记录状态呈现（不猜进程死，观测面永不崩）。
+
 ## 13. MCP stdio 传输层帧级拒收（v0.7.1 边界-5）
 
 协议消息仍走 MCP SDK 的 stdio 传输；产品只在其上覆写**帧边界**行为（`GuardedStdioTransport`），
@@ -525,6 +747,7 @@ capacity: {watermarkPct: 23.5, freeGb: 7.2, level: GREEN}
 | 「待领池」 | `status === "pending"`，按 `sortTasksForBoard`（priority → createdAt）取前 10；依赖列 `-`=无依赖、尾缀 `!`=依赖未终态；池共 M 个时末行记「（待领池共 M 个，列前 10）」 |
 | 「最近 journal」 | 每任务取 `.crosschat/tasks/<taskId>/journal.md` **末 5 个非空行**；最多覆盖 10 个任务（超出记「（另有 N 个任务 journal 未列入）」）；文件缺失记「（无 journal：<path> 不存在）」——**不得静默跳过**；读取失败记「（journal 读取失败：<path>）」不影响其他章 |
 | 「未读摘要」 | `readUnreadMailbox` + `urgentFirst`（C1 读取序）取前 5；每条只记 `[urgent?] <from> | <正文首行截断 80 字符>（<msgId 短 8 位>）`——**只抄索引不搬原文**（与 `ARCHIVE_PREVIEW_MAX_CHARS` 同纪律）；超出记「（另有 N 条未读…）」；读取失败记「（未读读取失败）」并在 payload `warnings[]` 披露 |
+| 「身份」章 sessionId | **全量渲染**（v0.9.2 V090-15：v0.9.1 及以前 `slice(0,8)` 在 `sess_`/`sess_dwf-` 前缀下恒等退化、不同成员的检查点显示同一串，与 team.json / `xc_overview` 成员行的全量口径矛盾）；`lastSeen` 仍是 ISO + 相对分钟；msgId 摘要列仍短 8 位（uuid 前缀不撞、无身份寻址职责） |
 | 「建议下一步」 | 由 `stallSuggestion` + 依赖未满足项 + 单在途任务规则提示 + 容量 RED 建议行拼装；无项时记「（暂无：按 journal 指针继续）」 |
 | 「note」 | 上限 **500 字符**（与 evidence note 的长度钳同口径）；控制字符折空格；缺省「（未提供）」 |
 
@@ -654,12 +877,13 @@ v0.8.0 冻结链缺后三键，dispatch/message/tool-approval/tool-executed 等�
 | `dispatch` | `dispatch`、`dispatch-refused` |
 | `claim` | `claim` |
 | `report` | `report` |
-| `sweep` | `task-swept`、`revoked-stale` |
+| `sweep` | `task-swept`、`revoked-stale`、`task-sweep-deferred`（v0.9.1 活性豁免留痕，§12.4） |
 | `offline` | `task-offline` |
 | `approval` | `tool-approval-request`、`tool-approval`、`tool-expired` |
 | `tool` | `tool-request`、`tool-executed`、`tool-result-rejected` |
 | `lead` | `lead-set`、`lead-transfer`、`lead-release` |
 | `member` | `member-added`、`member-add-started`、`member-add-failed`、`member-stopped`、`member-archive-written`、`member-archive-failed`、`member-provision-timeout`、`member-takeover` |
+| `liveness` | `session-running`、`session-idle`（v0.9.0 G-9，§12.4）、`session-record-anomaly`（v0.9.1 活性字段异常审计） |
 | `other` | 其余全部（含 `status`/`inject-budget`/`inbox-check` 等高频噪声事件） |
 
 `limit` 缺省 20、上限 100；`limit > 100` 钳到 100 并披露 `limitClamped: {requested, applied}`。
@@ -676,6 +900,15 @@ v0.8.0 冻结链缺后三键，dispatch/message/tool-approval/tool-executed 等�
 **尾窗披露**（v0.8.1 C3-B6/M04 修复）：文件确被尾部窗口截断（size > `TAIL_READ_MAX_BYTES`）时，**每一页**都披露
 `tailWindowBytes` + `olderEventsOmitted: true`（v0.8.0 只在「窗口内事件 < limit+offset」的远 offset 末页披露，默认首页看不到）——不假装看全历史。
 文本视图对日志派生字段做控制字符清洗（C0/C1 折空格，v0.8.1 C3-B4）；JSON payload 保持原值（`JSON.stringify` 正常转义）。
+
+**v0.9.0 新事件族冻结（集成道收口，替换并行期占位段）**：组 A（活性与清扫）的会话活性事件族
+`session-running` / `session-idle` → family `liveness`（§12.4 冻结，迁移键 `prev`/`state`）——已并入上方
+family 表与 `TIMELINE_FAMILY_BY_EVENT`（core/timeline.ts）。组 B（配置/唤醒/送达）新增事件
+`config-malformed` / `wake-retry` / `wake-retry-failed`（`wake-skipped` payload 增 `wakeGateSource` /
+`configWarning` 可选键）**不扩 family 表**——与既有 wake 系事件（`wake-child`/`wake-failed`/`wake-skipped`）
+同入 `other` 族，actor 取值序沿用上方 v0.8.1 冻结链不改。组 C 本版自有的
+`message-withdrawn` / `message-withdraw-rejected`（§7.1）同入 `other` 族，不扩 family 表
+（表变更属渲染面；`TIMELINE_FAMILY_BY_EVENT` 之外的事件一律回落 `other`，见 core/timeline.ts `timelineFamilyOf`）。
 
 ### 14.5 紧凑状态视图（status；替代状态栏）
 
@@ -698,3 +931,4 @@ unread: alice=3, bob=0, carol=1
 无检查点记 `(none)`（**不省略**——与 `unread` 行的「对每个成员」平行，谁还没落检查点一眼可见；v0.8.1 C4-F3：v0.8.0 散文写「所有有检查点的成员」而同节示例含 `carol=(none)`，文档自相矛盾，实现与示例口径一致故以散文对齐示例，非改行为）；`unread` = 对每个成员 `readMailbox` + `countUnreadFor`
 （与板面同口径——观测面必须自洽）。
 预算：`receiverInjectBudget` + 固定降级序（`unread` 行 → `checkpoint` 行 → `offline`/`stalled` 明细行 → `capacity` 明细行），每级留名披露 `truncated`。
+v0.9.0（G-9）增量：payload 顶层增 `liveness:{running,idle,dead,byMember}` 块（成员活性，§12.4 口径）——**文本行序冻结不加行**（活性只在 payload；`byMember` 值形状与 team/panel 的 `members[].liveness` 完全一致，三视图同源 `memberLivenessView` 单一实现）。
