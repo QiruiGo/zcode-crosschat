@@ -108,6 +108,16 @@ master 雷达会话（被 cron/wake 反复无头唤醒）4 次用户语音盖章
 
 ---
 
+## 第六批输入（2026-11-19 15:2x 内存红线事故，主控转交+监督源码复核）——G-12 wake 失败静默区
+
+**事故**：15:07–15:25 内存红线（watermark 11–15%）下 5 个 0 字节 wake 日志（spawn --resume 起来即死），BD865 延误 25min、t63 stalled 334min。
+
+**源码定性**：①wake 链路**无容量闸**——`attemptWake` 不读 capacity verdict，RED 只是展示面；不存在"预估过保守误拦"，是真实内存枯竭杀死了子进程。②**0 字节日志在失败侦测域外**：`findWakeFailureEvidence` 只认正向证据（isError:true/success:false/error 字段），设计口径"窗口静默=不表态"；而 spawn 成功即 markDelivered（fire-and-forget）、delivered:wake 不留邮箱副本——死会话永不 pull，消息实质丢失直至人工发现。③red3 公式双重计入（freeBytes 已含在跑回合占用再乘 count×1.5GB）；1.5GB 预估系 E3 期实测，与当前机型不符（当日 headlessTurnMaxRssBytes=280MB，主控实测峰值 ~350MB）。
+
+**修复方案**：a) 侦测补口——wake-child 启动即写 start 头行、退出必写 exit 行；「文件存在但 T 秒仍 0 字节/无头行」=确定性失败 → wake-failed + **重投邮箱** + urgent 通知 lead；b) spawn 前容量闸——watermark<硬底或边际预估>freeBytes 时直接 deliver=mailbox + `wake-deferred{reason:"capacity-red"}` + 冷却重试；预估校准用采样器已有的 headlessTurnMaxRssBytes 滚动观测×2–3x（env 已可调）；c) 死会话直判——zcode-locate 查无目标进程即跳过 wake 直接告警。
+
+---
+
 ## 给升级会话的指引（v0.9.0 输入）
 
 1. **原始数据**：`docs/trial-data/2026-11-18-lims2.0-records.jsonl`（监督快照持续更新，字段说明见 `docs/TRIAL-DATA-2026-11-18-lims2.0.md`）；复现环境为 lims2.0 工作区 `.crosschat/`（生产数据，未随仓库提交）。
