@@ -134,6 +134,8 @@ master 雷达会话（被 cron/wake 反复无头唤醒）4 次用户语音盖章
 
 ---
 
+**G-12 修正 v2（2026-11-19 17:1x）**：0 字节可持续 12min+ 但子进程活着（session-start 跟上）——源码机制：`openSync(logFile,"a")` spawn 时建空文件、stdout/stderr 流式直落，**0 字节=尚未产出输出，与成败无关**。三态模型替代二态：①0→补写=慢启动；②0 持续+session-start=**静默长回合（非失败）**；③有输出后死=wake-failed（侦测有效）。真静默死亡无实例；**真缺口=spawn-ok→delivered=wake 瞬间记录与回合实际开跑之间的长延迟无遥测**（BD865 25min 的机制）。改进 v2：a) wake-child 生命周期写日志（start 头行/exit 尾行）；b) wake-failed→urgent 通知 lead；c) 新增 wake-slow 信号（spawn 后 5min 无 session-start 即告知 lead）；d) 0 字节永远不作失败判据。
+
 ## 第八批输入（2026-11-19 16:3x，主控根因分析四条，监督侧仲裁）
 
 **仲裁1（wake 失败）——方向对，三处修正**：①"wake-failed 零记录"不实——15:39 起已 23 条，逐条关联 nonce→wakeLog 全部有输出（14–251KB），**侦测对"写输出后死"有效**；真正无侦测的"完全静默 spawn"至今未获实证（所有 0 字节样本事后全部补写=慢启动瞬态）。②"引擎自动重试"未见证据——重试波=主控重发消息的新 spawn，本身是内存放大器。③认同告警缺口：wake-failed 只写 engine.jsonl、lead 无通道（BD865 延误根因是"不巡检"非"无记录"）。
