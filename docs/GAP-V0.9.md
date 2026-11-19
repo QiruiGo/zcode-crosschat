@@ -102,6 +102,12 @@
 
 ---
 
+## 第五批输入（2026-11-19 午，监督发现并复现）——G-11 uservoice 盖章与 wake 唤醒回合的归属冲突
+
+master 雷达会话（被 cron/wake 反复无头唤醒）4 次用户语音盖章被拒：`uservoice-stamp-refused, reason=session-id-held-elsewhere`（11:20×2、11:24、13:05）。安全机制按设计工作（防冒充），但 wake-child 回合与桌面原会话的 sessionId 归属二义导致被唤醒回合无法盖章——主控传导用户裁决话术的能力受损（uservoice-hit 此前成功 4 次，被拒时点与 wake 全量生效相关）。改进方向：明确 wake 续跑回合的 uservoice 归属规则（继承原会话 voice 归属，或显式 voice 代理授权）。
+
+---
+
 ## 给升级会话的指引（v0.9.0 输入）
 
 1. **原始数据**：`docs/trial-data/2026-11-18-lims2.0-records.jsonl`（监督快照持续更新，字段说明见 `docs/TRIAL-DATA-2026-11-18-lims2.0.md`）；复现环境为 lims2.0 工作区 `.crosschat/`（生产数据，未随仓库提交）。
