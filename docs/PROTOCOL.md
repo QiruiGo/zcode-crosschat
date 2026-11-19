@@ -28,6 +28,8 @@
 ├── archive/<name>/journal.md            ← 成员留档日志（C4；member-stop archive 时写）
 ├── archive/<name>/meta.json             ← 留档元数据
 ├── capacity/sample.json                 ← 内存采样缓存（惰性采样，无定时器）
+├── capacity/wake-deferred.json          ← v0.9.1 G-12-b 容量闸冷却记录（RED deferral 的 until 窗；转 GREEN 即删）
+├── logs/wake-lifecycle-<to>-<ts>.jsonl  ← v0.9.1 G-12v3 wake-child 生命周期账（start 头行/exit 尾行；spawn 即写头行，0 字节日志不再出现）
 ├── locks/<name>.lock                    ← 跨进程锁（registry → team 固定加锁序）
 └── logs/engine.jsonl | wake-<to>-<ts>.json
 ```
@@ -169,6 +171,7 @@ duplicateKey = (to 成员键, 任务票文本) ∧ 该派发信封未被读过(r
   3. `turn-concurrency`：并发 headless 回合数 × `XC_TURN_ESTIMATE_BYTES`（单回合瞬时占用预估，缺省 1.5GB）> 当前可用内存（建议减少并发回合或让成员休眠）。
   CIM 不可用时降级为只报 os 水位 + `degraded:"cim-unavailable"`，进程类规则（2/3）无数据不评、不虚报。
 - 压缩联动（C9，**建议级非拦截级**）：verdict 标红时 `formatCapacityLines` 追加固定 `compress-advice` 建议行——先按 longtask checklist 落 journal（`.crosschat/tasks/<taskId>/journal.md`）再接受压缩；lead 可 `xc_relay` 要求目标先 `xc_report(status:"in_progress")` 附 journal 路径。平台无宿主压缩钩子接口，插件**不能拦截或触发压缩**，只做「预警 + 建议 + 落盘副本」最小闭环；team/panel 两视图都经 `capacityMount`，改一处两处生效。
+- **spawn 前容量闸（v0.9.1 G-12-b）**：预警不再只停在展示面——`attemptWake` 在 `createWakeNonce` 之前读同一份 verdict（`judgeCapacity` 任一规则命中 ∨ 边际预估 `XC_TURN_ESTIMATE_BYTES` > `freeBytes`），命中即**不 spawn**、`delivered:"mailbox"` + `wake-deferred{reason:"capacity-red"}` + 冷却窗（`XC_MEM_WAKE_COOLDOWN_MS` 缺省 120s；`XC_MEM_WAKE_GATE=off` 关闸），sessionNotFound 自动重试前复检同一道闸。闸只挡唤醒不拦 pull——消息照常落邮箱，收方自己的回合随时可读（§2.5 mailbox 行兜底不变）；判据、冷却记录与冻结键集见 §15.2。
 
 ### 5.1 建员 provisioning 超时（v0.7.1，故障注-1 修复）
 
@@ -324,7 +327,7 @@ total = clamp(16000 × scale, 4000, 64000)，且 total ≥ item  # 批次基准�
 | `XC_INJECT_TOTAL_CHARS` | `inject_total_chars` | 空 | 批次预算覆盖（0/非法=自动） |
 | `XC_USERVOICE_TTL_MS` | `uservoice_ttl_ms` | `600000`（10min） | 盖章链匹配窗口；每条原话 ≤3 次 |
 
-仅代码读取、无用户设置项的演练 env：`XC_STALL_MINUTES`（停滞阈值，缺省 120；小于 `XC_STALE_TASK_MINUTES` 时按 stale 钳制并附 WARNING + payload `stalledThresholdClamped`；v0.8.1 起 0/负数/非数字同样**不静默**——回落内置缺省 120min 并附 WARNING + payload `stalledThresholdFallback:true`，见 §5）、`XC_MEM_WARN_WATERMARK`（缺省 0.15；合法域 (0,1)，v0.8.1 起越界值（0/负数/≥1/非数字）不再静默——回落内置缺省并附 WARNING + capacity payload `memWarnWatermarkFallback:true`，见 §5）、`XC_MEM_SESSION_LIMIT_BYTES`（缺省 800MB）、`XC_TURN_ESTIMATE_BYTES`（并发 headless 回合单回合瞬时占用预估，缺省 1.5GB=1610612736 字节；>0 合法，非法/未设回落缺省——见 §5 预警规则 3）、`XC_MEM_SAMPLE_MIN_MS`（缺省 60000）、`XC_TOOL_REQUEST_TTL_MS`（v0.7 C6 转办请求缺省有效期，缺省 3600000=1h，硬上限 86400000=24h）、`XC_OFFLINE_MINUTES`（v0.7 C8 离线判定空闲阈值，缺省 240min；低于 `XC_STALE_TASK_MINUTES` 时按 stale 钳制并附 WARNING；v0.7.2 起 0/负数/非数字同样**不静默**——回落内置缺省 240min 并附 WARNING + payload `offlineThresholdFallback:true`，见 §12）、`XC_CHECKPOINT_NUDGE`（v0.8 检查点提醒开关；**`0` = 关闭 UserPromptSubmit 的检查点提醒**，其余值/未设 = 默认开启。判据五态与 30min 阈值/节流见 §14.2；阈值本身不做 env 化）。均为高级 env，不进插件设置面。
+仅代码读取、无用户设置项的演练 env：`XC_STALL_MINUTES`（停滞阈值，缺省 120；小于 `XC_STALE_TASK_MINUTES` 时按 stale 钳制并附 WARNING + payload `stalledThresholdClamped`；v0.8.1 起 0/负数/非数字同样**不静默**——回落内置缺省 120min 并附 WARNING + payload `stalledThresholdFallback:true`，见 §5）、`XC_MEM_WARN_WATERMARK`（缺省 0.15；合法域 (0,1)，v0.8.1 起越界值（0/负数/≥1/非数字）不再静默——回落内置缺省并附 WARNING + capacity payload `memWarnWatermarkFallback:true`，见 §5）、`XC_MEM_SESSION_LIMIT_BYTES`（缺省 800MB）、`XC_TURN_ESTIMATE_BYTES`（并发 headless 回合单回合瞬时占用预估，缺省 1.5GB=1610612736 字节；>0 合法，非法/未设回落缺省——见 §5 预警规则 3；v0.9.1 起同时是 spawn 前容量闸的**边际预估**判据，见 §15.2）、`XC_MEM_SAMPLE_MIN_MS`（缺省 60000）、`XC_MEM_WAKE_COOLDOWN_MS`（v0.9.1 G-12-b 容量闸冷却窗，缺省 120000=120s；>=0 合法，0=每次投递都重新判定，非法/未设回落缺省——见 §15.2）、`XC_MEM_WAKE_GATE`（v0.9.1 G-12-b 容量闸开关；`off`=关闸回到「只警不拦」，其余值/未设=开启——见 §15.2）、`XC_LIMBO_TIMEOUT_MS`（v0.9.1 G-12v3 消费确认超时，缺省 600000=10min；盖章后无 `consumedAt` 回写即自动降级回 unread，见 §15.3）、`XC_WAKE_SLOW_MS`（v0.9.1 G-12v3 wake-slow 阈值，缺省 300000=5min；spawn 后无 session-start 即告知 lead，见 §15.3）、`XC_TOOL_REQUEST_TTL_MS`（v0.7 C6 转办请求缺省有效期，缺省 3600000=1h，硬上限 86400000=24h）、`XC_OFFLINE_MINUTES`（v0.7 C8 离线判定空闲阈值，缺省 240min；低于 `XC_STALE_TASK_MINUTES` 时按 stale 钳制并附 WARNING；v0.7.2 起 0/负数/非数字同样**不静默**——回落内置缺省 240min 并附 WARNING + payload `offlineThresholdFallback:true`，见 §12）、`XC_CHECKPOINT_NUDGE`（v0.8 检查点提醒开关；**`0` = 关闭 UserPromptSubmit 的检查点提醒**，其余值/未设 = 默认开启。判据五态与 30min 阈值/节流见 §14.2；阈值本身不做 env 化）。均为高级 env，不进插件设置面。
 
 ## 10. 身份与安全底线（v0.6 口径）
 
@@ -932,3 +935,181 @@ unread: alice=3, bob=0, carol=1
 （与板面同口径——观测面必须自洽）。
 预算：`receiverInjectBudget` + 固定降级序（`unread` 行 → `checkpoint` 行 → `offline`/`stalled` 明细行 → `capacity` 明细行），每级留名披露 `truncated`。
 v0.9.0（G-9）增量：payload 顶层增 `liveness:{running,idle,dead,byMember}` 块（成员活性，§12.4 口径）——**文本行序冻结不加行**（活性只在 payload；`byMember` 值形状与 team/panel 的 `members[].liveness` 完全一致，三视图同源 `memberLivenessView` 单一实现）。
+
+## 15. v0.9.1 增量：文件引用（G-10）/ spawn 前容量闸（G-12-b）/ 消费确认（G-12v3）
+
+> 本节是 v0.9.1 三组修复中【组 C 传输与容量】的协议下沉处（refs + 容量闸 + G-17 结论），
+> 并冻结组 A（消息可靠性）的消费确认契约供跨组对拍。工具面仍**恰 10**、命令 8、
+> **0 新增必填配置**（本节所有旋钮都是可选高级 env，见 §9）。
+
+### 15.1 消息文件引用 `refs`（G-10：跨会话传文件 = 传引用，不传内容）
+
+**缺口事实**（2026-11-19 实测）：消息通道是纯文本 JSON（帧硬闸 1 MiB + 注入预算
+16k 字符），`[img]` 是工单系统语法、crosschat 注入面不渲染——「消息送达但图不可见」。
+合规解法（符合文件真源架构）不是附件区也不是 base64 内联，而是**消息带引用**：
+
+`xc_relay({to, msg, refs:[{path, sha256?, mime?, note?}]})`——队内轴与 peer 轴均可选带。
+
+- **path 必须是工作区内真实普通文件**：复用 `xc_report` evidence 的三道硬闸（同一实现
+  `mcp/tools-relay.ts resolveMessageRefs`，锁外现算——sha256 是慢操作，§2.7-4）：
+  ① 越出工作区 → `evidence_path_outside_workspace`；② 目录/设备文件 → `evidence_not_a_file`；
+  ③ 不存在/不可读 → `evidence_file_missing`。三个错误的 payload 都带 `field:"refs"`
+  （标明触发面，与 evidence 门的键集只差这一个键）。
+- **sha256 缺省由工具现算**（流式，不整文件读进内存）；声明值与现算值不符 →
+  `evidence_checksum_mismatch` 整单拒绝（hex 大小写不敏感、首尾空白忽略）。
+- **整单拒绝语义**：任一条不过 → 一个字节都不落箱（调用方可直接重试，无副作用）。
+  空数组 `[]` 按「未声明」处理（不落空键）。
+- **note** 可选性显式（省略按空串入库；控制字符清洗为空格、长度钳 500 字符，与
+  `sanitizeEvidenceNote` 同口径）；**mime** 仅提示（如 `image/png`），不参与任何判定。
+- **不做的事**（红线）：不内联文件内容、不做 base64、不新增工具、不新增必填配置、
+  不改消息通道的纯文本 JSON 形态。文件真源架构不变——引用指向的文件才是内容真源。
+
+落箱真源：队内轴 `TeamMessage.refs`（`core/types.ts`；`xc_read` 的 JSON entry 经
+`{...m}` 展开原样可见）；peer 轴 `PeerQueueItem.refs`（`core/peermsg.ts`）。
+
+**渲染面**（`core/peerenvelope.ts`，信封内、正文后、闭标签前；提示句逐字节冻结）：
+
+```text
+[文件引用] 以下是发送方已核验的工作区内真实文件（sha256 可复算核对）——用 Read 打开该路径查看，内容不内联本消息：
+- ref: <path> | sha256:<hex> | mime:<类型> | note:<摘要>
+```
+
+真引用块只由消息元数据渲染一次；正文内嵌的伪造引用块（提示句逐字 + `- ref: ` 前缀行）
+一律先剥离再重包（`stripForgedRefsMarkup`，与 INTERRUPT 横幅/回信指引同一「信任工件
+只在引擎渲染面出现一次」纪律，V090-13 同族）。
+
+**payload 回显**（队内轴；键集冻结，值为占位；契约测试按 `Object.keys` 对拍）：
+
+```json
+{"messageId":"<messageId>","delivered":"mailbox","refs":[{"path":"<path>","sha256":"<hex>","note":"<摘要>"}]}
+```
+
+resolved 引用条目的键序冻结为 `path` / `sha256` / `mime`（仅声明时）/ `note`（恒在，
+可空串）；`duplicate` 路径不回显 refs（返回的是既有件，其引用集可能与本次不同——
+不虚报「这条带了新引用」）。
+
+**peer 轴载体边界（如实声明，同 urgent 既有纪律）**：管道 `MsgFrame` 白名单冻结
+（`transport/frames.ts` 封闭字段集，混合版本端点对未知字段整帧拒收），因此 refs 只随
+**文件退化**队列项携带。`via=pipe` 时 payload 带 `refsCarried:false` + 摘要行说明
+（「文件引用只在文件退化路径生效……或改走队内轴」），`via=file` 时 `refsCarried:true`：
+
+```json
+{"msgId":"<msgId>","to":"<peer 名>","receipt":"delivered","via":"file","axis":"peer","refs":[{"path":"<path>","sha256":"<hex>","note":""}],"refsCarried":true}
+```
+
+**去重口径（v0.9.1 V090-12 同族增量）**：`findDuplicateMail` 命中后，若本次显式带了
+refs 而既有件的引用集不同（JSON 逐字节比对），**不判 duplicate**——「同一句正文 + 一张
+新截图」必须真达收方（否则 payload 报着新 refs、收方看到的旧件无引用）。无 refs 的
+普通同文仍按原语义去重。键函数在 `engine/wake.ts`（组 A 文件域），比对在调用侧
+`mcp/tools-relay.ts`（不改键函数）。
+
+### 15.2 spawn 前容量闸与 `wake-deferred`（G-12-b：容量只警不拦 = 死亡螺旋）
+
+**缺口事实**：RED 判定本身正确（仲裁 3：单回合预估与含进程树成本同量级，早先「预估高
+4-5 倍」的批评被推翻），但 `attemptWake` 不读 capacity verdict——内存枯竭期继续 spawn
+无头 `--resume` 子进程 → 更多 OOM（当日 wake-failed 16+、水位 8.9%、并发 13）。
+
+**闸门位置**：`attemptWake` 步骤 3.8，在分层唤醒闸 / 在途 nonce / 成员状态门 /
+spawn 配置闸之后、`createWakeNonce` **之前**——前面的门都不触发时才值得采样
+（采样有 60s 缓存窗，成本 = 一次文件读 + `os.freemem()`）。与组 A 的边界：**容量闸在
+spawn 前，消费确认在 spawn 后**（§15.3），两者互不覆盖。
+
+**判据**（G-12-b 原文「水位<硬底或边际预估>freeBytes」）：
+① `judgeCapacity` 任一规则命中（watermark 硬底 / session-limit / turn-concurrency，
+degraded 样本只评 watermark——不虚报）；
+② **边际预估**：单回合预估 `XC_TURN_ESTIMATE_BYTES` > 当前 `freeBytes`（再起一个无头
+回合也放不下）。
+
+**动作**：不 spawn、不写 nonce、不盖租约（跳过路径不留 15min 在途标记，与成员状态门
+同纪律）→ `delivered:"mailbox"` + payload `wake-deferred` 块 + engine 事件
+`wake-deferred` + 冷却窗。冷却窗内再来的唤醒不重复采样、不 spawn（RED 期的重试风暴
+本身是放大器）；窗到期重新采样，转 GREEN 即删冷却记录、下次唤醒立即通行。
+冷却记录落 `capacity/wake-deferred.json`（`{until, …}`；损坏/过期 → 重新判定，不因
+冷却文件坏掉而永久挡唤醒）。采样意外 → **fail-open** + `wake-capacity-probe-failed`
+事件（不因观测故障永久挡住协作唤醒）。
+
+**`wake-deferred` payload 块**（键集冻结，值为占位；契约测试按 `Object.keys` 对拍）：
+
+```json
+{"reason":"capacity-red","detail":["watermark: 可用内存 8.9% < 预警线 15.0%（XC_MEM_WARN_WATERMARK；可用 2.79GB / 总 31.30GB）"],"watermark":0.089,"freeBytes":2790000000,"cooldownMs":120000,"retryAfterMs":120000,"cooldownActive":false}
+```
+
+**engine 事件 `wake-deferred`**（键集冻结，行级 `ts` 除外）：
+
+```json
+{"event":"wake-deferred","reason":"capacity-red","scene":"message","teamId":"default","to":"b","watermark":0.089,"freeBytes":2790000000,"detail":["<命中规则明细>"],"cooldownMs":120000,"retryAfterMs":120000,"cooldownActive":false,"wakeGateEnabled":true}
+```
+
+**env**（均可选，缺省即工作；`XC_MEM_WAKE_GATE=off` 关闸回到 v0.9.0「只警不拦」行为）：
+`XC_MEM_WAKE_COOLDOWN_MS`（缺省 120000）、`XC_MEM_WAKE_GATE`、判据复用
+`XC_MEM_WARN_WATERMARK` / `XC_TURN_ESTIMATE_BYTES`（§9）。
+
+**如实边界**：① 闸只挡**唤醒**（spawn），不拦 pull——消息照常落邮箱，收方自己的回合
+随时可读；② 派单面的「RED 期排队拒绝」需在派单工具面接线（`mcp/tools-tasks.ts` 属组 B
+文件域），本版只在 wake 层给出 deferral 块 + 冷却窗，派单回执经既有 `note` 字段透出
+原因与 `retryAfterMs` 窗口；③ 容量采样本身是设备级读数（`os.freemem` + CIM 进程树），
+宿主若限制进程枚举则降级为只评 watermark（既有 degraded 口径）。
+
+### 15.3 消费确认 `consumedAt` 与 limbo（G-12v3 机制 B；组 A 域实现，本节冻结契约）
+
+**缺口事实**：`deliveredAt` 在 spawn 成功瞬间盖（fire-and-forget），子进程在成员回合
+**消费内容前**死亡（内存红线 OOM / 宿主重启杀无头子进程）→ 消息已盖投递章、从未被读、
+且因不再是 unread 而永不被未读注入钩子呈现。生产 4 实例经收方行为实测**零动作**。
+
+**契约**（实现 = `core/mailbox.ts` / `engine/wake.ts` / `hooks/*`，组 A 文件域）：
+
+- `TeamMessage.consumedAt`：**消费确认**时刻，与 `deliveredAt`（投递盖章）分离。
+  回写面 = 成员回合真实消费（hook 未读注入 / `xc_read` / `xc_claim` 读件），幂等
+  （已有值不被改写）。
+- **limbo 降级**：`deliveredAt` 已盖而 `consumedAt` 超 `XC_LIMBO_TIMEOUT_MS`（缺省
+  10min）未回写 → 团队锁内打回可重新投递态（清 `deliveredAt`/`deliveryClaimedAt`，
+  `readAt`/`consumedAt` 不动）+ engine 事件 `message-limbo` + urgent 告知 lead。
+  锁内复判「消费先到」则跳过（已被读，不是 limbo）；同一消息只降级一次。
+- **wake-child 生命周期账**（`logs/wake-lifecycle-<to>-<ts>.jsonl`）：spawn 即写
+  `{event:"wake-child-start", nonce, sid, to, scene, teamId, ts}` 头行；观察到子进程
+  消失写 `{event:"wake-child-exit", pid, durationMs, exitCode, evidence?}` 尾行
+  （孤儿化唤醒子退出码不可观测，如实记 `null`）。**0 字节日志永不出现**（至少有头行），
+  且 0 字节依旧**不是**失败判据。
+- **wake-slow**：spawn 后 `XC_WAKE_SLOW_MS`（缺省 5min）内目标 sid 无 session-start
+  投影 → engine 事件 + urgent 告知 lead（「≥5min 且无 session-start」才判慢，慢写瞬态
+  不误判）。
+- 事件族键集冻结（行级 `ts` 除外；契约测试按 `Object.keys` 对拍）：
+
+```json
+{"event":"message-limbo","teamId":"default","to":"b","from":"a","messageId":"<messageId>","nonce":"<nonce>","sid":"<sid>","scene":"message","stampedAt":0,"downgradedAt":0,"waitedMs":600000,"timeoutMs":600000}
+```
+
+```json
+{"event":"wake-slow","scene":"message","teamId":"default","to":"b","nonce":"<nonce>","sid":"<sid>","pid":1234,"waitedMs":300000,"thresholdMs":300000}
+```
+
+`message-limbo` 的 `taskId` 为可选键（消息绑定了任务时才出现）。
+
+### 15.4 G-17 可行性结论：无头回合 MCP 子集加载（宿主层，本版不实现）
+
+**诉求**（GAP 第八批仲裁 3）：主控实测每回合 ≈1GB（主进程 290MB + 7-9 个 plugin host
+×85-100MB）——若只给无头回合挂 crosschat + ticket 两个 MCP server（plugin host 7-9→2），
+每回合可省 ~600MB；RED 期这条与容量闸（§15.2）叠加是内存危机最直接的杠杆。
+
+**结论：插件无法控制宿主为无头回合加载哪些 plugin——属宿主层能力，本版只出结论与
+平台反馈建议，不自造实现。** 依据（均可复现）：
+
+1. crosschat 的 MCP server 是宿主**之外**的独立 stdio 进程（README「转办怎么走」同款
+   事实），看不到宿主为某个会话装配了哪些 MCP server，也没有「配置别的 server 装载集」
+   的接口；
+2. 唤醒路径只持有 `spawnResume`（`engine/resume-cli.ts`：`--resume <sid>` + prompt +
+   `--cwd`），无「会话级 MCP 装配」参数；宿主的 CreateSession/SendToSession 侧才决定
+   plugin host 的装载；
+3. 插件能做的只有「少唤醒」（§15.2 容量闸）与「让回合自己少干活」（成员守则 v2 的
+   不空转轮询），都不是子集加载本身。
+
+**平台反馈建议**（转 zcode 平台侧，不在本插件交付范围）：
+
+1. 无头/`--resume` 回合支持**按会话声明 MCP 子集**（如 `--mcp-subset crosschat,ticket`
+   或会话记录里的 `mcpServers` 覆盖），使无人值守回合不为用不到的 server 起 plugin host；
+2. 或提供「回合结束回收空闲 plugin host」的宿主策略（与诉求同效，插件零参与）；
+3. 宿主暴露**只读**的「本会话已装载 MCP server 清单」，让插件至少能如实诊断
+   「这个会话为什么有 9 个 plugin host」（当前只能靠进程树采样旁证，见 §5）。
+
+同族边界（一并记录，本版不修）：G-15 lead 工具白名单（会拦合法操作，需用户拍板延后）；
+宿主不允许插件否决工具调用 → G-14 上界只能是醒目重复注入，不得声称能拦截首条工具调用。

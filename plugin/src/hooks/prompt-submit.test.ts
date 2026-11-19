@@ -31,6 +31,10 @@ const sharedMocks = vi.hoisted(() => ({
   peerRootFromEnv: vi.fn(() => "/peers"),
   readHookPermissionMode: vi.fn(() => "prompting" as const),
   refreshPeerBaseRecord: vi.fn(async () => {}),
+  // v0.9.1（G-12v3 机制 B）：hook 注入的 consumedAt 回写——真实实现要碰团队锁与邮箱
+  // 盘（本文件的 stateRoot 是占位串），这里 mock 成计数桩；真实写入行为由
+  // engine/wake-v091-limbo.test.ts 的「hook 注入回写 → 不降级」锚点覆盖。
+  markInjectedConsumed: vi.fn(async (): Promise<number> => 0),
 }));
 
 const peerMocks = vi.hoisted(() => ({
@@ -363,5 +367,31 @@ describe("UserPromptSubmit 钩子：零注入块的 stdout 形状（C1-B03）", 
     const parsed = JSON.parse(captured[0]!) as Record<string, unknown>;
     expect(Object.keys(parsed)).toEqual(["additionalContext"]);
     expect(String(parsed["additionalContext"])).toContain("未读协作消息");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.9.1（G-12v3 机制 B）：hook 注入 = 消费确认回写（limbo 降级的放行判据）。
+// 真实写入行为（团队锁 + 邮箱盘）由 engine/wake-v091-limbo.test.ts 锚点 2b 覆盖；
+// 本文件只测钩子侧接线：有未读注入时必须调用 markInjectedConsumed，零注入不调用。
+// ---------------------------------------------------------------------------
+describe("UserPromptSubmit 钩子：未读注入的 consumedAt 回写接线", () => {
+  it("有未读 → 注入前调用 markInjectedConsumed（会话活着≠limbo）", async () => {
+    sharedMocks.markInjectedConsumed.mockClear();
+    sharedMocks.unreadSummary.mockResolvedValue({ count: 1, senders: ["bob"], messages: [] });
+    peerMocks.drainPeerQueue.mockResolvedValue([]);
+    await runHook();
+    expect(sharedMocks.markInjectedConsumed).toHaveBeenCalledTimes(1);
+    expect(sharedMocks.markInjectedConsumed).toHaveBeenCalledWith("<stateRoot>", "alice");
+  });
+
+  it("零未读 → 不回写（无需证明）", async () => {
+    sharedMocks.markInjectedConsumed.mockClear();
+    sharedMocks.unreadSummary.mockResolvedValue({ count: 0, senders: [], messages: [] });
+    peerMocks.drainPeerQueue.mockResolvedValue([]);
+    checkpointMocks.checkpointNudgeState.mockResolvedValue({ openTaskCount: 0, lastCheckpointAt: null, lastNudgeAt: null });
+    checkpointMocks.checkpointNudgeDecision.mockReturnValue({ nudge: false, reason: "no-active-task" });
+    await runHook();
+    expect(sharedMocks.markInjectedConsumed).not.toHaveBeenCalled();
   });
 });

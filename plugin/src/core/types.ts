@@ -320,6 +320,25 @@ export function memberIdentity(member: TeamMember): MemberIdentity {
 }
 
 /**
+ * v0.9.1（G-10）：消息文件引用（跨会话/队内传图与二进制的合规解法）。
+ *
+ * 字段形状与 `xc_report` 的 evidence 条目对齐（path+sha256+mime+note）——「传引用
+ * 不传内容」是文件真源架构的延伸：消息通道是纯文本 JSON（帧闸 1 MiB + 注入预算
+ * 16k 字符），内联 base64 会同时违反「正文即状态」与预算纪律，因此附件一律以
+ * 工作区内真实文件的引用形态随消息传递，接收面提示用 Read 打开该路径。
+ */
+export interface MessageRef {
+  /** 工作区内相对或绝对路径（发送侧已过三道硬闸：越界/非文件/缺失拒绝）。 */
+  path: string;
+  /** 文件 sha256（hex；发送侧缺省现算——接收方可复算核对）。 */
+  sha256?: string;
+  /** MIME 提示（可选，如 image/png）；仅提示，不参与任何判定。 */
+  mime?: string;
+  /** 一句话说明（可选；控制字符清洗 + 长度钳制，同 evidence note 口径）。 */
+  note?: string;
+}
+
+/**
  * One mailbox message (one JSONL line in `inbox/<agentKey>.jsonl`,
  * DESIGN.md §2.4). Fields that dsh leaves absent are absent here too; the
  * read-side validator additionally tolerates `null` (the DESIGN example shows
@@ -340,6 +359,13 @@ export interface TeamMessage {
   sourceTaskStatus?: TaskStatus;
   deliveryClaimedAt?: number;
   deliveredAt?: number;
+  /**
+   * v0.9.1（G-12v3 机制 B）：**消费确认**回写时刻——与 deliveredAt（投递盖章）分离。
+   * 写入点：成员回合实际消费（hook 未读注入 / xc_read inbox / xc_claim 读件）。
+   * 用途：deliveredAt 已盖而 consumedAt 久未回写 = limbo（唤醒子进程在消费前死亡），
+   * 引擎按 XC_LIMBO_TIMEOUT_MS（默认 10min）降级回 unread 并 urgent 告知 lead。
+   */
+  consumedAt?: number;
   readAt?: number;
   discardedAt?: number;
   /** v0.5（R-11）：作者身份标记；absent = agent（旧记录缺省）。权威不随消息转移（无 authority 字段）。 */
@@ -353,6 +379,9 @@ export interface TeamMessage {
   /** v0.9（G-2）：软中断信封标记——xc_relay interrupt:true 写入，读取面据此渲染
    *  INTERRUPT 横幅（安全点纪律见 crosschat 技能 §6）。absent=false；内容永不授权。 */
   interrupt?: boolean;
+  /** v0.9.1（G-10）：随消息传递的文件引用（可选）——只传路径与 sha256，不内联内容；
+   *  读取面渲染「用 Read 打开该路径」提示（PROTOCOL §15.1）。absent=无引用。 */
+  refs?: MessageRef[];
 }
 
 /** One session record in `registry/sessions/<sessionId>.json` (DESIGN.md §2.2). */
@@ -414,6 +443,17 @@ export interface WakeNonce {
   sid: string;
   ts: number;
   used?: boolean;
+  /**
+   * v0.9.1（G-11）：**用户语音归属**——本次唤醒续跑的原会话（= sid）。
+   * 无头 --resume 回合与桌面原会话共享 sid，uservoice 盖章若按「sid 被别的活进程
+   * 持有」一票否决，被唤醒回合永远无法转达用户原话（生产 4 次 session-id-held-
+   * elsewhere 拒绝）。本字段由 attemptWake 随 nonce 落盘、xc_identify 消费 nonce
+   * 时转记到连接身份（mcp/identity.ts BoundIdentity.voiceOwner），盖章面据此承认
+   * 「本连接是该 sid 的唤醒续跑」而不再因 elsewhere 持有拒章。**不构成凭据**：
+   * nonce 本身是一次性能力令牌（只有唤醒 prompt 的接收方看得到），且放宽仅对
+   * voiceOwner === 本 sid 生效，对外部会话的拒绝线不放松。
+   */
+  voiceOwner?: string;
 }
 
 /**
@@ -492,6 +532,9 @@ export function isTeamMessage(value: unknown): value is TeamMessage {
   const urgent = absent(value['urgent']);
   // v0.9（G-2）：interrupt 宽容增量——旧记录缺省照读；在场时必须布尔（urgent 同款纪律）。
   const interrupt = absent(value['interrupt']);
+  // v0.9.1（G-10）：refs 宽容增量——旧记录缺省照读；在场时必须是数组且每条含非空
+  // path（interrupt 同款纪律：取值非法整行拒绝，不做静默裁剪）。
+  const refs = absent(value['refs']);
   return (
     isNonBlankString(value['id'])
     && isNonBlankString(value['from'])
@@ -500,6 +543,9 @@ export function isTeamMessage(value: unknown): value is TeamMessage {
     && isFiniteNumber(value['ts'])
     && absentOrFinite(value['deliveryClaimedAt'])
     && absentOrFinite(value['deliveredAt'])
+    // v0.9.1（G-12v3 机制 B）：consumedAt 宽容增量——旧记录缺省照读；在场时必须
+    // 有限数（deliveredAt/readAt 同款纪律）。
+    && absentOrFinite(value['consumedAt'])
     && absentOrFinite(value['readAt'])
     && absentOrFinite(value['discardedAt'])
     && absentOrString(value['taskId'])
@@ -513,7 +559,26 @@ export function isTeamMessage(value: unknown): value is TeamMessage {
     && (forged === undefined || typeof forged === 'boolean')
     && (urgent === undefined || typeof urgent === 'boolean')
     && (interrupt === undefined || typeof interrupt === 'boolean')
+    && (refs === undefined || isMessageRefList(refs))
   );
+}
+
+/**
+ * v0.9.1（G-10）：refs 形状判定（宽容增量——缺省照读；在场时必须是数组且每条含
+ * 非空 `path`，可选 sha256/mime/note 必须为字符串）。写侧面（resolveMessageRefs）
+ * 已过三道硬闸，这里只做读取侧的形状卫生：非法 refs 整行拒绝（不进渲染面）。
+ */
+export function isMessageRefList(value: unknown): value is MessageRef[] {
+  if (!Array.isArray(value)) return false;
+  return value.every((entry) => {
+    if (!isRecord(entry)) return false;
+    if (!isNonBlankString(entry['path'])) return false;
+    for (const key of ['sha256', 'mime', 'note'] as const) {
+      const v = entry[key];
+      if (v !== undefined && typeof v !== 'string') return false;
+    }
+    return true;
+  });
 }
 
 /**
@@ -539,6 +604,8 @@ export function normalizeMessage(value: TeamMessage): TeamMessage {
   assign('sourceTaskStatus', absent(value.sourceTaskStatus));
   assign('deliveryClaimedAt', absent(value.deliveryClaimedAt));
   assign('deliveredAt', absent(value.deliveredAt));
+  // v0.9.1（G-12v3 机制 B）：consumedAt 宽容拷贝（deliveredAt 同款纪律）。
+  assign('consumedAt', absent(value.consumedAt));
   assign('readAt', absent(value.readAt));
   assign('discardedAt', absent(value.discardedAt));
   // v0.5（R-11）origin 三字段宽容拷贝：非法值归 absent（normalize 后的记录字段
@@ -550,6 +617,16 @@ export function normalizeMessage(value: TeamMessage): TeamMessage {
   if (typeof value.urgent === 'boolean') out.urgent = value.urgent;
   // v0.9（G-2）：interrupt 宽容拷贝（urgent 同款纪律）。
   if (typeof value.interrupt === 'boolean') out.interrupt = value.interrupt;
+  // v0.9.1（G-10）：refs 宽容拷贝（数组原样保留——形状已由 isTeamMessage 把关；
+  // 条目内的可选串缺省归 absent，与 originSessionId 同口径）。
+  if (Array.isArray(value.refs)) {
+    out.refs = value.refs.map((ref) => ({
+      path: ref.path,
+      ...(typeof ref.sha256 === 'string' ? { sha256: ref.sha256 } : {}),
+      ...(typeof ref.mime === 'string' ? { mime: ref.mime } : {}),
+      ...(typeof ref.note === 'string' ? { note: ref.note } : {}),
+    }));
+  }
   return out;
 }
 
@@ -964,7 +1041,19 @@ export function coerceWakeNonce(value: unknown): ParsedNonce | RejectedNonce {
   if (used !== undefined && typeof used !== 'boolean') {
     return { ok: false, defect: 'field "used" is not a boolean' };
   }
-  return { ok: true, nonce: { teamId, agentKey, sid, ts, ...(used === undefined ? {} : { used }) } };
+  // v0.9.1（G-11）：voiceOwner 宽容增量——旧 nonce 缺省照读；在场时必须非空串。
+  const voiceOwnerRaw = absent(value['voiceOwner']);
+  if (voiceOwnerRaw !== undefined && (typeof voiceOwnerRaw !== 'string' || voiceOwnerRaw.trim() === '')) {
+    return { ok: false, defect: 'field "voiceOwner" is not a non-blank string' };
+  }
+  return {
+    ok: true,
+    nonce: {
+      teamId, agentKey, sid, ts,
+      ...(used === undefined ? {} : { used }),
+      ...(voiceOwnerRaw === undefined ? {} : { voiceOwner: voiceOwnerRaw }),
+    },
+  };
 }
 
 /**

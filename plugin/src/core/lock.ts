@@ -26,9 +26,9 @@
  *
  * @module core/lock
  */
+import { createHash, randomUUID } from 'node:crypto';
 import { closeSync, openSync, unlinkSync, writeSync } from 'node:fs';
 import { mkdir, readFile, rmdir, rm, stat, unlink } from 'node:fs/promises';
-import { randomUUID } from 'node:crypto';
 import { lockFile, locksDir, registryLockNames, teamLockNames } from './paths.js';
 import { logEngineEvent } from './log.js';
 
@@ -416,6 +416,105 @@ export async function withFileLock<T>(
     return await fn();
   } finally {
     await lock.release();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 2b. v0.9.1（G-16）：同 sessionId 双回合并发互斥（turn 锁）
+//
+// 背景（G-16，与 G-11 同根）：wake-resume 无头回合与桌面交互回合共享
+// 同一 sessionId——两个 MCP server 进程（一个桌面交互、一个 cron/wake spawn 的
+// --resume）可能同时对这**一个 sid** 发起变更类写操作。生产形态：15:40:46 /
+// 15:41:43 / 15:41:44 三连重复派单（G-13 管「同票活任务」查重，本锁管「同一身份
+// 的同时写」——两道闸不同层）。
+//
+// 实现纪律：**复用本模块既有锁原语**（acquireFileLock/withFileLock：同一 O_EXCL
+// 创建语义、同一 pidAlive 死判与陈旧接管、同一 token 释放保护），不引第三方锁。
+// 锁粒度 = sessionId（不是 team/registry）：团队锁保护「同一份 team.json 的
+// 读改写」，turn 锁保护「同一身份不要同时写」——两者正交，故锁序固定
+// **turn(sid) → team**（既有 team 路径从不持 turn，无环可生）。
+//
+// 让位而非排队：非阻塞夺取（waitMs=0），拿不到即交回 busy_interactive_turn 回执
+// （调用方建议稍后/改道，不自动重试）——「排队等 15s」对 cron 回合是把一次冲突
+// 放大成一次超时，对交互回合是把用户卡住。同进程的并行工具调用（一条助手消息
+// 里多个 tool_use，MCP 协议允许并发）**不属**双回合并发：按 pid 判同进程后退
+// 回普通等待，避免把合法并行请求误判成冲突。
+// ---------------------------------------------------------------------------
+
+/**
+ * turn 锁的夺取窗口（ms）。**恰 0**：让位是即时判定，不等持锁方干完——
+ * 等下去就把「让位」变成了「阻塞」，与 G-16「不阻塞不重试」的要求相反。
+ */
+export const SESSION_TURN_LOCK_TRY_MS = 0;
+
+/** turn 锁名：`turn-<sha256(sid) 前 16 hex>`。sid 是任意串（含路径符也可能），
+ *  哈希后才是安全文件名；同 sid 恒同锁（跨进程互斥的锚）。 */
+export function sessionTurnLockName(sessionId: string): string {
+  return `turn-${createHash('sha256').update(sessionId).digest('hex').slice(0, 16)}`;
+}
+
+/** 读一个锁文件的当前持有者（文件不存在/内容不可解析 → undefined）。 */
+export async function readLockHolder(stateRoot: string, name: string): Promise<LockContent | undefined> {
+  try {
+    return parseLockContent(await readFile(lockFile(stateRoot, name), 'utf8'));
+  } catch {
+    return undefined;
+  }
+}
+
+/** turn 锁被另一个活进程持有：让位（结构化事实供工具层出回执）。 */
+export class SessionTurnBusyError extends Error {
+  readonly sessionId: string;
+  readonly lock: string;
+  /** 持锁进程 pid；读回时已松手则为 null（毫秒级竞态，如实披露）。 */
+  readonly holderPid: number | null;
+  /** 持锁时长（ms；不可知时为 null）。 */
+  readonly holderAgeMs: number | null;
+
+  constructor(input: { sessionId: string; lock: string; holder?: LockContent; now?: number }) {
+    const now = input.now ?? Date.now();
+    super(
+      `another live process is already writing session "${input.sessionId}" ` +
+        `(lock ${input.lock}${input.holder !== undefined ? `, holder pid ${input.holder.pid}` : ''})`,
+    );
+    this.name = 'SessionTurnBusyError';
+    this.sessionId = input.sessionId;
+    this.lock = input.lock;
+    this.holderPid = input.holder?.pid ?? null;
+    this.holderAgeMs = input.holder !== undefined ? Math.max(0, now - input.holder.ts) : null;
+  }
+}
+
+/**
+ * v0.9.1（G-16）：在同一 sessionId 的 turn 锁内执行一次变更类写操作。
+ *
+ * 三条出路：
+ * 1. 非阻塞夺得锁 → 正常执行（finally 释放；释放仍走 token 匹配，不误删别人的锁）；
+ * 2. 锁被**本进程**持有 → 同回合并行工具调用，退回普通等待（持锁方只做毫秒级
+ *    读改写），不让位；
+ * 3. 锁被**另一个活进程**持有 → 抛 {@link SessionTurnBusyError}（调用方转
+ *    busy_interactive_turn 回执）。持锁方在读回执前松手（毫秒级竞态）→ 锁空着，
+ *    再取一次即执行，不误让位。
+ */
+export async function withSessionTurnLock<T>(
+  stateRoot: string,
+  sessionId: string,
+  fn: () => Promise<T> | T,
+): Promise<T> {
+  const name = sessionTurnLockName(sessionId);
+  try {
+    return await withFileLock(stateRoot, name, fn, { waitMs: SESSION_TURN_LOCK_TRY_MS });
+  } catch (error) {
+    if (!(error instanceof LockBusyError)) throw error;
+    const holder = await readLockHolder(stateRoot, name);
+    if (holder !== undefined && holder.pid === process.pid) {
+      return withFileLock(stateRoot, name, fn);
+    }
+    if (holder === undefined) {
+      // 持锁方已松手：锁空着，直接再取（不是操作重试——业务函数一次都没跑过）。
+      return withFileLock(stateRoot, name, fn, { waitMs: SESSION_TURN_LOCK_TRY_MS });
+    }
+    throw new SessionTurnBusyError({ sessionId, lock: name, holder });
   }
 }
 

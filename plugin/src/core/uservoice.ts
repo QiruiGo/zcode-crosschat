@@ -139,6 +139,26 @@ export type StampAuthorityVerdict =
   | { ok: false; reason: 'unanchored' | 'session-id-held-elsewhere' };
 
 /**
+ * 盖章权验证选项。
+ * v0.9.1（G-11）：`voiceOwner` = 调用方连接经**唤醒 nonce 证明**继承到的原会话
+ * （xc_identify 的 wakeToken 路径从 nonce.voiceOwner 转记，见 mcp/identity.ts）。
+ * 与 `sessionId` 相等时，第 1 条拒绝线（sid 被别的活进程持有）对**本 sid** 放宽——
+ * 无头 --resume 回合与桌面原会话共享 sid，按 sid 独占一票否决会让被唤醒回合永远
+ * 无法转达用户原话（生产 4 次 session-id-held-elsewhere 拒绝）。放宽仅对
+ * voiceOwner === 本 sid 生效——外部会话/peer 冒充（无 nonce）的拒绝线不放松。
+ *
+ * v0.9.1 打回第 1 轮（V091-01/V091-02）口径校正：原注释声称 nonce「只随唤醒
+ * prompt 到无头进程」——adv-1 实测该保密性前提不成立（nonce 曾明文落共享日志）。
+ * 现行信任基础 = mcp/identity.ts 三层收窄（nonce 真值不落共享日志只留摘要；
+ * wakeToken 路径拒「别的 sid 的活注册会话」消费令牌；放宽仅限本 sid），残余边界
+ * （无 peer 活记录的脚本形态 + 同状态根可读真源）与 README 已知限制 12 同族，
+ * 在此如实声明，不假装成密码学防御。
+ */
+export interface StampAuthorityOptions {
+  voiceOwner?: string;
+}
+
+/**
  * origin=user 盖章前的会话归属核验（工具层在 {@link uservoiceMatchAndConsume}
  * 之前调用；peer 轴与队内轴共用）。
  *
@@ -149,13 +169,16 @@ export type StampAuthorityVerdict =
  * 拒绝线（任一命中即拒绝）：
  *
  * 1. `session-id-held-elsewhere`：机器全局注册表里该 sid 被一个**别的活进程**持有
- *    ——真实归属者正在活动，本进程不可能是它（覆盖旧版本遗留/直写注册表的冒充态）；
+ *    ——真实归属者正在活动，本进程不可能是它（覆盖旧版本遗留/直写注册表的冒充态）。
+ *    v0.9.1（G-11）例外：`options.voiceOwner === sessionId`（唤醒续跑证明）时本线
+ *    对本 sid 放宽——共享 sid 的无头回合是原会话的合法续跑，不是冒充；
  * 2. `unanchored`：本会话的工作区没有钩子锚定的会话记录
  *    （`.crosschat/registry/sessions/<sid>.json`——SessionStart/refreshSessionLastSeen
  *    对每个真会话都写）。跨工作区偷 sid 时，受害者的锚定记录在**受害者**的工作区，
  *    攻击者工作区没有 → 拒绝。注意不能把「peers/base/<sid>.json 存在」当作锚：
  *    该文件机器全局，偷来的 sid 同样查得到（非判别信号）；也不能把「本进程注册过
- *    该 sid」当作锚——那正是冒充者自己造的状态。
+ *    该 sid」当作锚——那正是冒充者自己造的状态。**本线不因 voiceOwner 放宽**：
+ *    唤醒路径的 xc_identify 会服务端代写锚定记录，合法续跑本就满足。
  *
  * 残余边界（如实声明）：受害者已死亡且与攻击者同工作区时，锚定记录仍在、注册表
  * 记录已被清扫 → 无法区分「复活的本人」与「小偷」——与 README 已知限制 12 的
@@ -165,11 +188,16 @@ export async function verifyUservoiceStampAuthority(
   root: string,
   stateRoot: string,
   sessionId: string,
+  options: StampAuthorityOptions = {},
 ): Promise<StampAuthorityVerdict> {
-  const scanned = await scanPeers(root);
-  const holder = scanned.active.find((record) => record.sessionId === sessionId);
-  if (holder !== undefined && holder.pid !== process.pid) {
-    return { ok: false, reason: 'session-id-held-elsewhere' };
+  // v0.9.1（G-11）：唤醒续跑证明在场时，第 1 条线对本 sid 免检（第 2 条锚定线照旧）。
+  const wakeContinuation = options.voiceOwner !== undefined && options.voiceOwner === sessionId;
+  if (!wakeContinuation) {
+    const scanned = await scanPeers(root);
+    const holder = scanned.active.find((record) => record.sessionId === sessionId);
+    if (holder !== undefined && holder.pid !== process.pid) {
+      return { ok: false, reason: 'session-id-held-elsewhere' };
+    }
   }
   const anchored = await readSession(stateRoot, sessionId).catch(() => undefined);
   if (anchored !== undefined) return { ok: true };

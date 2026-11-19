@@ -49,7 +49,7 @@ import { newTeamState, noteTeamReset, readTeam, writeTeam } from "../core/teamst
 import { logEngineEvent } from "../core/log.js";
 import { DEFAULT_TEAM_ID, memberState } from "../core/types.js";
 import type { MemberRole, SessionRecord, TeamMember, TeamState } from "../core/types.js";
-import { describeSessionIdConflict, findLiveSessionIdHolder } from "../core/peerregistry.js";
+import { describeSessionIdConflict, findLiveSessionIdHolder, scanPeers } from "../core/peerregistry.js";
 import type { PeerRecord } from "../core/peerregistry.js";
 
 export { DEFAULT_TEAM_ID };
@@ -80,6 +80,23 @@ export interface BoundIdentity {
   sessionId: string;
   role: MemberRole;
   boundAt: number;
+  /**
+   * v0.9.1（G-11）：**用户语音归属**——本连接经唤醒 nonce 证明继承的原会话
+   * （= sessionId；来自 WakeNonce.voiceOwner，attemptWake 盖章）。仅 wakeToken
+   * 路径会设置；uservoice 盖章面据此承认「本连接是该 sid 的唤醒续跑」而不再因
+   * sid 被桌面原会话（elsewhere 活进程）持有而拒章。peer/交互路径恒缺失
+   * （对外部会话的拒绝线不放松）。
+   *
+   * v0.9.1 打回第 1 轮（V091-01/V091-02）口径校正：放宽的信任基础**不是**
+   * 「nonce 只随唤醒 prompt 到达」的保密性——adv-1 实测该前提不成立（nonce 曾
+   * 明文落共享日志；状态真源在同状态根本来就可读，属 README 已知限制 12 同族
+   * 边界）。现行论证 = 三层收窄：① nonce 真值不落任何共享日志（engine/wake.ts
+   * wakeNonceDigest，只留不可反查摘要）；② wakeToken 路径拒「已是别的 sid 的
+   * 活注册会话」消费令牌（本文件 wake_token_session_mismatch 闸，且拒时不消费
+   * nonce——合法无头回合不受影响）；③ 放宽仅对 voiceOwner === 本 sid 生效。
+   * 残余边界如实见该闸注释（无 peer 活记录的脚本形态）。
+   */
+  voiceOwner?: string;
 }
 
 /**
@@ -109,6 +126,19 @@ export class IdentityStore {
    */
   unbind(connectionKey: string): void {
     this.#byConnection.delete(connectionKey);
+  }
+  /**
+   * v0.9.1（G-11）：本进程内持有该 sid 的连接所继承的 voiceOwner（唤醒续跑证明）。
+   * 供 peer 轴盖章核验使用（peer-services 的 self 没有队内身份对象）；无匹配/
+   * 未走 wakeToken 路径 → undefined（调用方按「无证明」走完整拒绝线）。
+   */
+  voiceOwnerForSession(sessionId: string): string | undefined {
+    for (const identity of this.#byConnection.values()) {
+      if (identity.sessionId === sessionId && identity.voiceOwner !== undefined) {
+        return identity.voiceOwner;
+      }
+    }
+    return undefined;
   }
 }
 
@@ -208,6 +238,9 @@ export async function xcRegister(
     // 在名字/sid 交叉校验之后才抛（见下方 `sidHolder` 处），以保住 v0.6.0 起文档化的
     // `name_taken` / `session_already_bound` 错误码契约（历史回归断言按旧码判）。
     let sidHolder: PeerRecord | undefined;
+    // v0.9.1（G-11）：wakeToken 路径从消费掉的 nonce 取到的 voiceOwner（唤醒续跑
+    // 证明；hook 路径恒 undefined）。绑定身份时转记到连接上。
+    let consumedVoiceOwner: string | undefined;
 
     // ---- v0.2（DESIGN-V0.2 §7.4-I5/§7.3.3）：removed 成员的注册一律拒绝 ----
     // xc_team member-stop 后花名不释放（roster 记录保留）；重新启用必须由 lead 走
@@ -243,8 +276,50 @@ export async function xcRegister(
       if (stored.agentKey !== agentKey || stored.sid !== sessionId) {
         throw invalidParamsError("wakeToken does not match this name/sessionId");
       }
+      // ---- v0.9.1 打回第 1 轮（V091-01/V091-02）：活会话跨 sid 冒名闸 ----
+      // 背景（adv-1 裁决实测）：wake 路径明示不设 sid 活性闸（本分支下方注释），
+      // 于是一次性唤醒 nonce 可被同工作区的**另一个已注册活会话**收割/抢先消费：
+      // rogue 以受害者 (name, sid) 绑定成功并继承 voiceOwner（TC-2 端到端越权盖章），
+      // 合法无头回合反被 "already used" 踢掉（TC-1 第 4 步，消息 10min 后误判 limbo）。
+      // 修法（软校验，落在 consumeWakeNonce **之前**——拒掉时不消耗令牌，合法回合照常可用）：
+      // 本进程若已是**另一个 sid** 的 peer 活注册会话（interactive/bg 心跳保鲜中），
+      // 就没有合法理由消费别人的一次性唤醒令牌——那是给该 sid 新起的无头回合的。
+      // 不误伤合法形态：
+      // - 合法无头回合：--resume 每次都是新 MCP server 进程/新连接，注册时无任何
+      //   peer 活记录（队内轴先于 peer 轴执行，tools-identify.ts 常规注册顺序）；
+      //   即便某形态下 peer 轴先注册，其 sid 也是同一个（共享 sid）→ 相等 → 放行；
+      // - 桌面/交互会话自己重连：走 hook 路径（有锚定记录），不消费 wakeToken。
+      // 残余边界（如实声明）：无 peer 活记录的进程（如一次性脚本直连 MCP）仍可通过本闸
+      // —— 但 nonce 真值已不在共享日志（V091-01：engine.jsonl/lifecycle 只落摘要），
+      // 该形态必须去读 registry/wake/ 状态真源，与 README 已知限制 12（同机可读状态
+      // 文件、不做密码学防御）同族；本闸挡的是「另一个真实成员会话」这一主攻击形态。
+      if (options.peerRoot !== undefined) {
+        const selfActive = (await scanPeers(options.peerRoot)).active.find((r) => r.pid === process.pid);
+        if (selfActive !== undefined && selfActive.sessionId !== sessionId) {
+          await logEngineEvent(stateRoot, {
+            event: "wake-token-session-mismatch",
+            teamId,
+            agentKey,
+            sessionId,
+            heldBySessionId: selfActive.sessionId,
+          });
+          throw new ToolError({
+            error: "wake_token_session_mismatch",
+            name: agentKey,
+            sessionId,
+            message:
+              `this connection is a live registered session of "${selfActive.sessionId}" and cannot consume a one-shot wake token for "${sessionId}": `
+              + "wake tokens belong to the headless round newly spawned for the target sid. "
+              + "Register with your own sessionId (hook path), or let the target session's own headless round register.",
+          });
+        }
+      }
       const consumed = await consumeWakeNonce(stateRoot, nonce, { teamId, agentKey, sid: sessionId }, now);
       if (consumed === undefined) throw invalidParamsError(`wakeToken "${nonce}" is no longer usable`);
+      // v0.9.1（G-11）：从消费掉的 nonce 取 voiceOwner（attemptWake 盖章的「本次唤醒
+      // 续跑的原会话」）——下方绑定身份时转记到连接上，uservoice 盖章面据此承认
+      // 共享 sid 的无头续跑（core/uservoice.ts 的放宽只认这一个来源）。
+      consumedVoiceOwner = consumed.voiceOwner;
       // 服务端代写 sessions/<sid>.json：wakeToken 路径不依赖钩子落盘（§2.3-4 ②）。
       // v0.5.3（a6）：代写不得抹掉钩子已写的锚定令牌（保留既有 regToken；缺失则
       // 补铸一枚，令牌与后续 SessionStart 的延续逻辑同源）。
@@ -429,6 +504,12 @@ export async function xcRegister(
       sessionId,
       role,
       boundAt: now,
+      // v0.9.1（G-11）：wakeToken 路径把 nonce 的 voiceOwner 转记到连接身份——
+      // 本连接=该 sid 的唤醒续跑，uservoice 盖章据此承认（共享 sid 不再被
+      // session-id-held-elsewhere 一票否决）。hook 路径恒缺失（无 nonce 证明），
+      // 外部会话/peer 冒充的拒绝线不放松。旧 nonce（无 voiceOwner 字段）→ 缺失，
+      // 行为与 v0.9.0 一致（fail-closed 方向）。
+      ...(via === "wake" && consumedVoiceOwner !== undefined ? { voiceOwner: consumedVoiceOwner } : {}),
     });
 
     await logEngineEvent(stateRoot, {

@@ -352,10 +352,23 @@ export async function unbindName(stateRoot: string, name: string, sessionId: str
  * Generate a wake token and its nonce record. The token doubles as the file
  * name (`wake/<token>.json`), so a prompt-carried wakeToken alone is enough
  * for xc_register to look the nonce up (DESIGN.md §2.3-4).
+ *
+ * v0.9.1（G-11）：`voiceOwner`（可选）——本次唤醒续跑的原会话（= sid）。attemptWake
+ * 恒填；xc_identify 消费 nonce 时转记到连接身份，uservoice 盖章面据此放宽「sid 被
+ * elsewhere 活进程持有」的拒章（共享 sid 的无头回合要能转达用户原话）。
  */
-export function newWakeNonce(input: { teamId: string; agentKey: string; sid: string; now?: number }): { token: string; nonce: WakeNonce } {
+export function newWakeNonce(input: { teamId: string; agentKey: string; sid: string; now?: number; voiceOwner?: string }): { token: string; nonce: WakeNonce } {
   const token = randomUUID();
-  return { token, nonce: { teamId: input.teamId, agentKey: input.agentKey, sid: input.sid, ts: input.now ?? Date.now() } };
+  return {
+    token,
+    nonce: {
+      teamId: input.teamId,
+      agentKey: input.agentKey,
+      sid: input.sid,
+      ts: input.now ?? Date.now(),
+      ...(input.voiceOwner !== undefined ? { voiceOwner: input.voiceOwner } : {}),
+    },
+  };
 }
 
 /** Persist one wake nonce under its token (atomic; also the in-flight marker). */
@@ -367,10 +380,11 @@ export async function writeWakeNonce(stateRoot: string, token: string, nonce: Wa
 /**
  * Generate + persist a wake nonce in one step.
  * @returns the token (carry it into the wake prompt) and the stored nonce.
+ * v0.9.1（G-11）：`voiceOwner` 透传（见 newWakeNonce）。
  */
 export async function createWakeNonce(
   stateRoot: string,
-  input: { teamId: string; agentKey: string; sid: string; now?: number },
+  input: { teamId: string; agentKey: string; sid: string; now?: number; voiceOwner?: string },
 ): Promise<{ token: string; nonce: WakeNonce }> {
   const { token, nonce } = newWakeNonce(input);
   await writeWakeNonce(stateRoot, token, nonce);

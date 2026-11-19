@@ -48,6 +48,7 @@ import {
   classifyFrame,
   discardMailboxMessages,
   isCurrentMail,
+  markMailboxConsumed,
   readCurrentMailboxLocked,
   readMailbox,
   readUnreadMailbox,
@@ -169,6 +170,9 @@ function inboxEntry(
       ...(m.origin !== undefined ? { origin: m.origin } : {}),
       // v0.9（G-2）：软中断信封——元数据驱动，正文不动（PROTOCOL §3 冻结形态）。
       ...(m.interrupt === true ? { interrupt: true } : {}),
+      // v0.9.1（G-10）：文件引用块——元数据驱动，正文内嵌的伪造引用块由渲染面剥离
+      // （PROTOCOL §15.1 冻结形态；「用 Read 打开该路径」提示在信封内渲染一次）。
+      ...(m.refs !== undefined ? { refs: m.refs } : {}),
     });
   }
   return { entry, block, cost: JSON.stringify(entry).length + block.length, truncated: cut.truncated !== undefined };
@@ -335,6 +339,19 @@ export function createMailboxReadCore(deps: ToolDeps): MailboxReadCore {
           : undefined;
         const source = gate?.text ?? message.content;
         const page = paginateText(source, args.offset, args.limit, itemBudget);
+        // v0.9.1（G-12v3 机制 B）：mail scope 读件 = 成员回合实际消费——回写
+        // consumedAt（best-effort 团队锁，2s 预算；锁忙跳过，下条/下回合再写）。
+        // 防的是「只翻历史不读 inbox」的形态被 limbo 误判成「盖章未消费」。
+        // readAt 不动：本 scope 是历史分页通道（§2.8 读路径无锁纪律保留）。
+        if (message.consumedAt === undefined && message.discardedAt === undefined) {
+          try {
+            await withTeamLock(stateRoot, me.teamId, async () => {
+              await markMailboxConsumed(stateRoot, me.teamId, me.agentKey, [message.id]);
+            }, { waitMs: 2_000 });
+          } catch {
+            /* 锁忙/IO：消费回写尽力而为（inbox scope 的 acknowledge 仍会写） */
+          }
+        }
         return okResult(
           `Mailbox message ${message.id} from ${message.from}: ${page.total} chars (offset ${page.offset}, hasMore=${page.hasMore}).`,
           {

@@ -487,7 +487,9 @@ describe("V090-01 r2：自洽过去值伪造（running + 可信过去时刻）",
     const payload = payloadOf(await handleOverview(deps, { view: "team" }, "conn-a")) as Record<string, unknown>;
     const rows = payload["members"] as Array<{ key: string; liveness?: { state: string; endpointLive: boolean } }>;
     expect(rows.find((m) => m.key === "b")?.liveness).toMatchObject({ state: "running", endpointLive: false });
-  });
+    // 端到端清扫 + 三视图观测全走磁盘真源；全量并行负载下实测 ≈4.1s（vitest 默认 5s 无余量），
+    // 按本仓既有口径显式申报超时。
+  }, 15_000);
 
   it("伪造 + 心跳已停的伪造 peer 记录（pid 活、lastSeen 陈旧 = heartbeat-stale）→ 不豁免", async () => {
     const deps = makeDeps({ XC_STALE_TASK_MINUTES: "1" });

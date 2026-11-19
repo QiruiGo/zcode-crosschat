@@ -42,6 +42,7 @@ import { mkdir, readdir, readFile, rename, rm, stat } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { writeFileAtomic, stripLeadingBom } from './atomic.js';
 import { appendJsonl } from './jsonl.js';
+import type { MessageRef } from './types.js';
 // v0.6（C1，M3）：urgent-first 呈现序的唯一实现在 core/mailbox.ts（peermsg 与
 // hooks/shared、peer-drain 共用同一函数，规则不分叉）。
 import { urgentFirst } from './mailbox.js';
@@ -96,6 +97,16 @@ export interface PeerQueueItem {
    * 旧队列行无此键照常解析（宽容读取）。
    */
   urgent?: boolean;
+  /**
+   * v0.9.1（G-10）：随消息传递的文件引用（可选；PROTOCOL §15.1）。
+   *
+   * 载体边界（同 urgent 的既有纪律）：**管道 MsgFrame 白名单冻结**（transport/frames.ts
+   * 封闭字段集，混合版本端点对未知字段整帧拒收），因此 pipe 路径不携带本键——只有
+   * 发送侧构造的文件退化队列项（xc_relay fallbackItem）与 held 晋升路径原样携带。
+   * 发送侧在 via=pipe 时于 payload 如实披露「refs 未随管道帧传递」。
+   * isPeerQueueItem 不校验本键——旧队列行无此键照常解析（宽容读取）。
+   */
+  refs?: MessageRef[];
   // v0.6（DESIGN-V0.6.md §2.2 行 3）：`forged` 可疑信封标记已随对抗检测砍除；
   // 存量队列/held 行里的 forged 字段经 isPeerQueueItem 宽容读取（多余键不拒）。
 }

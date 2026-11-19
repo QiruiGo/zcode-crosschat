@@ -200,7 +200,9 @@ describe("xc_team action=checkpoint：服务端落盘（临时 stateRoot 端到�
     expect(names).toHaveLength(20);
     const last = await handleTeam(deps, { action: "checkpoint" }, "conn-alice");
     expect((payloadOf(last) as { pruned: number }).pruned).toBe(1);
-  });
+    // 22 次服务端 checkpoint 全走磁盘真源；全量并行负载下实测 ≈4.4s（vitest 默认 5s 无余量），
+    // 按本仓既有口径（core/lock.test.ts 15s、core/capacity.test.ts 30s）显式申报超时。
+  }, 15_000);
 
   it("写失败 → checkpoint_write_failed（不返回成功、不假装落盘）+ 审计", async () => {
     await seedTeam([task()]);

@@ -32,7 +32,7 @@
 import { readFileSync } from 'node:fs';
 import { resolveStateRoot, workspaceFromEnv } from '../core/paths.js';
 import { readNames, namesBoundToSession, readSession, refreshSessionLastSeen } from '../core/registry.js';
-import { readUnreadMailbox, urgentFirst } from '../core/mailbox.js';
+import { readUnreadMailbox, urgentFirst, markMailboxConsumed } from '../core/mailbox.js';
 import { withRegistryLock, withTeamLock, LockBusyError } from '../core/lock.js';
 import { logEngineEvent, type EngineEvent } from '../core/log.js';
 import { DEFAULT_TEAM_ID, type NameBindings, type SessionRecord, type TeamMessage } from '../core/types.js';
@@ -227,6 +227,48 @@ export async function unreadSummary(stateRoot: string, name: string): Promise<Un
   }
   const urgentCount = messages.filter((message) => message.urgent === true).length;
   return { count: messages.length, senders, messages, urgentCount };
+}
+
+/**
+ * v0.9.1（G-12v3 机制 B）：hook 未读注入的**消费确认回写**（consumedAt，best-effort）。
+ *
+ * 语义：UserPromptSubmit 钩子把「你有 N 条未读」注入进成员回合 = 该会话**实际开跑
+ * 并被知会**——不是 limbo（limbo 的生产形态是唤醒子进程在成员回合消费前死亡，钩子
+ * 从未运行）。盖章（deliveredAt）与消费确认自此在数据面分离：limbo 降级 sweep 以
+ * consumedAt 为放行判据（engine/wake.ts startWakeLifecycleWatch）。
+ *
+ * 纪律：团队锁 2s 预算（HOOK_LOCK_WAIT_MS）——锁忙即跳过（丢失一次回写无害：下回合
+ * 再写；消息仍在未读态，钩子每回合重复提醒，不会丢）；无未读/全部已回写 → 不碰盘。
+ * readAt 不动（消费动作仍归 xc_read；本回写只证明「会话活着且被知会」）。
+ *
+ * @returns 本次回写的消息 id 数（0 = 无需回写或锁忙跳过）。
+ */
+export async function markInjectedConsumed(
+  stateRoot: string,
+  agentKey: string,
+  now: number = Date.now(),
+): Promise<number> {
+  try {
+    let marked = 0;
+    await withTeamLock(
+      stateRoot,
+      DEFAULT_TEAM_ID,
+      async () => {
+        const team = await readTeam(stateRoot, DEFAULT_TEAM_ID);
+        if (team === undefined) return;
+        const ids = (await readUnreadMailbox(stateRoot, DEFAULT_TEAM_ID, agentKey))
+          .filter((m) => m.consumedAt === undefined)
+          .map((m) => m.id);
+        if (ids.length === 0) return;
+        await markMailboxConsumed(stateRoot, DEFAULT_TEAM_ID, agentKey, ids, now);
+        marked = ids.length;
+      },
+      { waitMs: HOOK_LOCK_WAIT_MS },
+    );
+    return marked;
+  } catch {
+    return 0; // 锁忙/IO：尽力而为（钩子永不因它失败）
+  }
 }
 
 /**
