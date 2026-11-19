@@ -96,6 +96,12 @@
 
 ---
 
+## 第四批输入（2026-11-19，用户发现）——G-10 图片/二进制传输缺位
+
+跨会话传图不可用：消息通道纯文本 JSON（帧硬闸 1 MiB，注入预算 16k 字符+截断），源码零命中 image/base64/attachment。`[img]` 标记是工单系统语法，crosschat 通道注入后不渲染（实测 11-19 11:23 form-fix-3「YF2188 两截图经 [img] 标记已传上」delivered:wake——消息送达但图无法呈现）。当下绕法=传路径（共享目录+对端 Read 读图）/交付物走 evidence(path+sha256)。改进方向：①消息协议支持文件引用字段（path+sha256+mime），接收面提示用 Read 打开；②或附件区（.crosschat/attachments/）+消息带引用 id。
+
+---
+
 ## 给升级会话的指引（v0.9.0 输入）
 
 1. **原始数据**：`docs/trial-data/2026-11-18-lims2.0-records.jsonl`（监督快照持续更新，字段说明见 `docs/TRIAL-DATA-2026-11-18-lims2.0.md`）；复现环境为 lims2.0 工作区 `.crosschat/`（生产数据，未随仓库提交）。
