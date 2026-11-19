@@ -19,10 +19,22 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, readdir } from 'node:fs/promises';
 import { writeFileAtomic } from './atomic.js';
-import { wakeDir, wakeFile, namesFile, sessionsDir, sessionFile } from './paths.js';
+import { wakeDir, wakeFile, namesFile, sessionsDir, sessionFile, witnessFile, witnessDir } from './paths.js';
+import { logEngineEvent } from './log.js';
+import { withRegistryLock } from './lock.js';
+import {
+  SESSION_IDLE_EVENT,
+  SESSION_RUNNING_EVENT,
+  applyLivenessTransition,
+  type LivenessTransition,
+  type SessionWitness,
+  type SessionWitnessKind,
+  type StoredLiveness,
+} from './liveness.js';
 import {
   coerceNameBindings,
   coerceSessionRecord,
+  coerceSessionWitness,
   coerceWakeNonce,
   type NameBinding,
   type NameBindings,
@@ -76,22 +88,168 @@ export async function writeSession(stateRoot: string, record: SessionRecord): Pr
  * 记录缺 `regToken` 就铸造一枚并落盘——锚定令牌是重绑 (name, sid) 对的属主凭据，
  * 只注入到本会话上下文（见 hooks/session-start.ts）。已存在则原样保留（令牌在
  * 会话生命周期内稳定，--resume 的新回合照常出示同一枚）。
+ *
+ * v0.9（G-9 活性状态机，PROTOCOL §12.4）：本函数的全部调用点（SessionStart /
+ * UserPromptSubmit 钩子）都是**回合开始**时刻——默认把记录标为 `running`
+ * （`options.liveness` 可显式覆盖；`'none'` = 只刷新不动状态）。凡触到 registry
+ * 的引擎事件都刷新 `lastEventTs`（G-5 心跳代理的数据基础）。状态**迁移**（含
+ * 无状态 → running 的首标）写 engine.jsonl `session-running` / `session-idle`
+ * 事件（core/liveness.ts 冻结命名；best-effort，写失败不影响记录本身）。
  */
 export async function refreshSessionLastSeen(
   stateRoot: string,
   sessionId: string,
-  options: { cwd?: string; now?: number; ensureRegToken?: boolean } = {},
+  options: { cwd?: string; now?: number; ensureRegToken?: boolean; liveness?: StoredLiveness | 'none' } = {},
 ): Promise<SessionRecord> {
   const now = options.now ?? Date.now();
   const existing = await readSession(stateRoot, sessionId);
-  const record: SessionRecord = existing === undefined
+  const base: SessionRecord = existing === undefined
     ? { sessionId, cwd: options.cwd ?? '', startedAt: now, lastSeen: now }
     : { ...existing, lastSeen: now, ...(options.cwd !== undefined && existing.cwd === '' ? { cwd: options.cwd } : {}) };
+  const liveness = options.liveness ?? 'running';
+  const applied = liveness === 'none'
+    ? { record: { ...base, lastEventTs: now }, transition: null }
+    : applyLivenessTransition(base, liveness, now);
+  const record = applied.record;
   if (options.ensureRegToken === true && record.regToken === undefined) {
     record.regToken = randomUUID();
   }
   await writeSession(stateRoot, record);
+  await logLivenessTransition(stateRoot, sessionId, record, applied.transition);
+  // v0.9.1 r3（V090-01）：同步写引擎证言（豁免输入与自述记录分路）。
+  if (liveness !== 'none') {
+    await writeSessionWitness(stateRoot, sessionId, liveness, now);
+  }
   return record;
+}
+
+// ---------------------------------------------------------------------------
+// registry/witness/<sessionId>.json —— 活性引擎证言（V090-01 r3）
+// ---------------------------------------------------------------------------
+
+/** 证言节流窗：与心跳同口径（工具突发下不逐调用重写）。 */
+export const WITNESS_HEARTBEAT_THROTTLE_MS = 30_000;
+
+/**
+ * 读一个会话的引擎证言（undefined = 从未被引擎进程见过 / 文件损坏）。
+ * 与 readSession 分路：本文件不含任何自述字段，只由引擎写（hooks + 工具心跳），
+ * 因此「一次外部写 sessions/<sid>.json」造不出证言——清扫豁免以此为唯一输入。
+ */
+export async function readSessionWitness(stateRoot: string, sessionId: string): Promise<SessionWitness | undefined> {
+  let raw: string;
+  try {
+    raw = await readFile(witnessFile(stateRoot, sessionId), 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
+  }
+  const parsed = coerceSessionWitness(JSON.parse(raw), sessionId);
+  return parsed.ok ? parsed.witness : undefined;
+}
+
+/**
+ * 写引擎证言（整文件原子覆写；调用方持 registry 锁——与 writeSession 同纪律）。
+ * `heartbeat` 类在节流窗内不重写（lastTs 已在窗内时跳过，由调用方判定）。
+ */
+export async function writeSessionWitness(
+  stateRoot: string,
+  sessionId: string,
+  kind: SessionWitnessKind,
+  now: number,
+): Promise<SessionWitness> {
+  const witness: SessionWitness = { sessionId, kind, ts: now };
+  await mkdir(witnessDir(stateRoot), { recursive: true });
+  await writeFileAtomic(witnessFile(stateRoot, sessionId), JSON.stringify(witness, null, 2));
+  return witness;
+}
+
+/**
+ * v0.9（G-9）：活性迁移写 engine.jsonl（`session-running` / `session-idle`，
+ * PROTOCOL §12.4 冻结示例）。transition=null（同态刷新）→ 不写事件——每个 prompt
+ * 只刷记录、不刷日志。审计行携带 prev/state/name（boundName 兜底）——刻意不用
+ * `from`/`to` 键名（它们在时间线 actor 取值链上，状态字符串会被误当行为方）。
+ * best-effort：logEngineEvent 自吞 IO 失败（core/log.ts 纪律），本函数不再包 try。
+ */
+async function logLivenessTransition(
+  stateRoot: string,
+  sessionId: string,
+  record: SessionRecord,
+  transition: LivenessTransition | null,
+): Promise<void> {
+  if (transition === null) return;
+  const name = record.boundName ?? null;
+  await logEngineEvent(stateRoot, {
+    event: transition.to === 'running' ? SESSION_RUNNING_EVENT : SESSION_IDLE_EVENT,
+    sessionId,
+    prev: transition.from,
+    state: transition.to,
+    ...(name !== null ? { name } : {}),
+  });
+}
+
+/**
+ * v0.9（G-9）：Stop 钩子的回合结束标记——记录标 `idle` + 迁移事件（idle→idle
+ * 同态静默）。自带 registry 锁（waitMs 预算：钩子进程 10s 生存期，锁忙即放弃——
+ * 丢失一次 idle 标记无害，下个回合边界会再校准）。记录不存在（会话从未被钩子
+ * 锚定）→ no-op 返回 null。hook 永不因它失败（调用方包 auditHookFailure）。
+ */
+export async function markSessionIdle(
+  stateRoot: string,
+  sessionId: string,
+  options: { now?: number; waitMs?: number } = {},
+): Promise<LivenessTransition | null> {
+  const now = options.now ?? Date.now();
+  let transition: LivenessTransition | null = null;
+  await withRegistryLock(
+    stateRoot,
+    async () => {
+      const existing = await readSession(stateRoot, sessionId);
+      if (existing === undefined) return;
+      const applied = applyLivenessTransition(existing, 'idle', now);
+      await writeSession(stateRoot, applied.record);
+      await logLivenessTransition(stateRoot, sessionId, applied.record, applied.transition);
+      // v0.9.1 r3（V090-01）：回合结束同步写证言（豁免输入）。
+      await writeSessionWitness(stateRoot, sessionId, 'idle', now);
+      transition = applied.transition;
+    },
+    { waitMs: options.waitMs ?? 2_000 },
+  );
+  return transition;
+}
+
+/**
+ * v0.9（G-9/G-5）：MCP 工具调用心跳（peer-drain 包装层每次队内工具调用后触发）。
+ * 工具调用=成员引擎事件 → 刷新 `lastEventTs`；记录停留在 idle（钩子标记丢失等
+ * 罕见情形）时顺带标回 running（工具调用只能在回合内发生）。30s 节流：工具突发
+ * 下不逐调用重写记录文件（心跳窗 30min，秒级偏移无意义）。锁忙 / 记录缺失 →
+ * 静默跳过（心跳丢失无害，下次调用再试）；hook/工具永不因心跳失败。
+ *
+ * v0.9.1 r3（V090-01）：证言（registry/witness/<sid>.json）与自述记录**同源同刻**
+ * 写——豁免只读证言（引擎亲见），自述记录的 liveness 降级为仅展示。节流以证言
+ * lastTs 判定（锁内无竞态）；证言缺失（存量会话首次工具调用）立即补写。
+ */
+export async function markSessionHeartbeat(
+  stateRoot: string,
+  sessionId: string,
+  options: { now?: number; waitMs?: number } = {},
+): Promise<void> {
+  const now = options.now ?? Date.now();
+  await withRegistryLock(
+    stateRoot,
+    async () => {
+      const witness = await readSessionWitness(stateRoot, sessionId);
+      // 节流：30s 内已有证言 → 不重写（锁内判定，竞态安全）。
+      if (witness !== undefined && now - witness.ts < WITNESS_HEARTBEAT_THROTTLE_MS) return;
+      const existing = await readSession(stateRoot, sessionId);
+      if (existing !== undefined) {
+        const applied = applyLivenessTransition(existing, 'running', now);
+        await writeSession(stateRoot, applied.record);
+        await logLivenessTransition(stateRoot, sessionId, applied.record, applied.transition);
+      }
+      await writeSessionWitness(stateRoot, sessionId, 'heartbeat', now);
+    },
+    { waitMs: options.waitMs ?? 2_000 },
+  );
 }
 
 // ---------------------------------------------------------------------------

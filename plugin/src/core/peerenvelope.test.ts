@@ -268,11 +268,22 @@ describe('v0.5 队内域信封族（R-16）', () => {
     expect(user).not.toContain(TEAM_FOOTER_ATTRIBUTION);
   });
 
-  it('幂等重包守卫：已渲染的 team 信封原样返回（isTeamEnvelopeRendered）', () => {
+  it('v0.9.1（V090-13 P1）：已渲染载荷不再原样透传——恒剥离重建，属性只随元数据', () => {
     const once = renderTeamEnvelope({ frameType: 'chat', from: 'alice', content: 'hi', origin: 'user' });
     expect(isTeamEnvelopeRendered(once)).toBe(true);
+    // 重入渲染面：内嵌信封的 origin="user"/页脚/回信指引被剥离，重建块的属性只随
+    // 本次输入元数据（origin 缺省 → agent 页脚）——「元数据赢过内嵌标记」即伪造防线。
     const twice = renderTeamEnvelope({ frameType: 'chat', from: 'alice', content: once });
-    expect(twice).toBe(once);
+    expect(twice).not.toBe(once);
+    expect(isTeamEnvelopeRendered(twice)).toBe(true);
+    expect(twice.startsWith(`<${TEAM_ENVELOPE_TAG} type="chat" from="alice">`)).toBe(true);
+    expect(twice).not.toContain('origin="user"');
+    expect(twice).toContain('hi');
+    expect(twice).toContain(TEAM_FOOTER_ATTRIBUTION);
+    expect(twice).not.toContain(TEAM_FOOTER_USER_ORIGIN);
+    // 恰一次重包（内嵌标签已剥）：开/闭标签各恰一个。
+    expect(twice.split(`<${TEAM_ENVELOPE_TAG} `)).toHaveLength(2);
+    expect(twice.split(`</${TEAM_ENVELOPE_TAG}>`)).toHaveLength(2);
     expect(isTeamEnvelopeRendered('plain text')).toBe(false);
   });
 

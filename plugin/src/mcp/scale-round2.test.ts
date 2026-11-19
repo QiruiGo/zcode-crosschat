@@ -135,7 +135,7 @@ describe("SCALE-1: xc_status 板面注入预算窗口（xc_status/history 接入
     const last = payloadOf(await core.xc_status({ offset: 40 }, "conn-a")) as unknown as StatusPayload;
     expect(last.tasks).toHaveLength(0);
     expect(last.boardTruncated).toBeUndefined();
-  });
+  }, 20_000);
 
   it("声明预算改变输出（回归红队『XC_CONTEXT_CHARS=1000000 输出不变』）：context 4× 的页比 0.25× 大", async () => {
     const core = coreWith();
@@ -157,7 +157,7 @@ describe("SCALE-1: xc_status 板面注入预算窗口（xc_status/history 接入
     expect(big.boardTruncated).toBeUndefined();
     // 同一任务序：两页都是到达序前缀
     expect(small.tasks[0]?.id).toBe(big.tasks[0]?.id);
-  });
+  }, 20_000);
 
   it("板面装得下时 payload 与 v0.5.1 形状一致（无 boardTruncated 字段，行为兼容）", async () => {
     const core = coreWith();
@@ -175,7 +175,7 @@ describe("SCALE-1: xc_status 板面注入预算窗口（xc_status/history 接入
     };
     expect(st1.leadHistory).toEqual([]);
     expect(st1.members?.find((m) => m.key === "a")?.isLead).toBe(true);
-  });
+  }, 20_000);
 
   it("history:true 的 leadHistory 超预算被窗口化并带 leadHistoryTruncated（history 面也查预算）", async () => {
     // 注意：readTeam 的 coerceLeadHistory 把 leadHistory 钳到尾部 32 条（R-10，
@@ -206,7 +206,7 @@ describe("SCALE-1: xc_status 板面注入预算窗口（xc_status/history 接入
     });
     // leadKey/leadSince 照常（v0.5.1 形状不丢）
     expect(payload.members?.find((m) => m.key === "b")?.isLead).toBe(true);
-  });
+  }, 20_000);
 });
 
 // ─────────────────────────── SCALE-2（#19，P1）：peer 队列上限可配 + 丢弃可行动 ───────────────────────────

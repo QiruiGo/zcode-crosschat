@@ -55,7 +55,7 @@ export const TIMELINE_DEFAULT_LIMIT = 20;
 /** timeline 条数上限（方案 §2 A3「最大 100」；超限钳制并披露）。 */
 export const TIMELINE_MAX_LIMIT = 100;
 
-/** 事件族（DESIGN §5 冻结表：九族 + other）。 */
+/** 事件族（DESIGN §5 冻结表：九族 + v0.9 增量 liveness + other）。 */
 export type TimelineFamily =
   | 'dispatch'
   | 'claim'
@@ -66,6 +66,7 @@ export type TimelineFamily =
   | 'tool'
   | 'lead'
   | 'member'
+  | 'liveness'
   | 'other';
 
 /** 事件族映射表（照抄 DESIGN §5；不在表内 → other）。 */
@@ -80,6 +81,8 @@ export const TIMELINE_FAMILY_BY_EVENT: Readonly<Record<string, TimelineFamily>> 
   // sweep
   'task-swept': 'sweep',
   'revoked-stale': 'sweep',
+  // v0.9.1（V090-06）：活性豁免留痕（每任务每阈值周期一行）。
+  'task-sweep-deferred': 'sweep',
   // offline
   'task-offline': 'offline',
   // approval
@@ -103,6 +106,11 @@ export const TIMELINE_FAMILY_BY_EVENT: Readonly<Record<string, TimelineFamily>> 
   'member-archive-failed': 'member',
   'member-provision-timeout': 'member',
   'member-takeover': 'member',
+  // v0.9（G-9，PROTOCOL §12.4）：会话活性迁移（core/liveness.ts 冻结命名）。
+  'session-running': 'liveness',
+  'session-idle': 'liveness',
+  // v0.9.1（V090-01/06）：会话记录活性字段异常（伪造/损坏，不产生豁免，据实审计）。
+  'session-record-anomaly': 'liveness',
 };
 
 /** 事件名 → 族（不在表内 → other）。 */
@@ -248,6 +256,12 @@ function summarize(event: string, rec: Record<string, unknown>, actor: string | 
       const key = strField(rec['agentKey']);
       if (key === undefined) return event;
       return event === 'member-stopped' ? `member stopped ${key}` : `${event} ${key}`;
+    }
+    case 'liveness': {
+      // 活性迁移的主角是会话（sessionId）：花名（name）优先呈现，无绑定名退 sid。
+      // 不走 actor 链（sessionId 不在其中，v0.8.1 冻结链不动）。
+      const who = strField(rec['name']) ?? strField(rec['sessionId']);
+      return who === undefined ? event : `${event} ${who}`;
     }
     default:
       return event;

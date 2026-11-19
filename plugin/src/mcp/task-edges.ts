@@ -43,7 +43,20 @@
 
 import { payloadOf } from "./protocol.js";
 import type { ToolCore, ToolDeps } from "./core.js";
-import { findInflightWakeNonce } from "../core/registry.js";
+import { findInflightWakeNonce, readSession, readSessionWitness } from "../core/registry.js";
+// v0.9（G-9/G-5）：清扫联动活性的纯判据（owner-running / 心跳代理豁免）。
+// v0.9.1（V090-01/06）：可信度校验（未来值/无时刻的 running 不豁免）+ 异常检测与
+// 豁免留痕（task-sweep-deferred / session-record-anomaly）。
+// v0.9.1 r3（V090-01，V090-GUIDANCE-R3）：豁免输入收敛为**引擎证言**（witness），
+// 自述记录仅展示；豁免有界（2× 阈值无证言照扫）。
+import {
+  sessionRecordLivenessAnomaly,
+  sessionRecordWitnessMismatch,
+  sweepOwnerGuard,
+  sweepOwnerGuardReason,
+  type SessionWitness,
+  type SweepOwnerGuard,
+} from "../core/liveness.js";
 import { appendMailbox, createMessage, readMailbox } from "../core/mailbox.js";
 import { logEngineEvent } from "../core/log.js";
 import { withTeamLock } from "../core/lock.js";
@@ -210,6 +223,17 @@ interface WakePlanItem {
  * C6-BUG-4 修复）+ 唤醒计划，并进 `offline` 返回面 / `task-offline` 审计（两种属主
  * 身份都恒定落审计）。回池路径本身不新开：仍是 stale sweeper 的 revokeAttempt
  * （§4.2「复用 sweeper」）。`opts` 缺省 = 不产离线判定（旧调用点零行为变化）。
+ *
+ * v0.9（G-5 清扫联动活性，PROTOCOL §12.4）：wake-nonce 豁免之后新增**属主活性豁免**
+ * ——属主会话 `running`（回合执行中）→ 暂停 stale 倒计时；属主在 stale 窗口内有过
+ * 引擎事件（registry lastEventTs 心跳代理）→ 不要求手动 xc_report 打卡（GAP t1/t17
+ * 误扫的两个模式）。判据纯函数在 core/liveness.ts（sweepOwnerGuard）；`dead`
+ * （C8 pid-dead 硬证据）不豁免——崩溃成员照旧回池 + 转交通知；blocked 不在
+ * SWEEPABLE 清扫域的旧口径不变。
+ * v0.9.1（V090-06）：豁免逐周期留痕 `task-sweep-deferred`（epoch 去重）。
+ * v0.9.1 r2（V090-01/05）：豁免要求**端点活性证词**（peer 注册表 live，单文件伪造
+ * 60s 衰减失效）；豁免**不壅蔽 C8**——豁免任务仍算 offlineVerdict，命中即 lead
+ * 转交通知（offlineNoticeAt 持久闸防逐节拍刷邮箱），豁免只暂停回池不遮蔽离线信号。
  */
 async function sweepStaleTasksLocked(
   stateRoot: string,
@@ -217,7 +241,7 @@ async function sweepStaleTasksLocked(
   thresholdMs: number,
   now: number,
   opts: { scan?: PeerScanResult; offlineThresholdMs?: number } = {},
-): Promise<{ swept: SweptTaskInfo[]; wakePlan: WakePlanItem[]; offline: OfflineMember[] }> {
+): Promise<{ swept: SweptTaskInfo[]; wakePlan: WakePlanItem[]; offline: OfflineMember[]; exemptOfflineNotified: boolean }> {
   const teamId = team.teamId;
   const candidates = staleTasks(team.tasks, now, thresholdMs);
   const swept: SweptTaskInfo[] = [];
@@ -228,6 +252,9 @@ async function sweepStaleTasksLocked(
     string,
     { member: TeamState["members"][number]; liveness: MemberLiveness; evidence: OfflineEvidence; tasks: OfflineTaskInfo[] }
   >();
+  // v0.9.1（V090-05 r2）：豁免任务的 C8 转交通知是否落过（写 team 的依据之一——
+  // offlineNoticeAt 字段随通知落盘，豁免不清扫也要持久化）。
+  let exemptOfflineNotified = false;
   for (const task of candidates) {
     // 豁免条件（§5.4）：该成员有在途 wake nonce → 本次跳过（唤醒回合可能仍在跑，
     // 其下一份 report/心跳会刷新 updatedAt）。进程死证据**不绕过**豁免（nonce 有
@@ -235,6 +262,50 @@ async function sweepStaleTasksLocked(
     if (task.assignee !== null) {
       const inflight = await findInflightWakeNonce(stateRoot, task.assignee, { teamId, now });
       if (inflight !== undefined) continue;
+    }
+    // 豁免条件（v0.9 G-5）：属主会话活性（running / stale 窗口内心跳代理）→ 跳过。
+    // v0.9.1（V090-06）：豁免**必须留痕**——每任务每阈值周期一行 `task-sweep-deferred`
+    // （epoch 去重，进程内台账；running 保护下的长任务不逐 60s 节拍刷日志，但 lead 在
+    // 时间线/审计里看得到「这单被活性豁免到第 N 个周期」+ 证言年龄），伪造/损坏自述
+    // 的异常另落 `session-record-anomaly`（ownerSweepGuard 内）。
+    // v0.9.1（V090-05 r2）：豁免**不壅蔽 C8**——豁免任务仍算 offlineVerdict，命中
+    // （process-dead / idle-timeout）即照常 lead 转交通知（持久闸防逐节拍刷邮箱）；
+    // 豁免只暂停回池，不再遮蔽离线信号。v0.9.1 r3（V090-02）：豁免任务的通知文案
+    // 如实写「未回池、仍滞留属主名下」（requeued:false），不再谎称已回待领池。
+    if (task.assignee !== null) {
+      const exempt = await ownerSweepGuard(stateRoot, team, task.assignee, opts.scan, now, thresholdMs);
+      if (exempt !== null) {
+        const member = team.members.find((m) => m.key === task.assignee);
+        if (
+          member !== undefined
+          && opts.scan !== undefined
+          && opts.offlineThresholdMs !== undefined
+          && now - (task.offlineNoticeAt ?? 0) >= opts.offlineThresholdMs
+        ) {
+          const liveness = memberLiveness(member, opts.scan, now);
+          const verdict = offlineVerdict(task, member, liveness, now, opts.offlineThresholdMs);
+          if (verdict.offline && verdict.evidence !== null) {
+            const entry = offlineHits.get(task.assignee) ?? {
+              member,
+              liveness,
+              evidence: verdict.evidence,
+              tasks: [],
+            };
+            entry.tasks.push({
+              taskId: task.id,
+              title: task.title,
+              status: task.status,
+              idleForMin: Math.max(1, Math.round((now - lastProgressTs(task)) / 60_000)),
+              requeued: false, // r3（V090-02）：活性豁免滞留，未回池
+            });
+            offlineHits.set(task.assignee, entry);
+            task.offlineNoticeAt = now;
+            exemptOfflineNotified = true;
+          }
+        }
+        await auditSweepDeferred(stateRoot, teamId, task, exempt.guard, exempt.peerLiveness, exempt.witnessAgeMin, now, thresholdMs);
+        continue;
+      }
     }
     const assigneeBefore = task.assignee;
     const revokedAttemptId = task.attemptId;
@@ -306,12 +377,159 @@ async function sweepStaleTasksLocked(
         evidence: offlineHit.evidence,
         tasks: [],
       };
-      entry.tasks.push({ taskId: task.id, title: task.title, status: offlineHit.status, idleForMin: offlineHit.idleForMin });
+      entry.tasks.push({
+        taskId: task.id,
+        title: task.title,
+        status: offlineHit.status,
+        idleForMin: offlineHit.idleForMin,
+        requeued: true, // r3（V090-02）：真回池（本任务刚被 revokeAttempt 重置回 pending）
+      });
       offlineHits.set(assigneeBefore, entry);
     }
   }
   const offline = await notifyOfflineLeadLocked(stateRoot, team, offlineHits, wakePlan, now);
-  return { swept, wakePlan, offline };
+  return { swept, wakePlan, offline, exemptOfflineNotified };
+}
+
+/**
+ * v0.9（G-5）：属主活性豁免的取数薄封装——会话记录（registry lastSeen 同源读，
+ * 只读不加锁）+ C8 peer 扫描交给 core/liveness.ts 的纯判据 sweepOwnerGuard。
+ * 成员不在册（派发后被 member-stop 回池等瞬态）→ 不豁免（null）。读失败按无
+ * 记录处理（保守：不豁免，真僵尸照扫）。
+ *
+ * v0.9.1（V090-06）：异常记录审计——活性字段违反自写不变式（running 无可信
+ * livenessTs / 时间戳在未来值域，core/liveness.ts sessionRecordLivenessAnomaly）
+ * 的记录**不产生豁免**（纯判据已按保守口径降级），此处据实落 `session-record-anomaly`
+ * 审计（进程内按「状态根 × 会话 × 字段」去重一次；engine.jsonl 是跨进程权威）。
+ * v0.9.1 r2（V090-01/05）：返回值带 peerLiveness（C8 四态）——豁免审计据此区分
+ * 「有端点证词的豁免」与不可辨形态；纯判据内部已强制 endpointLive 闸。
+ */
+/**
+ * v0.9（G-5）：属主活性豁免的取数薄封装——读引擎证言（registry/witness/<sid>.json，
+ * 只读不加锁）交给 core/liveness.ts 的纯判据 sweepOwnerGuard。
+ * 成员不在册（派发后被 member-stop 回池等瞬态）→ 不豁免（null）。
+ *
+ * v0.9.1 r3（V090-01，V090-GUIDANCE-R3）：豁免输入**只有引擎证言**——自述记录
+ * （sessions/<sid>.json 的 liveness/lastEventTs）可被一次本地文件写伪造，且成员自有
+ * MCP server 全会话常驻使端点活性证词（r2 修法）同样可被攻击者满足；证言由引擎进程
+ * 分路写（hooks 回合边界 + 工具调用心跳），伪造自述造不出证言。
+ * 自述 vs 证言的不一致（记录声称 running 而无证言/证言止于 idle）与未来值异常一并落
+ * `session-record-anomaly`（进程内按状态根×会话×字段去重一次；engine.jsonl 权威）。
+ */
+async function ownerSweepGuard(
+  stateRoot: string,
+  team: TeamState,
+  assignee: string,
+  scan: PeerScanResult | undefined,
+  now: number,
+  thresholdMs: number,
+): Promise<{ guard: SweepOwnerGuard; peerLiveness: MemberLiveness; witnessAgeMin: number } | null> {
+  const member = team.members.find((m) => m.key === assignee);
+  if (member === undefined) return null;
+  let witness: SessionWitness | undefined;
+  try {
+    witness = await readSessionWitness(stateRoot, member.sessionId);
+  } catch {
+    witness = undefined;
+  }
+  // 审计：自述异常（未来值 / 自述 running 而无证言）——不阻断豁免判定（证言已是唯一输入）。
+  try {
+    const record = await readSession(stateRoot, member.sessionId);
+    const anomaly = sessionRecordLivenessAnomaly(record, now) ?? sessionRecordWitnessMismatch(record, witness, now);
+    if (anomaly !== null) {
+      const memoKey = `${stateRoot}:${member.sessionId}:${anomaly.field}`;
+      if (!anomalyAuditMemo.has(memoKey)) {
+        memoAddBounded(anomalyAuditMemo, memoKey, ANOMALY_AUDIT_MEMO_LIMIT);
+        await logEngineEvent(stateRoot, {
+          event: "session-record-anomaly",
+          sessionId: member.sessionId,
+          member: assignee,
+          field: anomaly.field,
+          detail: anomaly.detail,
+        });
+      }
+    }
+  } catch {
+    /* 记录读失败：证言判定不受影响（自述本就只作展示） */
+  }
+  // 端点活性仅展示（r3 起非豁免输入）：成员自有 server 常驻，live 不构成安全证据；
+  // 但 pid-dead 仍是 C8 immediacy 的硬开关（见下）。
+  const peerLiveness: MemberLiveness = scan !== undefined ? memberLiveness(member, scan, now) : "no-record";
+  const guard = sweepOwnerGuard(witness, now, thresholdMs);
+  if (guard === null) return null;
+  // C8 immediacy（§4.1 口径不变）：pid-dead 硬证据在场 → 活性豁免立即失效（不等证言
+  // 衰减到阈值）——崩溃成员名下任务照旧回池 + 转交通知。证言只对活成员有意义。
+  if (peerLiveness === "pid-dead") return null;
+  return {
+    guard,
+    peerLiveness,
+    witnessAgeMin: Math.max(0, Math.round((now - (witness?.ts ?? now)) / 60_000)),
+  };
+}
+
+// v0.9.1（V090-06）：豁免/异常审计的进程内去重台账（engine.jsonl 是跨进程权威）。
+// deferred：任务 → 已审计的超阈周期（epoch）——每任务每阈值周期一行，不逐 60s 节拍刷；
+// anomaly：状态根×会话×字段——伪造/损坏字段一次留痕即可（之后同异常不重复刷）。
+const deferredAuditMemo = new Map<string, number>();
+const anomalyAuditMemo = new Set<string>();
+const DEFERRED_AUDIT_MEMO_LIMIT = 1024;
+const ANOMALY_AUDIT_MEMO_LIMIT = 1024;
+
+/** 有界台账写入（超限丢最早插入的键；Map 保序）。 */
+function memoAddBounded(set: Set<string>, key: string, limit: number): void {
+  set.add(key);
+  if (set.size > limit) {
+    const oldest = set.values().next();
+    if (!oldest.done) set.delete(oldest.value);
+  }
+}
+
+/** 任务的超阈周期序（1 起）：floor(超阈时长 / 阈值)——豁免审计的去重刻度。 */
+function sweepDeferredEpoch(task: { updatedAt: number }, now: number, thresholdMs: number): number {
+  return Math.max(1, Math.floor((now - task.updatedAt) / thresholdMs));
+}
+
+/**
+ * v0.9.1（V090-06）：活性豁免的审计留痕 `task-sweep-deferred`（family=sweep）。
+ * 去重刻度 = 超阈周期（epoch）：豁免从第 N 个周期跨到 N+1 时再落一行——一条被
+ * running 保护 2h 的任务留 ~4 行（而非每个清扫节拍 120 行），时间线（timeline 视图）
+ * 与审计从此能回答「这单为什么一直没被扫」。
+ * v0.9.1 r2（V090-01/05）：事件带 `peerLiveness`（C8 四态）——豁免必然伴随端点
+ * 活性证词（sweepOwnerGuard 的 endpointLive 闸），`reason=owner-running ∧
+ * peerLiveness=live`（有证词）与无证词形态在审计上可辨。
+ */
+async function auditSweepDeferred(
+  stateRoot: string,
+  teamId: string,
+  task: { id: string; assignee: string | null; updatedAt: number },
+  guard: SweepOwnerGuard,
+  peerLiveness: MemberLiveness,
+  witnessAgeMin: number,
+  now: number,
+  thresholdMs: number,
+): Promise<void> {
+  const epoch = sweepDeferredEpoch(task, now, thresholdMs);
+  const memoKey = `${stateRoot}:${task.id}`;
+  const prior = deferredAuditMemo.get(memoKey) ?? 0;
+  if (epoch <= prior) return;
+  deferredAuditMemo.delete(memoKey);
+  deferredAuditMemo.set(memoKey, epoch);
+  if (deferredAuditMemo.size > DEFERRED_AUDIT_MEMO_LIMIT) {
+    const oldest = deferredAuditMemo.keys().next();
+    if (!oldest.done) deferredAuditMemo.delete(oldest.value);
+  }
+  await logEngineEvent(stateRoot, {
+    event: "task-sweep-deferred",
+    teamId,
+    taskId: task.id,
+    assignee: task.assignee,
+    reason: guard,
+    peerLiveness,
+    witnessAgeMin,
+    staleMinutes: Math.max(1, Math.round((now - task.updatedAt) / 60_000)),
+    epoch,
+    note: sweepOwnerGuardReason(guard),
+  });
 }
 
 /**
@@ -363,6 +581,18 @@ async function notifyOfflineLeadLocked(
       idleForMin,
       tasks: hit.tasks,
     });
+    // v0.9.1 r3（V090-02）：通知文案分流——真回池（任务已 revokeAttempt 重置回 pending）
+    // 与活性豁免滞留（任务仍在属主名下、未回池）是两种事实，旧文案一律声称「requeued to
+    // the pending pool」对豁免任务是谎报：lead 按通知去待领池找不到任务。豁免版如实写
+    // 「仍滞留 <成员> 名下（活性豁免），未回池」并附处置指引（cancel / xc_dispatch 改派）。
+    const lodged = hit.tasks.filter((t) => t.requeued === false);
+    const requeued = hit.tasks.filter((t) => t.requeued !== false);
+    const disposition = lodged.length === 0
+      ? 'open task(s) requeued to the pending pool'
+      : requeued.length === 0
+        ? `open task(s) still held by "${key}" under liveness exemption — NOT requeued; cancel via xc_team({action:"cancel"}) or reassign via xc_dispatch`
+        : `open task(s) split: ${requeued.length} requeued to the pending pool, ${lodged.length} still held by "${key}" under liveness exemption (NOT requeued)`;
+    const error = `offline-handover: member "${key}" looks gone (${hit.evidence}) — ${disposition}`;
     // 收件人：属主非 lead → lead 本人；属主即 lead → 其他在册成员（可寻址队友）。
     const recipients: Array<{ key: string; sessionId: string | null }> = key === leadKey
       ? team.members
@@ -376,7 +606,7 @@ async function notifyOfflineLeadLocked(
       attemptId: null,
       status: "failed",
       result: null,
-      error: `offline-handover: member "${key}" looks gone (${hit.evidence}) — open task(s) requeued to the pending pool`,
+      error,
       evidence: [],
       offline: {
         member: key,
@@ -384,6 +614,8 @@ async function notifyOfflineLeadLocked(
         liveness: hit.liveness,
         idleForMin,
         taskIds: hit.tasks.map((t) => t.taskId),
+        // r3（V090-02）：逐任务回池事实（豁免滞留 = false），机器可读。
+        tasks: hit.tasks.map((t) => ({ taskId: t.taskId, status: t.status, idleForMin: t.idleForMin, requeued: t.requeued !== false })),
         suggestion: offlineSuggestion(hit.evidence),
       },
     });
@@ -692,14 +924,47 @@ export async function sweepStaleTasksOnce(deps: ToolDeps, now: number = Date.now
     // v0.7（C8，§4.1/§4.2）：只读 peer 扫描在锁外做（查询路径无清扫副作用，
     // peerregistry.ts scanPeers 的 sweep:false 契约），活性/离线判据在锁内纯函数完成。
     const scan = await scanPeers(peerRootFromEnv(env), now, { sweep: false });
+    // v0.9（G-5）：无锁预检延伸——候选全部被属主活性豁免（running / 心跳代理，
+    // t17 长任务模式的常态）也不碰锁。无属主候选（异常记录）不走豁免（照旧进锁
+    // 清扫）；锁内 sweepStaleTasksLocked 仍按锁内状态重算豁免（竞态安全：预检只
+    // 省锁周期，不放行任何清扫）。v0.9.1（V090-06）：全豁免跳过同样逐任务留痕
+    // （task-sweep-deferred，epoch 去重——不留痕则全保护盘面在 engine.jsonl 零痕迹）。
+    // v0.9.1 r2（V090-05）：豁免不壅蔽 C8——预检对豁免候选同样算 offlineVerdict，
+    // 命中（通知闸开启时）→ 不跳过、进锁走正式通知路径（预检无锁不写 team，通知
+    // 与 offlineNoticeAt 落盘都在锁内完成）。
+    const probeCandidates = staleTasks(probe.tasks, now, thresholdMs);
+    const probeOfflineThresholdMs = offlineThresholdMsFromEnv(env, thresholdMs).ms;
+    let allProtected = probeCandidates.length > 0 && probeCandidates.every((t) => t.assignee !== null);
+    let protectedOfflineHit = false;
+    if (allProtected) {
+      for (const candidate of probeCandidates) {
+        const exempt = await ownerSweepGuard(stateRoot, probe, candidate.assignee!, scan, now, thresholdMs);
+        if (exempt === null) {
+          allProtected = false;
+          break;
+        }
+        await auditSweepDeferred(stateRoot, teamId, candidate, exempt.guard, exempt.peerLiveness, exempt.witnessAgeMin, now, thresholdMs);
+        // 豁免候选的 C8 兜底：通知闸开启（从未通知 / 距上次 ≥ 阈值窗口）且
+        // idle-timeout 命中 → 不跳过，进锁由 sweepStaleTasksLocked 正式通知。
+        const member = probe.members.find((m) => m.key === candidate.assignee);
+        if (
+          member !== undefined
+          && now - (candidate.offlineNoticeAt ?? 0) >= probeOfflineThresholdMs
+        ) {
+          const verdict = offlineVerdict(candidate, member, exempt.peerLiveness, now, probeOfflineThresholdMs);
+          if (verdict.offline && verdict.evidence !== null) protectedOfflineHit = true;
+        }
+      }
+      if (allProtected && !protectedOfflineHit) return { swept: 0, skipped: true, offline: 0 };
+    }
     const offlineThresholdMs = offlineThresholdMsFromEnv(env, thresholdMs).ms;
     const outcome = await withTeamLock(stateRoot, teamId, async () => {
       const team = await readTeam(stateRoot, teamId);
       if (team === undefined) {
-        return { swept: [] as SweptTaskInfo[], wakePlan: [] as WakePlanItem[], offline: [] as OfflineMember[] };
+        return { swept: [] as SweptTaskInfo[], wakePlan: [] as WakePlanItem[], offline: [] as OfflineMember[], exemptOfflineNotified: false };
       }
       const sweep = await sweepStaleTasksLocked(stateRoot, team, thresholdMs, now, { scan, offlineThresholdMs });
-      if (sweep.swept.length > 0) await writeTeam(stateRoot, team);
+      if (sweep.swept.length > 0 || sweep.exemptOfflineNotified) await writeTeam(stateRoot, team);
       return sweep;
     });
     await runWakePlan(deps, outcome.wakePlan);
@@ -880,7 +1145,8 @@ export function withTaskEdges(core: ToolCore, deps: ToolDeps): ToolCore {
             );
             outcome.swept = sweep.swept;
             outcome.offline = sweep.offline;
-            if (sweep.swept.length > 0) await writeTeam(stateRoot, team);
+            // v0.9.1 r2（V090-05）：豁免任务的 C8 转交通知落盘（offlineNoticeAt）也触发写盘。
+            if (sweep.swept.length > 0 || sweep.exemptOfflineNotified) await writeTeam(stateRoot, team);
             if (status === "completed") {
               const unblock = await unblockDependentsLocked(stateRoot, team, taskId, now);
               outcome.unblocked = unblock.unblocked;

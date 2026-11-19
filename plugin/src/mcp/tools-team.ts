@@ -906,7 +906,9 @@ export function createLeadToolCore(deps: ToolDepsLike): LeadToolCore {
           const mine = team.members.find((m) => m.key === me.agentKey);
           const mailboxOnly = mine !== undefined && blocksWake(memberState(mine));
           // v0.5.3（安全对-4 a9 修复）：completedTaskId 任务归属校验。
-          let integrityWarning: string | undefined;
+          // v0.9.2（V090-03 P2 修复）：帧自称状态与任务板矛盾 → **硬拒**（v0.5.3~v0.9.1 为
+          // 帧内 integrityWarning 告警不阻断——谎报 completed 而板面 in_progress/0 证据的
+          // 假帧照发入 lead 邮箱，第 3 轮裁决确认此口径不足；矛盾即拒，帧不投递）。
           const claimedTaskId = args.completedTaskId !== undefined && args.completedTaskId.trim() !== ""
             ? args.completedTaskId
             : undefined;
@@ -930,9 +932,41 @@ export function createLeadToolCore(deps: ToolDepsLike): LeadToolCore {
             if (args.completedStatus !== undefined && args.completedStatus.trim() !== ""
               && (task.status !== args.completedStatus
                 || (args.completedStatus === "completed" && task.evidence.length === 0))) {
-              integrityWarning =
-                `task ${task.id} board status="${task.status}" with ${task.evidence.length} evidence item(s) does not back the idle frame's claimed status "${args.completedStatus}" — verify with xc_overview/xc_read before trusting`;
+              throw new ToolError({
+                error: "idle_status_contradiction",
+                taskId: task.id,
+                boardStatus: task.status,
+                evidenceCount: task.evidence.length,
+                claimedStatus: args.completedStatus,
+                message: `idle frame claims status "${args.completedStatus}" for task ${task.id} but the board says `
+                  + `"${task.status}" with ${task.evidence.length} evidence item(s) — the frame was NOT sent; `
+                  + "verify with xc_overview/xc_read and report the true status (xc_report) before idling",
+              });
             }
+          }
+          // v0.9.2（V090-03 P2 修复）：假空闲帧门控——idle 的契约是「没有可做的活」，
+          // 调用者名下还有**非 blocked 开放任务**（claimed/in_progress）时不得报空闲：
+          // 先把手头的单报告掉（completed/failed）或 blocked（原因必填）。单开槽位模型
+          // （OPEN_TASK_STATUSES）同口径：blocked 是合法暂停，仅 blocked 在途时允许
+          // idleReason="blocked-only" 的滞留上报；no-claimable-task/inbox-empty 与之矛盾。
+          // 位置在 completedTaskId 校验之后：帧内任务引用矛盾优先报具体错误码。
+          const openTasks = memberOpenTasks(team.tasks, me.agentKey);
+          const activeOpen = openTasks.filter((t) => t.status !== 'blocked');
+          if (activeOpen.length > 0) {
+            throw new ToolError({
+              error: "has_open_task",
+              openTaskIds: activeOpen.map((t) => t.id),
+              openTasks: activeOpen.map((t) => ({ taskId: t.id, status: t.status })),
+              message: `cannot report idle while holding open task(s) `
+                + `${activeOpen.map((t) => `${t.id} (${t.status})`).join(", ")}: `
+                + "finish them first (xc_report completed/failed) or park with xc_report(blocked, error=原因)",
+            });
+          }
+          if (openTasks.length > 0 && (args.idleReason ?? "no-claimable-task") !== "blocked-only") {
+            throw invalidParamsError(
+              `caller's only open task(s) ${openTasks.map((t) => t.id).join(", ")} are blocked (legal pause); `
+                + 'idleReason must be "blocked-only" when the slot holds a parked task',
+            );
           }
           // idle-notification 帧（§5.3 契约）。
           const frame = JSON.stringify({
@@ -945,7 +979,6 @@ export function createLeadToolCore(deps: ToolDepsLike): LeadToolCore {
             completedStatus: args.completedStatus ?? null,
             failureReason: args.failureReason ?? null,
             result: args.result ?? null,
-            ...(integrityWarning !== undefined ? { integrityWarning } : {}),
           });
           const message = createMessage(me.agentKey, to, frame, { deliveryClaimedAt: Date.now() });
           await appendMailbox(stateRoot, me.teamId, to, message);
@@ -954,7 +987,6 @@ export function createLeadToolCore(deps: ToolDepsLike): LeadToolCore {
             messageId: message.id,
             mailboxOnly,
             toSessionId: team.members.find((m) => m.key === to)?.sessionId ?? null,
-            integrityWarning,
           };
         });
 
@@ -986,14 +1018,12 @@ export function createLeadToolCore(deps: ToolDepsLike): LeadToolCore {
           delivered,
           mailboxOnly: prepared.mailboxOnly,
           messageId: prepared.messageId,
-          ...(prepared.integrityWarning !== undefined ? { integrityWarning: true } : {}),
         });
         return okResult(renderIdle(me.agentKey, prepared.to, delivered), {
           to: prepared.to,
           delivered,
           ...(prepared.mailboxOnly ? { mailboxOnly: true } : {}),
           ...(note !== undefined ? { note } : {}),
-          ...(prepared.integrityWarning !== undefined ? { integrityWarning: prepared.integrityWarning } : {}),
         });
       });
     },

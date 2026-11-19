@@ -248,6 +248,24 @@ export async function xcRegister(
       // 服务端代写 sessions/<sid>.json：wakeToken 路径不依赖钩子落盘（§2.3-4 ②）。
       // v0.5.3（a6）：代写不得抹掉钩子已写的锚定令牌（保留既有 regToken；缺失则
       // 补铸一枚，令牌与后续 SessionStart 的延续逻辑同源）。
+      //
+      // v0.9.1 r4（V090-04，P2）：**不再写 boundName**（旧实现无条件
+      // `boundName: agentKey`）。该字段在 v0.9.1 r3 起是「引擎供给的无头持有者」
+      // 判据（core/config.ts engineHolderIsHeadless：行当前 sid 的记录带本名
+      // boundName ⟺ 免开关成立）。旧写法可被交互会话**自签**：交互会话经
+      // xc_identify({takeover:true}) 接管已死引擎成员花名（joinTeam 保留
+      // identity="engine"、只换 sid）后，在 wake_enabled=true 期被 dispatch
+      // 唤醒——wake prompt 身份行显式携带 wakeToken——接管方用它走本路径即可把
+      // boundName 写进自己的会话记录；此后用户把 config.json 改
+      // {"wake_enabled":false} 也无效（resolveWakeGate 对 engine 标行免开关放行），
+      // G-7「全局开关保护交互会话」被一次 takeover + 一次唤醒期派单永久解除
+      // （裁决证据链 r3-c3b：stubCallsToB=2、bypassedUserDisable=true）。
+      // 修后 boundName 的**唯一**写入路径 = member-add 供给代写
+      // （mcp/tools-team.ts Phase 3，供给即无头会话、攻击者无法让引擎为自己的
+      // 交互 sid 代写）；本路径只做「不依赖钩子落盘」的记录锚定，不替代供给链。
+      // 既有记录已带的 boundName 经下方 spread 原样保留（合法成员的记录本就由
+      // member-add 盖过，重写不丢）；记录缺失/无 boundName（交互会话钩子锚定形态）
+      // → 保持缺失，免开关不成立（回落 file/env/默认层，fail-safe）。
       const existingRecord = await readSession(stateRoot, sessionId);
       const record: SessionRecord = {
         ...(existingRecord ?? {}),
@@ -255,7 +273,6 @@ export async function xcRegister(
         cwd: process.cwd(),
         startedAt: existingRecord?.startedAt ?? now,
         lastSeen: now,
-        boundName: agentKey,
         regToken: existingRecord?.regToken ?? randomUUID(),
       };
       await writeSession(stateRoot, record);

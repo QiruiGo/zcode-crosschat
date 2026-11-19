@@ -23,12 +23,23 @@
  *
  * urgent/interrupt（§3.1，E1 全部平台事实支撑）：
  * - urgent：队内轴落邮箱时盖 `urgent:true`（M3 读取面 urgentFirst 据此插队）+
- *   wake 携带段首位 URGENT 横幅（engine/wake.ts buildWakePrompt）；不豁免 dedup、
- *   不绕过 decideDelivery 三重条件（E1 §1.2：忙时 -32010 拒收 → 下一回合必读）。
- * - interrupt：v0.6 平台限制下**如实降级**——interrupt 蕴含 urgent，不做任何
- *   stop→send 尝试（插件不持有目标会话 wire，provision.ts:381 keeper kill；
- *   E1 §3.1 证明盲发有并发写风险，宁降级不冒险）；payload 固定携带
- *   `interrupt:{requested,result:"deferred-next-turn",reason}`。
+ *   wake 携带段首位 URGENT 横幅（engine/wake.ts buildWakePrompt）；不绕过
+ *   decideDelivery 三重条件（E1 §1.2：忙时 -32010 拒收 → 下一回合必读）。
+ *   v0.9.2（V090-12）：dedup 键纳入优先级差异——同文后发 urgent/interrupt 不判
+ *   duplicate（软中断信封必须真达、urgent 重发必须插队；优先级相同才去重）。
+ * - interrupt：v0.9 起软中断（G-2）——interrupt 蕴含 urgent，消息加 `interrupt:true`
+ *   元数据落箱（正文保持原话，uservoice 盖章字节匹配不受影响），读取面信封渲染
+ *   INTERRUPT 横幅（peerenvelope.TEAM_INTERRUPT_BANNER），收方按安全点纪律
+ *   （crosschat 技能 §6）处理并回确认；宿主仍无回合中注入原语（E1，不做任何
+ *   stop→send 尝试——插件不持有目标会话 wire），队内轴 payload 固定携带
+ *   `interrupt:{requested,result:"deferred-next-turn",reason,envelope:"team-inbox"|absent}`
+ *   如实回报；v0.9.2（V090-12）peer 轴显式 `envelope:"none"`+note（wire 冻结、无痕迹）。
+ * - 撤回（v0.9 G-3）：`withdrawMessageIds`（仅队内轴，与 msg/urgent/interrupt/summary/
+ *   source* 互斥）——只撤自己发给该目标的未读件：整行删除（mailbox.deleteMailboxMessages）
+ *   + withdrawal-notice 通知帧 + engine 事件 + 尽力唤醒；含已读/非本人/不存在/已作废件
+ *   整单拒绝（`withdraw_rejected`）并逐条报状态。peer 轴显式拒收
+ *   （`withdraw_peer_axis_unsupported`）。v0.9.2（V090-10）：通知帧自身不可撤
+ *   （items 状态 `notice`）——对账锚点，链式撤回会把它架空。
  * - peer 轴 urgent：管道 MsgFrame 不携带 urgent（transport/frames.ts 白名单冻结，
  *   防混合版本端点整帧拒收——封闭字段集对未知字段整帧拒绝）；文件退化路径的
  *   队列项携带 urgent（M3 排空面 urgent-first 生效）；peer 端点无 wake 通道
@@ -59,7 +70,7 @@ import { LockBusyError, withTeamLock } from "../core/lock.js";
 import { sanitizeKey } from "../core/sanitize.js";
 import { DEFAULT_TEAM_ID, memberState } from "../core/types.js";
 import type { TeamMessage, TeamState } from "../core/types.js";
-import { appendMailbox, createMessage, readMailbox } from "../core/mailbox.js";
+import { appendMailbox, classifyFrame, createMessage, deleteMailboxMessages, readMailbox } from "../core/mailbox.js";
 import { getTask, memberOpenTasks, readTeam } from "../core/teamstate.js";
 import { appendHeldMessage, readInboundPolicy } from "../core/policy.js";
 import { localPidDomain, peerInboxFile, peerKeyFile, peerRootFromEnv, readPeerBaseRecord } from "../core/peerdir.js";
@@ -103,12 +114,13 @@ const TEAM_ID = DEFAULT_TEAM_ID;
 
 export const RelayShape = {
   to: z.string().min(1).describe("目标名（队内成员或跨会话 peer；两轴同名时用 \"名字[team]\" / \"名字[peer]\" 消歧）"),
-  msg: z.string().min(1).describe("消息正文（/xc-say 场景必须逐字引用用户原话——origin=user 盖章按字节匹配）"),
+  msg: z.string().min(1).optional().describe("消息正文（/xc-say 场景必须逐字引用用户原话——origin=user 盖章按字节匹配）。仅在 withdrawMessageIds 撤回模式下可省略"),
   urgent: z.boolean().optional().describe("插队：排到目标所有未读之前 + 尽力推送唤醒"),
-  interrupt: z.boolean().optional().describe("请求打断目标当前回合（v0.6 平台限制下降级为 urgent+下一回合必读，payload 如实回报）"),
+  interrupt: z.boolean().optional().describe("软中断（v0.9 G-2）：发结构化 INTERRUPT 信封（urgent 置顶语义不变）；宿主无回合中注入原语，收方在下一回合 inbox-check 撞见后按安全点纪律回确认，payload 如实回报"),
   summary: z.string().optional().describe("一句话摘要（peer 轴帧携带；队内轴进审计）"),
   sourceTaskId: z.string().optional().describe("与 sourceAttemptId 成对；任务上下文关联（过期自动作废）"),
   sourceAttemptId: z.string().optional(),
+  withdrawMessageIds: z.array(z.string().min(1)).min(1).optional().describe("撤回（v0.9 G-3，仅队内轴）：要撤回的 messageId 数组——只允许撤回**自己发给该目标且仍未读**的消息（整行删除 + 给收方投一条 withdrawal-notice 通知帧 + engine 事件）；含已读/非本人/不存在/已作废/通知帧（withdrawal-notice 自身不可撤——链式撤回会架空对账契约）件时整单拒绝并逐条报状态。撤回模式下 msg/urgent/interrupt/summary/source* 一律不接受"),
 };
 
 export type RelayArgs = z.infer<z.ZodObject<typeof RelayShape>>;
@@ -119,14 +131,29 @@ export type RelayArgs = z.infer<z.ZodObject<typeof RelayShape>>;
 export const INTERRUPT_DEFERRED_REASON =
   "host wire has no interrupt primitive (E1 §1.1); stop->send requires same-host bookkeeping the plugin does not hold";
 
-/** interrupt 结果词（v0.6 只有降级态；v0.7 approval/interrupt 帧族另议）。 */
+/** interrupt 结果词（v0.6 只有降级态；v0.9 起软中断信封见 {@link INTERRUPT_ENVELOPE_TEAM}）。 */
 export const INTERRUPT_DEFERRED_RESULT = "deferred-next-turn" as const;
+
+/**
+ * v0.9（G-2）：队内轴 INTERRUPT 信封的 payload 标注值——interrupt:true 的消息携带
+ * `interrupt:true` 元数据落箱（内容保持原话，uservoice 盖章字节匹配不受影响），
+ * 读取面（xc_read 信封）渲染 INTERRUPT 横幅；收方按安全点纪律处理
+ * （crosschat 技能 §6）。peer 轴不带本标注（管道 MsgFrame 白名单冻结，v0.9 不动 wire）。
+ */
+export const INTERRUPT_ENVELOPE_TEAM = "team-inbox" as const;
 
 /** interrupt payload 块（请求/结果对：requested=请求标记，result=平台判定结果）。 */
 export interface InterruptOutcome {
   requested: boolean;
   result: typeof INTERRUPT_DEFERRED_RESULT | "not-requested";
   reason?: string;
+  /** v0.9（G-2）：队内轴信封标注（PROTOCOL §7 冻结键）；absent = 本路径未落信封。
+   *  v0.9.2（V090-12 C 域）：peer 轴显式写 `"none"`——管道 MsgFrame 白名单冻结，
+   *  收方看不到任何 INTERRUPT 痕迹，payload 必须如实说清（不许让调用方以为 peer
+   *  也收到了队内轴的软中断信封）。 */
+  envelope?: typeof INTERRUPT_ENVELOPE_TEAM | "none";
+  /** v0.9.2（V090-12）：peer 轴附加说明（队内轴不出现）。 */
+  note?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -174,9 +201,43 @@ async function teamRosterHit(stateRoot: string, target: string): Promise<TeamSta
   return team.members.some((m) => m.key === key) ? team : undefined;
 }
 
-/** interrupt payload 块（requested=true 固定降级回报；§3.1 固定结构）。 */
-function interruptBlock(): { requested: true; result: typeof INTERRUPT_DEFERRED_RESULT; reason: string } {
-  return { requested: true, result: INTERRUPT_DEFERRED_RESULT, reason: INTERRUPT_DEFERRED_REASON };
+/**
+ * interrupt payload 块（requested=true 固定降级回报；§3.1/PROTOCOL §7 固定结构）。
+ * v0.9（G-2）：`envelope:"team-inbox"` 仅在队内轴消息真实落箱（mailbox/wake 路径）时
+ * 携带——held/duplicate 不带（信封未进可读邮箱 / 重复的是既有消息）。
+ * v0.9.2（V090-12 C 域）：peer 轴走 {@link interruptBlockPeer}——如实回报「无信封」。
+ */
+function interruptBlock(envelope: boolean): InterruptOutcome {
+  return envelope
+    ? { requested: true, result: INTERRUPT_DEFERRED_RESULT, reason: INTERRUPT_DEFERRED_REASON, envelope: INTERRUPT_ENVELOPE_TEAM }
+    : { requested: true, result: INTERRUPT_DEFERRED_RESULT, reason: INTERRUPT_DEFERRED_REASON };
+}
+
+/**
+ * v0.9.2（V090-12 C 域）：peer 轴 interrupt 的**如实**回报块。管道 MsgFrame 白名单
+ * 冻结（v0.9 不动 wire），peer 收方看不到任何 INTERRUPT 痕迹——既不渲染信封也不渲染
+ * 横幅；若继续只回 `{requested,result,reason}`，调用方会误以为 peer 也受到了队内轴的
+ * 软中断信封。现在显式 `envelope:"none"` + note 说明边界（文件退化件带 urgent 排序，
+ * 管道帧连 urgent 都不带——同一 note 里说清）。
+ */
+function interruptBlockPeer(): InterruptOutcome {
+  return {
+    requested: true,
+    result: INTERRUPT_DEFERRED_RESULT,
+    reason: INTERRUPT_DEFERRED_REASON,
+    envelope: "none",
+    note: "peer axis carries no INTERRUPT trace (MsgFrame wire whitelist frozen in v0.9): "
+      + "the receiver sees a plain peer message; in-band effect is urgent ordering on file-fallback items only",
+  };
+}
+
+/**
+ * v0.9（G-3）：withdrawal-notice 通知帧正文（PROTOCOL §7.1 冻结键集——契约测试
+ * 按 Object.keys 对拍）。纯通知帧：只报哪些 id 被撤回与撤回时刻，**不带被撤消息
+ * 的正文**（收方尚未读过，撤回的意义就是让它不被看到）。
+ */
+export function buildWithdrawalNoticeFrame(withdrawnMessageIds: readonly string[], ts: number): string {
+  return JSON.stringify({ type: "withdrawal-notice", withdrawnMessageIds: [...withdrawnMessageIds], withdrawnCount: withdrawnMessageIds.length, ts });
 }
 
 // ---------------------------------------------------------------------------
@@ -275,6 +336,112 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
           throw invalidParamsError("sourceTaskId and sourceAttemptId must be provided together");
         }
 
+        // v0.9（G-3）：撤回模式（PROTOCOL §7.1 冻结）——与消息发送完全互斥（不静默
+        // 丢参：冲突参数显式点名拒绝）。整单语义：任一件不可撤（已读/非本人/不存在/
+        // 已作废）→ 全单拒绝、一个字节不动；全可撤 → 整行删除 + withdrawal-notice
+        // 通知帧 + engine 事件 + 尽力唤醒（不带 urgent——撤回本身不是插队请求）。
+        const withdrawIds = args.withdrawMessageIds;
+        if (withdrawIds !== undefined) {
+          const offenders = (["msg", "urgent", "interrupt", "summary", "sourceTaskId", "sourceAttemptId"] as const)
+            .filter((k) => args[k] !== undefined);
+          if (offenders.length > 0) {
+            throw invalidParamsError(
+              `withdrawMessageIds is exclusive: ${offenders.join("/")} must be omitted in withdraw mode`,
+              { error: "withdraw_exclusive_params", offenders: [...offenders] },
+            );
+          }
+          const uniqueIds = [...new Set(withdrawIds)];
+          const now = Date.now();
+          const outcome = await withTeamLock(stateRoot, me.teamId, async () => {
+            const team = await readTeam(stateRoot, me.teamId);
+            if (team === undefined) throw new ToolError({ error: "no_team", message: "no team on disk yet" });
+            const recipient = team.members.find((m) => m.key === toKey);
+            if (recipient === undefined) {
+              throw new ToolError({
+                error: "not_a_member",
+                agentKey: toKey,
+                message: `"${toKey}" is not a member of team "${team.teamId}"`,
+              });
+            }
+            const box = await readMailbox(stateRoot, me.teamId, toKey);
+            // 逐条状态（PROTOCOL §7.1 冻结词表：unread 可撤；read/not_found/foreign/
+            // discarded/notice 不可撤）。判定次序 = found → 本人 → 通知帧 → 未读 → 未作废。
+            // v0.9.2（V090-10 P2 修复）：withdrawal-notice 帧结构性不可撤——它是对账锚点
+            // （收方靠它知道哪些 id 被撤）。v0.9.0~v0.9.1 通知帧满足全部撤回判据，发送者可
+            // 链式撤回通知，收方最终只剩内容=上一条通知 id 的孤儿通知、原始被撤 ids 永久
+            // 不可见，PROTOCOL §7.1 对账契约被架空。
+            const items = uniqueIds.map((id) => {
+              const m = box.find((x) => x.id === id);
+              if (m === undefined) return { messageId: id, status: "not_found" as const };
+              if (m.from !== me.agentKey) return { messageId: id, status: "foreign" as const };
+              const cls = classifyFrame(m.content);
+              if (cls.kind === "frame" && cls.frameType === "withdrawal-notice") {
+                return { messageId: id, status: "notice" as const };
+              }
+              if (m.readAt !== undefined) return { messageId: id, status: "read" as const };
+              if (m.discardedAt !== undefined) return { messageId: id, status: "discarded" as const };
+              return { messageId: id, status: "unread" as const };
+            });
+            const blocked = items.filter((i) => i.status !== "unread");
+            if (blocked.length > 0) {
+              await logEngineEvent(stateRoot, {
+                event: "message-withdraw-rejected",
+                teamId: me.teamId,
+                from: me.agentKey,
+                to: toKey,
+                requested: uniqueIds.length,
+                blocked: blocked.map((i) => i.messageId),
+              });
+              throw new ToolError({
+                error: "withdraw_rejected",
+                to: toKey,
+                items,
+                message: `withdraw rejected: ${blocked.length}/${items.length} message(s) are not withdrawable `
+                  + "(unread-only, own-sent); nothing was deleted",
+              });
+            }
+            const removed = await deleteMailboxMessages(stateRoot, me.teamId, toKey, uniqueIds);
+            if (removed !== uniqueIds.length) {
+              // 锁内读改写一致性对账：删除数 ≠ 请求数 = 邮箱在锁内被并发改写——
+              // 显式失败（不静默少删），调用方可直接重试（幂等：缺失件报 not_found）。
+              throw new ToolError({
+                error: "internal",
+                message: `withdraw deleted ${removed} of ${uniqueIds.length} selected message(s); `
+                  + "mailbox changed under the lock — retry",
+              });
+            }
+            const notice = createMessage(me.agentKey, toKey, buildWithdrawalNoticeFrame(uniqueIds, now), {
+              deliveryClaimedAt: now,
+            });
+            await appendMailbox(stateRoot, me.teamId, toKey, notice);
+            await logEngineEvent(stateRoot, {
+              event: "message-withdrawn",
+              teamId: me.teamId,
+              from: me.agentKey,
+              to: toKey,
+              messageIds: uniqueIds,
+              count: uniqueIds.length,
+              noticeMessageId: notice.id,
+            });
+            return { withdrawn: uniqueIds, noticeId: notice.id, noticeContent: notice.content, toSessionId: recipient.sessionId };
+          });
+          const sent = await wake(toKey, outcome.toSessionId, "withdrawal", [outcome.noticeId], outcome.noticeContent, false);
+          return okResult(
+            `Withdrew ${outcome.withdrawn.length} unread message(s) to "${toKey}" (deleted from their inbox); `
+            + "a withdrawal-notice frame was appended so the receiver knows.",
+            {
+              withdrawn: outcome.withdrawn,
+              withdrawnCount: outcome.withdrawn.length,
+              noticeMessageId: outcome.noticeId,
+              to: toKey,
+              delivered: sent.delivered,
+            },
+          );
+        }
+        if (args.msg === undefined) {
+          throw invalidParamsError("msg is required unless withdrawMessageIds is provided (withdraw mode)");
+        }
+
         // C1 语义归一：interrupt 蕴含 urgent（§3.1）。
         const interruptRequested = args.interrupt === true;
         const urgent = args.urgent === true || interruptRequested;
@@ -355,7 +522,10 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
         // 转办/审批帧的控制点是审批门，不是入站策略——hold 会让请求永远躺隔离区）。
         const policy = await readInboundPolicy(stateRoot, me.teamId, env);
         if (policy.mode === "hold" && toolFrameType === undefined) {
-          const msg = createMessage(me.agentKey, toKey, content, { ...(urgent ? { urgent: true } : {}) });
+          const msg = createMessage(me.agentKey, toKey, content, {
+            ...(urgent ? { urgent: true } : {}),
+            ...(interruptRequested ? { interrupt: true as const } : {}),
+          });
           await appendHeldMessage(stateRoot, me.teamId, toKey, msg);
           await logEngineEvent(stateRoot, {
             event: "inbound-held",
@@ -364,6 +534,7 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
             to: toKey,
             messageId: msg.id,
             ...(urgent ? { urgent: true } : {}),
+            ...(interruptRequested ? { interruptRequested: true } : {}),
           });
           return okResult(
             `Message held by inbound policy (mode=hold, source=${policy.source}): quarantined in ` +
@@ -375,7 +546,8 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
               delivered: "held",
               policy: "hold",
               ...(urgent ? { urgent: true } : {}),
-              ...(interruptRequested ? { interrupt: interruptBlock() } : {}),
+              // held 件不带 envelope 标注——信封未进可读邮箱（接受审阅后随元数据渲染）。
+              ...(interruptRequested ? { interrupt: interruptBlock(false) } : {}),
             },
           );
         }
@@ -470,6 +642,12 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
           }
 
           // duplicate 去重（findDuplicateMail；urgent 不豁免 dedup——§4.2-M4 判定注记）。
+          // v0.9.2（V090-12 C 域）：去重键**纳入优先级差异**——同文后发 interrupt/urgent
+          // 不得判 duplicate：软中断信封必须真达收方（否则 interrupt 语义被 dedup 吞掉、
+          // 收方永远看不到 INTERRUPT 信封），urgent 重发也必须插队（判 duplicate 会把
+          // urgent 标记丢在旧件上）。优先级相同才去重（防误触双发）。
+          // 实现在本模块（不动 engine/wake.ts 的键函数——B 域文件）：dup 命中后比对
+          // 既有件与本次的 urgent/interrupt 标记，有差异即放行重发。
           const existing = await readMailbox(stateRoot, me.teamId, toKey);
           const dup = findDuplicateMail(existing, team, {
             from: me.agentKey,
@@ -480,7 +658,10 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
             sourceAttemptId: src.sourceAttemptId,
             sourceTaskStatus: src.sourceTaskStatus,
           });
-          if (dup !== undefined) {
+          const samePriority = dup !== undefined
+            && (dup.urgent === true) === urgent
+            && (dup.interrupt === true) === interruptRequested;
+          if (dup !== undefined && samePriority) {
             return { delivered: "duplicate" as const, messageId: dup.id, toSessionId: recipient.sessionId };
           }
 
@@ -522,6 +703,7 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
             deliveryClaimedAt: now,
             ...(stamp.hit ? { origin: "user" as const, originSessionId: me.sessionId } : {}),
             ...(urgent ? { urgent: true } : {}),
+            ...(interruptRequested ? { interrupt: true as const } : {}),
           });
           await appendMailbox(stateRoot, me.teamId, toKey, msg);
 
@@ -647,7 +829,9 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
           messageId: out.messageId,
           delivered,
           ...(urgent ? { urgent: true } : {}),
-          ...(interruptRequested ? { interrupt: interruptBlock() } : {}),
+          // v0.9（G-2）：信封标注只在消息真实落箱（非 duplicate）时携带——duplicate
+          // 返回的是既有消息，未必带 interrupt 元数据，不得虚报。
+          ...(interruptRequested ? { interrupt: interruptBlock(out.delivered !== "duplicate") } : {}),
           ...(delivered === "duplicate" ? { duplicate: true } : {}),
           ...(toolFrameType === "tool_request" && toolRequestCheck !== undefined
             ? {
@@ -702,9 +886,23 @@ export async function relayPeerSend(
   interruptRequested: boolean,
 ): Promise<ToolResult> {
   const { stateRoot, env } = deps;
+  // v0.9（G-3）：撤回是队内邮箱语义（messageId + readAt 真源都在 team inbox）——peer
+  // 队列没有可撤的真源（管道即达/文件退化件无未读簿），显式拒收，不静默降级。
+  if (args.withdrawMessageIds !== undefined) {
+    throw new ToolError(
+      {
+        error: "withdraw_peer_axis_unsupported",
+        to: target,
+        axis: "peer",
+        message: "withdrawMessageIds is team-axis only (unread-mailbox deletion lives on the team inbox); "
+          + "peer messages cannot be withdrawn once sent",
+      },
+      "withdrawMessageIds is team-axis only",
+    );
+  }
   // v0.7（C6，§2.2）：C6/C7 帧只走队内轴+文件邮箱（审批门/台账都以队内状态根为锚）。
   // peer 轴转办未验（E4 §9.3：隔离 storage 下 peer 根孤立）——显式拒收，不静默降级。
-  const peerToolFrame = parseToolFrameType(args.msg);
+  const peerToolFrame = parseToolFrameType(args.msg ?? "");
   if (peerToolFrame !== undefined) {
     throw new ToolError(
       {
@@ -829,6 +1027,11 @@ export async function relayPeerSend(
   }
 
   // 盖章链（SEC-1 会话归属验证 + R-12 字节匹配；平移 peer-tools send）。
+  // v0.9（G-3）：撤回单已在上方显式拒收；到此 msg 必须在场（与队内轴同口径——
+  // 缺 msg 且无 withdrawMessageIds 的调用显式 invalid_params，不静默当空正文）。
+  if (args.msg === undefined) {
+    throw invalidParamsError("msg is required unless withdrawMessageIds is provided (withdraw mode)");
+  }
   const msgId = randomUUID();
   const text = args.msg;
   const authority = await verifyUservoiceStampAuthority(root, stateRoot, self.sessionId);
@@ -962,7 +1165,8 @@ export async function relayPeerSend(
       axis: "peer",
       ...(detail !== undefined ? { detail } : {}),
       ...(urgent ? { urgent: true } : {}),
-      ...(interruptRequested ? { interrupt: interruptBlock() } : {}),
+      // v0.9.2（V090-12 C 域）：peer 轴 interrupt 如实回报「无 INTERRUPT 痕迹」。
+      ...(interruptRequested ? { interrupt: interruptBlockPeer() } : {}),
     },
   );
 }
@@ -1126,8 +1330,10 @@ export function registerRelay(
   };
   const description =
     "Send a message / deliver a user intervention to a team member or a cross-session peer. " +
-    "urgent=true queues it ahead of every unread message and best-effort pushes a wake; interrupt=true requests stopping the target's current turn — " +
-    "the host wire has no interrupt primitive (E1), so it degrades to urgent + first-read-next-turn and says so in the payload. " +
+    "urgent=true queues it ahead of every unread message and best-effort pushes a wake; interrupt=true sends a structured soft-interrupt " +
+    "envelope (urgent ordering unchanged) — the host has no mid-turn injection primitive, so the receiver sees it at its next inbox check " +
+    "and acks per the safety-point discipline (finish the current atomic operation, start nothing new, reply to confirm); the payload reports this honestly. " +
+    "withdrawMessageIds (team axis only, v0.9) withdraws your own still-unread messages: all-or-nothing — any read/foreign/missing/discarded id, or a withdrawal-notice frame itself (notices are the accounting anchor and are never withdrawable), rejects the whole order with per-item status. " +
     "forwardOf was removed in v0.6: write the body directly, send annotations as a separate message. " +
     'msg may carry a JSON protocol frame; v0.7 C6 transfer frames are {type:"tool_request"|"tool_result"} (team axis only): ' +
     "a tool_request asks a teammate who has an MCP tool you lack to run it — it stays invisible until an approval file authorizes it " +

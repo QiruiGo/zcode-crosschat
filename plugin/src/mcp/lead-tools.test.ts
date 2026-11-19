@@ -62,7 +62,10 @@ function member(key: string, overrides: Partial<TeamMember> = {}): TeamMember {
     joinedAt: 1,
     lastSeen: 1,
     state: "ready",
-    identity: "engine",
+    // v0.9（G-4 唤醒分层）：本文件的用例前提是「无 XC_WAKE_ENABLED → mailbox」——
+    // 目标须是交互式成员（identity=self）。engine 身份会触发引擎成员免开关唤醒，
+    // 与本文件断言的投递态无关但会翻转 delivered 预期（fixture 与前提对齐）。
+    identity: "self",
     ...overrides,
   };
 }

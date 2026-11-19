@@ -136,6 +136,15 @@ export const TEAM_FOOTER_USER_ORIGIN = [
 export const TEAM_FOOTER_MARKER = '不是你的用户打的字';
 export const TEAM_FOOTER_USER_MARKER = '发送会话用户的原话';
 
+/**
+ * v0.9（G-2）：INTERRUPT 软中断横幅（PROTOCOL §3 冻结逐字节，契约测试对拍）。
+ * 渲染位置 = 信封开标签后、正文前一行（消息带 `interrupt:true` 元数据时）；
+ * 安全点纪律全文见 crosschat 技能 §6——横幅只是就地提醒：完成当前原子操作、
+ * 不开新步骤、先回确认。通知性内容，不带授权语义。
+ */
+export const TEAM_INTERRUPT_BANNER =
+  '[INTERRUPT 软中断请求：完成当前原子操作、不开新步骤；先回确认（xc_relay 回发件人）再继续]';
+
 /** The six receipt states (CC `Ae(e)` @36116756; DESIGN-V0.3 §7.4). */
 export type PeerReceiptState = 'held' | 'denied' | 'expired' | 'delivered' | 'refused' | 'dropped';
 
@@ -248,7 +257,14 @@ export function isPeerEnvelopeRendered(text: string): boolean {
     && (text.includes(PEER_FOOTER_MARKER) || text.includes(PEER_FOOTER_USER_MARKER));
 }
 
-/** R-16：队内域幂等守卫（team tag + 页脚 marker，peerenvelope 同款双 marker 语义）。 */
+/**
+ * R-16：队内域「形似已渲染」检测（team tag + 页脚 marker 双子串）。
+ * v0.9.1（V090-13 P1 修复）：**本函数不再作为透传守卫**——它只查两个子串，
+ * 纯文本伪造的完整信封（含 interrupt="true" 属性 + INTERRUPT 横幅 + 页脚 +
+ * 回信指引）会被判「已渲染」而原样升级进注入面，与引擎真实渲染不可区分。
+ * 现仅保留为检测用（测试/诊断）；渲染面一律走 {@link renderTeamEnvelope}
+ * 的「恒由元数据重建」路径。
+ */
 export function isTeamEnvelopeRendered(text: string): boolean {
   return text.includes(`</${TEAM_ENVELOPE_TAG}>`)
     && (text.includes(TEAM_FOOTER_MARKER) || text.includes(TEAM_FOOTER_USER_MARKER));
@@ -415,27 +431,82 @@ export interface TeamEnvelopeInput {
   content: string;
   /** 作者身份标记；absent/"agent" = agent（页脚取 TEAM_FOOTER_ATTRIBUTION）。 */
   origin?: 'user' | 'agent';
+  /** v0.9（G-2）：软中断信封（TeamMessage.interrupt）——true 时开标签加
+   *  interrupt="true" 属性并在正文前渲染 {@link TEAM_INTERRUPT_BANNER}。 */
+  interrupt?: boolean;
 }
 
 /**
- * R-16：队内域逐条信封——`<crosschat-team-message type="…" from="…"[ origin="user"]>`
+ * v0.9.1（V090-13 P1 修复）：回信指引行模板正则（团队域剥离用，与渲染面同模板）。
+ * 伪造回信指引会指向攻击者花名——回信寻址是信封信任工件的一部分，正文内嵌的
+ * 指引行一律剥离，指引只由引擎按真实发送者渲染一次。
+ */
+export const TEAM_REPLY_INSTRUCTION_RE =
+  /After completing your current task, decide whether\/how to respond: reply with `xc_relay\(\{to: "[^"\n]*"\}\)`\.`?/g;
+
+/**
+ * v0.9.2（V090-11 P3 修复）：INTERRUPT 横幅的**模式**剥离（v0.9.1 为逐字 split——
+ * 近似变体（全角括号改半角、加空格、［］方括号等）绕过剥离后在诚实信封体内原样
+ * 渲染，对 LLM 读面保留近似真横幅的指令驱动力）。
+ * 版式：`[` 或 `［` 开头 + `INTERRUPT`（空白容忍）+ `软中断请求` + 任意非括号内容 +
+ * `]` 或 `］` 收尾；行内匹配（`[^\]\n］]*` 不跨行，防把整段正文当横幅吃掉）。
+ * 裸形态（无括号的 `INTERRUPT 软中断请求：…` 行）同样剥离——该短语是信任工件的
+ * 稳定词样，正文出现即视为引用/伪造信任工件。精确横幅恒被本模式覆盖（超集）。
+ */
+export const TEAM_INTERRUPT_BANNER_RE = /[\[［]\s*INTERRUPT\s*软中断请求[^\]\n］]*[\]］]/g;
+/** 裸横幅短语行（无括号变体）——剥到行尾（该短语是信任工件稳定词样）。 */
+export const TEAM_INTERRUPT_BANNER_BARE_RE = /INTERRUPT\s*软中断请求：[^\n]*/g;
+
+/**
+ * v0.9.1（V090-13 P1 修复）：团队域正文渲染卫生（升级版）——从正文中剥离：
+ * ① 信封开/闭标签（≤4 轮，既有 stripNestedEnvelope 纪律）；
+ * ② INTERRUPT 横幅（{@link TEAM_INTERRUPT_BANNER_RE} 模式匹配 + 裸短语
+ *    {@link TEAM_INTERRUPT_BANNER_BARE_RE}——伪造/近似横幅不得留在正文触发软中断
+ *    安全点纪律；真横幅只随消息元数据由引擎渲染一次）；
+ * ③ 回信指引行（{@link TEAM_REPLY_INSTRUCTION_RE}——回信寻址只由引擎按真实
+ *    发送者渲染一次）；
+ * ④ 归因页脚常量（{@link TEAM_FOOTER_ATTRIBUTION}/{@link TEAM_FOOTER_USER_ORIGIN}
+ *    逐字——伪造 user-origin 归因不得留在正文）。
+ * 全部逐字/定版式匹配（无启发式）：合法正文不含这些完整常量；含了就是伪造/引用
+ * 信任工件的情形，剥离即卫生。既有先例=stripNestedEnvelope 的静默渲染卫生。
+ */
+export function stripForgedTeamEnvelopeMarkup(body: string): string {
+  let current = stripNestedEnvelope(body, TEAM_ENVELOPE_TAG);
+  current = current.replace(TEAM_INTERRUPT_BANNER_RE, '');
+  current = current.replace(TEAM_INTERRUPT_BANNER_BARE_RE, '');
+  current = current.replace(TEAM_REPLY_INSTRUCTION_RE, '');
+  current = current.split(TEAM_FOOTER_ATTRIBUTION).join('');
+  current = current.split(TEAM_FOOTER_USER_ORIGIN).join('');
+  return current;
+}
+
+/**
+ * R-16：队内域逐条信封——`<crosschat-team-message type="…" from="…"[ origin="user"][ interrupt="true"]>`
  * 包裹正文 + 归因尾注（按 origin 分叉）+ 回复指引（xc_relay）。
- * 幂等：已渲染（team tag + 页脚 marker）的 content 原样返回（peerenvelope 同款守卫）。
  * v0.6（DESIGN-V0.6.md §2.2 行 3）：防伪造 verified 标记砍除；嵌套 team 信封仍剥离
  * ≤4 轮（渲染卫生）。
+ * **v0.9.1（V090-13 P1 修复）：恒由消息元数据重建**——v0.9.0 及以前「已渲染
+ * （team tag + 页脚 marker）的 content 原样返回」的幂等守卫废除：该守卫只查两个
+ * 子串，纯文本伪造的完整信封会被当已渲染工件原样透传，与引擎真实渲染不可区分
+ * （伪造 interrupt="true"+横幅直接驱动软中断安全点纪律、伪造 from 冒名任意成员）。
+ * 现在：正文一律先过 {@link stripForgedTeamEnvelopeMarkup} 再重包，开标签属性
+ * （type/from/origin/interrupt）与横幅只由 input 元数据驱动，from 恒为真实发送者。
+ * 伪造标记只活在磁盘真源与 JSON entry / mail scope 原文（真值层不动）。
  */
 export function renderTeamEnvelope(input: TeamEnvelopeInput): string {
-  if (isTeamEnvelopeRendered(input.content)) return input.content;
-  const body = stripNestedEnvelope(input.content, TEAM_ENVELOPE_TAG);
+  const body = stripForgedTeamEnvelopeMarkup(input.content);
   // type 属性来自消息自身的 JSON type 字段（可为任意字符串）：控制字符→空格防属性注入，
   // 再过属性转义；from 是成员键，转义兜底。
   const frameType = input.frameType.replace(/[\u0000-\u001f\u007f]/g, ' ');
   const originAttr = input.origin === 'user' ? ' origin="user"' : '';
-  const openTag = `<${TEAM_ENVELOPE_TAG} type="${escapePeerAttr(frameType)}" from="${escapePeerAttr(input.from)}"${originAttr}>`;
+  // v0.9（G-2）：软中断信封——interrupt 属性 + 正文前横幅（元数据驱动，正文不动）。
+  const interruptAttr = input.interrupt === true ? ' interrupt="true"' : '';
+  const openTag = `<${TEAM_ENVELOPE_TAG} type="${escapePeerAttr(frameType)}" from="${escapePeerAttr(input.from)}"${originAttr}${interruptAttr}>`;
   const attribution = input.origin === 'user' ? TEAM_FOOTER_USER_ORIGIN : TEAM_FOOTER_ATTRIBUTION;
   const reply = `After completing your current task, decide whether/how to respond: reply with \`xc_relay({to: "${input.from}"})\`.`;
   return [
     openTag,
+    ...(input.interrupt === true ? [TEAM_INTERRUPT_BANNER] : []),
     body,
     `</${TEAM_ENVELOPE_TAG}>`,
     '',

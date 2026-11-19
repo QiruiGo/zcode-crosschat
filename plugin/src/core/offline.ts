@@ -44,6 +44,12 @@ export interface OfflineTaskInfo {
   status: TaskStatus;
   /** 该任务无进展时长（分钟，展示取整；判定用毫秒原值，见 offlineVerdict）。 */
   idleForMin: number;
+  /**
+   * v0.9.1 r3（V090-02）：该任务是否**真被回池**（revokeAttempt 重置回 pending）。
+   * false = 活性豁免滞留（任务仍在属主名下、未回池）——C8 转交通知据此分流文案，
+   * 不再对豁免任务谎称「requeued to the pending pool」。absent = 旧调用方（默认 true）。
+   */
+  requeued?: boolean;
 }
 
 /** 一名被判离线的成员 + 其名下**判据命中**的非终态任务。 */

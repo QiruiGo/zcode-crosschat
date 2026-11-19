@@ -199,6 +199,13 @@ export interface Task {
    * lastProgressTs 的兜底口径），行为不变。
    */
   lastProgressTs?: number;
+  /**
+   * v0.9.1（V090-05 r2）：上次 C8 离线转交通知的时刻（epoch ms）——**活性豁免**的
+   * 任务不被清扫、会跨清扫节拍持续命中 idle-timeout，本字段是 lead 通知的持久闸
+   * （阈值窗口内不重复通知）。absent = 从未通知。引擎特有字段，外部写入经
+   * plausibleLivenessTs 未来值校验（压制通知的伪造在读盘即失效）。
+   */
+  offlineNoticeAt?: number;
   result: string | null;
   error: string | null;
   evidence: EvidenceItem[];
@@ -343,6 +350,9 @@ export interface TeamMessage {
   forged?: boolean;
   /** v0.6（C1）：urgent 消息在一切读取面排最前（urgentFirst 排序键）。absent=false。 */
   urgent?: boolean;
+  /** v0.9（G-2）：软中断信封标记——xc_relay interrupt:true 写入，读取面据此渲染
+   *  INTERRUPT 横幅（安全点纪律见 crosschat 技能 §6）。absent=false；内容永不授权。 */
+  interrupt?: boolean;
 }
 
 /** One session record in `registry/sessions/<sessionId>.json` (DESIGN.md §2.2). */
@@ -360,6 +370,22 @@ export interface SessionRecord {
    * 纯 MCP API 层堵死（令牌不出现在任何工具输出/注册表外的公开面上）。
    */
   regToken?: string;
+  /**
+   * v0.9（G-9）：会话活性落盘两态（PROTOCOL §12.4）——`running`（回合执行中：
+   * UserPromptSubmit/SessionStart 起）/ `idle`（Stop 钩子止）；`dead` 是 C8 pid-dead
+   * 的派生态，不落盘（core/liveness.ts）。absent = v0.8 存量记录 → 读作 idle
+   * （保守：不给清扫豁免）。
+   */
+  liveness?: 'running' | 'idle';
+  /** v0.9（G-9）：进入当前 liveness 态的时刻（epoch ms）；观测面算 stateAgeMin 用。 */
+  livenessTs?: number;
+  /**
+   * v0.9（G-9/G-5）：本会话最近一次引擎事件的时刻（epoch ms）——钩子回合边界
+   * （SessionStart/UserPromptSubmit/Stop）与 MCP 工具调用心跳（peer-drain 包装层）
+   * 都刷新它。清扫侧作为心跳代理：属主在 stale 窗口内有过引擎事件即豁免（t1 模式），
+   * 不再要求手动 xc_report 打卡。
+   */
+  lastEventTs?: number;
 }
 
 /**
@@ -388,6 +414,20 @@ export interface WakeNonce {
   sid: string;
   ts: number;
   used?: boolean;
+}
+
+/**
+ * v0.9.1 r3（V090-01）：会话活性**引擎证言**（`registry/witness/<sid>.json`）。
+ * 与 {@link SessionRecord} 分路：后者是自述（可被一次本地文件写伪造、仅作展示），
+ * 本类型只由引擎进程写（hooks 回合边界 + MCP 工具调用心跳），是清扫豁免的唯一活性
+ * 输入（core/liveness.ts sweepOwnerGuard 只吃它）。
+ */
+export type SessionWitnessKind = 'running' | 'idle' | 'heartbeat';
+export interface SessionWitness {
+  sessionId: string;
+  kind: SessionWitnessKind;
+  /** 证言写入时刻（引擎时钟，epoch ms）。 */
+  ts: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -450,6 +490,8 @@ export function isTeamMessage(value: unknown): value is TeamMessage {
   const forged = absent(value['forged']);
   // v0.6（C1）：urgent 宽容增量——旧记录缺省照读；在场时必须布尔（forged 同款纪律）。
   const urgent = absent(value['urgent']);
+  // v0.9（G-2）：interrupt 宽容增量——旧记录缺省照读；在场时必须布尔（urgent 同款纪律）。
+  const interrupt = absent(value['interrupt']);
   return (
     isNonBlankString(value['id'])
     && isNonBlankString(value['from'])
@@ -470,6 +512,7 @@ export function isTeamMessage(value: unknown): value is TeamMessage {
     && absentOrString(value['originSessionId'])
     && (forged === undefined || typeof forged === 'boolean')
     && (urgent === undefined || typeof urgent === 'boolean')
+    && (interrupt === undefined || typeof interrupt === 'boolean')
   );
 }
 
@@ -505,6 +548,8 @@ export function normalizeMessage(value: TeamMessage): TeamMessage {
   if (typeof value.forged === 'boolean') out.forged = value.forged;
   // v0.6（C1）：urgent 宽容拷贝（origin 同款纪律）。
   if (typeof value.urgent === 'boolean') out.urgent = value.urgent;
+  // v0.9（G-2）：interrupt 宽容拷贝（urgent 同款纪律）。
+  if (typeof value.interrupt === 'boolean') out.interrupt = value.interrupt;
   return out;
 }
 
@@ -540,7 +585,7 @@ function coerceDependsOn(value: unknown): string[] | undefined {
   return value.every((entry) => typeof entry === 'string') ? (value as string[]) : undefined;
 }
 
-function coerceTask(value: unknown): Task | undefined {
+function coerceTask(value: unknown, now: number = Date.now()): Task | undefined {
   if (!isRecord(value)) return undefined;
   const status = value['status'];
   if (typeof status !== 'string' || !TASK_STATUSES.includes(status as TaskStatus)) return undefined;
@@ -601,6 +646,11 @@ function coerceTask(value: unknown): Task | undefined {
   const lastProgressTs = isFiniteNumber(lastProgressTsRaw) && Number.isSafeInteger(lastProgressTsRaw) && lastProgressTsRaw >= 0
     ? lastProgressTsRaw
     : undefined;
+  // v0.9.1（V090-05 r2）：C8 离线转交通知的持久闸——活性豁免的任务不被清扫、会跨
+  // 清扫节拍持续命中 idle-timeout，本字段记录上次 lead 通知时刻，阈值窗口内不重复
+  // （无闸则每 60s 节拍刷一次 lead 邮箱）。未来值同 plausibleLivenessTs 校验（伪造
+  // 未来值压制 C8 通知的路径在读盘即失效）。
+  const offlineNoticeAt = plausibleLivenessTs(value['offlineNoticeAt'], now) ? value['offlineNoticeAt'] : undefined;
   return {
     id,
     title,
@@ -624,6 +674,7 @@ function coerceTask(value: unknown): Task | undefined {
     ...(blockedAt === undefined ? {} : { blockedAt }),
     ...(preBlockedStatus === undefined ? {} : { preBlockedStatus }),
     ...(to === undefined ? {} : { to }),
+    ...(offlineNoticeAt === undefined ? {} : { offlineNoticeAt }),
   };
 }
 
@@ -695,7 +746,7 @@ export interface RejectedTeam {
  * complete file; DESIGN.md §2.7-5): bad data yields a diagnostic, never a
  * partially-coerced in-memory state.
  */
-export function coerceTeamState(value: unknown, expectedTeamId: string): ParsedTeam | RejectedTeam {
+export function coerceTeamState(value: unknown, expectedTeamId: string, now: number = Date.now()): ParsedTeam | RejectedTeam {
   if (!isRecord(value)) return { ok: false, defect: 'team.json is not a JSON object' };
   const teamId = optionalString(value['teamId']);
   if (teamId === undefined) return { ok: false, defect: 'field "teamId" missing or blank' };
@@ -733,7 +784,7 @@ export function coerceTeamState(value: unknown, expectedTeamId: string): ParsedT
   const tasks: Task[] = [];
   const taskIds = new Set<string>();
   for (const raw of value['tasks']) {
-    const task = coerceTask(raw);
+    const task = coerceTask(raw, now);
     if (task === undefined) {
       return { ok: false, defect: `invalid task record: ${JSON.stringify(raw)}` };
     }
@@ -794,7 +845,25 @@ function coerceLeadHistory(value: unknown): LeadHistoryEntry[] | undefined {
 // Session / name-binding / wake-nonce validation
 // ---------------------------------------------------------------------------
 
-export function coerceSessionRecord(value: unknown, expectedSessionId: string): ParsedSession | RejectedSession {
+/**
+ * v0.9.1（V090-01）：活性时间戳的**未来值容差**（同机时钟漂移上限）。
+ * 产品自写的活性时刻恒为写入时的 Date.now()（core/registry.ts 三个写入点），
+ * 超出容差的未来值只可能来自外部伪造/损坏——durable boundary 上一律丢弃该字段。
+ */
+export const LIVENESS_TS_FUTURE_SKEW_MS = 5 * 60_000;
+
+/**
+ * v0.9.1（V090-01）：活性时间戳的物理可信校验（纯函数）。
+ * 有限正数且不晚于 `now + LIVENESS_TS_FUTURE_SKEW_MS` 才可信；未来值在
+ * coerceSessionRecord（durable boundary）与 core/liveness.ts 纯函数（防御纵深，
+ * 兜内联构造的记录）两处消费——伪造 `lastEventTs=+1年` 不能再制造
+ * `now - last <= thresholdMs` 恒真的永久心跳豁免。
+ */
+export function plausibleLivenessTs(value: unknown, now: number): value is number {
+  return isFiniteNumber(value) && value > 0 && value <= now + LIVENESS_TS_FUTURE_SKEW_MS;
+}
+
+export function coerceSessionRecord(value: unknown, expectedSessionId: string, now: number = Date.now()): ParsedSession | RejectedSession {
   if (!isRecord(value)) return { ok: false, defect: 'session record is not a JSON object' };
   const sessionId = optionalString(value['sessionId']);
   if (sessionId === undefined) return { ok: false, defect: 'field "sessionId" missing or blank' };
@@ -810,6 +879,15 @@ export function coerceSessionRecord(value: unknown, expectedSessionId: string): 
   const boundName = optionalString(value['boundName']);
   // v0.5.3（a6）：regToken 可选透传——旧格式记录（升级前锚定）缺该字段照常解析。
   const regToken = optionalString(value['regToken']);
+  // v0.9（G-9）：活性三字段宽容增量（§11.1 纪律）——旧记录缺省照读；在场时取值
+  // 非法（liveness 枚举外 / 时间戳非有限数）整字段丢弃，绝不整文件拒绝。
+  // v0.9.1（V090-01）：livenessTs/lastEventTs 加**未来值校验**（plausibleLivenessTs）
+  // ——未来时刻在物理上不可能是产品自写的值，durable boundary 直接丢弃（absent =
+  // 无心跳/无状态时刻，下游按保守口径处理：running 失去可信时刻 → 不豁免清扫）。
+  const livenessRaw = optionalString(value['liveness']);
+  const liveness = livenessRaw === 'running' || livenessRaw === 'idle' ? livenessRaw : undefined;
+  const livenessTs = plausibleLivenessTs(value['livenessTs'], now) ? value['livenessTs'] : undefined;
+  const lastEventTs = plausibleLivenessTs(value['lastEventTs'], now) ? value['lastEventTs'] : undefined;
   return {
     ok: true,
     record: {
@@ -819,6 +897,9 @@ export function coerceSessionRecord(value: unknown, expectedSessionId: string): 
       lastSeen,
       ...(boundName === undefined ? {} : { boundName }),
       ...(regToken === undefined ? {} : { regToken }),
+      ...(liveness === undefined ? {} : { liveness }),
+      ...(livenessTs === undefined ? {} : { livenessTs }),
+      ...(lastEventTs === undefined ? {} : { lastEventTs }),
     },
   };
 }
@@ -884,6 +965,46 @@ export function coerceWakeNonce(value: unknown): ParsedNonce | RejectedNonce {
     return { ok: false, defect: 'field "used" is not a boolean' };
   }
   return { ok: true, nonce: { teamId, agentKey, sid, ts, ...(used === undefined ? {} : { used }) } };
+}
+
+/**
+ * v0.9.1 r3（V090-01）：会话活性**引擎证言**的宽容解析（`registry/witness/<sid>.json`，
+ * paths.ts witnessFile）。形状：`{sessionId, kind: 'running'|'idle'|'heartbeat', ts}`。
+ * 与 coerceSessionRecord 的关键差异：**未来值整条拒绝**（证言时刻是引擎写入时的
+ * Date.now()，未来值必为伪造——自述记录的 5min 容差不适用于此：证言没有时钟漂移
+ * 场景，钩子与 MCP server 同机同钟）。损坏/缺字段 → 调用方按「无证言」处理
+ * （保守：不给豁免）。
+ *
+ * v0.9.1 r4（V090-02）：容差**归零**——`ts > now` 即拒（r3 实现误继承自述的 5min 容差，
+ * 与上方注释自认的「无漂移场景」矛盾：伪造 `ts=now+4min` 使守卫 age 为负、恒满足
+ * `age ≤ boundMs`，单次写的豁免窗被放大到 skew+2×阈值，实测 360s vs 过去值 120s）。
+ * 未来值一毫秒都不接受：证言与判定同机同钟，无漂移可容。
+ */
+export function coerceSessionWitness(value: unknown, expectedSessionId: string): ParsedWitness | RejectedWitness {
+  if (!isRecord(value)) return { ok: false, defect: 'session witness is not a JSON object' };
+  const sessionId = optionalString(value['sessionId']);
+  if (sessionId === undefined) return { ok: false, defect: 'field "sessionId" missing or blank' };
+  if (sessionId !== expectedSessionId) {
+    return { ok: false, defect: `field "sessionId" is "${sessionId}", expected "${expectedSessionId}"` };
+  }
+  const kind = optionalString(value['kind']);
+  if (kind !== 'running' && kind !== 'idle' && kind !== 'heartbeat') {
+    return { ok: false, defect: 'field "kind" must be running|idle|heartbeat' };
+  }
+  const ts = optionalFinite(value['ts']);
+  if (ts === undefined) return { ok: false, defect: 'field "ts" missing or not a number' };
+  if (ts > Date.now()) {
+    return { ok: false, defect: 'field "ts" is in the future (witness is engine-written on the same machine; zero skew tolerance)' };
+  }
+  return { ok: true, witness: { sessionId, kind, ts } };
+}
+export interface ParsedWitness {
+  ok: true;
+  witness: SessionWitness;
+}
+export interface RejectedWitness {
+  ok: false;
+  defect: string;
 }
 export interface ParsedNonce {
   ok: true;

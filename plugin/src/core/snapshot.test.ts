@@ -84,6 +84,20 @@ describe("env 防御解析（V7 / V18 同口径）", () => {
 });
 
 describe("buildSnapshot（§7.3.1 v2 形状）", () => {
+  it("v0.9（G-6 钩子侧热生效）：Stop 钩子每次收尾经 buildSnapshot 现读 config.json——改文件即改 wake 显示", async () => {
+    const team = await seedTeam();
+    // 无 config.json + env 未给 → 默认层关闭（防打扰默认不变）
+    const before = await buildSnapshot(root, team, { now: 500, env: {} });
+    expect(before.engine).toEqual({ wakeEnabled: false, wakeSource: "default", maxMembers: 8, inboundMode: "accept" });
+    // 写入 config.json 一行开启 → 下一次收尾（同进程同调用）即生效，无重启/无缓存
+    writeFileSync(join(root, "config.json"), JSON.stringify({ wake_enabled: true }), "utf8");
+    const after = await buildSnapshot(root, team, { now: 600, env: {} });
+    expect(after.engine).toEqual({ wakeEnabled: true, wakeSource: "file", maxMembers: 8, inboundMode: "accept" });
+    // 改回 false 同样即时生效（file 层显式关）
+    writeFileSync(join(root, "config.json"), JSON.stringify({ wake_enabled: false }), "utf8");
+    const toggled = await buildSnapshot(root, team, { now: 700, env: {} });
+    expect(toggled.engine).toEqual({ wakeEnabled: false, wakeSource: "file", maxMembers: 8, inboundMode: "accept" });
+  });
   it("全字段：leadKey/members(state,identity,openTaskId)/tasks(blockedBy)/dag/unread/engine", async () => {
     const team = await seedTeam({ withV2Fields: true });
     // m2 邮箱 1 条未读
@@ -95,7 +109,8 @@ describe("buildSnapshot（§7.3.1 v2 形状）", () => {
     expect(snap.teamId).toBe("default");
     expect(snap.generatedAt).toBe(500);
     expect(snap.leadKey).toBe("a");
-    expect(snap.engine).toEqual({ wakeEnabled: true, maxMembers: 5, inboundMode: "hold" });
+    // v0.9（G-6）：wakeEnabled 改分层真值（无 config.json → env 层），wakeSource 标注来源
+    expect(snap.engine).toEqual({ wakeEnabled: true, wakeSource: "env", maxMembers: 5, inboundMode: "hold" });
 
     const m1 = snap.members.find((m) => m.key === "m1")!;
     expect(m1).toMatchObject({ state: "ready", identity: "engine", openTaskId: null, sessionId: "sess_m1" });

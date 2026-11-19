@@ -22,6 +22,8 @@
  */
 import { logEngineEvent } from "../core/log.js";
 import { peerRootFromEnv } from "../core/peerdir.js";
+import { markSessionHeartbeat } from "../core/registry.js";
+import { identityStore } from "./identity.js";
 import { drainPeerQueue, renderPeerEnvelope, type PeerQueueItem } from "../core/peermsg.js";
 import { queueItemToInjectBlock } from "../core/peerenvelope.js";
 import { contextCharsFromEnv, layoutInjectBlocks, receiverInjectBudget } from "../core/budget.js";
@@ -225,6 +227,19 @@ export function withPeerDrain(core: ToolCore, deps: PeerDrainDeps): ToolCore {
     <A>(inner: (args: A, connectionKey: string) => Promise<ToolResult>) =>
     async (args: A, connectionKey: string): Promise<ToolResult> => {
       const result = await inner(args, connectionKey);
+      // v0.9（G-9/G-5）：队内工具调用 = 成员引擎事件 → 刷新调用方 registry
+      // lastEventTs（心跳代理；30s 节流 + 锁忙静默跳过，core/registry.ts
+      // markSessionHeartbeat）。此刻内层工具已返回（团队锁已释放），取 registry
+      // 锁不违反 §2.7-3 锁序（registry → team）。身份未绑定的连接（免注册观测
+      // 工具）取不到 sessionId → 无操作。
+      const sessionId = identityStore.get(connectionKey)?.sessionId;
+      if (sessionId !== undefined) {
+        try {
+          await markSessionHeartbeat(deps.stateRoot, sessionId);
+        } catch {
+          /* 心跳丢失无害：下次工具调用再试（永不影响工具结果） */
+        }
+      }
       return await appendPeerEnvelopes(result, deps);
     };
 
