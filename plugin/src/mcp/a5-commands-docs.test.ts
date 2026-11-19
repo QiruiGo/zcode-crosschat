@@ -326,18 +326,19 @@ describe('A5 文档：无 PreCompact，故用提醒+一键（ACCEPT15-1 文档�
 // 8. 版本五处统一（AC6 静态面）
 // ---------------------------------------------------------------------------
 
-describe('A5 版本五处统一 0.9.0', () => {
-  it('package.json / plugin.json / marketplace.json / server.ts 四处 = 0.9.0', () => {
-    expect(JSON.parse(readRel('plugin/package.json')).version).toBe('0.9.0');
-    expect(JSON.parse(readRel('plugin/.zcode-plugin/plugin.json')).version).toBe('0.9.0');
-    expect(JSON.parse(readRel('marketplace.json')).plugins[0].version).toBe('0.9.0');
-    expect(readRel('plugin/src/mcp/server.ts')).toContain('const SERVER_VERSION = "0.9.0"');
+describe('A5 版本五处统一 0.9.1', () => {
+  it('package.json / plugin.json / marketplace.json / server.ts 四处 = 0.9.1', () => {
+    expect(JSON.parse(readRel('plugin/package.json')).version).toBe('0.9.1');
+    expect(JSON.parse(readRel('plugin/.zcode-plugin/plugin.json')).version).toBe('0.9.1');
+    expect(JSON.parse(readRel('marketplace.json')).plugins[0].version).toBe('0.9.1');
+    expect(readRel('plugin/src/mcp/server.ts')).toContain('const SERVER_VERSION = "0.9.1"');
   });
 
-  it('README 安装段与版本记录指向 0.9.0（第五处）', () => {
+  it('README 安装段与版本记录指向 0.9.1（第五处）', () => {
     const readme = readRel('README.md');
-    expect(readme).toContain('zcode-crosschat-0.9.0-prebuilt-slim.tar.gz');
-    expect(readme).toContain('Installed plugin zcode-crosschat@dev-zcode-crosschat (0.9.0)');
+    expect(readme).toContain('zcode-crosschat-0.9.1-prebuilt-slim.tar.gz');
+    expect(readme).toContain('Installed plugin zcode-crosschat@dev-zcode-crosschat (0.9.1)');
+    expect(readme).toContain('**v0.9.1**（2026-11-19，v0.8.1 首日生产实战第二批教训');
     expect(readme).toContain('**v0.9.0**（2026-11-19，lims2.0 首日实战九缺口修复');
     expect(readme).toContain('8 个斜杠命令');
   });

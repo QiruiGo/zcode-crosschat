@@ -12,7 +12,10 @@
  * 覆盖：
  * 1. 边界-7：`sanitizeEvidenceNote`/`sha256File` 纯函数 + 去重键定义不含发送方；
  * 2. 规模压-B3：去重键 = (to, ticket) ∧ 未读 ∧ current——**谁派的无关**；
- *    回执披露 duplicateKey 与 originalCreatedBy；
+ *    回执披露 duplicateKey 与 originalCreatedBy。**v0.9.1（G-13）改判**：B3 的
+ *    「收方已读旧票后重派」原断言 v0.7.0 口径「已读即建新单」，现由任务板查重硬闸
+ *    拦下（`duplicate_active_task`，`force:true` 显式越权放行）——信封层口径本身
+ *    未回归，完整新契约见 `tools-dispatch-g13.test.ts`；
  * 3. 边界-9：peers 视图里队内成员行**不再渲染不可作地址的 `[ref]`**，跨会话行照旧
  *    渲染且 `名字 [ref]` 精确可寻址；
  * 4. 规模压-B1：peer 入队闸 dropped 时，`xc_relay` 把接收方给的「原因 + 恢复动作」
@@ -161,14 +164,37 @@ describe('规模压-B3：重复派发去重键（不含发送方）', () => {
     expect(other.taskId).not.toBe(first.taskId);
   });
 
-  it('收方已读旧票后重派 → 建新单（未读才算在途重复，v0.7.0 语义保留）', async () => {
+  it('收方已读旧票后重派 → 任务板硬闸拦下（v0.9.1 G-13 改判：v0.7.0「已读即建新单」被有意取代）', async () => {
     await hookRegister('conn-a', 'a', 'sess-a');
     await hookRegister('conn-c', 'c', 'sess-c');
     const first = payloadOf(await core.xc_dispatch({ ...args }, 'conn-a')) as { taskId: string };
-    await core.xc_check_inbox({}, 'conn-c'); // 读走 → readAt 落盘
-    const second = payloadOf(await core.xc_dispatch({ ...args }, 'conn-a')) as { taskId: string; delivered: string };
-    expect(second.delivered).toBe('mailbox');
-    expect(second.taskId).not.toBe(first.taskId);
+    await core.xc_check_inbox({}, 'conn-c'); // 读走 → readAt 落盘（信封层不再参与幂等）
+
+    // v0.7.0 口径（本用例原断言）：信封已读 → 同一张票可再建成新单。
+    // v0.9.1（G-13，GAP-V0.9 生产事故「58 秒内对同一成员连派三张重复票」）**有意改判**：
+    // 信封被消费掉之后，任务板上的同票活任务（pending/claimed/in_progress）继续拦重复
+    // 派单——否则「读过即失效」会让硬闸对生产形态零价值。两层口径：
+    //   · 信封层（未读才算在途重复）在上方两个用例里原样保留，未回归；
+    //   · 任务板层（同 assignee + 同票 + 活任务 → duplicate_active_task）的完整契约见
+    //     `tools-dispatch-g13.test.ts`（含 force:true 越权放行与审计）。
+    const second = payloadOf(await core.xc_dispatch({ ...args }, 'conn-a')) as {
+      error: string; taskId: string; status: string; assignee: string; ticketFingerprint: string;
+    };
+    expect(second.error).toBe('duplicate_active_task');
+    expect(second.taskId).toBe(first.taskId); // 指向既有那一单，不另建
+    expect(second.status).toBe('pending');
+    expect(second.assignee).toBe('c');
+    expect(second.ticketFingerprint).toMatch(/^[0-9a-f]{16}$/);
+
+    // 硬闸不建新单：任务板仍只有一单（事故形态「三连票建成三单」被堵死）。
+    const { readTeam } = await import('../core/teamstate.js');
+    const state = await readTeam(stateRoot, 'default');
+    expect(state!.tasks).toHaveLength(1);
+
+    // force:true = 显式越权放行（审计 dispatch-force-duplicate）——确有第二单需求时的出口。
+    const forced = payloadOf(await core.xc_dispatch({ ...args, force: true }, 'conn-a')) as { taskId: string; delivered: string };
+    expect(forced.delivered).toBe('mailbox');
+    expect(forced.taskId).not.toBe(first.taskId);
   });
 });
 

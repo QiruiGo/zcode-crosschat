@@ -400,13 +400,87 @@ export async function markMailboxDelivered(
  * Acknowledge selected messages as read. This happens at the instant the tool
  * returns the messages to the model — host acceptance is NOT consumption
  * (DESIGN.md §2.1; dsh state.js:500-509).
+ *
+ * v0.9.1（G-12v3 机制 B）：readAt 落盘的同时回写 **consumedAt**（消费确认）——
+ * xc_read({scope:"inbox"}) 把消息实体交到模型手上即「成员回合实际消费」；投递盖章
+ * （deliveredAt）与消费确认自此分离，limbo 降级 sweep 以 consumedAt 为放行判据。
  */
 export async function acknowledgeMailbox(
   stateRoot: string, teamId: string, agentKey: string, ids: readonly string[], now: number = Date.now(),
 ): Promise<void> {
   await mutateMailbox(stateRoot, teamId, agentKey, ids, (message) => {
     const { deliveryClaimedAt: _claimed, ...rest } = message;
-    return { ...rest, deliveredAt: message.deliveredAt ?? now, readAt: message.readAt ?? now };
+    return {
+      ...rest,
+      deliveredAt: message.deliveredAt ?? now,
+      readAt: message.readAt ?? now,
+      consumedAt: message.consumedAt ?? now,
+    };
+  });
+}
+
+/**
+ * v0.9.1（G-12v3 机制 B）：**只回写消费确认**（consumedAt），不动 readAt。
+ *
+ * 用于「消息被某会话知悉/处置但尚未（或不必）走 readAt 路径」的消费面：
+ * - hook 未读注入（hooks/shared.ts）：成员回合实际开跑并被提示有未读 ⇒ 该会话活着，
+ *   不是 limbo（唤醒子进程在消费前死亡的形态）；
+ * - xc_claim 读件（mcp/tools-tasks.ts）：认领任务 = 消费了对应派单信封。
+ * 幂等：已有 consumedAt 的消息值不被改写。
+ */
+export async function markMailboxConsumed(
+  stateRoot: string,
+  teamId: string,
+  agentKey: string,
+  ids: readonly string[],
+  now: number = Date.now(),
+): Promise<void> {
+  await mutateMailbox(stateRoot, teamId, agentKey, ids, (message) => ({
+    ...message,
+    consumedAt: message.consumedAt ?? now,
+  }));
+}
+
+/**
+ * v0.9.1（G-12v3 机制 B）：**limbo 降级**——把「已盖投递章但超时无消费确认」的消息
+ * 打回可重新投递态（清 deliveredAt + deliveryClaimedAt；readAt/consumedAt 不动）。
+ *
+ * 生产形态（G-12 修正 v3 邮箱文件级实锤）：wake 路径 spawn 成功瞬间即盖 deliveredAt
+ * （fire-and-forget），子进程在成员回合消费内容前死亡（内存红线 OOM / 宿主重启杀
+ * 无头子进程）→ 消息已盖章、从未被读、且不再是可投递态，死会话永不 pull，实质丢失
+ * 直至人工发现（4/4 收方零动作）。降级后消息重新可注入（未读钩子按 readAt 判）/
+ * 可 pull（xc_read）/ 可重新 push（投递面对 deliveredAt 的条件）。
+ *
+ * 幂等（同一消息一个投递轮次只降级一次）：判据要求 deliveredAt 在场，而降级恰好清掉
+ * 它——第二遍扫不到同一条；重投后再超时构成**新的**轮次（正确语义，非重复降级）。
+ * 竞态：调用方持团队锁，与消费回写（acknowledgeMailbox / markMailboxConsumed）互斥；
+ * 锁内复判 deliveredAt 仍在场才降级——消费先到则跳过（已被读，不是 limbo）。
+ *
+ * @returns 本次降级的消息（降级后形状；空 = 无 limbo 或锁内复判已被消费/已陈旧）。
+ */
+export async function sweepLimboDeliveriesLocked(
+  stateRoot: string,
+  team: TeamState,
+  agentKey: string,
+  now: number,
+  timeoutMs: number,
+): Promise<TeamMessage[]> {
+  const all = await readMailbox(stateRoot, team.teamId, agentKey);
+  const limbo = all.filter((message) =>
+    message.deliveredAt !== undefined
+    && message.consumedAt === undefined
+    && message.readAt === undefined
+    && message.discardedAt === undefined
+    && now - message.deliveredAt >= timeoutMs
+    && isCurrentMail(team, message));
+  if (limbo.length === 0) return [];
+  await mutateMailbox(stateRoot, team.teamId, agentKey, limbo.map((m) => m.id), (message) => {
+    const { deliveryClaimedAt: _claimed, deliveredAt: _delivered, ...rest } = message;
+    return rest;
+  });
+  return limbo.map((message) => {
+    const { deliveryClaimedAt: _claimed, deliveredAt: _delivered, ...rest } = message;
+    return rest;
   });
 }
 

@@ -13,7 +13,7 @@
  *
  * @module core/teamstate
  */
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { writeFileAtomic } from './atomic.js';
@@ -34,6 +34,7 @@ import {
   type TaskPriority,
   type TaskStatus,
   type TeamMember,
+  type TeamMessage,
   type TeamState,
 } from './types.js';
 import { logEngineEvent } from './log.js';
@@ -550,6 +551,109 @@ export function unsatisfiedDependencies(tasks: readonly Task[], dependencies: re
 /** Open (claimed/in_progress/blocked——v0.6 C2 起含 blocked 单开槽位) tasks owned by one member. */
 export function memberOpenTasks(tasks: readonly Task[], assignee: string): Task[] {
   return tasks.filter((task) => task.assignee === assignee && OPEN_TASK_STATUSES.includes(task.status));
+}
+
+// ---------------------------------------------------------------------------
+// v0.9.1（G-13）：派单查重硬闸的纯判据（调用方 = mcp/tools-tasks.ts 的 xc_dispatch，
+// 持团队锁调用；本模块只出判据不持锁——与全模块纪律一致）。
+//
+// 与既有「未读信封幂等」（tools-tasks.ts 的 dispatchDedupKey：邮箱里是否已有一条
+// 同票、未读、仍现行的派发信封）是**两层**，不是替代：信封层看投递面，本层看
+// **任务板**——信封被消费掉之后（读过的信封不再参与幂等），同一张票仍会借任务板
+// 上的活任务被拦住。生产事故形态（GAP-V0.9 G-13）：58 秒内对同一成员连派三张
+// 重复票，信封层只挡「还没被读」的那一张。
+// ---------------------------------------------------------------------------
+
+/**
+ * 查重硬闸的「活任务」域：pending/claimed/in_progress（G-13 任务书原文口径）。
+ *
+ * 与 OPEN_TASK_STATUSES（含 blocked）刻意不同：blocked 是合法暂停（有属主、
+ * attempt 保留、unblock 可续），同一张票 blocked 后再派是**恢复手段**而非重复
+ * 派单，放进查重域会把「解除阻塞的正常改派」一起拦死。终态（completed/failed/
+ * cancelled）同理不在域内——历史单不挡新派。
+ */
+export const ACTIVE_DUPLICATE_TASK_STATUSES: readonly TaskStatus[] = [
+  'pending',
+  'claimed',
+  'in_progress',
+];
+
+/**
+ * v0.9.1（G-13）：派单票面指纹（标题 + 内容 + 验收标准）。
+ *
+ * 不含发送方、受领人、taskId、attempt：查重要判的是「同一张票」，不是「同一次
+ * 派发动作」（dispatchDedupKey 的口径）。acceptance 缺省归一为空串——省略与显式
+ * 空串视为同一张票。title 去首尾空白（与建单侧 makeTask 同款 trim），prompt 原样
+ * （内容差异必须可分辨，不做任何归一）。
+ */
+export function taskTicketFingerprint(input: {
+  title: string;
+  prompt: string;
+  acceptance?: string;
+}): string {
+  const canonical = JSON.stringify([
+    'v091-g13-ticket',
+    input.title.trim(),
+    input.prompt,
+    (input.acceptance ?? '').trim(),
+  ]);
+  return createHash('sha256').update(canonical).digest('hex').slice(0, 16);
+}
+
+/**
+ * v0.9.1（G-13）：任务板上的同票**活任务**（纯函数；锁内调用）。
+ *
+ * 判据三件齐：① 受领人相同（task.to 命中 toKey；回池任务 to 已清 = 共享待领池，
+ * 不算「派给同一人」）② 票面指纹相同 ③ 状态 ∈ ACTIVE_DUPLICATE_TASK_STATUSES。
+ * 命中多个时返回**最早创建**的那一单（createdAt 升序，同值按 id 字典序保确定）——
+ * 回执要指向「既有那一单」，多个候选时指向最早者最稳定。
+ *
+ * 指纹由任务记录自身字段现算（不新增落盘字段）：存量记录与手写 team.json 同样
+ * 参与判定，无 schema 变更、无迁移。
+ */
+export function findActiveDuplicateTask(
+  team: TeamState,
+  input: { to: string; title: string; prompt: string; acceptance?: string },
+): Task | undefined {
+  const fingerprint = taskTicketFingerprint(input);
+  const hits = team.tasks
+    .filter(
+      (task) =>
+        task.to === input.to
+        && ACTIVE_DUPLICATE_TASK_STATUSES.includes(task.status)
+        && taskTicketFingerprint(task) === fingerprint,
+    )
+    .sort((a, b) => (a.createdAt === b.createdAt ? (a.id < b.id ? -1 : 1) : a.createdAt - b.createdAt));
+  return hits[0];
+}
+
+// ---------------------------------------------------------------------------
+// v0.9.1（G-14）：回合开始强提醒的「已完成未接力」判据（纯函数；钩子锁外读取用）。
+//
+// 口径：派发方邮箱里躺着某任务的 **completed 回执且未读**，且任务板上该任务
+// 仍是 completed = 活已干完、回执没人取（GAP-V0.9 G-14「任务板有 completed 未接力
+// 项」）。回执被读（readAt 落下）即视为已接力——提醒随之停止，与「重复注入直到
+// 消费」的收口条件同源。回执只作**判据**，不改写任务状态（伪造回执不得变成伪造
+// 完成态，与 v0.5.2 回执链检测同一纪律）。
+// ---------------------------------------------------------------------------
+
+/**
+ * v0.9.1（G-14）：给定某成员的未读消息，返回其中「已完成但尚未被接力」的任务
+ * （按 createdAt 升序、去重）。`unread` 传该成员的未读邮件（ urgentFirst 排序的
+ * 全量未读即可，本函数自行按 sourceTaskStatus 过滤）。
+ */
+export function unrelayedCompletedTasks(team: TeamState, unread: readonly TeamMessage[]): Task[] {
+  const found: Task[] = [];
+  for (const message of unread) {
+    if (message.sourceTaskStatus !== 'completed') continue;
+    const taskId = message.sourceTaskId;
+    if (taskId === undefined) continue;
+    const task = team.tasks.find((candidate) => candidate.id === taskId);
+    // 回执在而任务已不在板上（孤儿引用）不属「未接力」——那是 orphanTaskIds 的域。
+    if (task === undefined || task.status !== 'completed') continue;
+    if (!found.includes(task)) found.push(task);
+  }
+  return found.sort((a, b) => (a.createdAt === b.createdAt ? (a.id < b.id ? -1 : 1) : a.createdAt - b.createdAt));
 }
 
 /**

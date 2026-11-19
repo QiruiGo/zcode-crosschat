@@ -197,7 +197,9 @@ describe("tools: 闭环主流程（register→dispatch→claim→report→inbox�
       tasks: Array<{ id: string; status: string; evidenceCount: number }>;
     };
     expect(snap.tasks[0]).toMatchObject({ id: taskId, status: "completed", evidenceCount: 1 });
-  });
+    // register→dispatch→claim→report→inbox 全链路磁盘真源；全量并行负载下实测 ≈4.4s
+    // （vitest 默认 5s 无余量），按本仓既有口径显式申报超时。
+  }, 15_000);
 
   it("依赖未满足/自派发/非成员/双线认领均被硬拒", async () => {
     await hookRegister("conn-a", "a", "sess-a");

@@ -26,6 +26,7 @@ import {
   WAKE_INFLIGHT_MS,
   WAKE_RULES_SCENES,
   WAKE_SCENES,
+  wakeNonceDigest,
   type WakeRequest,
 } from "./wake";
 
@@ -368,7 +369,9 @@ describe("attemptWake", () => {
     expect(captured).toHaveLength(0);
     const skip = readEngineEvents().find((e) => e["event"] === "wake-skipped");
     expect(skip).toBeDefined();
-    expect(skip!["inflightNonce"]).toBe(token);
+    // v0.9.1 打回第 1 轮（V091-01）：在途令牌在共享日志里只落不可反查摘要
+    // （真值仅存于 registry/wake/ 真源与唤醒 prompt；对账仍可做，收割不可行）。
+    expect(skip!["inflightNonce"]).toBe(wakeNonceDigest(token));
     expect(String(skip!["reason"])).toContain("inflight-nonce");
   });
 

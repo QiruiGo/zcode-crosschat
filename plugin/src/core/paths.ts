@@ -193,6 +193,19 @@ export function wakeLogFile(root: string, to: string, ts: number): string {
   return join(root, 'logs', `wake-${to}-${ts}.json`);
 }
 
+/**
+ * v0.9.1（G-12v3）：wake-child **生命周期日志**（JSONL，与唤醒子的 stdout 日志
+ * `wakeLogFile` 分文件——互不干扰：失败证据侦听只解析后者，本文件只记引擎侧观察到
+ * 的 spawn 生命周期）。
+ * 行形态：`{event:"wake-child-start", nonce, sid, to, scene, ts}`（spawn 即写）与
+ * `{event:"wake-child-exit", pid, durationMs, exitCode, evidence?}`（观察到子进程
+ * 消失时写）。孤儿化唤醒子（V9）的退出码对引擎进程不可观测，exitCode 如实记 null，
+ * 失败语义由 evidence（findWakeFailureEvidence 的快照）承载。
+ */
+export function wakeLifecycleFile(root: string, to: string, ts: number): string {
+  return join(root, 'logs', `wake-lifecycle-${to}-${ts}.jsonl`);
+}
+
 // --- lock identity ----------------------------------------------------------
 
 import { createHash } from 'node:crypto';

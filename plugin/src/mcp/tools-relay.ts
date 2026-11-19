@@ -62,7 +62,8 @@
  * @module mcp/tools-relay
  */
 import { randomUUID } from "node:crypto";
-import { lstat } from "node:fs/promises";
+import { lstat, stat } from "node:fs/promises";
+import { resolve, sep } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { auditDegradationWarning, logEngineEvent } from "../core/log.js";
@@ -92,6 +93,8 @@ import {
 } from "../core/toolrelay.js";
 import { createToolRequest, readToolRequest, updateToolRequest } from "../core/toolledger.js";
 import { isWithinStateRoot } from "../core/toolapproval.js";
+import { sha256File, sanitizeEvidenceNote } from "./tools-tasks.js";
+import type { MessageRef } from "../core/types.js";
 import {
   errorResult,
   invalidParamsError,
@@ -102,7 +105,7 @@ import {
   type ToolResult,
 } from "./protocol.js";
 import { renderMessage } from "./render.js";
-import { attemptWake, findDuplicateMail, type MailIdentity } from "../engine/wake.js";
+import { attemptWake, findDuplicateMail, type MailIdentity, type WakeDeferral } from "../engine/wake.js";
 import type { ToolDeps } from "./core.js";
 
 /** v1 单队固定 default（与 tools.ts 同规）。 */
@@ -120,7 +123,21 @@ export const RelayShape = {
   summary: z.string().optional().describe("一句话摘要（peer 轴帧携带；队内轴进审计）"),
   sourceTaskId: z.string().optional().describe("与 sourceAttemptId 成对；任务上下文关联（过期自动作废）"),
   sourceAttemptId: z.string().optional(),
-  withdrawMessageIds: z.array(z.string().min(1)).min(1).optional().describe("撤回（v0.9 G-3，仅队内轴）：要撤回的 messageId 数组——只允许撤回**自己发给该目标且仍未读**的消息（整行删除 + 给收方投一条 withdrawal-notice 通知帧 + engine 事件）；含已读/非本人/不存在/已作废/通知帧（withdrawal-notice 自身不可撤——链式撤回会架空对账契约）件时整单拒绝并逐条报状态。撤回模式下 msg/urgent/interrupt/summary/source* 一律不接受"),
+  // v0.9.1（G-10）：文件引用——「传引用不传内容」：图片/二进制/大文件一律以工作区内
+  // 真实文件的 path+sha256 随消息传递，接收面渲染「用 Read 打开该路径」提示；消息通道
+  // 是纯文本 JSON（帧闸 1 MiB + 注入预算 16k 字符），不内联内容、不做 base64。
+  refs: z
+    .array(
+      z.object({
+        path: z.string().min(1).describe("工作区内真实普通文件路径（绝对或相对工作区；越界/非文件/缺失一律整单拒绝）"),
+        sha256: z.string().optional().describe("可选：调用方自算的 sha256（hex，大小写不敏感）；缺省=由工具现算后随消息落库"),
+        mime: z.string().optional().describe("可选：MIME 提示（如 image/png）；仅提示，不参与任何判定"),
+        note: z.string().optional().describe("可选：一句话说明；省略按空串入库，控制字符清洗为空格、长度钳 500 字符"),
+      }),
+    )
+    .optional()
+    .describe("v0.9.1（G-10）文件引用（队内轴与 peer 轴均可）：每条 = 工作区内一个真实普通文件 + sha256（缺省现算）+ 可选 mime/note；三道硬闸复用 evidence 口径（evidence_path_outside_workspace / evidence_not_a_file / evidence_file_missing），sha256 声明值与现算值不符整单拒绝（evidence_checksum_mismatch）。接收面在信封内渲染「用 Read 打开该路径」提示，内容不内联、不做 base64"),
+  withdrawMessageIds: z.array(z.string().min(1)).min(1).optional().describe("撤回（v0.9 G-3，仅队内轴）：要撤回的 messageId 数组——只允许撤回**自己发给该目标且仍未读**的消息（整行删除 + 给收方投一条 withdrawal-notice 通知帧 + engine 事件）；含已读/非本人/不存在/已作废/通知帧（withdrawal-notice 自身不可撤——链式撤回会架空对账契约）件时整单拒绝并逐条报状态。撤回模式下 msg/urgent/interrupt/summary/source*/refs 一律不接受"),
 };
 
 export type RelayArgs = z.infer<z.ZodObject<typeof RelayShape>>;
@@ -241,6 +258,121 @@ export function buildWithdrawalNoticeFrame(withdrawnMessageIds: readonly string[
 }
 
 // ---------------------------------------------------------------------------
+// v0.9.1（G-10）：refs 文件引用闸（复用 evidence 三道硬闸；锁外现算）
+// ---------------------------------------------------------------------------
+
+/** refs 声明的入参形状（zod 推断的子集；解析产物 = {@link MessageRef}）。 */
+export interface RelayRefInput {
+  path: string;
+  sha256?: string;
+  mime?: string;
+  note?: string;
+}
+
+/**
+ * v0.9.1（G-10）：文件引用闸——`refs` 每条都必须指向**工作区内真实存在的普通文件**，
+ * sha256 缺省由工具现算（复用 `tools-tasks.ts` 的 `sha256File`，流式不整文件读进内存）。
+ *
+ * 三道硬闸与 `xc_report` 的 evidence 门逐条同口径（`field:"refs"` 标明触发面）：
+ * ① 路径越出工作区 → `evidence_path_outside_workspace`（v0.5.2 bug-05 遏制不回退）；
+ * ② 不是普通文件（目录/设备文件）→ `evidence_not_a_file`；
+ * ③ 不存在/不可读 → `evidence_file_missing`；
+ * ④ 声明值与现算值不符 → `evidence_checksum_mismatch`（hex 大小写不敏感、首尾空白忽略）。
+ * 任一条不过 → **整单拒绝、一个字节都不落箱**（调用方可直接重试，无副作用）。
+ *
+ * 位置在团队锁外：慢操作（sha256 现算）不持锁（§2.7-4），与 evidence 门的锁外口径一致。
+ * 空数组按「未声明」处理（返回 undefined，不落空键）；`undefined` 同样原样返回。
+ */
+export async function resolveMessageRefs(
+  workspace: string,
+  refs: readonly RelayRefInput[] | undefined,
+): Promise<MessageRef[] | undefined> {
+  if (refs === undefined || refs.length === 0) return undefined;
+  const wsRoot = resolve(workspace);
+  const wsPrefix = wsRoot.endsWith(sep) ? wsRoot : wsRoot + sep;
+  const samePath = (a: string, b: string): boolean =>
+    process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+  const underWorkspace = (abs: string): boolean =>
+    samePath(abs, wsRoot)
+    || (process.platform === "win32"
+      ? abs.toLowerCase().startsWith(wsPrefix.toLowerCase())
+      : abs.startsWith(wsPrefix));
+  const resolved: MessageRef[] = [];
+  for (const ref of refs) {
+    const abs = resolve(ref.path);
+    if (!underWorkspace(abs)) {
+      throw new ToolError({
+        error: "evidence_path_outside_workspace",
+        field: "refs",
+        path: ref.path,
+        workspace: wsRoot,
+        message: `refs file "${ref.path}" resolves outside the workspace (${wsRoot}); `
+          + "file references must live inside the shared workspace (§15.1, same containment as the evidence gate)",
+      });
+    }
+    let stats;
+    try {
+      stats = await stat(abs);
+    } catch {
+      throw new ToolError({
+        error: "evidence_file_missing",
+        field: "refs",
+        path: ref.path,
+        message: `refs file "${ref.path}" does not exist or is unreadable; a file reference must point at a real file (§15.1)`,
+      });
+    }
+    if (!stats.isFile()) {
+      throw new ToolError({
+        error: "evidence_not_a_file",
+        field: "refs",
+        path: ref.path,
+        message: `refs file "${ref.path}" is not a regular file (${stats.isDirectory() ? "directory" : "non-regular file"}); `
+          + "a file reference must point at a real file inside the workspace (§15.1)",
+      });
+    }
+    const computed = await sha256File(abs);
+    if (computed === null) {
+      throw new ToolError({
+        error: "evidence_file_missing",
+        field: "refs",
+        path: ref.path,
+        message: `refs file "${ref.path}" does not exist or is unreadable; a file reference must point at a real file (§15.1)`,
+      });
+    }
+    const claimed = typeof ref.sha256 === "string" ? ref.sha256.trim().toLowerCase() : "";
+    if (claimed !== "" && claimed !== computed.toLowerCase()) {
+      throw new ToolError({
+        error: "evidence_checksum_mismatch",
+        field: "refs",
+        path: ref.path,
+        claimed: ref.sha256 as string,
+        computed,
+        message: `refs sha256 mismatch for "${ref.path}": claimed ${ref.sha256}, computed ${computed}`,
+      });
+    }
+    resolved.push({
+      path: ref.path,
+      sha256: computed,
+      ...(ref.mime !== undefined ? { mime: ref.mime } : {}),
+      note: sanitizeEvidenceNote(ref.note),
+    });
+  }
+  return resolved;
+}
+
+/**
+ * v0.9.1（G-10，V090-12 同族）：refs 差异判定——同文消息但引用集不同时**不判 duplicate**。
+ *
+ * 教训同 V090-12（urgent/interrupt 档位进去重键）：「同一句正文 + 一张新截图」若被
+ * dedup 吞掉，收方看到的仍是旧消息（无新引用），发送方 payload 却带着新 refs——虚报。
+ * 键函数在 `engine/wake.ts`（A 组文件域），本模块在调用侧比对（不改键函数）。
+ */
+function refsDiffer(existing: TeamMessage, candidate: readonly MessageRef[] | undefined): boolean {
+  if (candidate === undefined || candidate.length === 0) return false; // 无引用=旧语义，照常去重
+  return JSON.stringify(existing.refs ?? []) !== JSON.stringify(candidate);
+}
+
+// ---------------------------------------------------------------------------
 // 队内轴核心（M1 core.ts 组装契约：内部方法名沿用 v0.5.3 形态，入参 RelayArgs）
 // ---------------------------------------------------------------------------
 
@@ -297,6 +429,9 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
 
   /**
    * 推送唤醒（必须已在团队锁外，attemptWake 内部会短暂重取锁补盖章）。
+   * v0.9.1（G-12-b）：容量闸 deferral 块随结果透出——attemptWake 在 spawn 前读
+   * capacity verdict，RED 时不 spawn 并带 wake-deferred{reason:"capacity-red"} +
+   * 冷却窗；这里原样转交调用方进 payload（不丢信息）。
    */
   async function wake(
     toAgentKey: string,
@@ -305,7 +440,7 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
     receiptIds: readonly string[],
     ticket: string,
     urgent: boolean,
-  ): Promise<{ delivered: "wake" | "mailbox"; wakeLog?: string; note?: string }> {
+  ): Promise<{ delivered: "wake" | "mailbox"; wakeLog?: string; note?: string; wakeDeferred?: WakeDeferral }> {
     if (toSessionId === null) {
       return { delivered: "mailbox", note: "target has no sessionId on file" };
     }
@@ -321,7 +456,12 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
       env,
       ...(urgent ? { urgent: true } : {}),
     });
-    return { delivered: res.delivered, wakeLog: res.wakeLog, note: res.note };
+    return {
+      delivered: res.delivered,
+      wakeLog: res.wakeLog,
+      note: res.note,
+      ...(res.wakeDeferred !== undefined ? { wakeDeferred: res.wakeDeferred } : {}),
+    };
   }
 
   return {
@@ -342,7 +482,7 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
         // 通知帧 + engine 事件 + 尽力唤醒（不带 urgent——撤回本身不是插队请求）。
         const withdrawIds = args.withdrawMessageIds;
         if (withdrawIds !== undefined) {
-          const offenders = (["msg", "urgent", "interrupt", "summary", "sourceTaskId", "sourceAttemptId"] as const)
+          const offenders = (["msg", "urgent", "interrupt", "summary", "sourceTaskId", "sourceAttemptId", "refs"] as const)
             .filter((k) => args[k] !== undefined);
           if (offenders.length > 0) {
             throw invalidParamsError(
@@ -442,6 +582,10 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
           throw invalidParamsError("msg is required unless withdrawMessageIds is provided (withdraw mode)");
         }
 
+        // v0.9.1（G-10）：文件引用闸（锁外现算——sha256 是慢操作，§2.7-4）。整单拒绝
+        // 语义与 evidence 门一致：任一条不过则一个字节都不落箱（无副作用，可重试）。
+        const refs = await resolveMessageRefs(workspace, args.refs);
+
         // C1 语义归一：interrupt 蕴含 urgent（§3.1）。
         const interruptRequested = args.interrupt === true;
         const urgent = args.urgent === true || interruptRequested;
@@ -522,10 +666,14 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
         // 转办/审批帧的控制点是审批门，不是入站策略——hold 会让请求永远躺隔离区）。
         const policy = await readInboundPolicy(stateRoot, me.teamId, env);
         if (policy.mode === "hold" && toolFrameType === undefined) {
-          const msg = createMessage(me.agentKey, toKey, content, {
-            ...(urgent ? { urgent: true } : {}),
-            ...(interruptRequested ? { interrupt: true as const } : {}),
-          });
+          // v0.9.1（G-10）：refs 随暂存件保留（审阅放行后插队不丢引用）。
+          const msg: TeamMessage = {
+            ...createMessage(me.agentKey, toKey, content, {
+              ...(urgent ? { urgent: true } : {}),
+              ...(interruptRequested ? { interrupt: true as const } : {}),
+            }),
+            ...(refs !== undefined ? { refs } : {}),
+          };
           await appendHeldMessage(stateRoot, me.teamId, toKey, msg);
           await logEngineEvent(stateRoot, {
             event: "inbound-held",
@@ -535,6 +683,7 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
             messageId: msg.id,
             ...(urgent ? { urgent: true } : {}),
             ...(interruptRequested ? { interruptRequested: true } : {}),
+            ...(refs !== undefined ? { refCount: refs.length } : {}),
           });
           return okResult(
             `Message held by inbound policy (mode=hold, source=${policy.source}): quarantined in ` +
@@ -548,6 +697,7 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
               ...(urgent ? { urgent: true } : {}),
               // held 件不带 envelope 标注——信封未进可读邮箱（接受审阅后随元数据渲染）。
               ...(interruptRequested ? { interrupt: interruptBlock(false) } : {}),
+              ...(refs !== undefined ? { refs } : {}),
             },
           );
         }
@@ -585,7 +735,14 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
         const stamp = toolFrameType !== undefined
           ? { hit: false as const, reason: "machine-frame-exempt (C6/C7)" }
           : await (async () => {
-              const authority = await verifyUservoiceStampAuthority(peerRootFromEnv(env), stateRoot, me.sessionId);
+              // v0.9.1（G-11）：me.voiceOwner = 本连接经唤醒 nonce 证明继承的原会话
+              // （wakeToken 路径转记）。盖章核验据此承认共享 sid 的无头续跑——不再因
+              // 桌面原会话（elsewhere 活进程）持有同一 sid 而拒章；无证明（hook/peer
+              // 注册）时恒缺失，拒绝线不放松（安全面不回退）。
+              const authority = await verifyUservoiceStampAuthority(
+                peerRootFromEnv(env), stateRoot, me.sessionId,
+                { voiceOwner: me.voiceOwner },
+              );
               if (!authority.ok) {
                 await logEngineEvent(stateRoot, {
                   event: "uservoice-stamp-refused",
@@ -661,7 +818,9 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
           const samePriority = dup !== undefined
             && (dup.urgent === true) === urgent
             && (dup.interrupt === true) === interruptRequested;
-          if (dup !== undefined && samePriority) {
+          // v0.9.1（G-10，V090-12 同族）：引用集有差异也不判重——「同一句正文 + 一张
+          // 新截图」必须真达收方（否则 payload 报着新 refs、收方看到的旧件无引用）。
+          if (dup !== undefined && samePriority && !refsDiffer(dup, refs)) {
             return { delivered: "duplicate" as const, messageId: dup.id, toSessionId: recipient.sessionId };
           }
 
@@ -697,14 +856,20 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
             }
           }
 
-          const msg = createMessage(me.agentKey, toKey, content, {
-            ...src,
-            ...rec,
-            deliveryClaimedAt: now,
-            ...(stamp.hit ? { origin: "user" as const, originSessionId: me.sessionId } : {}),
-            ...(urgent ? { urgent: true } : {}),
-            ...(interruptRequested ? { interrupt: true as const } : {}),
-          });
+          // v0.9.1（G-10）：refs 随消息落箱（TeamMessage.refs；不内联内容、不做 base64）。
+          // createMessage 的 extra 白名单不动（core/mailbox.ts 属 A 组文件域），引用字段
+          // 在此按 TeamMessage 形状补齐——读取面 entry 的 `{...m}` 展开与信封渲染都吃它。
+          const msg: TeamMessage = {
+            ...createMessage(me.agentKey, toKey, content, {
+              ...src,
+              ...rec,
+              deliveryClaimedAt: now,
+              ...(stamp.hit ? { origin: "user" as const, originSessionId: me.sessionId } : {}),
+              ...(urgent ? { urgent: true } : {}),
+              ...(interruptRequested ? { interrupt: true as const } : {}),
+            }),
+            ...(refs !== undefined ? { refs } : {}),
+          };
           await appendMailbox(stateRoot, me.teamId, toKey, msg);
 
           // v0.7（C6，§2.5）：tool_result 回投终填台账（ok→executed / error→error /
@@ -756,6 +921,8 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
         }
 
         let delivered: "wake" | "mailbox" | "duplicate";
+        // v0.9.1（G-12-b）：容量闸 deferral（仅 wake 路径产生；tool_request 禁唤醒路径无）。
+        let wakeDeferred: WakeDeferral | undefined;
         if (out.delivered === "duplicate") {
           delivered = "duplicate";
         } else if (toolFrameType === "tool_request") {
@@ -776,6 +943,9 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
         } else {
           const sent = await wake(toKey, out.toSessionId, "message", [out.messageId], out.content, urgent);
           delivered = sent.delivered;
+          // v0.9.1（G-12-b）：容量闸 deferral 进 payload（delivered 恒为 mailbox——
+          // 消息已在箱里，pull 兜底；块里带原因明细与冷却窗，调用方看得见「为何没唤醒」）。
+          if (sent.wakeDeferred !== undefined) wakeDeferred = sent.wakeDeferred;
         }
         await logEngineEvent(stateRoot, {
           event: "message",
@@ -788,6 +958,8 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
           ...(interruptRequested ? { interruptRequested: true } : {}),
           ...(args.summary !== undefined ? { summary: args.summary } : {}),
           ...(toolFrameType !== undefined ? { frame: toolFrameType } : {}),
+          // v0.9.1（G-10）：引用条数进审计（路径与 sha256 已在消息真源里，审计只记计数）。
+          ...(refs !== undefined ? { refCount: refs.length } : {}),
         });
         // v0.7（C6，§2.5 审计四件套）：tool-request（发送）/ tool-executed（回投）。
         if (toolFrameType === "tool_request" && toolRequestCheck !== undefined) {
@@ -833,6 +1005,11 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
           // 返回的是既有消息，未必带 interrupt 元数据，不得虚报。
           ...(interruptRequested ? { interrupt: interruptBlock(out.delivered !== "duplicate") } : {}),
           ...(delivered === "duplicate" ? { duplicate: true } : {}),
+          // v0.9.1（G-10）：refs 回显（duplicate 返回既有件——其引用集可能与本次不同，
+          // 故只在真实落箱时回显，避免虚报「这条带了新引用」）。
+          ...(refs !== undefined && out.delivered !== "duplicate" ? { refs } : {}),
+          // v0.9.1（G-12-b）：容量闸 deferral（原因 + 冷却窗；delivered 已降级 mailbox）。
+          ...(wakeDeferred !== undefined ? { wakeDeferred } : {}),
           ...(toolFrameType === "tool_request" && toolRequestCheck !== undefined
             ? {
                 frame: "tool_request",
@@ -1032,9 +1209,18 @@ export async function relayPeerSend(
   if (args.msg === undefined) {
     throw invalidParamsError("msg is required unless withdrawMessageIds is provided (withdraw mode)");
   }
+  // v0.9.1（G-10）：peer 轴同样收 refs——三道硬闸与队内轴同一函数（锁外现算）。
+  // 载体边界（同 urgent 既有纪律）：管道 MsgFrame 白名单冻结，refs 只在**文件退化**
+  // 队列项里携带；via=pipe 时在 payload 如实披露「未随帧传递」，不虚报。
+  const peerRefs = await resolveMessageRefs(deps.workspace, args.refs);
   const msgId = randomUUID();
   const text = args.msg;
-  const authority = await verifyUservoiceStampAuthority(root, stateRoot, self.sessionId);
+  // v0.9.1（G-11）：peer 轴盖章同样承认唤醒续跑证明——本进程队内身份若经 wakeToken
+  // 绑定（identityStore 里该 sid 的 voiceOwner），共享 sid 的无头回合可盖章转达用户
+  // 原话；无证明（普通交互会话）时恒走完整拒绝线，安全面不回退。
+  const authority = await verifyUservoiceStampAuthority(root, stateRoot, self.sessionId, {
+    voiceOwner: identityStore.voiceOwnerForSession(self.sessionId),
+  });
   const stamp = authority.ok
     ? await uservoiceMatchAndConsume(root, self.sessionId, text, Date.now(), env)
     : ({ hit: false as const, reason: authority.reason });
@@ -1073,7 +1259,8 @@ export async function relayPeerSend(
 
   // 文件退化路径（§4.5）：发送侧构造队列项——urgent 随件携带（M3 排空面
   // urgent-first 生效）。管道 MsgFrame 不携带 urgent（transport 白名单冻结，
-  // 见模块头注）。
+  // 见模块头注）。v0.9.1（G-10）：refs 同样只随文件退化项携带（帧白名单冻结），
+  // pipe 路径的未携带事实由 payload refsCarried:false 如实披露。
   const fallbackItem: PeerQueueItem = {
     msgId,
     from: frame.from,
@@ -1085,6 +1272,7 @@ export async function relayPeerSend(
     ...(origin === "user" ? { origin: "user" as const } : {}),
     ...(origin === "user" && originSessionId !== undefined ? { originSessionId } : {}),
     ...(urgent ? { urgent: true } : {}),
+    ...(peerRefs !== undefined ? { refs: peerRefs } : {}),
     ts: Date.now(),
     via: "file",
   };
@@ -1129,6 +1317,17 @@ export async function relayPeerSend(
   // 此前这里只取 state 丢掉 detail，发送方只看到 `receipt:"dropped"`——README §7
   // 「附原因与恢复动作」的承诺在工具面落空，模型极易把静默丢件当成已投递。
   const detail = result.reply?.type === "status" ? result.reply.detail : undefined;
+  // v0.9.1（G-10）：refs 载体如实回报——pipe 路径帧白名单冻结，引用只随文件退化件
+  // 抵达；此时 payload 必须说清（不许让调用方以为对端看得到引用）。
+  const refsCarried = peerRefs !== undefined && result.via === "file";
+  const refsNote = peerRefs !== undefined && !refsCarried
+    ? "；注意：peer 管道帧不携带文件引用（wire 白名单冻结），本条 refs 未随帧传递——"
+      + "文件引用只在文件退化路径生效（对端 xc_read({scope:\"peer\"}) 排空后可见），或改走队内轴 xc_relay"
+    : "";
+  const urgentNote = urgent && result.via === "pipe"
+    ? "；注意：peer 管道帧不携带 urgent 标记（wire 白名单冻结），插队排序仅对文件退化件与队内轴生效"
+    : "";
+  const detailNote = detail !== undefined ? `；未投递原因与恢复动作：${detail}` : "";
   await logPeerEvent(root, {
     event: "peer-sent",
     to: row.name,
@@ -1138,6 +1337,7 @@ export async function relayPeerSend(
     ...(urgent ? { urgent: true } : {}),
     ...(interruptRequested ? { interruptRequested: true } : {}),
     ...(detail !== undefined ? { detail } : {}),
+    ...(peerRefs !== undefined ? { refCount: peerRefs.length, refsCarried } : {}),
   });
   await logEngineEvent(stateRoot, {
     event: "relay-peer",
@@ -1150,13 +1350,10 @@ export async function relayPeerSend(
     ...(urgent ? { urgent: true } : {}),
     ...(interruptRequested ? { interruptRequested: true } : {}),
     ...(detail !== undefined ? { detail } : {}),
+    ...(peerRefs !== undefined ? { refCount: peerRefs.length, refsCarried } : {}),
   });
-  const urgentNote = urgent && result.via === "pipe"
-    ? "；注意：peer 管道帧不携带 urgent 标记（wire 白名单冻结），插队排序仅对文件退化件与队内轴生效"
-    : "";
-  const detailNote = detail !== undefined ? `；未投递原因与恢复动作：${detail}` : "";
   return okResult(
-    `Peer message ${msgId.slice(0, 8)} → ${row.name}: receipt=${receipt}, via=${result.via}${urgentNote}${detailNote}`,
+    `Peer message ${msgId.slice(0, 8)} → ${row.name}: receipt=${receipt}, via=${result.via}${urgentNote}${detailNote}${refsNote}`,
     {
       msgId,
       to: row.name,
@@ -1167,6 +1364,8 @@ export async function relayPeerSend(
       ...(urgent ? { urgent: true } : {}),
       // v0.9.2（V090-12 C 域）：peer 轴 interrupt 如实回报「无 INTERRUPT 痕迹」。
       ...(interruptRequested ? { interrupt: interruptBlockPeer() } : {}),
+      // v0.9.1（G-10）：refs 回显 + 是否真随消息抵达（pipe=未携带，如实标注）。
+      ...(peerRefs !== undefined ? { refs: peerRefs, refsCarried } : {}),
     },
   );
 }
@@ -1334,6 +1533,7 @@ export function registerRelay(
     "envelope (urgent ordering unchanged) — the host has no mid-turn injection primitive, so the receiver sees it at its next inbox check " +
     "and acks per the safety-point discipline (finish the current atomic operation, start nothing new, reply to confirm); the payload reports this honestly. " +
     "withdrawMessageIds (team axis only, v0.9) withdraws your own still-unread messages: all-or-nothing — any read/foreign/missing/discarded id, or a withdrawal-notice frame itself (notices are the accounting anchor and are never withdrawable), rejects the whole order with per-item status. " +
+    "refs (optional, v0.9.1 G-10) attaches file references to the message: each entry must be a real regular file inside the workspace (path+sha256, computed when omitted; the same three hard gates as xc_report evidence), and the receiver's envelope renders a \"open that path with Read\" hint — references are never inlined and never base64. " +
     "forwardOf was removed in v0.6: write the body directly, send annotations as a separate message. " +
     'msg may carry a JSON protocol frame; v0.7 C6 transfer frames are {type:"tool_request"|"tool_result"} (team axis only): ' +
     "a tool_request asks a teammate who has an MCP tool you lack to run it — it stays invisible until an approval file authorizes it " +

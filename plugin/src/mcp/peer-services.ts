@@ -105,6 +105,7 @@ import {
 } from "../core/budget.js";
 import { resolvePeerMessage, storedMessageCorruptFile, storePeerMessageFull } from "../core/msgstore.js";
 import { uservoiceMatchAndConsume, verifyUservoiceStampAuthority } from "../core/uservoice.js";
+import { identityStore } from "./identity.js";
 import { RESERVED_MEMBER_KEYS } from "../core/types.js";
 import { leadKeyOf } from "./tools-team.js";
 import {
@@ -726,7 +727,12 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
         // 盖章前先验会话归属——未锚定或 sid 被别的活进程持有时**不盖章**（消息照发，
         // origin 缺省=agent，fail-closed）+ uservoice-stamp-refused 审计；payload
         // 层的警告由工具层按回执/载荷如实披露（P1-④「不盖章+审计+警告」）。
-        const authority = await verifyUservoiceStampAuthority(r, deps.stateRoot, self.sessionId);
+        const authority = await verifyUservoiceStampAuthority(r, deps.stateRoot, self.sessionId, {
+          // v0.9.1（G-11）：peer 轴盖章承认唤醒续跑证明（队内身份经 wakeToken 绑定时
+          // 该 sid 带 voiceOwner）——共享 sid 的无头回合不再被 session-id-held-
+          // elsewhere 拒章；无证明时拒绝线不放松（对外部会话安全面不回退）。
+          voiceOwner: identityStore.voiceOwnerForSession(self.sessionId),
+        });
         const stamp = authority.ok
           ? await uservoiceMatchAndConsume(r, self.sessionId, text, Date.now(), deps.env)
           : ({ hit: false as const, reason: authority.reason });

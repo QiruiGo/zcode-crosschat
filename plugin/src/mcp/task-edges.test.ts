@@ -210,7 +210,11 @@ describe("withTaskEdges: xc_report completed → 依赖解除（E-b ②）", () 
 
     // 快照刷新（terminal 边沿后）。
     expect(refreshCount()).toBeGreaterThanOrEqual(1);
-  });
+    // 唤醒路径用例（XC_WAKE_ENABLED=true，真走 attemptWake：spawn 同步失败 → wake-failed
+    // 事件 + 租约释放 + 生命周期监视）磁盘 I/O 重；隔离实测 ≈1s，全量并行负载下实测触及
+    // vitest 默认 5s 超时（2026-11-20 全量红 2 例即此处）。按本仓既有口径（core/lock.test.ts
+    // 的 15s、core/capacity.test.ts 的 30s）显式放宽，判据不变。
+  }, 15_000);
 
   it("收件人有开放任务 → 只入箱不唤醒（woken:false，无 unblock 唤醒事件）", async () => {
     const core = makeCore({ XC_WAKE_ENABLED: "true" });
@@ -233,7 +237,8 @@ describe("withTaskEdges: xc_report completed → 依赖解除（E-b ②）", () 
     // m2 没有被唤醒（wake 事件只属于 m1 的 report 回执路径，scene=report）。
     const wakeEvents = readEngineEvents().filter((e) => e["event"] === "wake-failed" && e["to"] === "m2");
     expect(wakeEvents.some((e) => e["scene"] === "unblock")).toBe(false);
-  });
+    // 唤醒路径用例：显式放宽超时（理由同上一用例，磁盘 I/O 重 + 全量并行负载）。
+  }, 15_000);
 
   it("removed 成员不唤醒（§6.3/§7.3.3），通知照常入箱", async () => {
     const core = makeCore({ XC_WAKE_ENABLED: "true" });
@@ -255,7 +260,8 @@ describe("withTaskEdges: xc_report completed → 依赖解除（E-b ②）", () 
       (e) => e["event"] === "wake-failed" && e["to"] === "m2" && e["scene"] === "unblock",
     );
     expect(wakeEvents).toHaveLength(0);
-  });
+    // 唤醒路径用例：显式放宽超时（理由同上一用例，磁盘 I/O 重 + 全量并行负载）。
+  }, 15_000);
 
   it("v0.5.3（A3 修复）failed 报告 → 死锁下游自动解除：t2 置 cancelled + 创建者收回执 + edges.deadlocked", async () => {
     const core = makeCore({ XC_WAKE_ENABLED: "true" }); // 未配 exe → spawn 失败 → wake-failed 证明走到唤醒
@@ -282,9 +288,18 @@ describe("withTaskEdges: xc_report completed → 依赖解除（E-b ②）", () 
     expect(t2Task.history.at(-1)).toMatchObject({ event: "dependency-deadlock", by: "engine" });
 
     // 创建者（a）邮箱：cancelled 回执（cancelledBy=engine）。
+    // v0.9.1（G-12v3）：同箱还可能有引擎信号的 urgent 告知件（from="engine" 的纯文本
+    // 通知——wake-failed 告警通道，见 engine/wake.ts notifyLeadUrgent）——机器帧过滤
+    // 前先容错解析（非 JSON 正文跳过），不回退既有断言。
     const aBox = await readMailbox(stateRoot, "default", "a");
     const receipts = aBox
-      .map((m) => JSON.parse(m.content) as Record<string, unknown>)
+      .flatMap((m) => {
+        try {
+          return [JSON.parse(m.content) as Record<string, unknown>];
+        } catch {
+          return [] as Record<string, unknown>[];
+        }
+      })
       .filter((c) => c["type"] === "task-receipt" && c["taskId"] === t2);
     expect(receipts).toHaveLength(1);
     expect(receipts[0]).toMatchObject({ status: "cancelled", cancelledBy: "engine" });
@@ -300,7 +315,8 @@ describe("withTaskEdges: xc_report completed → 依赖解除（E-b ②）", () 
     // m2 邮箱里没有 unblock-notice（completed 专属），但派单还在（消息面不清理）。
     const box = await readMailbox(stateRoot, "default", "m2");
     expect(box.some((m) => m.content.includes('"unblock-notice"'))).toBe(false);
-  });
+    // 唤醒路径用例（failed 边沿同样触发 attemptWake）：显式放宽超时，理由同上一用例。
+  }, 15_000);
 
   it("v0.5.3（A3 修复）传递闭包：t3 依赖 t2、t2 依赖 t1，t1 failed → t2/t3 一并解除", async () => {
     const core = makeCore();

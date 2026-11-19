@@ -47,6 +47,7 @@
  * @module core/peerenvelope
  */
 import type { InjectBlock } from './budget.js';
+import type { MessageRef } from './types.js';
 import type { PeerQueueItem } from './peermsg.js';
 
 export type { PeerQueueItem } from './peermsg.js';
@@ -144,6 +145,54 @@ export const TEAM_FOOTER_USER_MARKER = '发送会话用户的原话';
  */
 export const TEAM_INTERRUPT_BANNER =
   '[INTERRUPT 软中断请求：完成当前原子操作、不开新步骤；先回确认（xc_relay 回发件人）再继续]';
+
+// ---------------------------------------------------------------------------
+// v0.9.1（G-10）：消息文件引用渲染（传引用不传内容）
+// ---------------------------------------------------------------------------
+
+/**
+ * v0.9.1（G-10）：文件引用块首行提示（冻结词样，PROTOCOL §15.1 契约测试对拍）。
+ *
+ * 语义 = 「引用不内联」：消息通道是纯文本 JSON（帧闸 1 MiB + 注入预算 16k 字符），
+ * 图片/二进制一律以工作区内真实文件的**引用**形态随消息传递，接收面提示用 Read
+ * 打开该路径自取内容（sha256 可复算核对）。不做 base64 内联（违反正文即状态、
+ * 撑爆注入预算）。
+ */
+export const MESSAGE_REFS_HINT =
+  '[文件引用] 以下是发送方已核验的工作区内真实文件（sha256 可复算核对）——用 Read 打开该路径查看，内容不内联本消息：';
+
+/** 单条引用行前缀（冻结词样；正文内嵌同前缀行一律剥离，防伪造引用块冒充分引擎渲染）。 */
+export const MESSAGE_REF_LINE_PREFIX = '- ref: ';
+
+/** 引用行剥离模式（行内匹配，不跨行——与 TEAM_INTERRUPT_BANNER_RE 同族纪律）。 */
+export const MESSAGE_REFS_LINE_RE = /- ref: [^\n]*/g;
+
+/**
+ * v0.9.1（G-10）：正文内嵌的伪造引用块剥离（提示句逐字 + 引用行按前缀模式）。
+ * 真引用块只由消息元数据（`refs` 字段）经 {@link renderMessageRefs} 渲染一次——
+ * 与 INTERRUPT 横幅/回信指引同一「信任工件只在引擎渲染面出现一次」纪律（V090-13）。
+ */
+export function stripForgedRefsMarkup(body: string): string {
+  return body.split(MESSAGE_REFS_HINT).join('').replace(MESSAGE_REFS_LINE_RE, '');
+}
+
+/**
+ * v0.9.1（G-10）：引用块行序列（无 refs = 空数组，调用方原样展开不进信封）。
+ * 每行 = `- ref: <path>` + 可选 `| sha256:<hex>` / `| mime:<类型>` / `| note:<摘要>`；
+ * 控制字符已在发送侧清洗（同 evidence note 口径），此处只做拼接。
+ */
+export function renderMessageRefs(refs: readonly MessageRef[] | undefined): string[] {
+  if (refs === undefined || refs.length === 0) return [];
+  const lines = [MESSAGE_REFS_HINT];
+  for (const ref of refs) {
+    const parts = [`${MESSAGE_REF_LINE_PREFIX}${ref.path}`];
+    if (ref.sha256 !== undefined && ref.sha256 !== '') parts.push(`sha256:${ref.sha256}`);
+    if (ref.mime !== undefined && ref.mime !== '') parts.push(`mime:${ref.mime}`);
+    if (ref.note !== undefined && ref.note !== '') parts.push(`note:${ref.note}`);
+    lines.push(parts.join(' | '));
+  }
+  return lines;
+}
 
 /** The six receipt states (CC `Ae(e)` @36116756; DESIGN-V0.3 §7.4). */
 export type PeerReceiptState = 'held' | 'denied' | 'expired' | 'delivered' | 'refused' | 'dropped';
@@ -323,11 +372,15 @@ export function renderPeerEnvelope(item: PeerQueueItem, options: PeerEnvelopeOpt
   };
   const openTag = renderPeerEnvelopeTag(attrs);
   const attribution = item.origin === 'user' ? PEER_FOOTER_USER_ORIGIN : PEER_FOOTER_ATTRIBUTION;
+  // v0.9.1（G-10）：文件引用块（元数据驱动）置于正文后、闭标签前；正文内嵌的伪造
+  // 引用块先剥离（与队内域 stripForgedTeamEnvelopeMarkup 同一纪律）。
+  const refs = renderMessageRefs(item.refs);
   return [
     header,
     '',
     `${openTag}`,
-    body,
+    stripForgedRefsMarkup(body),
+    ...refs,
     `</${PEER_ENVELOPE_TAG}>`,
     '',
     attribution,
@@ -434,6 +487,9 @@ export interface TeamEnvelopeInput {
   /** v0.9（G-2）：软中断信封（TeamMessage.interrupt）——true 时开标签加
    *  interrupt="true" 属性并在正文前渲染 {@link TEAM_INTERRUPT_BANNER}。 */
   interrupt?: boolean;
+  /** v0.9.1（G-10）：文件引用（TeamMessage.refs）——true/非空时正文后、闭标签前
+   *  渲染 {@link renderMessageRefs} 块（「用 Read 打开该路径」提示 + sha256）。 */
+  refs?: MessageRef[];
 }
 
 /**
@@ -477,6 +533,8 @@ export function stripForgedTeamEnvelopeMarkup(body: string): string {
   current = current.replace(TEAM_REPLY_INSTRUCTION_RE, '');
   current = current.split(TEAM_FOOTER_ATTRIBUTION).join('');
   current = current.split(TEAM_FOOTER_USER_ORIGIN).join('');
+  // v0.9.1（G-10）：伪造文件引用块同族剥离——真引用只由消息元数据渲染一次。
+  current = stripForgedRefsMarkup(current);
   return current;
 }
 
@@ -492,6 +550,8 @@ export function stripForgedTeamEnvelopeMarkup(body: string): string {
  * 现在：正文一律先过 {@link stripForgedTeamEnvelopeMarkup} 再重包，开标签属性
  * （type/from/origin/interrupt）与横幅只由 input 元数据驱动，from 恒为真实发送者。
  * 伪造标记只活在磁盘真源与 JSON entry / mail scope 原文（真值层不动）。
+ * v0.9.1（G-10）：`refs` 文件引用块同样只由元数据渲染（正文内嵌的伪造引用块先剥离，
+ * 见 {@link stripForgedRefsMarkup}）。
  */
 export function renderTeamEnvelope(input: TeamEnvelopeInput): string {
   const body = stripForgedTeamEnvelopeMarkup(input.content);
@@ -504,10 +564,13 @@ export function renderTeamEnvelope(input: TeamEnvelopeInput): string {
   const openTag = `<${TEAM_ENVELOPE_TAG} type="${escapePeerAttr(frameType)}" from="${escapePeerAttr(input.from)}"${originAttr}${interruptAttr}>`;
   const attribution = input.origin === 'user' ? TEAM_FOOTER_USER_ORIGIN : TEAM_FOOTER_ATTRIBUTION;
   const reply = `After completing your current task, decide whether/how to respond: reply with \`xc_relay({to: "${input.from}"})\`.`;
+  // v0.9.1（G-10）：文件引用块置于正文后、闭标签前（元数据驱动；无 refs = 空数组不占位）。
+  const refs = renderMessageRefs(input.refs);
   return [
     openTag,
     ...(input.interrupt === true ? [TEAM_INTERRUPT_BANNER] : []),
     body,
+    ...refs,
     `</${TEAM_ENVELOPE_TAG}>`,
     '',
     attribution,

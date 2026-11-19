@@ -50,6 +50,24 @@
  *   均携带 gate.warning（与 wake-skipped 原因行同口径）。
  * - V090-12（本域部分）去重键档位：findDuplicateMail 纳入 urgent/interrupt
  *   差异——同文后发的 interrupt/urgent 不得判重（调用方接线在 C 域 tools-relay.ts）。
+ * - v0.9.1（G-12-b）spawn 前容量闸：attemptWake 在 createWakeNonce 之前读 capacity
+ *   verdict（judgeCapacity 任一规则 ∨ 边际预估 > freeBytes）→ 不 spawn、deliver=mailbox
+ *   + wake-deferred{reason:"capacity-red"} + 冷却重试（XC_MEM_WAKE_COOLDOWN_MS，
+ *   XC_MEM_WAKE_GATE=off 可关闸）；重试路径（sessionNotFound 自动重绑）复检同一道闸。
+ *   闸只挡唤醒不拦 pull——消息照常落邮箱，收方自己的回合随时可读。
+ *
+ * v0.9.1 打回第 1 轮增量（V091-01/V091-02，voiceOwner 伪造/越权盖章面）：
+ * - **wake nonce 真值不落任何共享日志**：engine.jsonl 的 wake/wake-child/wake-failed/
+ *   wake-retry/wake-retry-skipped/wake-skipped/wake-slow/message-limbo 事件与
+ *   wake-lifecycle 头行，其 `nonce` 字段一律改记**不可反查摘要**
+ *   （{@link wakeNonceDigest} = sha256 前 12 hex）。非ce 真值只存在于两处：
+ *   唤醒 prompt（只达无头进程）与 registry/wake/<token>.json 状态真源。
+ *   背景：裁决实测（adv-1 TC-1）同状态根会话读 logs/engine.jsonl 即可收割 nonce，
+ *   抢先消费（consumeWakeNonce 置 used）把合法无头回合踢掉并冒名注册——日志面是
+ *   被高频外泄/贴证的面，真源则不被贴；本修复把泄露面收回状态真源（README 已知
+ *   限制 12 同款边界：同机可读状态文件，不做密码学防御）。
+ * - 键名保持不变（PROTOCOL §15.3 冻结键集只对拍键名），值从令牌变摘要——运维
+ *   对账仍可做（同一次唤醒的各行摘要相同），但拿不到可消费的令牌。
  *
  * dsh 原版参照（dsh-agent-teams 0.1.29，lib/ 目录）：
  * - tools.js:2088-2093  duplicate 幂等判定（from+content+taskId/attemptId+source* 全等 ∧
@@ -75,11 +93,26 @@ import {
   isCurrentMail,
   markMailboxDelivered,
   releaseMailboxDelivery,
+  appendMailbox,
+  createMessage,
+  sweepLimboDeliveriesLocked,
 } from "../core/mailbox";
-import { readFileSync } from "node:fs";
+import { readFileSync, rm, appendFileSync, mkdirSync } from "node:fs";
+import { createHash } from "node:crypto";
+// v0.9.1（G-12-b）：容量闸冷却记录用 promise 版 mkdir/rm（与 core/atomic.ts 同族口径）。
+import { mkdir, readFile, rm as rmAsync } from "node:fs/promises";
 import { logEngineEvent } from "../core/log";
-import { withTeamLock } from "../core/lock";
-import { wakeLogFile } from "../core/paths";
+import { pidAlive, withTeamLock } from "../core/lock";
+import { wakeLifecycleFile, wakeLogFile } from "../core/paths";
+import { dirname, join } from "node:path";
+import { writeFileAtomic } from "../core/atomic.js";
+import {
+  capacityCacheFile,
+  judgeCapacity,
+  sampleCapacity,
+  turnEstimateBytesFromEnv,
+  type CapacitySample,
+} from "../core/capacity";
 import {
   resolveWakeGate,
   wakeDisabledReason,
@@ -87,11 +120,12 @@ import {
   workspaceConfigFile,
   type WakeGate,
 } from "../core/config";
-import { readTeam } from "../core/teamstate";
+import { readTeam, leadKeyOf } from "../core/teamstate";
 import {
   consumeWakeNonce,
   createWakeNonce,
   findInflightWakeNonce,
+  readSession,
   WAKE_INFLIGHT_MS,
 } from "../core/registry";
 import { sanitizeKey } from "../core/sanitize";
@@ -479,6 +513,474 @@ export function buildWakePrompt(input: WakePromptInput, maxChars: number = WAKE_
   return prompt;
 }
 
+// ─────────────────────────── spawn 前容量闸（v0.9.1 G-12-b） ───────────────────────────
+
+/**
+ * v0.9.1（G-12-b）：spawn 前容量闸——「容量只警不拦 = 死亡螺旋」的收口。
+ *
+ * 现场事实（GAP-V0.9 第六/八批，lims2.0 2026-11-19 内存红线事故）：RED 判定本身正确
+ * （仲裁 3：预估与含进程树成本同量级，早先「预估高 4-5 倍」的批评被推翻），但
+ * `attemptWake` 不读 capacity verdict——内存枯竭期继续 spawn 无头 --resume 子进程 →
+ * 更多 OOM（当日 wake-failed 16+、水位 8.9%），而 wake 层正好是内存放大器的入口。
+ *
+ * 判据（G-12-b 原文「水位<硬底或边际预估>freeBytes」）：
+ * ① `judgeCapacity` 任一规则命中（watermark 硬底 / session-limit / turn-concurrency）；
+ * ② **边际预估**：单回合预估（`XC_TURN_ESTIMATE_BYTES`，采样器 headlessTurnMaxRssBytes
+ *    校准后仍由 env 调）> 当前 freeBytes——再起一个无头回合也放不下。
+ * degraded 样本（CIM 不可用）只评 watermark 一条（既有 judgeCapacity 口径，不虚报）。
+ *
+ * 动作：**不 spawn**，直接 `delivered:"mailbox"` + payload `wake-deferred{reason:"capacity-red"}`
+ * + engine 事件 `wake-deferred` + 冷却窗（`XC_MEM_WAKE_COOLDOWN_MS`，缺省 120s）：窗内
+ * 再来的唤醒不重复采样、不 spawn（RED 期的重试风暴本身是放大器）；窗到期后重新采样，
+ * 转 GREEN 即清掉冷却标记、下次唤醒立即通行。
+ *
+ * 边界（如实声明）：闸门只挡**唤醒**（spawn），不拦 pull——消息照常落邮箱，收方自己
+ * 的回合随时可读（§2.5 mailbox 行兜底不变）。派单面的「RED 期排队拒绝」需在派单工具
+ * 面接线（非本文件域），本版在 wake 层给出 deferral 块与冷却窗供其消费（PROTOCOL §15.2）。
+ */
+
+/** 容量闸冷却窗缺省值（ms）——RED deferral 后的静默窗，窗内不重复采样/spawn。 */
+export const WAKE_CAPACITY_COOLDOWN_MS_DEFAULT = 120_000;
+
+/** 冷却窗 env：`XC_MEM_WAKE_COOLDOWN_MS`（ms，>=0 合法；0=不冷却=每次投递都重新判定）。 */
+export function wakeCapacityCooldownMsFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env["XC_MEM_WAKE_COOLDOWN_MS"];
+  if (raw === undefined || raw.trim() === "") return WAKE_CAPACITY_COOLDOWN_MS_DEFAULT;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : WAKE_CAPACITY_COOLDOWN_MS_DEFAULT;
+}
+
+/**
+ * 容量闸开关 env：`XC_MEM_WAKE_GATE`。`"off"` = 关闭容量闸（回到 v0.9.0「只警不拦」
+ * 行为）；其余值/未设 = 开启。非法值不静默——按开启处理并在事件里带 `gateEnv` 原值，
+ * 运维可分辨「我没配」与「我配错了」。
+ */
+export function wakeCapacityGateEnabledFromEnv(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env["XC_MEM_WAKE_GATE"];
+  if (raw === undefined || raw.trim() === "") return true;
+  return raw.trim().toLowerCase() !== "off";
+}
+
+/** 冷却状态文件（与 capacity 采样缓存同目录）：`<stateRoot>/capacity/wake-deferred.json`。 */
+export function wakeDeferralFile(stateRoot: string): string {
+  return join(dirname(capacityCacheFile(stateRoot)), "wake-deferred.json");
+}
+
+/** deferral 块（进 WakeResult 与工具 payload；PROTOCOL §15.2 键集冻结）。 */
+export interface WakeDeferral {
+  reason: "capacity-red";
+  /** 命中规则明细（judgeCapacity detail + 边际预估行；人可读）。 */
+  detail: string[];
+  /** 采样时刻的设备水位（freeBytes/totalBytes）。 */
+  watermark: number;
+  freeBytes: number;
+  /** 本次生效的冷却窗长度（ms）。 */
+  cooldownMs: number;
+  /** 还需等待多久才重新判定（ms；cooldownActive=true 时 = 窗内剩余）。 */
+  retryAfterMs: number;
+  /** true = 本次是冷却窗内的重复请求（未重新采样）。 */
+  cooldownActive: boolean;
+}
+
+/** 落盘的冷却记录（比块多一个 `until` 绝对时刻）。 */
+interface WakeDeferralRecord extends WakeDeferral {
+  until: number;
+}
+
+function formatBytesLabel(n: number): string {
+  if (!Number.isFinite(n) || n < 0) return String(n);
+  if (n >= 1024 ** 3) return `${(n / 1024 ** 3).toFixed(2)}GB`;
+  if (n >= 1024 ** 2) return `${(n / 1024 ** 2).toFixed(1)}MB`;
+  return `${Math.round(n)}B`;
+}
+
+/** 读冷却记录；过期/损坏/未来时钟 → undefined（重新判定）。 */
+async function readWakeDeferral(file: string, now: number): Promise<WakeDeferralRecord | undefined> {
+  try {
+    const rec = JSON.parse(await readFile(file, "utf8")) as Record<string, unknown>;
+    const until = Number(rec["until"]);
+    if (!Number.isFinite(until) || until <= now) return undefined;
+    const detail = Array.isArray(rec["detail"])
+      ? (rec["detail"] as unknown[]).filter((d): d is string => typeof d === "string")
+      : [];
+    return {
+      reason: "capacity-red",
+      detail,
+      watermark: Number(rec["watermark"]) || 0,
+      freeBytes: Number(rec["freeBytes"]) || 0,
+      cooldownMs: Number(rec["cooldownMs"]) || 0,
+      retryAfterMs: Math.max(0, until - now),
+      cooldownActive: true,
+      until,
+    };
+  } catch {
+    return undefined; // 缺文件/损坏 JSON → 重新判定（不因冷却文件坏掉而永久挡唤醒）
+  }
+}
+
+/**
+ * 容量闸判定（spawn 前调用；返回 undefined = 放行）。
+ *
+ * 顺序：开关 → 冷却窗（窗内直接 deferred，不采样）→ 真采样 → 判定 → 写冷却记录。
+ * 采样意外（os 读数异常等）**fail-open**：不因观测故障永久挡住协作唤醒，但落
+ * `wake-capacity-probe-failed` 事件如实披露（与「只警不拦」的旧行为相比仍是净增益：
+ * 正常情况下闸在工作）。
+ *
+ * @param sampleOverride 测试注入的容量样本（缺省=真采样 `sampleCapacity`）——与
+ *   `req.cfg`/`req.spawn` 同一注入纪律：注入即信任，生产路径永不传。
+ */
+export async function capacityWakeDeferral(
+  stateRoot: string,
+  env: NodeJS.ProcessEnv,
+  now: number,
+  sampleOverride?: CapacitySample,
+): Promise<WakeDeferral | undefined> {
+  if (!wakeCapacityGateEnabledFromEnv(env)) return undefined;
+  const cooldownMs = wakeCapacityCooldownMsFromEnv(env);
+  const file = wakeDeferralFile(stateRoot);
+  if (cooldownMs > 0) {
+    const active = await readWakeDeferral(file, now);
+    if (active !== undefined) return active;
+  }
+  let sample: CapacitySample;
+  if (sampleOverride !== undefined) {
+    sample = sampleOverride;
+  } else {
+    try {
+      sample = await sampleCapacity(env, capacityCacheFile(stateRoot), now);
+    } catch (err) {
+      await logEngineEvent(stateRoot, {
+        event: "wake-capacity-probe-failed",
+        error: String(err),
+        note: "容量闸 fail-open：采样异常不挡唤醒（pull 兜底不变）",
+      });
+      return undefined;
+    }
+  }
+  const verdict = judgeCapacity(sample, env);
+  const estimate = turnEstimateBytesFromEnv(env);
+  const marginalExceeded = estimate > sample.freeBytes;
+  if (!verdict.red && !marginalExceeded) {
+    // GREEN：清掉可能存在的过期冷却标记，下次唤醒立即通行（不留残挡）。
+    await rmAsync(file, { force: true }).catch(() => undefined);
+    return undefined;
+  }
+  const detail = [...verdict.detail];
+  if (marginalExceeded) {
+    detail.push(
+      `marginal-estimate: 单回合预估 ${formatBytesLabel(estimate)} > 可用 ${formatBytesLabel(sample.freeBytes)}`
+        + "（XC_TURN_ESTIMATE_BYTES；再起一个无头回合也放不下）",
+    );
+  }
+  const deferral: WakeDeferral = {
+    reason: "capacity-red",
+    detail,
+    watermark: sample.watermark,
+    freeBytes: sample.freeBytes,
+    cooldownMs,
+    retryAfterMs: cooldownMs,
+    cooldownActive: false,
+  };
+  if (cooldownMs > 0) {
+    const record: WakeDeferralRecord = { ...deferral, until: now + cooldownMs };
+    await mkdir(dirname(file), { recursive: true });
+    await writeFileAtomic(file, `${JSON.stringify(record, null, 2)}\n`).catch(() => undefined);
+  }
+  return deferral;
+}
+
+// ─────────────────────────── wake-child 生命周期 + limbo/wake-slow 信号（v0.9.1 G-12v3） ───────────────────────────
+
+/**
+ * v0.9.1（G-12v3 机制 B）：**投递盖章与消费确认分离** + 三类引擎信号。
+ *
+ * 现场事实（GAP-V0.9 第六/七批，2026-11-19）：wake 路径 spawn 成功瞬间即盖
+ * deliveredAt（fire-and-forget，dsh tools.js:2150 对应物），子进程在成员回合消费
+ * 内容前死亡（内存红线 OOM / 宿主重启杀无头子进程）→ 消息**已盖章、从未被读、且
+ * 不再是可投递态**，死会话永不 pull——生产 4 实例收方行为级零动作（邮箱文件级实锤），
+ * 另有 8 条成员→master 回执同机制。主控对 limbo **无感知**（重踢是响应用户提醒，
+ * 不是自发现）。
+ *
+ * 本版收口（方案 §二 组A）：
+ * ① **生命周期日志**：spawn 即写 start 头行（nonce/sid/ts），观察到唤醒子进程消失
+ *    即写 exit 尾行（时长；孤儿化唤醒子的退出码对本进程不可观测，如实 exitCode:null，
+ *    失败语义由 evidence 快照承载）。**0 字节日志永不作失败判据**（G-12 修正 v2：
+ *    慢写瞬态可 12min+ 后补写；只有「≥5min 且无 session-start」才判 slow/limbo）。
+ * ② **limbo 降级**：deliveredAt 已盖而 consumedAt 超时（XC_LIMBO_TIMEOUT_MS，默认
+ *    10min）未回写 → 团队锁内降级回 unread（清 deliveredAt/deliveryClaimedAt，
+ *    重新可注入/可 pull/可重投）+ engine 事件 `message-limbo` + urgent 告知 lead。
+ *    幂等：一个投递轮次恰降级一次（判据要求 deliveredAt 在场，降级恰好清掉它）；
+ *    与消费回写的竞态走团队锁，锁内复判（消费先到则跳过）。
+ * ③ **wake-slow**：spawn 后 XC_WAKE_SLOW_MS（默认 5min）目标 sid 无任何会话活动
+ *    （session-start 会刷新会话记录）→ engine 事件 + urgent 告知 lead。
+ * ④ **wake-failed**（v0.5.1 既有事件）补告警通道：releaseOnFailure 里 urgent 告知
+ *    lead（此前只写 engine.jsonl，lead 不巡检不知情——BD865 延误 25min 的根因）。
+ *
+ * 边界（如实声明）：监视器是**引擎进程内的有界观测**（unref 定时器，不拖进程；
+ * 总窗 = nonce TTL 15min）。引擎进程中途死亡时降级不再发生——与 v0.9.0 已知限制
+ * 20（120s 窗外失败不可观测）同科；消息不丢（仍在邮箱，pull 兜底）。
+ */
+
+/** limbo 超时默认值（ms）：盖章后无消费确认即降级（可配 XC_LIMBO_TIMEOUT_MS）。 */
+export const LIMBO_TIMEOUT_DEFAULT_MS = 10 * 60_000;
+/** wake-slow 阈值默认值（ms）：spawn 后 5min 无 session-start 才判慢（可配 XC_WAKE_SLOW_MS）。 */
+export const WAKE_SLOW_DEFAULT_MS = 5 * 60_000;
+/** 生命周期监视轮询间隔默认值（ms）。 */
+export const WAKE_LIFECYCLE_POLL_MS = 5_000;
+
+/**
+ * v0.9.1 打回第 1 轮（V091-01）：wake nonce 的**不可反查摘要**（落共享日志用）。
+ *
+ * 为什么需要：adv-1 TC-1 实测——nonce 真值明文落进同状态根的 engine.jsonl /
+ * wake-lifecycle 日志，同工作区任一会话读日志即可收割，抢先 consumeWakeNonce
+ * （置 used）把合法无头回合踢掉（"already used"），并冒名注册目标成员、
+ * 继承 voiceOwner 越权盖章（TC-2）。日志面恰是最高频的外泄面（引擎日志被大量
+ * 贴进报告/对话/证据）。
+ *
+ * 口径：nonce 真值只存在于唤醒 prompt（只达无头进程）与 registry/wake/<token>.json
+ * 状态真源；一切共享日志（engine.jsonl / lifecycle 账）只记本摘要——sha256 前
+ * 12 hex（48 bit，原像需 2^48 次 xc_identify 调用，且真源里本就有真值，摘要不增加
+ * 任何可达路径）。同一次唤醒的各行摘要相同，运维对账能力不降级。
+ * 键名保持 `nonce` 不变（PROTOCOL §15.3 冻结键集只对拍键名，值不比对）。
+ */
+export function wakeNonceDigest(token: string): string {
+  return createHash("sha256").update(token).digest("hex").slice(0, 12);
+}
+
+/** env 正整数读取（缺省/非法/非正 → fallback；0 与负值不合法——监视类阈值必须为正）。 */
+function positiveIntFromEnv(env: NodeJS.ProcessEnv, key: string, fallback: number): number {
+  const raw = env[key];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const n = Number(raw);
+  return Number.isSafeInteger(n) && n > 0 ? n : fallback;
+}
+
+/** limbo 超时（ms）：env `XC_LIMBO_TIMEOUT_MS` > 内置默认 10min。 */
+export function limboTimeoutFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+  return positiveIntFromEnv(env, "XC_LIMBO_TIMEOUT_MS", LIMBO_TIMEOUT_DEFAULT_MS);
+}
+
+/** wake-slow 阈值（ms）：env `XC_WAKE_SLOW_MS` > 内置默认 5min。 */
+export function wakeSlowFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+  return positiveIntFromEnv(env, "XC_WAKE_SLOW_MS", WAKE_SLOW_DEFAULT_MS);
+}
+
+/**
+ * 追加一行生命周期日志（O_APPEND 追加写；失败吞掉——观测面永不阻断主流程）。
+ * 与唤醒子 stdout 日志分文件（core/paths.ts wakeLifecycleFile）：失败证据侦听
+ * （findWakeFailureEvidence）只解析后者，两本账互不干扰。
+ */
+function appendWakeLifecycle(file: string, line: Record<string, unknown>): void {
+  try {
+    mkdirSync(dirname(file), { recursive: true });
+    appendFileSync(file, `${JSON.stringify({ ts: Date.now(), ...line })}\n`);
+  } catch {
+    /* 观测面尽力而为 */
+  }
+}
+
+/**
+ * v0.9.1（G-12v3）：引擎信号 **urgent 告知 lead**——复用既有邮箱（不新增工具）：
+ * from="engine" 的 urgent 消息进 lead 收件箱（未读注入钩子与 urgent-first 读取面
+ * 照常呈现），signal 事件本身已由调用方写 engine.jsonl（双通道披露口径）。
+ * lead 解析不到（无队伍/roster 空）→ 静默跳过（engine.jsonl 仍是真源）。
+ * 告知是尽力面：失败不阻断信号本身（调用方已留痕）。
+ */
+async function notifyLeadUrgent(stateRoot: string, teamId: string, text: string): Promise<void> {
+  try {
+    const team = await readTeam(stateRoot, teamId);
+    if (team === undefined) return;
+    const leadKey = leadKeyOf(team);
+    if (leadKey === "") return;
+    await appendMailbox(stateRoot, teamId, leadKey, createMessage("engine", leadKey, text, { urgent: true }));
+  } catch {
+    /* 告知尽力而为 */
+  }
+}
+
+/**
+ * 目标 sid 在 spawn 之后是否有过会话活动（session-start 的磁盘投影）：
+ * SessionStart/UserPromptSubmit 钩子都会刷新会话记录（lastSeen/startedAt）——
+ * 有刷新即「回合开跑过」，wake-slow 不判。取不到记录/读盘失败 → false（保守：无证据
+ * 即视为无活动）。桌面原会话与无头回合**共享 sid** 时桌面的刷新同样算数——那种
+ * 形态下消息会经未读注入钩子浮现，不应报慢（只在全静默时告警）。
+ */
+async function sessionStartedSince(stateRoot: string, sid: string, sinceTs: number): Promise<boolean> {
+  try {
+    const record = await readSession(stateRoot, sid);
+    if (record === undefined) return false;
+    return record.lastSeen >= sinceTs || record.startedAt >= sinceTs;
+  } catch {
+    return false;
+  }
+}
+
+/** 生命周期监视配置（attemptWake 装配；测试可注轮询/阈值/pid 判定）。 */
+export interface WakeLifecycleWatchConfig {
+  stateRoot: string;
+  teamId: string;
+  to: string;
+  nonce: string;
+  sid: string;
+  scene: string;
+  /** 唤醒子 stdout/stderr 日志（exit 尾行的失败证据快照来源）。 */
+  wakeLog: string;
+  /** 生命周期日志文件（start 头行已由 attemptWake 在 spawn 前写下）。 */
+  lifecycleFile: string;
+  /** 投递盖章时刻（spawn 成功；limbo/wake-slow 两个计时都从它起算）。 */
+  stampedAt: number;
+  /** 唤醒子 pid（helper 汇报后才拿得到；取不到 = 无法观察退出，其余信号不受影响）。 */
+  getChildPid: () => number | undefined;
+  /** 轮询间隔 / limbo 超时 / wake-slow 阈值 / 总窗（ms）。 */
+  pollMs: number;
+  limboTimeoutMs: number;
+  wakeSlowMs: number;
+  windowMs: number;
+  /** 测试注入：pid 存活判定（缺省 core/lock 的 pidAlive）。 */
+  pidAliveProbe?: (pid: number) => boolean;
+}
+
+/**
+ * 启动 wake-child 生命周期监视（unref 定时器；引擎进程活着才有效，见边界声明）。
+ * 三类信号各自只发一次（进程内flag）：exit 尾行 / wake-slow / limbo 降级+告知。
+ * 消费确认到齐（本批消息全部 consumedAt/readAt/discardedAt）即收工，不空转。
+ */
+export function startWakeLifecycleWatch(cfg: WakeLifecycleWatchConfig): void {
+  if (cfg.pollMs <= 0 || cfg.windowMs <= 0) return;
+  const isAlive = cfg.pidAliveProbe ?? pidAlive;
+  let slowSignaled = false;
+  let limboHandled = false;
+  let exitRecorded = false;
+  let ticking = false;
+  let stopped = false;
+
+  const stop = (): void => {
+    stopped = true;
+    clearInterval(timer);
+    clearTimeout(stopTimer);
+  };
+
+  const tick = async (): Promise<void> => {
+    if (stopped || ticking) return; // 上一轮未结束（锁竞争等）→ 跳过本轮，不叠加
+    ticking = true;
+    try {
+      const now = Date.now();
+      const pid = cfg.getChildPid();
+
+      // ① exit 尾行：观察到唤醒子进程消失即写（时长 + 失败证据快照）。
+      if (!exitRecorded && pid !== undefined && !isAlive(pid)) {
+        exitRecorded = true;
+        let evidence: string | undefined;
+        try {
+          evidence = findWakeFailureEvidence(readFileSync(cfg.wakeLog, "utf8"));
+        } catch {
+          /* 日志尚未出现/不可读：无快照 */
+        }
+        appendWakeLifecycle(cfg.lifecycleFile, {
+          event: "wake-child-exit",
+          pid,
+          durationMs: now - cfg.stampedAt,
+          exitCode: null, // 孤儿化唤醒子（V9）的退出码对引擎进程不可观测——如实记 null
+          ...(evidence !== undefined ? { evidence } : {}),
+        });
+      }
+
+      // ② wake-slow：阈值内目标 sid 全静默（无 session-start 投影）→ 事件 + urgent lead。
+      if (!slowSignaled && now - cfg.stampedAt >= cfg.wakeSlowMs) {
+        if (!(await sessionStartedSince(cfg.stateRoot, cfg.sid, cfg.stampedAt))) {
+          slowSignaled = true;
+          const waitedMin = Math.round((now - cfg.stampedAt) / 60000);
+          await logEngineEvent(cfg.stateRoot, {
+            event: "wake-slow",
+            scene: cfg.scene,
+            teamId: cfg.teamId,
+            to: cfg.to,
+            nonce: wakeNonceDigest(cfg.nonce),
+            sid: cfg.sid,
+            pid: pid ?? null,
+            waitedMs: now - cfg.stampedAt,
+            thresholdMs: cfg.wakeSlowMs,
+          });
+          await notifyLeadUrgent(
+            cfg.stateRoot,
+            cfg.teamId,
+            `[zcode-crosschat 引擎信号] wake-slow：唤醒 "${cfg.to}" 已 ${waitedMin} 分钟无 session-start`
+            + `（spawn 成功但回合未开跑；场景 ${cfg.scene}）。消息已盖投递章仍在邮箱（pull 兜底不丢）。`
+            + `若成员会话已死，请重发或由 lead 用 xc_team({action:"member-add"}) 幂等重供给。`
+            + `（0 字节日志不作失败判据；只有 ≥5min 无 session-start 才判慢。）`,
+          );
+        }
+      }
+
+      // ③ limbo：盖章超时无消费确认 → 团队锁内降级 + 事件 + urgent lead（一个轮次恰一次）。
+      if (!limboHandled && now - cfg.stampedAt >= cfg.limboTimeoutMs) {
+        let downgraded: TeamMessage[] = [];
+        let examined = false;
+        try {
+          await withTeamLock(cfg.stateRoot, cfg.teamId, async () => {
+            const team = await readTeam(cfg.stateRoot, cfg.teamId);
+            if (team === undefined) return;
+            downgraded = await sweepLimboDeliveriesLocked(
+              cfg.stateRoot, team, cfg.to, now, cfg.limboTimeoutMs,
+            );
+            examined = true;
+          });
+        } catch {
+          examined = false; // 锁忙/IO：下一轮再试（不视为已处理）
+        }
+        if (examined) {
+          limboHandled = true;
+          for (const message of downgraded) {
+            await logEngineEvent(cfg.stateRoot, {
+              event: "message-limbo",
+              teamId: cfg.teamId,
+              to: cfg.to,
+              from: message.from,
+              messageId: message.id,
+              ...(message.taskId !== undefined ? { taskId: message.taskId } : {}),
+              nonce: wakeNonceDigest(cfg.nonce),
+              sid: cfg.sid,
+              scene: cfg.scene,
+              stampedAt: cfg.stampedAt,
+              downgradedAt: now,
+              waitedMs: now - cfg.stampedAt,
+              timeoutMs: cfg.limboTimeoutMs,
+            });
+          }
+          if (downgraded.length > 0) {
+            appendWakeLifecycle(cfg.lifecycleFile, {
+              event: "limbo-downgrade",
+              messageIds: downgraded.map((m) => m.id),
+              waitedMs: now - cfg.stampedAt,
+            });
+            const waitedMin = Math.round((now - cfg.stampedAt) / 60000);
+            await notifyLeadUrgent(
+              cfg.stateRoot,
+              cfg.teamId,
+              `[zcode-crosschat 引擎信号] limbo：${downgraded.length} 条消息盖投递章后 ${waitedMin} 分钟无消费确认，`
+              + `已自动降级回 unread（重新可注入/可 pull）。目标 "${cfg.to}"（sid ${cfg.sid}）的唤醒回合`
+              + `疑似在消费前死亡（内存红线 OOM / 宿主重启杀无头子进程）。消息 id：`
+              + `${downgraded.map((m) => m.id).join(", ")}。可重发，或让成员 xc_read({scope:"inbox"}) 兜底。`,
+            );
+          }
+          // 收工：本轮次已处理（有降级=已告知 lead；无降级=都已消费/无 limbo）。
+          // 之后新盖章的消息由各自唤醒轮次的监视器负责（判据自销，不会重复降级）。
+          stop();
+        }
+      }
+    } finally {
+      ticking = false;
+    }
+  };
+
+  const timer = setInterval(() => {
+    void tick();
+  }, cfg.pollMs);
+  timer.unref?.();
+  const stopTimer = setTimeout(stop, cfg.windowMs);
+  stopTimer.unref?.();
+}
+
 // ─────────────────────────── attemptWake（fire-and-forget 编排） ───────────────────────────
 
 /** M3 工具面 → M2 引擎的唤醒请求（tools.ts 头部 ASSUMED M1/M2 CONTRACT 的落地形状）。 */
@@ -527,6 +1029,24 @@ export interface WakeRequest {
   watchWindowMs?: number;
   /** v0.5.1（FI-7）：失败侦听轮询间隔（ms）；缺省 WAKE_WATCH_POLL_MS（500ms）。 */
   watchPollMs?: number;
+  /**
+   * v0.9.1（G-12v3）：limbo 超时（ms）；缺省 env XC_LIMBO_TIMEOUT_MS 或内置默认
+   * 10min。盖章后无消费确认即自动降级回 unread。测试注入用小值。
+   */
+  limboTimeoutMs?: number;
+  /** v0.9.1（G-12v3）：wake-slow 阈值（ms）；缺省 env XC_WAKE_SLOW_MS 或 5min。测试注入。 */
+  wakeSlowMs?: number;
+  /** v0.9.1（G-12v3）：生命周期监视轮询间隔（ms）；缺省 WAKE_LIFECYCLE_POLL_MS。测试注入。 */
+  lifecyclePollMs?: number;
+  /** v0.9.1（G-12v3）：生命周期监视总窗（ms）；缺省 WAKE_INFLIGHT_MS（nonce TTL）。测试注入。 */
+  lifecycleWindowMs?: number;
+  /** v0.9.1（G-12v3）：pid 存活判定注入（测试用；缺省 core/lock 的 pidAlive）。 */
+  pidAliveProbe?: (pid: number) => boolean;
+  /**
+   * v0.9.1（G-12-b）测试注入：容量样本（缺省=真采样 `sampleCapacity`）——与
+   * `req.cfg`/`req.spawn` 同一注入纪律：注入即信任，生产路径永不传。
+   */
+  capacitySample?: CapacitySample;
 }
 
 export interface WakeResult {
@@ -538,6 +1058,8 @@ export interface WakeResult {
   pid?: number;
   /** 实际参与投递的消息 id（=入参 receiptIds）。 */
   receiptIds?: string[];
+  /** v0.9.1（G-12-b）：唤醒结果可携带容量闸 deferral 块（不 spawn 的原因与冷却窗）。 */
+  wakeDeferred?: WakeDeferral;
   /** 本次写下的 wake nonce 令牌（wake 态才有）。 */
   nonce?: string;
 }
@@ -630,7 +1152,9 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
     const d = decideDelivery({ wakeGate: gate, ownerAbsent: req.ownerAbsent, inflight: true });
     await logEngineEvent(stateRoot, {
       event: "wake-skipped", reason: d.reason, scene: req.reason, teamId: req.teamId, to: toKey,
-      inflightNonce: inflight.token,
+      // v0.9.1 打回第 1 轮（V091-01）：在途令牌只落不可反查摘要——真值仅存于
+      // registry/wake/ 真源与唤醒 prompt，共享日志不给人可消费的令牌。
+      inflightNonce: wakeNonceDigest(inflight.token),
     });
     return { delivered: "mailbox", note: d.reason };
   }
@@ -669,9 +1193,46 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
     }
   }
 
+  // 3.8 v0.9.1（G-12-b）spawn 前容量闸：读 capacity verdict，水位低于硬底或边际预估
+  //     超过 freeBytes → **不 spawn**（不写 nonce、不盖租约——跳过路径不留 15min 在途
+  //     标记，与 2.5 状态门同纪律），直接 deliver=mailbox + wake-deferred{reason:
+  //     "capacity-red"} + 冷却重试（XC_MEM_WAKE_COOLDOWN_MS）。位置在最后一道 spawn
+  //     前置闸之后、createWakeNonce 之前：前面的门（分层闸/在途/状态/spawn 配置）都不
+  //     触发时才值得采样（采样有 60s 缓存窗，成本是一次文件读 + os.freemem()）。
+  //     消息已在邮箱（调用方锁内已 append），pull 兜底不丢——闸只挡唤醒不拦投递。
+  const capacityDeferral = await capacityWakeDeferral(stateRoot, req.env, now, req.capacitySample);
+  if (capacityDeferral !== undefined) {
+    const reason = `capacity-red: 内存容量预警（${capacityDeferral.detail.join("；")}）——不 spawn 无头回合，消息留邮箱（pull 兜底），${Math.round(capacityDeferral.retryAfterMs / 1000)}s 后重新判定`;
+    await logEngineEvent(stateRoot, {
+      event: "wake-deferred",
+      reason: "capacity-red",
+      scene: req.reason,
+      teamId: req.teamId,
+      to: toKey,
+      watermark: capacityDeferral.watermark,
+      freeBytes: capacityDeferral.freeBytes,
+      detail: capacityDeferral.detail,
+      cooldownMs: capacityDeferral.cooldownMs,
+      retryAfterMs: capacityDeferral.retryAfterMs,
+      cooldownActive: capacityDeferral.cooldownActive,
+      wakeGateEnabled: wakeCapacityGateEnabledFromEnv(req.env),
+    });
+    return {
+      delivered: "mailbox",
+      note: reason
+        + `（容量闸 v0.9.1 G-12-b；冷却 ${Math.round(capacityDeferral.cooldownMs / 1000)}s，env XC_MEM_WAKE_COOLDOWN_MS 可调，XC_MEM_WAKE_GATE=off 可关闸）`,
+      wakeDeferred: capacityDeferral,
+    };
+  }
+
   // 4. 写一次性 nonce（兼在途标记）+ 盖投递租约（尽力而为）。
+  // v0.9.1（G-11）：nonce 显式记录 voiceOwner=原会话（= 目标 sid）——无头 --resume
+  // 回合与桌面原会话共享 sid，xc_identify 消费本 nonce 时把 voiceOwner 转记到连接
+  // 身份，uservoice 盖章面据此承认「本连接是该 sid 的唤醒续跑」（不再因 sid 被
+  // elsewhere 活进程持有而拒章；对外部会话的拒绝线不放松，见 core/uservoice.ts）。
   const { token } = await createWakeNonce(stateRoot, {
     teamId: req.teamId, agentKey: toKey, sid: req.toSessionId, now,
+    voiceOwner: req.toSessionId,
   });
   const ids = [...req.receiptIds];
   await withLockBestEffort(stateRoot, req.teamId, () =>
@@ -690,10 +1251,16 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
     ...(req.urgent === true ? { urgent: true } : {}),
   });
   const logFile = wakeLogFile(stateRoot, toKey, now);
+  // v0.9.1（G-12v3）：wake-child 生命周期日志文件（start 头行/exit 尾行/limbo 行）。
+  const lifecycleFile = wakeLifecycleFile(stateRoot, toKey, now);
   /**
    * 失败善后（释放投递租约 + 消费 nonce + 审计）。v0.9（G-8）参数化：原始尝试与
    * sessionNotFound 重试共用一份释放逻辑，事件名与恢复动作由调用方给定——
    * 原始尝试 event=wake-failed；重试失败 event=wake-retry-failed（附 recovery）。
+   * v0.9.1（G-12v3）增量：① **同步** spawn 失败（where 以 "spawn" 结尾）= 唤醒子
+   * 从未被拉起，生命周期账补一条 exit 尾行（spawnError），start 头行不悬空；
+   * ② wake-failed/wake-retry-failed **urgent 告知 lead**（此前只写 engine.jsonl，
+   * lead 不巡检不知情——BD865 延误 25min 的根因即「不巡检」而非「无记录」）。
    */
   const releaseOnFailure = async (
     where: string,
@@ -713,10 +1280,44 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
     }
     await logEngineEvent(stateRoot, {
       event, where, error: String(err), scene: req.reason, teamId: req.teamId,
-      to: toKey, nonce: lease.nonce,
+      // v0.9.1 打回第 1 轮（V091-01）：失败事件只记 nonce 摘要，真值不进共享日志。
+      to: toKey, nonce: wakeNonceDigest(lease.nonce),
       ...(recovery !== undefined ? { recovery } : {}),
     });
+    // 同步 spawn 失败：子进程从未存在——生命周期账补 exit 尾行（start 头行已写）。
+    if (where === "spawn" || where === "retry-spawn") {
+      appendWakeLifecycle(lifecycleFile, {
+        event: "wake-child-exit",
+        pid: null,
+        durationMs: 0,
+        exitCode: null,
+        spawnError: String(err),
+      });
+    }
+    // v0.9.1（G-12v3）：wake-failed 告警通道——urgent 告知 lead（邮箱复用，不新增工具）。
+    await notifyLeadUrgent(
+      stateRoot,
+      req.teamId,
+      `[zcode-crosschat 引擎信号] ${event}：唤醒 "${toKey}" 失败（${where}）：${String(err).slice(0, 300)}`
+      + `（场景 ${req.reason}）。消息仍在邮箱（pull 兜底不丢，租约到期可重试）`
+      + `——可重发，或让成员 xc_read({scope:"inbox"}) 直接消费。`,
+    );
   };
+  // v0.9.1（G-12v3）：spawn 即写 start 头行（nonce 摘要/sid/ts）——在任何 spawn 尝试
+  // 之前，使「文件存在但没有任何行」的旧观测形态不再可能出现（0 字节日志依旧不是失败
+  // 判据，现在连 0 字节都不会有：至少有头行）。
+  // v0.9.1 打回第 1 轮（V091-01）：头行只记 nonce 摘要——真值仅存于唤醒 prompt 与
+  // registry/wake/ 真源；同状态根读者拿不到可消费的令牌（adv-1 TC-1 实锤的收割面）。
+  appendWakeLifecycle(lifecycleFile, {
+    event: "wake-child-start",
+    nonce: wakeNonceDigest(token),
+    sid: req.toSessionId,
+    to: toKey,
+    scene: req.reason,
+    teamId: req.teamId,
+  });
+  // 唤醒子 pid（helper 汇报后才拿得到）——生命周期监视的退出观察经此 ref 读取。
+  const childPidRef: { pid: number | undefined } = { pid: undefined };
   let pid: number | undefined;
   // v0.4（DESIGN-V0.4 §2.4）：spawn 配置解析改为「env → 自动探测」，结果落审计。
   // req.cfg 测试注入优先级不变：注入时零探测（不触发任何子进程），审计行 source 记 test_injected。
@@ -741,9 +1342,13 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
       },
       // v0.2 W1 接线（DESIGN-V0.2 §4.2 审计）：helper 汇报的唤醒子 pid 追记
       // engine.jsonl {event:"wake-child", pid}，与 wake 行的 helper pid 并排可查。
+      // v0.9.1（G-12v3）：同时转交生命周期监视的退出观察（ref 读取，见 childPidRef）。
+      // v0.9.1 打回第 1 轮（V091-01）：pid 行只记 nonce 摘要（共享日志无真值）。
       onHelperSpawned: (childPid) => {
+        childPidRef.pid = childPid;
         void logEngineEvent(stateRoot, {
-          event: "wake-child", pid: childPid, scene: req.reason, teamId: req.teamId, to: toKey, nonce: token,
+          event: "wake-child", pid: childPid, scene: req.reason, teamId: req.teamId, to: toKey,
+          nonce: wakeNonceDigest(token),
         });
       },
     });
@@ -765,11 +1370,37 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
   await withLockBestEffort(stateRoot, req.teamId, () =>
     markMailboxDelivered(stateRoot, req.teamId, toKey, ids, now));
   await logEngineEvent(stateRoot, {
-    event: "wake", scene: req.reason, teamId: req.teamId, to: toKey, pid, nonce: token,
+    event: "wake", scene: req.reason, teamId: req.teamId, to: toKey, pid,
+    // v0.9.1 打回第 1 轮（V091-01）：wake 行只记 nonce 摘要（共享日志无真值）。
+    nonce: wakeNonceDigest(token),
     wakeLog: logFile, receiptIds: ids, wakeGateSource: gate.source,
+    // v0.9.1（G-12v3）：生命周期日志路径随行披露（运营面可直接 tail 这本账）。
+    lifecycleLog: lifecycleFile,
     ...(gate.takenOver === true ? { takenOver: true } : {}),
     ...(gate.warning !== undefined ? { configWarning: gate.warning } : {}),
     ...(req.urgent === true ? { urgent: true } : {}),
+  });
+
+  // v0.9.1（G-12v3 机制 B）：启动生命周期监视——exit 尾行 / wake-slow / limbo 降级。
+  // 计时从**盖章时刻**（now）起算：limbo 判据 = deliveredAt 已盖而 consumedAt 超时
+  // 未回写（消费回写面：hook 注入 / xc_read / xc_claim，见 mailbox.ts 与 hooks/）。
+  // unref 定时器：引擎进程退出即停（观测面不拖进程；总窗 = nonce TTL）。
+  startWakeLifecycleWatch({
+    stateRoot,
+    teamId: req.teamId,
+    to: toKey,
+    nonce: token,
+    sid: req.toSessionId,
+    scene: req.reason,
+    wakeLog: logFile,
+    lifecycleFile,
+    stampedAt: now,
+    getChildPid: () => childPidRef.pid,
+    pollMs: req.lifecyclePollMs ?? WAKE_LIFECYCLE_POLL_MS,
+    limboTimeoutMs: req.limboTimeoutMs ?? limboTimeoutFromEnv(req.env),
+    wakeSlowMs: req.wakeSlowMs ?? wakeSlowFromEnv(req.env),
+    windowMs: req.lifecycleWindowMs ?? WAKE_INFLIGHT_MS,
+    ...(req.pidAliveProbe !== undefined ? { pidAliveProbe: req.pidAliveProbe } : {}),
   });
 
   // v0.9（G-8）：sessionNotFound 的单次自动重试（方案 §一 G-8「投递遇 sessionNotFound →
@@ -804,24 +1435,37 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
       : undefined;
     const retryGate = resolveWakeGate(stateRoot, req.env, rebound);
     const retryInflight = await findInflightWakeNonce(stateRoot, toKey, { teamId: req.teamId, now: retryNow });
-    if (retryGateState !== undefined || !retryGate.enabled || retryInflight !== undefined) {
+    // v0.9.1（G-12-b）：容量闸对重试同等有效——重试也是一次 spawn，内存红线期重试
+    // 只会放大 OOM（事故当日「重试波 = 主控重发消息的新 spawn，本身是内存放大器」）。
+    // 复检不过 → 不 spawn、不重开租约，落 wake-retry-skipped（冷却原因写进 reason）。
+    const retryCapacity = await capacityWakeDeferral(stateRoot, req.env, retryNow);
+    if (retryGateState !== undefined || !retryGate.enabled || retryInflight !== undefined || retryCapacity !== undefined) {
       const reason = retryGateState !== undefined
         ? `member-state:${retryGateState}: 重试前复检命中成员状态门，不再唤醒（V090-06：removed 成员不被重试唤醒）`
         : retryInflight !== undefined
           ? `inflight-nonce: 重试前复检发现已有在途唤醒（${retryInflight.token}），不重复 --resume（§2.5-3）`
-          : `wake-disabled(重试前复检): ${wakeDisabledReason(retryGate)}`;
+          : retryCapacity !== undefined
+            ? `capacity-red: 重试前复检命中容量闸（${retryCapacity.detail.join("；")}），不再 spawn（G-12-b；${Math.round(retryCapacity.retryAfterMs / 1000)}s 后重新判定）`
+            : `wake-disabled(重试前复检): ${wakeDisabledReason(retryGate)}`;
       await logEngineEvent(stateRoot, {
         event: "wake-retry-skipped", reason, scene: req.reason, teamId: req.teamId, to: toKey,
-        attempt: 1, fromSessionId: req.toSessionId, sid, nonce: token, trigger: evidence,
+        attempt: 1, fromSessionId: req.toSessionId, sid,
+        // v0.9.1 打回第 1 轮（V091-01）：重试跳过事件只记 nonce/在途令牌摘要。
+        nonce: wakeNonceDigest(token), trigger: evidence,
         ...(retryGateState !== undefined ? { memberState: retryGateState } : {}),
         wakeGateSource: retryGate.source,
         ...(retryGate.takenOver === true ? { takenOver: true } : {}),
-        ...(retryInflight !== undefined ? { inflightNonce: retryInflight.token } : {}),
+        ...(retryInflight !== undefined ? { inflightNonce: wakeNonceDigest(retryInflight.token) } : {}),
+        ...(retryCapacity !== undefined
+          ? { capacityRed: true, retryAfterMs: retryCapacity.retryAfterMs, detail: retryCapacity.detail }
+          : {}),
       });
       return;
     }
     const { token: retryToken } = await createWakeNonce(stateRoot, {
       teamId: req.teamId, agentKey: toKey, sid, now: retryNow,
+      // v0.9.1（G-11）：重试同样记录 voiceOwner=重绑后的原会话（sid）。
+      voiceOwner: sid,
     });
     const retryIds = [...ids];
     await withLockBestEffort(stateRoot, req.teamId, () =>
@@ -837,6 +1481,8 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
       ...(req.urgent === true ? { urgent: true } : {}),
     });
     const retryLogFile = wakeLogFile(stateRoot, toKey, retryNow);
+    // v0.9.1（G-12v3）：重试轮次的唤醒子 pid ref（生命周期监视的退出观察）。
+    const retryChildPidRef: { pid: number | undefined } = { pid: undefined };
     let retryPid: number | undefined;
     try {
       const spawned = (req.spawn ?? spawnResume)({
@@ -853,9 +1499,11 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
             "wake-retry-failed", SESSION_NOT_FOUND_RECOVERY).catch(() => undefined);
         },
         onHelperSpawned: (childPid) => {
+          retryChildPidRef.pid = childPid;
           void logEngineEvent(stateRoot, {
             event: "wake-child", pid: childPid, scene: req.reason, teamId: req.teamId, to: toKey,
-            nonce: retryToken, retried: true,
+            // v0.9.1 打回第 1 轮（V091-01）：只记 nonce 摘要。
+            nonce: wakeNonceDigest(retryToken), retried: true,
           });
         },
       });
@@ -870,11 +1518,32 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
       markMailboxDelivered(stateRoot, req.teamId, toKey, retryIds, retryNow));
     await logEngineEvent(stateRoot, {
       event: "wake-retry", attempt: 1, scene: req.reason, teamId: req.teamId, to: toKey,
-      fromSessionId: req.toSessionId, sid, pid: retryPid, nonce: retryToken,
+      fromSessionId: req.toSessionId, sid, pid: retryPid,
+      // v0.9.1 打回第 1 轮（V091-01）：只记 nonce 摘要。
+      nonce: wakeNonceDigest(retryToken),
       wakeLog: retryLogFile, receiptIds: retryIds, reason: evidence,
       ...(req.urgent === true ? { urgent: true } : {}),
     });
     startFailureWatch(retryLogFile, true, { nonce: retryToken, sid, ids: retryIds, now: retryNow });
+    // v0.9.1（G-12v3）：重试也是一次盖章（markMailboxDelivered）——生命周期监视对
+    // 重试轮次同等生效（exit 尾行/limbo 降级/wake-slow 从重试盖章时刻起算）。
+    startWakeLifecycleWatch({
+      stateRoot,
+      teamId: req.teamId,
+      to: toKey,
+      nonce: retryToken,
+      sid,
+      scene: req.reason,
+      wakeLog: retryLogFile,
+      lifecycleFile: wakeLifecycleFile(stateRoot, toKey, retryNow),
+      stampedAt: retryNow,
+      getChildPid: () => retryChildPidRef.pid,
+      pollMs: req.lifecyclePollMs ?? WAKE_LIFECYCLE_POLL_MS,
+      limboTimeoutMs: req.limboTimeoutMs ?? limboTimeoutFromEnv(req.env),
+      wakeSlowMs: req.wakeSlowMs ?? wakeSlowFromEnv(req.env),
+      windowMs: req.lifecycleWindowMs ?? WAKE_INFLIGHT_MS,
+      ...(req.pidAliveProbe !== undefined ? { pidAliveProbe: req.pidAliveProbe } : {}),
+    });
   };
 
   // v0.5.1（FI-7/故障注-7）：spawn 成功只代表「唤醒已发起」，不代表送达——helper 孤儿化后
