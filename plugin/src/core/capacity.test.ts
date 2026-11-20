@@ -1,15 +1,18 @@
 /**
  * C3 capacity 单测（DESIGN-V0.6.md §3.3 / §4.2-M6；E3 §① 实测口径）：
- * - 分类纯函数（E3 ps-procs.ps1 判定顺序 1:1，含踩坑 3 的 headless-turn 判定）；
+ * - 分类纯函数（E3 ps-procs.ps1 判定顺序 1:1；v0.9.2 C1 起 headless-turn 只认唤醒子标记，
+ *   原「命令行形态猜回合树」规则删除——README 文档化的用户 CLI 不再被误判 V091-13）；
  * - 预警公式 red1/red2/red3 + degraded 降级 + env 防御解析；
  * - 采样缓存窗口（XC_MEM_SAMPLE_MIN_MS）与损坏/未来缓存防御；
  * - parseCimRows 形态防御（数组/单对象/null CommandLine/垃圾输出）；
  * - 真机冒烟：takeFreshSample 形状不变式（不假设 ZCode 在场——降级与可信两态都合法）；
- * - C9 压缩联动（DESIGN-V0.7.md §5）：verdict.red 时 formatCapacityLines 追加
+ * - C9 压缩联动（DESIGN-V0.7 §5）：verdict.red 时 formatCapacityLines 追加
  *   compress-advice 建议行，绿样本不追加。
  * - v0.7.2（C9-B3 修复）：缓存窗口内设备水位与 os.freemem() 交叉复核；
  * - v0.7.2（C9-B4 修复）：第三条标红规则 turn-concurrency 与 XC_TURN_ESTIMATE_BYTES
  *   在 README/PROTOCOL 登记（文档-行为一致性回归锁；红队 grep 0 命中）。
+ * - v0.9.2（C2）：degraded 样本的面板文本把「常驻树/并发回合」显示为 n/a（未评），
+ *   不显示会被读成断言的 0。
  */
 import { describe, expect, it } from 'vitest';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -21,6 +24,7 @@ import {
   classifyZcodeProcesses,
   COMPRESS_ADVICE_LINE,
   formatCapacityLines,
+  isWakeChildCommandLine,
   judgeCapacity,
   memSampleMinMsFromEnv,
   memSessionLimitBytesFromEnv,
@@ -30,6 +34,9 @@ import {
   sampleCapacityWithSampler,
   takeFreshSample,
   turnEstimateBytesFromEnv,
+  WAKE_CHILD_COMMAND_MARKER,
+  WAKE_CHILD_ENV_MARKER,
+  WAKE_CHILD_ENV_VALUE,
 } from './capacity.js';
 import type { CapacitySample, ProcRow } from './capacity.js';
 
@@ -78,9 +85,21 @@ describe('classifyProcess（E3 §① 分类口径）', () => {
     expect(classifyProcess(row(8, 'ZCode.exe', 'ZCode.exe zcode.cjs app-server --stdio'))).toBe('headless-appserver');
   });
 
-  it('headless-turn：zcode.cjs ∧ ¬app-server ∧ ¬--surface（E3 踩坑 3）', () => {
-    expect(classifyProcess(row(9, 'ZCode.exe', 'ZCode.exe E:\\ZCode\\resources\\glm\\zcode.cjs --resume sess_x -p --mode yolo'))).toBe('headless-turn');
-    expect(classifyProcess(row(10, 'ZCode.exe', 'ZCode.exe zcode.cjs --version'))).toBe('headless-turn');
+  it('headless-turn：只认唤醒子标记（v0.9.2 C1；命令行带唤醒回执前缀即回合树）', () => {
+    // 唤醒 prompt 恒以 DESIGN §2.4 冻结回执前缀开头 → 随 --prompt 进命令行。
+    expect(classifyProcess(row(9, 'ZCode.exe', 'ZCode.exe E:\\ZCode\\resources\\glm\\zcode.cjs --resume sess_x --prompt "[CrossChat inbox receipt: {"teamId":"default","recipient":"b","ids":["m1"]}]\n\n身份行" --cwd D:\\ws --output-format json'))).toBe('headless-turn');
+  });
+
+  it('v0.9.2（C1/V091-13）：用户自己的 zcode CLI 不再被误归 headless-turn', () => {
+    // README 文档化的 ZC/zc 壳函数形态：与唤醒子命令行同形，但无唤醒子标记。
+    expect(classifyProcess(row(10, 'ZCode.exe', 'ZCode.exe E:\\ZCode\\resources\\glm\\zcode.cjs --resume sess_x -p --mode yolo'))).toBe('main');
+    expect(classifyProcess(row(15, 'ZCode.exe', 'ZCode.exe zcode.cjs --version'))).toBe('main');
+    // 原第⑥步的其余同形形态一并回归 main（宁漏计并发回合，不制造假红）。
+    expect(classifyProcess(row(16, 'ZCode.exe', 'ZCode.exe zcode.cjs app-server --stdio'))).toBe('headless-appserver');
+  });
+
+  it('v0.9.2（C1）：唤醒子标记先于一切形态规则（renderer 带标记仍归回合树）', () => {
+    expect(classifyProcess(row(17, 'ZCode.exe', 'ZCode.exe --type=renderer --x=[CrossChat inbox receipt: '))).toBe('headless-turn');
   });
 
   it('--type 先于 cjs 规则：renderer 引用 zcode.cjs 不误归回合树', () => {
@@ -90,6 +109,12 @@ describe('classifyProcess（E3 §① 分类口径）', () => {
   it('plugin-host 与 app-server 的判定都先于 headless-turn', () => {
     expect(classifyProcess(row(12, 'ZCode.exe', 'ZCode.exe zcode.cjs __zcode-plugin-host'))).toBe('plugin-host');
     expect(classifyProcess(row(13, 'ZCode.exe', 'ZCode.exe zcode.cjs app-server'))).toBe('headless-appserver');
+  });
+
+  it('isWakeChildCommandLine：非字符串/空串不抛错', () => {
+    expect(isWakeChildCommandLine(undefined)).toBe(false);
+    expect(isWakeChildCommandLine('')).toBe(false);
+    expect(isWakeChildCommandLine(WAKE_CHILD_COMMAND_MARKER)).toBe(true);
   });
 
   it('CommandLine 缺失（CIM 权限受限）→ 安全归 main 不抛错', () => {
@@ -105,7 +130,8 @@ describe('classifyZcodeProcesses（稳态/瞬态两列口径）', () => {
       row(3, 'ZCode.exe', 'ZCode.exe --type=utility --utility-sub-type=node.mojom.NodeService', 351 * MB), // cli-utility
       row(4, 'ZCode.exe', 'ZCode.exe zcode.cjs app-server --stdio --surface desktop', 200 * MB), // desktop-appserver
       row(5, 'ZCode.exe', 'ZCode.exe zcode.cjs __zcode-plugin-host', 170 * MB), // plugin-host
-      row(6, 'ZCode.exe', 'ZCode.exe zcode.cjs --resume s1 -p', 300 * MB), // headless-turn
+      // v0.9.2（C1）：唤醒子 = 命令行带唤醒回执标记的 --resume 树。
+      row(6, 'ZCode.exe', 'ZCode.exe zcode.cjs --resume s1 --prompt "[CrossChat inbox receipt: {...}]" --output-format json', 300 * MB), // headless-turn
       row(7, 'ZCode.exe', 'ZCode.exe zcode.cjs app-server --stdio', 240 * MB), // headless-appserver（临时 keeper，不计常驻）
     ]);
     const steady = 300 + 875 + 351 + 200 + 170; // MB
@@ -118,13 +144,23 @@ describe('classifyZcodeProcesses（稳态/瞬态两列口径）', () => {
 
   it('多个并发回合树：计数累加、峰值取最大', () => {
     const tree = classifyZcodeProcesses([
-      row(1, 'ZCode.exe', 'zcode.cjs --resume a', 250 * MB),
-      row(2, 'ZCode.exe', 'zcode.cjs --resume b', 640 * MB),
-      row(3, 'ZCode.exe', 'zcode.cjs --resume c', 310 * MB),
+      row(1, 'ZCode.exe', `zcode.cjs --resume a --prompt "[CrossChat inbox receipt: a]"`, 250 * MB),
+      row(2, 'ZCode.exe', `zcode.cjs --resume b --prompt "[CrossChat inbox receipt: b]"`, 640 * MB),
+      row(3, 'ZCode.exe', `zcode.cjs --resume c --prompt "[CrossChat inbox receipt: c]"`, 310 * MB),
     ]);
     expect(tree.headlessTurnCount).toBe(3);
     expect(tree.headlessTurnMaxRssBytes).toBe(640 * MB);
     expect(tree.steadyTreeBytes).toBe(0);
+  });
+
+  it('v0.9.2（C1/V091-13）：用户 CLI 与唤醒子混在时只计唤醒子（不再误伤）', () => {
+    const tree = classifyZcodeProcesses([
+      row(1, 'ZCode.exe', 'ZCode.exe E:\\ZCode\\resources\\glm\\zcode.cjs --resume sess_x -p --mode yolo', 900 * MB), // 用户 CLI：900MB
+      row(2, 'ZCode.exe', 'ZCode.exe zcode.cjs --resume s1 --prompt "[CrossChat inbox receipt: x]"', 300 * MB), // 唤醒子
+    ]);
+    expect(tree.categories['main'].count).toBe(1); // 用户 CLI 归 main（常驻列，不参与 red2/red3）
+    expect(tree.headlessTurnCount).toBe(1);
+    expect(tree.headlessTurnMaxRssBytes).toBe(300 * MB); // 900MB 的用户 CLI 不再触发 session-limit
   });
 
   it('无回合树：headlessTurnMaxRssBytes=null', () => {
@@ -478,6 +514,40 @@ describe('formatCapacityLines（panel 直出文本）', () => {
     const lines = formatCapacityLines(s, judgeCapacity(s, {}));
     expect(lines[0]).toContain('RED');
     expect(lines[lines.length - 1]).toBe(COMPRESS_ADVICE_LINE);
+  });
+
+  // v0.9.2（C2/V091-14）：degraded 样本的进程类数字不得显示成「0」——0 会被读成
+  // 「此刻没有无头回合」的断言，而 CIM 失败时这个数根本不可知。
+  it('degraded 绿样本：并发回合/常驻树显示 n/a（未评）而不是 0，且 detail 声明未评', () => {
+    const s = sample({ degraded: 'cim-unavailable', headlessTurnCount: 0, headlessTurnMaxRssBytes: null });
+    const v = judgeCapacity(s, {});
+    expect(v.red).toBe(false); // 只评水位 → 绿
+    expect(v.violated).toEqual([]);
+    const lines = formatCapacityLines(s, v);
+    expect(lines[0]).toContain('GREEN');
+    expect(lines[0]).toContain('并发回合 n/a（CIM 进程采样不可用，未评）');
+    expect(lines[0]).not.toContain('并发回合 0');
+    expect(lines[0]).toContain('常驻树 n/a（CIM 进程采样不可用，未评）');
+    expect(lines.join('\n')).toContain('进程类规则（session-limit/turn-concurrency）未评');
+  });
+
+  it('degraded 样本不因进程数据缺失而虚报绿/红（判据只吃可信字段）', () => {
+    // 缓存里可能带着上一次成功采样的进程数字 + degraded 标记：judgeCapacity 不得据此判定。
+    const s = sample({ degraded: 'cim-unavailable', headlessTurnCount: 99, headlessTurnMaxRssBytes: 100 * GB });
+    const v = judgeCapacity(s, {});
+    expect(v.violated).toEqual([]);
+    expect(v.red).toBe(false);
+  });
+});
+
+describe('v0.9.2 C1 唤醒子标记常量（env 标记与命令行标记同族）', () => {
+  it('env 标记键值是 XC_WAKE_CHILD=1（spawnResume 注入侧同名对拍）', () => {
+    expect(WAKE_CHILD_ENV_MARKER).toBe('XC_WAKE_CHILD');
+    expect(WAKE_CHILD_ENV_VALUE).toBe('1');
+  });
+
+  it('命令行标记 = 唤醒 prompt 的冻结回执前缀（与 core/mailbox.ts 同源）', () => {
+    expect(WAKE_CHILD_COMMAND_MARKER).toBe('[CrossChat inbox receipt: ');
   });
 });
 

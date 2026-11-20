@@ -64,6 +64,7 @@ import {
   wakeDeferralFile,
   type WakeRequest,
 } from '../engine/wake.js';
+import type { CapacitySample } from '../core/capacity.js';
 import type { SpawnResumeOptions, SpawnResumeResult } from '../engine/resume-cli.js';
 
 const SRC = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -595,7 +596,7 @@ describe('v0.9.1：撤回模式显式拒绝 refs（不静默丢参）', () => {
 // ─────────────────────────── 7. 容量闸（G-12-b） ───────────────────────────
 
 /** RED 样本：水位 8.9%（复现事故当日形态）。 */
-function redSample(): Parameters<typeof capacityWakeDeferral>[3] {
+function redSample(): CapacitySample {
   return {
     sampledAt: Date.now(),
     totalBytes: 31_300_000_000,
@@ -609,7 +610,7 @@ function redSample(): Parameters<typeof capacityWakeDeferral>[3] {
 }
 
 /** GREEN 样本：水位 90%、可用远大于单回合预估。 */
-function greenSample(): Parameters<typeof capacityWakeDeferral>[3] {
+function greenSample(): CapacitySample {
   return {
     sampledAt: Date.now(),
     totalBytes: 32_000_000_000,
@@ -623,7 +624,7 @@ function greenSample(): Parameters<typeof capacityWakeDeferral>[3] {
 }
 
 /** 高水位但可用字节低于单回合预估（边际预估命中）。 */
-function marginalSample(): Parameters<typeof capacityWakeDeferral>[3] {
+function marginalSample(): CapacitySample {
   return {
     sampledAt: Date.now(),
     totalBytes: 1_000_000_000_000,
@@ -640,6 +641,10 @@ describe('v0.9.1 G-12-b：spawn 前容量闸（不 spawn + wake-deferred + 冷�
   const spawnCalls: SpawnResumeOptions[] = [];
   const fakeSpawn = (opts: SpawnResumeOptions): SpawnResumeResult => {
     spawnCalls.push(opts);
+    // v0.9.2（A1 跨组）：模拟真实 helper——拉起唤醒子后经 onHelperSpawned 汇报 pid。
+    // 不汇报时 attemptWake 的启动确认等不到证据，会白等满 XC_START_CONFIRM_MS（5s）
+    // 把用例拖到超时；容量闸测试不关心启动确认，汇报即立刻结算，不影响被测判据。
+    opts.onHelperSpawned?.(4242);
     return { pid: 4242, logFile: opts.logFile };
   };
 
@@ -744,8 +749,9 @@ describe('v0.9.1 G-12-b：spawn 前容量闸（不 spawn + wake-deferred + 冷�
   });
 
   it('capacityWakeDeferral 直驱：GREEN 返回 undefined；RED 返回块（不写任何 spawn）', async () => {
-    expect(await capacityWakeDeferral(stateRoot, { XC_WAKE_ENABLED: 'true' }, Date.now(), greenSample())).toBeUndefined();
-    const block = await capacityWakeDeferral(stateRoot, { XC_WAKE_ENABLED: 'true' }, Date.now(), redSample());
+    const scope = { teamId: 'default', to: 'b', urgent: false };
+    expect(await capacityWakeDeferral(stateRoot, { XC_WAKE_ENABLED: 'true' }, Date.now(), scope, greenSample())).toBeUndefined();
+    const block = await capacityWakeDeferral(stateRoot, { XC_WAKE_ENABLED: 'true' }, Date.now(), scope, redSample());
     expect(block?.reason).toBe('capacity-red');
     expect(block?.cooldownMs).toBe(120_000);
   });

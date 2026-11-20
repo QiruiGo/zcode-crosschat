@@ -18,7 +18,7 @@
  * 读取序 urgent-first（C1 数据面，core/mailbox.ts urgentFirst）。
  */
 
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { z } from "zod";
 import { invalidParamsError, okResult, ToolError, type ToolResult } from "./protocol.js";
 import { renderInbox } from "./render.js";
@@ -79,6 +79,8 @@ import { peerRootFromEnv } from "../core/peerdir.js";
 import { logPeerEvent, scanPeers } from "../core/peerregistry.js";
 import { archiveJournalPath, taskJournalPath } from "../core/archive.js";
 import { getPeerServices } from "./peer-services.js";
+import { assertToolIdWithinLimit, truncateIdEcho } from "./tools-tasks.js";
+import { checkLinkContainment } from "../core/paths.js";
 import type { ToolDeps } from "./core.js";
 import { runCore } from "./core.js";
 
@@ -402,6 +404,15 @@ export function createMailboxReadCore(deps: ToolDeps): MailboxReadCore {
 // xc_read 工具层（scope 路由；peer 两轴经 PeerServices；journal 为 C4 新面）
 // ---------------------------------------------------------------------------
 
+/**
+ * v0.9.2（B4）：journal 体积闸——`xc_read({scope:"journal"})` 是**整文件读入**语义
+ * （读进来才分页），一个被写爆的 journal（成员把长任务全程追加进同一个文件，
+ * 或存储被灌）会把数百 MiB 一次拉进内存与字符串分页路径。闸在 readFile **之前**
+ * stat：超 8 MiB 即拒，并给归档/切分指引——拒绝而不是分页，因为分页也要先把
+ * 整个文件读进来（200 MiB journal 实测会挤爆注入预算与进程 RSS）。
+ */
+export const JOURNAL_MAX_BYTES = 8 * 1024 * 1024;
+
 /** journal 路径解析：id=<taskId> → 任务 journal；id="archive:<name>" → 留档 journal。 */
 export function resolveJournalPath(stateRoot: string, id: string): string {
   if (id.startsWith("archive:")) {
@@ -422,6 +433,10 @@ export function resolveJournalPath(stateRoot: string, id: string): string {
 }
 
 export async function handleRead(deps: ToolDeps, args: ReadArgs, connectionKey: string): Promise<ToolResult> {
+  // v0.9.2（B3）：id 类入参长度闸——一切带 id 的 scope（mail/task/peer-msg/journal/
+  // handoff）统一在入口裁；回显截断在 assertToolIdWithinLimit 内（超长输入不再
+  // 整段回吐进错误消息/payload）。inbox/peer 两 scope 不取 id，不受影响。
+  if (args.id !== undefined) assertToolIdWithinLimit(args.id, "id");
   const core = createMailboxReadCore(deps);
   switch (args.scope) {
     case "inbox":
@@ -508,7 +523,9 @@ async function readPeerMsgScope(deps: ToolDeps, args: ReadArgs, connectionKey: s
   );
 }
 
-/** scope=journal（C4 新面）：任务/留档日志全文分页（只读；文件缺失给可行动错误）。 */
+/** scope=journal（C4 新面）：任务/留档日志全文分页（只读；文件缺失给可行动错误）。
+ *  v0.9.2（B4）：readFile 之前先 stat 体积——超 {@link JOURNAL_MAX_BYTES} 即拒
+ *  （不读入内存），message 给归档/切分 + 分页指引。 */
 async function readJournalScope(deps: ToolDeps, args: ReadArgs): Promise<ToolResult> {
   if (args.id === undefined || args.id === "") {
     throw new ToolError({
@@ -517,6 +534,56 @@ async function readJournalScope(deps: ToolDeps, args: ReadArgs): Promise<ToolRes
     });
   }
   const file = resolveJournalPath(deps.stateRoot, args.id);
+  // v0.9.2（V092-10 修复）：journal 读取面的**链接逃逸闸**——与 evidence/refs 门同一
+  // 函数（core/paths.ts checkLinkContainment），锚点=**状态根**（journal 是 .crosschat
+  // 内部文件；容状态根整体经 junction 搬迁，故不按工作区锚）。
+  //
+  // 缺口事实（红队 adv-2/F1 实测复现）：本 scope 只做 sanitizeKey 段闸 + stat/readFile，
+  // 而 readFile **跟随**链接——预置 `<stateRoot>/tasks/<id>`（或 `archive/<name>`）
+  // junction 指向工作区外文件时，`xc_read({scope:"journal"})`（**不需身份**）可把
+  // ≤8 MiB 的任意文件全文读进任一会话模型上下文；同版本 evidence 门对同一 junction
+  // 正确拒载——同类防御只盖一半。闸先于 stat：不泄露外文件的体积，也不读一个字节。
+  const linkGate = await checkLinkContainment(deps.stateRoot, file);
+  if (linkGate.escaped) {
+    throw new ToolError({
+      error: "journal_path_outside_state_root",
+      id: args.id,
+      path: file,
+      message: `journal "${truncateIdEcho(args.id)}" escapes the state root via `
+        + `${linkGate.viaLink ? "symlink/junction" : "resolved path"}: it resolves to "${linkGate.real}", `
+        + `outside "${deps.stateRoot}" — journals are plugin-internal files under .crosschat/ `
+        + "(v0.9.2 B2 link containment, V092-10)",
+    });
+  }
+  // B4 体积闸：先 stat（文件缺失 → journal_not_found，与既有口径一致）。
+  let sizeBytes: number;
+  try {
+    sizeBytes = (await stat(file)).size;
+  } catch {
+    throw new ToolError({
+      error: "journal_not_found",
+      id: args.id,
+      path: file,
+      message: `no journal at "${file}" — task journals are written by members (longtask skill); ` +
+        'member handover journals exist after xc_team {action:"member-stop", archive:true}',
+    });
+  }
+  if (sizeBytes > JOURNAL_MAX_BYTES) {
+    const mib = (bytes: number): string => (bytes / 1048576).toFixed(1);
+    throw new ToolError({
+      error: "journal_too_large",
+      id: args.id,
+      path: file,
+      sizeBytes,
+      limitBytes: JOURNAL_MAX_BYTES,
+      message: `journal "${truncateIdEcho(args.id)}" is ${mib(sizeBytes)} MiB (${sizeBytes} bytes), over the `
+        + `${mib(JOURNAL_MAX_BYTES)} MiB read limit — xc_read({scope:"journal"}) loads the whole file before `
+        + "paginating, so a journal this large would blow the inject budget and process memory. "
+        + "Archive or split it first (rotate it into smaller per-date journals, or read it with your own "
+        + "file tools in chunks), then read the smaller part with "
+        + `xc_read({scope:"journal", id:"${truncateIdEcho(args.id)}", offset, limit}).`,
+    });
+  }
   let text: string;
   try {
     text = await readFile(file, "utf8");

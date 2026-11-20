@@ -442,6 +442,31 @@ export async function markMailboxConsumed(
 }
 
 /**
+ * v0.9.2（A4-c）：limbo **候选判据**（纯函数；sweep 与调用方锁外预读共用同一定义）。
+ *
+ * 与 {@link sweepLimboDeliveriesLocked} 内的过滤逐条件一致——抽出是为了让「预读拿
+ * (messageId, 轮次) 节流键」的面（engine/wake.ts 的 per-spawn 监视器与
+ * engine/watchdog.ts 的看门狗清扫）不必复制判据（复制的判据必然漂移，漂移的判据
+ * 会造出「预读说有、sweep 说无」的幽灵节流）。
+ *
+ * 条件：已盖投递章 ∧ 无消费确认（consumedAt）∧ 未读（readAt）∧ 未作废 ∧ 超时 ∧ 仍现行。
+ */
+export function limboCandidateMessages(
+  messages: readonly TeamMessage[],
+  team: TeamState,
+  now: number,
+  timeoutMs: number,
+): TeamMessage[] {
+  return messages.filter((message) =>
+    message.deliveredAt !== undefined
+    && message.consumedAt === undefined
+    && message.readAt === undefined
+    && message.discardedAt === undefined
+    && now - message.deliveredAt >= timeoutMs
+    && isCurrentMail(team, message));
+}
+
+/**
  * v0.9.1（G-12v3 机制 B）：**limbo 降级**——把「已盖投递章但超时无消费确认」的消息
  * 打回可重新投递态（清 deliveredAt + deliveryClaimedAt；readAt/consumedAt 不动）。
  *
@@ -466,13 +491,9 @@ export async function sweepLimboDeliveriesLocked(
   timeoutMs: number,
 ): Promise<TeamMessage[]> {
   const all = await readMailbox(stateRoot, team.teamId, agentKey);
-  const limbo = all.filter((message) =>
-    message.deliveredAt !== undefined
-    && message.consumedAt === undefined
-    && message.readAt === undefined
-    && message.discardedAt === undefined
-    && now - message.deliveredAt >= timeoutMs
-    && isCurrentMail(team, message));
+  // v0.9.2（A4-c）：判据抽成纯函数 limboCandidateMessages——锁外预读（拿节流键）
+  // 与这里共用同一定义，不再有两份会漂移的过滤条件。
+  const limbo = limboCandidateMessages(all, team, now, timeoutMs);
   if (limbo.length === 0) return [];
   await mutateMailbox(stateRoot, team.teamId, agentKey, limbo.map((m) => m.id), (message) => {
     const { deliveryClaimedAt: _claimed, deliveredAt: _delivered, ...rest } = message;

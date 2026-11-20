@@ -415,6 +415,14 @@ export interface SessionRecord {
    * 不再要求手动 xc_report 打卡。
    */
   lastEventTs?: number;
+  /**
+   * v0.9.2（A3）：本会话最近一次**回合开始**时刻（epoch ms）——全部写入点都是回合
+   * 边界（SessionStart / UserPromptSubmit 钩子经 {@link refreshSessionLastSeen}）。
+   * 用途单一：UserPromptSubmit 的「回合开始事故摘要」以**上一回合**的 lastTurnTs
+   * 为窗口起点（自上次回合至今：成员死亡 / limbo 降级 / 唤醒失败的计数）。
+   * absent = 存量记录（升级前锚定）→ 无窗口可言，A3 零注入（不回归）。
+   */
+  lastTurnTs?: number;
 }
 
 /**
@@ -965,6 +973,9 @@ export function coerceSessionRecord(value: unknown, expectedSessionId: string, n
   const liveness = livenessRaw === 'running' || livenessRaw === 'idle' ? livenessRaw : undefined;
   const livenessTs = plausibleLivenessTs(value['livenessTs'], now) ? value['livenessTs'] : undefined;
   const lastEventTs = plausibleLivenessTs(value['lastEventTs'], now) ? value['lastEventTs'] : undefined;
+  // v0.9.2（A3）：回合开始时刻同样走未来值校验——未来时刻在物理上不可能是产品自写的
+  // 值（durable boundary 丢弃；A3 无窗口起点即零注入，保守方向）。
+  const lastTurnTs = plausibleLivenessTs(value['lastTurnTs'], now) ? value['lastTurnTs'] : undefined;
   return {
     ok: true,
     record: {
@@ -977,6 +988,7 @@ export function coerceSessionRecord(value: unknown, expectedSessionId: string, n
       ...(liveness === undefined ? {} : { liveness }),
       ...(livenessTs === undefined ? {} : { livenessTs }),
       ...(lastEventTs === undefined ? {} : { lastEventTs }),
+      ...(lastTurnTs === undefined ? {} : { lastTurnTs }),
     },
   };
 }

@@ -62,7 +62,7 @@ import { offlineMemberLine, offlineMembers, offlineThresholdMsFromEnv, type Offl
 // v0.9（G-9，PROTOCOL §12.4）：成员活性视图（三视图统一口径，单一实现）。
 import { readSession, readSessionWitness } from "../core/registry.js";
 import { memberLivenessView, sweepOwnerGuard, type SessionLivenessView, type SweepOwnerGuard } from "../core/liveness.js";
-import { SWEEPABLE_TASK_STATUSES, type SessionWitness, type SessionWitnessKind } from "../core/types.js";
+import { SWEEPABLE_TASK_STATUSES, TASK_STATUSES, type SessionWitness, type SessionWitnessKind } from "../core/types.js";
 // C3 容量挂载（M6）+ v0.8.1（C4-O1）：水位越界回落披露助手。
 import {
   capacityCacheFile,
@@ -647,11 +647,14 @@ export async function overviewPanel(deps: ToolDeps): Promise<ToolResult> {
   };
   // C3 挂载（M6）：panel 同样携带 capacity 块（采样失败只丢观测块）。
   const capacity = await capacityMount(deps);
+  // v0.9.2（C4）：任务计数文本与 payload **同源**——同一份 `panel.tasks` 七态计数渲染，
+  // 不再有「文本三桶 / payload 七态」两套口径（与 status 视图 tasks 行同格式，可对账）。
+  const tasksLine = `tasks: ${TASK_STATUSES.map((s) => `${s} ${panel.tasks[s] ?? 0}`).join(' / ')}`;
   const panelLines = [
     panel.self !== undefined ? `self: ${panel.self.name} (${panel.self.status ?? "unknown"})` : "self: 未注册",
     `peers: ${panel.peers.length}${peersTruncated ? `（本页列 ${shownPeers}，其余用 xc_overview({view:"peers", offset:${shownPeers}}) 续读）` : ""}`,
     `members: ${panel.members.length}`,
-    `tasks: pending ${panel.tasks.pending} / in_progress ${panel.tasks.inProgress} / done ${panel.tasks.done}`,
+    tasksLine,
     stalledLine,
     // v0.9（G-9）：活性计数行（成员细节在 payload members[].liveness）。
     ...(liveness !== null ? [livenessTextLine(liveness.counts)] : []),

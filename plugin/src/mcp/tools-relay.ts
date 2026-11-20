@@ -75,6 +75,7 @@ import { appendMailbox, classifyFrame, createMessage, deleteMailboxMessages, rea
 import { getTask, memberOpenTasks, readTeam } from "../core/teamstate.js";
 import { appendHeldMessage, readInboundPolicy } from "../core/policy.js";
 import { localPidDomain, peerInboxFile, peerKeyFile, peerRootFromEnv, readPeerBaseRecord } from "../core/peerdir.js";
+import { checkLinkContainment } from "../core/paths.js";
 import { peerRowsFromRecord, resolvePeerTarget, type PeerRow } from "../core/peeraddr.js";
 import { logPeerEvent, readPeerKeyFile, scanPeers, type PeerRecord } from "../core/peerregistry.js";
 import { uservoiceMatchAndConsume, verifyUservoiceStampAuthority } from "../core/uservoice.js";
@@ -274,9 +275,10 @@ export interface RelayRefInput {
  * sha256 缺省由工具现算（复用 `tools-tasks.ts` 的 `sha256File`，流式不整文件读进内存）。
  *
  * 三道硬闸与 `xc_report` 的 evidence 门逐条同口径（`field:"refs"` 标明触发面）：
- * ① 路径越出工作区 → `evidence_path_outside_workspace`（v0.5.2 bug-05 遏制不回退）；
- * ② 不是普通文件（目录/设备文件）→ `evidence_not_a_file`；
- * ③ 不存在/不可读 → `evidence_file_missing`；
+ * ① 路径越出工作区 → `evidence_path_outside_workspace`（v0.5.2 bug-05 遏制不回退；
+ *    v0.9.2 B2 起同一错误码亦覆盖 symlink/junction 逃逸——realpath 归一后越界即拒）；
+ * ② 不是普通文件（目录/设备文件）→ `evidence_not_a_file`;
+ * ③ 不存在/不可读 → `evidence_file_missing`;
  * ④ 声明值与现算值不符 → `evidence_checksum_mismatch`（hex 大小写不敏感、首尾空白忽略）。
  * 任一条不过 → **整单拒绝、一个字节都不落箱**（调用方可直接重试，无副作用）。
  *
@@ -308,6 +310,23 @@ export async function resolveMessageRefs(
         workspace: wsRoot,
         message: `refs file "${ref.path}" resolves outside the workspace (${wsRoot}); `
           + "file references must live inside the shared workspace (§15.1, same containment as the evidence gate)",
+      });
+    }
+    // v0.9.2（B2）：符号链接/junction 逃逸闸——与 xc_report evidence 门同一函数
+    // （core/paths.ts checkLinkContainment；V092-10 起 journal 读取面同用，本面锚点=
+    // 工作区）、同一口径：stat 跟随链接，词法前缀判定看不出 `<ws>/escape → 外部目录`；
+    // realpath 归一后越界即整单拒绝。
+    const linkGate = await checkLinkContainment(wsRoot, abs);
+    if (linkGate.escaped) {
+      throw new ToolError({
+        error: "evidence_path_outside_workspace",
+        field: "refs",
+        path: ref.path,
+        workspace: wsRoot,
+        message: `refs file "${ref.path}" escapes the workspace via `
+          + `${linkGate.viaLink ? "symlink/junction" : "resolved path"}: it resolves to `
+          + `"${linkGate.real}", outside "${wsRoot}" — `
+          + "file references must live inside the shared workspace (§15.1, v0.9.2 B2 link containment)",
       });
     }
     let stats;

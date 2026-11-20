@@ -107,7 +107,7 @@ function fakeServices(overrides: Partial<PeerServices> = {}): PeerServices & { c
         self: row({ name: "alice", kind: "self" }),
         peers: [row()],
         members: [{ key: "m1", role: "worker", state: "ready", unread: 0, isLead: false }],
-        tasks: { pending: 1, inProgress: 2, done: 3 },
+        tasks: { pending: 1, claimed: 0, in_progress: 2, blocked: 0, completed: 3, failed: 0, cancelled: 0 },
         inboundPolicy: { mode: "hold", decidedBy: "repo-setting", strictest: "hold" },
       };
     },

@@ -25,7 +25,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { z } from "zod";
 import { attemptWake } from "../engine/wake.js";
 import { bootstrapTimeoutFromEnv, provisionMember, ProvisionError } from "../engine/provision.js";
@@ -45,7 +45,7 @@ import {
   type CapacityView,
   type CheckpointWriteResult,
 } from "../core/checkpoint.js";
-import { checkpointFile } from "../core/paths.js";
+import { checkLinkContainment, checkpointFile } from "../core/paths.js";
 import { capacityCacheFile, judgeCapacity, sampleCapacity } from "../core/capacity.js";
 import { stallThresholdMs } from "../core/stall.js";
 import {
@@ -562,11 +562,32 @@ interface MemberStopOutcome {
   revoked: { taskId: string; title: string; previousStatus: string }[];
   shutdownMessageId: string;
   toSessionId: string;
-  archive?: { dir: string; journalPath: string; metaPath: string };
+  archive?: { dir: string; journalPath: string; metaPath: string; skippedJournals?: string[]; warnings?: string[] };
   archiveError?: string;
 }
 
-/** C4（§3.4）：停止前留档——任务清单 + 未读索引 + 各任务 journal 聚合（best-effort）。 */
+/** C4（§3.4）：停止前留档——任务清单 + 未读索引 + 各任务 journal 聚合（best-effort）。
+ *
+ * v0.9.2（V092R-07 修复，P1）：任务 journal 读取装**链接逃逸闸**——与 xc_read journal /
+ * 检查点 / evidence / refs 同一函数（core/paths.ts checkLinkContainment，锚点=**状态根**：
+ * journal 是 .crosschat 内部文件，容状态根整体经 junction 搬迁，不过度遏制）。
+ *
+ * 缺口事实（adv2-r2-F1 实测复现）：本循环原先只靠 taskJournalPath 的段闸 + readFile，
+ * 而 readFile **跟随**链接——预置 `<stateRoot>/tasks/<taskId>` junction 指向工作区外
+ * 文件时，被停成员名下在途任务的 journal 可把 ≤8 MiB 任意文件全文读入并**持久化进
+ * 留档 journal.md**（状态根内真实文件），再经已装闸的
+ * `xc_read({scope:"journal", id:"archive:<name>"})` 放行（闸不挡根内真实文件）送进
+ * 任一会话模型上下文——构成完整遏制突破链（fix-b §一宣称覆盖的 junction 形态漏掉的
+ * 第 5 个读取入口）。闸先于 readFile：逃逸目标一个字节都不读；该任务 journal 缺席
+ * 留档（与「无 journal」同一 degrade 口径，三节正文照常聚合、停止照常完成——任务
+ * 不丢），且 taskId 记入 skippedJournals 如实披露（留档缺节不静默）。
+ *
+ * 体积闸（V092R-07 同入口同类缺口）：journal 是**整文件 readFile**，与
+ * `xc_read({scope:"journal"})` 的 B4 闸（tools-read.ts:414 JOURNAL_MAX_BYTES=8 MiB）
+ * 同口径——超限不读入内存、不写进留档 journal，记 warning 后照常完成停止。
+ */
+const JOURNAL_MAX_BYTES = 8 * 1024 * 1024;
+
 async function archiveBeforeStop(deps: ToolDeps, key: string, sessionId: string, reason: string, now: number): Promise<MemberStopOutcome["archive"]> {
   const team = await readTeam(deps.stateRoot, TEAM_ID);
   const tasks = (team?.tasks ?? [])
@@ -579,9 +600,31 @@ async function archiveBeforeStop(deps: ToolDeps, key: string, sessionId: string,
     preview: m.content.slice(0, 200),
   }));
   const taskJournals: Array<{ taskId: string; body: string }> = [];
+  const skippedJournals: string[] = [];
+  const warnings: string[] = [];
   for (const t of tasks) {
+    const journalPath = taskJournalPath(deps.stateRoot, t.taskId);
     try {
-      taskJournals.push({ taskId: t.taskId, body: await readFile(taskJournalPath(deps.stateRoot, t.taskId), "utf8") });
+      // V092R-07：链接逃逸闸先于 readFile——不读逃逸目标一个字节。
+      const linkGate = await checkLinkContainment(deps.stateRoot, journalPath);
+      if (linkGate.escaped) {
+        skippedJournals.push(t.taskId);
+        warnings.push(`journal 读入被跳过：链接逃逸工作区（task ${t.taskId} → ${linkGate.real}）`);
+        continue;
+      }
+      // 体积闸先于 readFile（与 tools-read.ts JOURNAL_MAX_BYTES 同口径）。
+      let sizeBytes: number;
+      try {
+        sizeBytes = (await stat(journalPath)).size;
+      } catch {
+        continue; // 无 journal 的任务照常留档（与既有 degrade 口径一致）
+      }
+      if (sizeBytes > JOURNAL_MAX_BYTES) {
+        skippedJournals.push(t.taskId);
+        warnings.push(`journal 读入被跳过：超过 ${JOURNAL_MAX_BYTES / 1048576} MiB 体积上限（task ${t.taskId}，${sizeBytes} bytes）`);
+        continue;
+      }
+      taskJournals.push({ taskId: t.taskId, body: await readFile(journalPath, "utf8") });
     } catch {
       /* 无 journal 的任务照常留档（三节正文由 buildJournalSections 兜底） */
     }
@@ -593,7 +636,57 @@ async function archiveBeforeStop(deps: ToolDeps, key: string, sessionId: string,
     taskJournals,
     now,
   });
-  return { dir: result.dir, journalPath: result.journalPath, metaPath: result.metaPath };
+  return {
+    dir: result.dir,
+    journalPath: result.journalPath,
+    metaPath: result.metaPath,
+    ...(skippedJournals.length > 0 ? { skippedJournals } : {}),
+    ...(warnings.length > 0 ? { warnings } : {}),
+  };
+}
+
+/**
+ * v0.9.2（V092R-08 修复，P1）：member-stop 的**授权/入参预检**——与锁内校验同一批
+ * 判据、逐字一致的错误信封，但在任何副作用（留档落盘、member-archive-written 审计
+ * 行）**之前**执行。
+ *
+ * 缺口事实（adv2-r2-F2 实测复现）：修复前 memberStop 先跑 archiveBeforeStop 并写
+ * `member-archive-written` 引擎事件，之后才进 withTeamLock 才做 not_lead 闸——任意
+ * 非 lead 成员一次调用即可把 `archive/<任意花名>/{journal.md,meta.json}` 写进团队
+ * 共享状态根、为仍在册活成员制造「幻影留档」，审计行还把写入者记成该非 lead（被拒
+ * 调用记成成功留档），违反 §10「失败=无副作用、可直接重试」；该写入路径同时是
+ * V092R-07 逃逸链的入口。同类缺陷在 takeover 路径已于 v0.8.1（C6-BUG-1）修复——
+ * tools-identify.ts:713-730 把校验前置到任何状态变更之前，member-stop 未同步应用。
+ *
+ * 锁内保留原校验为**权威**副本：预检与加锁之间队状态可变（TOCTOU），锁内闸兜底
+ * （同机敌对进程换链属威胁模型明示边界，paths.ts:440-443 同口径不防）。
+ */
+function assertStopAuthorized(team: TeamState, me: BoundIdentity, key: string): TeamMember {
+  if (leadKeyOf(team) !== me.agentKey) {
+    throw new ToolError({
+      error: "not_lead",
+      agentKey: me.agentKey,
+      leadKey: leadKeyOf(team),
+      message: `only the team lead ("${leadKeyOf(team)}") can stop members`,
+    });
+  }
+  const member = team.members.find((m) => m.key === key);
+  if (member === undefined) {
+    throw invalidParamsError(`no member "${key}" in team "${team.teamId}"`);
+  }
+  if (memberState(member) === "removed") {
+    throw new ToolError({
+      error: "member_removed",
+      name: key,
+      message: `member "${key}" is already removed`,
+    });
+  }
+  if (memberState(member) === "provisioning") {
+    throw invalidParamsError(
+      `member "${key}" is provisioning right now; retry after it turns ready/failed`,
+    );
+  }
+  return member;
 }
 
 async function memberStop(deps: ToolDeps, args: { name: string; reason?: string; archive?: boolean }, me: BoundIdentity): Promise<ToolResult> {
@@ -602,13 +695,27 @@ async function memberStop(deps: ToolDeps, args: { name: string; reason?: string;
   if (key === "") throw invalidParamsError(`name ${JSON.stringify(args.name)} sanitizes to an empty key`);
   const now = Date.now();
 
+  // ---- v0.9.2（V092R-08）：授权/入参预检——失败在副作用之前返回，零留档、零审计行 ----
+  const preflightTeam = await readTeam(stateRoot, me.teamId);
+  if (preflightTeam === undefined) {
+    throw new ToolError({ error: "no_team", message: "no team on disk yet" });
+  }
+  assertStopAuthorized(preflightTeam, me, key);
+
   // ---- 停止前留档（C4，缺省 true；写失败不阻断停止——任务照常回池，「不丢」）----
   let archiveOutcome: MemberStopOutcome["archive"];
   let archiveError: string | undefined;
   if (args.archive !== false) {
     try {
       archiveOutcome = await archiveBeforeStop(deps, key, "", args.reason ?? "", now);
-      await logEngineEvent(stateRoot, { event: "member-archive-written", teamId: me.teamId, name: key, by: me.agentKey });
+      await logEngineEvent(stateRoot, {
+        event: "member-archive-written", teamId: me.teamId, name: key, by: me.agentKey,
+        // V092R-07：逃逸/超限 journal 的跳过事实入审计（meta 之外的第二披露面；
+        // 措辞与 archive 结果的 warnings 同源，逐条如实）。
+        ...(archiveOutcome?.warnings !== undefined && archiveOutcome.warnings.length > 0
+          ? { skippedJournals: archiveOutcome.skippedJournals ?? [], warning: archiveOutcome.warnings.join("；") }
+          : {}),
+      });
     } catch (err) {
       archiveError = err instanceof Error ? err.message : String(err);
       await logEngineEvent(stateRoot, {
@@ -623,30 +730,8 @@ async function memberStop(deps: ToolDeps, args: { name: string; reason?: string;
     if (team === undefined) {
       throw new ToolError({ error: "no_team", message: "no team on disk yet" });
     }
-    if (leadKeyOf(team) !== me.agentKey) {
-      throw new ToolError({
-        error: "not_lead",
-        agentKey: me.agentKey,
-        leadKey: leadKeyOf(team),
-        message: `only the team lead ("${leadKeyOf(team)}") can stop members`,
-      });
-    }
-    const member = team.members.find((m) => m.key === key);
-    if (member === undefined) {
-      throw invalidParamsError(`no member "${key}" in team "${team.teamId}"`);
-    }
-    if (memberState(member) === "removed") {
-      throw new ToolError({
-        error: "member_removed",
-        name: key,
-        message: `member "${key}" is already removed`,
-      });
-    }
-    if (memberState(member) === "provisioning") {
-      throw invalidParamsError(
-        `member "${key}" is provisioning right now; retry after it turns ready/failed`,
-      );
-    }
+    // 权威复核（V092R-08 预检的锁内副本；错误信封逐字一致）。
+    const member = assertStopAuthorized(team, me, key);
 
     // 开放任务收回（§7.3.3，dsh remove_member 对应物）：引擎特权重置回 pending 池。
     const revoked: { taskId: string; title: string; previousStatus: string }[] = [];
@@ -735,6 +820,9 @@ async function memberStop(deps: ToolDeps, args: { name: string; reason?: string;
       `requeued tasks: ${out.revoked.map((r) => r.taskId).join(", ") || "none"}; ` +
       `shutdown notice → ${delivered}` +
       `${out.archive !== undefined ? `; archive → ${out.archive.dir}` : ""}` +
+      `${out.archive?.skippedJournals !== undefined && out.archive.skippedJournals.length > 0
+        ? `; archive journals skipped (link containment, V092R-07): ${out.archive.skippedJournals.join(", ")}`
+        : ""}` +
       `${out.archiveError !== undefined ? `; ARCHIVE FAILED: ${out.archiveError}` : ""}.`,
     {
       name: out.key,

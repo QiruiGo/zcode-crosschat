@@ -43,6 +43,7 @@ import { memberOpenTasks, readTeam, unsatisfiedDependencies } from './teamstate.
 import { stalledTasks, stallSuggestion, lastProgressTs, type StallFlag } from './stall.js';
 import { parseToolFrameType } from './toolrelay.js';
 import {
+  checkLinkContainment,
   checkpointDir,
   checkpointFile,
   checkpointNudgeFile,
@@ -573,7 +574,16 @@ export async function sweepCheckpointTmpFiles(
 
 // --- 落盘 ---------------------------------------------------------------------
 
-/** 读一个任务 journal 的末 N 个非空行（缺失/失败都在场——不得静默跳过）。 */
+/** 读一个任务 journal 的末 N 个非空行（缺失/失败都在场——不得静默跳过）。
+ *
+ * v0.9.2（V092-10 修复）：装**链接逃逸闸**（core/paths.ts checkLinkContainment，与
+ * xc_read journal / evidence / refs 同一函数；锚点=状态根）。缺口事实（红队 adv-2/F1
+ * 实测复现）：本路径原先只靠段闸 + readFile，而 readFile **跟随**链接——预置
+ * `<stateRoot>/tasks/<id>` junction 指向工作区外文件时，`xc_team checkpoint` 会把该
+ * 文件内容经本函数持久化进**团队共享**检查点（`.crosschat/checkpoints/<key>/*.md`，
+ * 任何成员经 handoff/检查点读取面可见）——泄密 + 提示注入通道。逃逸 → 归 `error`
+ * （lines 空）：单任务 journal 坏不毁掉整份检查点（§3.6 同口径），但一个字节都不进
+ * markdown（buildCheckpointMarkdown 对 error 只渲染「journal 读取失败」占位）。 */
 export async function readTaskJournalTail(
   stateRoot: string,
   taskId: string,
@@ -585,7 +595,13 @@ export async function readTaskJournalTail(
   let raw: string;
   try {
     displayPath = journalDisplayPath(stateRoot, taskId);
-    raw = await readFile(taskJournalPath(stateRoot, taskId), 'utf8');
+    const journalPath = taskJournalPath(stateRoot, taskId);
+    // V092-10：链接逃逸闸（先于 readFile——不读逃逸目标一个字节）。
+    const linkGate = await checkLinkContainment(stateRoot, journalPath);
+    if (linkGate.escaped) {
+      return { taskId, displayPath, lines: [], status: 'error' };
+    }
+    raw = await readFile(journalPath, 'utf8');
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     return { taskId, displayPath, lines: [], status: code === 'ENOENT' ? 'missing' : 'error' };

@@ -31,11 +31,12 @@ import { registerTeamTools } from "./tools-team.js";
 import { registerReviewTools } from "./tools-review.js";
 import { registerDoctorTool } from "./doctor-tool.js";
 import { startStaleSweeper } from "./task-edges.js";
+import { startMemberWatchdog } from "../engine/watchdog.js";
 import { stopPeerEndpoint } from "../transport/pipe.js";
 import { GuardedStdioTransport } from "../transport/mcpstdio.js";
 
 const SERVER_NAME = "zcode-crosschat";
-const SERVER_VERSION = "0.9.1";
+const SERVER_VERSION = "0.9.2";
 
 // v0.8.1（29 红队 M01 修复）：xc_doctor 的 action 形状在**入口模块**构建——本模块是
 // bundle 入口（模块体最后求值），此处用 zod 无初始化次序风险；而 doctor-tool.ts 若自建
@@ -121,6 +122,15 @@ export async function main(): Promise<void> {
 
   // v0.5.1（故障注-8 修复）：周期僵尸清扫（unref 不改退出语义）。
   startStaleSweeper(deps);
+
+  // v0.9.2（A2，方案 §二 组A）：成员看门狗——本进程（lead 的 MCP server）内的轻量
+  // 定时器，扫在册成员 pid（C8 offline 判据）/ 在途 nonce 生命周期 / limbo 判据；
+  // 仅 alive→dead 迁移发一次（状态真源 capacity/watchdog-state.json），发 = engine
+  // 事件 member-dead + lead 邮箱 urgent + 尝试唤醒 lead（容量闸约束，失败记事件）；
+  // lead 自己死 → 通知其余在册成员并唤醒。XC_WATCHDOG_MS 缺省 60s、0=关（返回
+  // undefined）；unref 不拖进程退出。看门狗随本进程死亡时，告警链由 UserPromptSubmit
+  // 的回合开始事故摘要（core/incidents.ts，A3）兜底。
+  startMemberWatchdog(deps);
 
   // v0.3 EOF 纪律（FEASIBILITY-V0.3 §3.3）：SDK 不监听 stdin 'end'，必须自建。
   process.stdin.once("end", () => {

@@ -21,6 +21,12 @@
  * 判据全从落盘真源现算，消费后自然消失（= 重复注入直到消费）；详见
  * {@link renderTurnStartReminder} 的三条硬口径。
  *
+ * v0.9.2 增量（A3，方案 §二 组A）：**回合开始事故摘要**——自上一回合（registry 的
+ * `lastTurnTs`）至今的成员死亡 / limbo 降级 / 唤醒失败计数，注入置顶块。看门狗
+ * （engine/watchdog.ts）只在 lead 的 MCP server 存活期间推得住；本块是它未覆盖时
+ * 的最后保险（只要还有人开回合就看得见）。无事故零注入；计数真源与文案属主
+ * core/incidents.ts。
+ *
  * Build entry: dist/hooks/prompt-submit.mjs (scripts/build.mjs).
  */
 import {
@@ -38,6 +44,10 @@ import {
   sweepStaleProvisioning,
   unreadSummary,
 } from './shared.js';
+// v0.9.2（A3）：回合开始事故摘要——计数真源与文案属主 core/incidents.ts（M1），
+// 「上一回合开始时刻」读自 registry 的会话记录（lastTurnTs，core/registry.ts 写）。
+import { readIncidentsSince, renderIncidentSummary } from '../core/incidents.js';
+import { readSession } from '../core/registry.js';
 import { drainPeerQueue } from '../core/peermsg.js';
 // 信封渲染的属主是 core/peerenvelope.ts（DESIGN-V0.3 §10.2）；W5 的 peermsg.ts
 // 目前只转出了 renderPeerReceipt，故这里直接向属主模块取 renderPeerEnvelope。
@@ -103,6 +113,19 @@ function renderTurnStartReminder(input: {
 async function main(): Promise<void> {
   const stdin = readStdinPayload();
   const ctx = resolveHookContext('UserPromptSubmit', stdin);
+
+  // v0.9.2（A3）：**先**取上一回合的开始时刻（registry 的 lastTurnTs）——下面的
+  // refreshSessionRegistration 会把 lastTurnTs 盖成本回合的新值，事故窗口
+  // 「自上次回合至今」因此由读取次序天然保证，不依赖任何内存状态。
+  // 取不到（存量会话首回合 / 读盘失败）→ 无窗口 → 零注入（不回归、不虚报）。
+  let previousTurnTs: number | undefined;
+  if (ctx.sessionId !== undefined) {
+    try {
+      previousTurnTs = (await readSession(ctx.stateRoot, ctx.sessionId))?.lastTurnTs;
+    } catch {
+      previousTurnTs = undefined; // 读盘失败：观测面不为难
+    }
+  }
 
   if (ctx.sessionId !== undefined) {
     try {
@@ -279,6 +302,34 @@ async function main(): Promise<void> {
       }
     } catch (error) {
       await auditHookFailure(ctx.stateRoot, 'prompt-submit-checkpoint-nudge', error);
+    }
+  }
+
+  // --- v0.9.2（A3，方案 §二 组A）：回合开始**事故摘要**（看门狗未覆盖时的最后保险）---
+  // 判据：自上一回合（registry lastTurnTs）至今，engine.jsonl 里有成员死亡 / limbo
+  // 降级 / 唤醒失败三类事件 → 注入置顶块（计数 + 点名 + 处置指引 + 平台边界声明）。
+  // **无事故零注入**：三个计数全 0（或无窗口可言）→ 不产块——数据即收口条件，与
+  // G-14 未读提醒同口径，不回归 v0.8.1 的零块 stdout 契约。
+  // 置顶：unshift 在未读强提醒之后执行 ⇒ 最终次序为「事故摘要 → 未读提醒 → peer
+  // 信封 → 检查点提醒」——先让会话知道「有人死了/有消息降级/有唤醒失败」，再谈消费。
+  // 任何异常只审计不阻断（钩子永不失败会话）。
+  if (previousTurnTs !== undefined) {
+    try {
+      const counts = await readIncidentsSince(ctx.stateRoot, previousTurnTs);
+      if (counts.total > 0) {
+        blocks.unshift(renderIncidentSummary(counts, Date.now()));
+        await logHookEvent(ctx.stateRoot, {
+          event: 'hook-prompt-submit-incidents',
+          sessionId: ctx.sessionId,
+          since: previousTurnTs,
+          memberDead: counts.memberDead,
+          limboDowngraded: counts.limboDowngraded,
+          wakeFailed: counts.wakeFailed,
+          deadMembers: counts.deadMembers,
+        });
+      }
+    } catch (error) {
+      await auditHookFailure(ctx.stateRoot, 'prompt-submit-incident-summary', error);
     }
   }
 

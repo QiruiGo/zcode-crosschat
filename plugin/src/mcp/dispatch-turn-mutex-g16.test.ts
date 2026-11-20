@@ -30,7 +30,7 @@ import { payloadOf, type ToolResult } from "./protocol.js";
 import { createToolCore, type ToolCore } from "./core.js";
 import { writeSession } from "../core/registry.js";
 import { engineLogFile, lockFile } from "../core/paths.js";
-import { sessionTurnLockName } from "../core/lock.js";
+import { pidAlive, sessionTurnLockName } from "../core/lock.js";
 import { readTeam } from "../core/teamstate.js";
 
 let workDir: string;
@@ -69,6 +69,28 @@ async function hookRegister(conn: string, name: string, sid: string): Promise<To
 }
 
 /**
+ * 轮询直到条件成立（每 intervalMs 一次，默认 15s deadline 后抛错）。
+ * 负载无关：并行全量跑时事件循环/子进程退出可能被拖到远超固定的几百毫秒，
+ * 固定 sleep 猜时序必然偶发；条件轮询等到**事实**成立再继续，且超时是硬失败，
+ * 不会把用例放宽成永远通过。
+ */
+async function waitUntil(
+  predicate: () => boolean | Promise<boolean>,
+  description: string,
+  timeoutMs = 15_000,
+  intervalMs = 50,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (await predicate()) return;
+    if (Date.now() >= deadline) {
+      throw new Error(`waitUntil: ${description} (not satisfied within ${timeoutMs}ms)`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+}
+
+/**
  * 起一个**真实活进程**持住某 sessionId 的 turn 锁（模拟并发的无头回合）。
  * @param holdMs 持锁时长；传 0 = 写完锁文件立即退出（制造「pid 已死」的残留锁）。
  */
@@ -92,10 +114,8 @@ async function foreignTurnHolder(
   const child = spawn(process.execPath, [script, lockPath, String(holdMs)], { stdio: "ignore" });
   children.push(child);
   // 等锁文件落盘 = 替身进程已持锁（否则测的是「还没开始并发」）。
-  for (let i = 0; i < 200 && !existsSync(lockPath); i += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-  if (!existsSync(lockPath)) throw new Error("foreignTurnHolder: lock file never appeared");
+  // 用 deadline 条件轮询而非固定次数/固定 sleep：并行负载下 node 启动可能被拖慢。
+  await waitUntil(() => existsSync(lockPath), "foreignTurnHolder: lock file to appear");
   return { pid: child.pid!, lockPath };
 }
 
@@ -197,12 +217,21 @@ describe("v0.9.1 G-16：同 sessionId 双回合并发互斥（派单/认领/回�
   });
 
   it("持锁进程已死（崩溃残留）→ 下笔写操作照常放行，不把残留锁当永久互斥", async () => {
-    await foreignTurnHolder("sess-a", 0); // 写完锁文件立即退出：pid 死、文件残留
-    await new Promise((resolve) => setTimeout(resolve, 300)); // 等子进程退出
+    const holder = await foreignTurnHolder("sess-a", 0); // 写完锁文件立即退出：pid 死、文件残留
+    // 负载无关：等「持锁 pid 已死」这一产品判据成立，而不是猜一段固定 sleep。
+    // 全量并行下子进程退出可能远超 300ms，旧的固定等待会把「还没死」误当「已死」，
+    // 让派单撞上活锁让位（busy_interactive_turn）而偶发失败。
+    await waitUntil(() => !pidAlive(holder.pid), `foreign holder pid ${holder.pid} to exit`);
+    // 前提仍是一个真实的崩溃残留锁：文件在场上、内容属于那个已死 pid。
+    // （下一笔派单必须自己回收它——不是「锁本来就不存在」的假通过。）
+    expect(existsSync(holder.lockPath)).toBe(true);
+    const residual = JSON.parse(await readFile(holder.lockPath, "utf8")) as { pid: number };
+    expect(residual.pid).toBe(holder.pid);
+
     const ok = await core.xc_dispatch({ to: "b", title: "崩溃后恢复", prompt: "p" }, "conn-a");
     expect(payloadOf(ok)["error"]).toBeUndefined();
     expect(await taskCount()).toBe(1);
-  });
+  }, 30_000);
 
   it("审计：每次让位落一行 turn-conflict-yield（tool/sessionId/holderPid/holderAgeMs）", async () => {
     const holder = await foreignTurnHolder("sess-a", 4000);

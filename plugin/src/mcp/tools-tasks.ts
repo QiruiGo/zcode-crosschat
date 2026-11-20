@@ -19,6 +19,7 @@ import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { resolve, sep } from "node:path";
 import { stat } from "node:fs/promises";
+import { checkLinkContainment } from "../core/paths.js";
 import {
   invalidParamsError,
   okResult,
@@ -164,6 +165,42 @@ export async function sha256File(path: string): Promise<string | null> {
   } catch {
     return null;
   }
+}
+
+// ---------------------------------------------------------------------------
+// v0.9.2（B3）：id 类入参的长度闸（≤512）与错误回显截断
+// ---------------------------------------------------------------------------
+
+/**
+ * v0.9.2（B3）：id 类入参（xc_read 的 id / xc_claim·xc_report 的 taskId …）长度上限。
+ *
+ * 这些 id 全是**短句柄**（`<era>-t<n>` 任务号 / uuid / 花名 / `archive:<name>`），
+ * 512 字符已远超一切合法形态。动机：它们会被工具原样回显进错误消息与结构化
+ * payload（`unknown task "<id>"`、`journal_not_found {id}`、`handoff id <id>` …）——
+ * 调用方塞进 1 MiB 垃圾串时，错误回显把整段吐回注入面：既烧注入预算，又是把
+ * 调用方输入放大回显的通道。长度闸在入口处硬拒，回显只留前 512 字符 + 长度标注。
+ */
+export const TOOL_ID_MAX_LENGTH = 512;
+
+/** 错误回显截断：超长只留前 {@link TOOL_ID_MAX_LENGTH} 字符 + `…[truncated, N chars total]` 标注。 */
+export function truncateIdEcho(id: string): string {
+  return id.length <= TOOL_ID_MAX_LENGTH
+    ? id
+    : `${id.slice(0, TOOL_ID_MAX_LENGTH)}…[truncated, ${id.length} chars total]`;
+}
+
+/**
+ * v0.9.2（B3）：长度闸——超限即结构化拒绝（`id_too_long`，invalid_params 族，
+ * 与 withdraw_exclusive_params 同款的显式错误码口径），回显截断不整段回吐。
+ */
+export function assertToolIdWithinLimit(id: string, field: string): void {
+  if (id.length <= TOOL_ID_MAX_LENGTH) return;
+  throw invalidParamsError(
+    `${field} exceeds the ${TOOL_ID_MAX_LENGTH}-char id limit (got ${id.length} chars); `
+      + "ids are short handles (task id / message id / member key) — echo truncated: "
+      + JSON.stringify(truncateIdEcho(id)),
+    { error: "id_too_long", field, length: id.length, limit: TOOL_ID_MAX_LENGTH },
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -520,6 +557,8 @@ export function createTaskCore(deps: ToolDeps): TaskCore {
     async xc_claim(args, connectionKey) {
       return runCore(stateRoot, async () => {
         const me = identityRequire(connectionKey);
+        // v0.9.2（B3）：id 长度闸在 turn 锁外——超长输入（回显放大面）不必惊动锁。
+        assertToolIdWithinLimit(args.taskId, "taskId");
         // v0.9.1（G-16）：turn 互斥在 team 锁之外（锁序 turn → team）。
         return withSessionTurnGuard(stateRoot, me, "xc_claim", async () => {
           const out = await withTeamLock(stateRoot, me.teamId, async () => {
@@ -656,6 +695,9 @@ export function createTaskCore(deps: ToolDeps): TaskCore {
     async xc_report(args, connectionKey) {
       return runCore(stateRoot, async () => {
         const me = identityRequire(connectionKey);
+        // v0.9.2（B3）：id 长度闸在 turn 锁外（与 xc_claim 同口径；attemptId 是工具
+        // 铸造的短令牌，不回显调用方原值，不设闸）。
+        assertToolIdWithinLimit(args.taskId, "taskId");
         // v0.9.1（G-16）：turn 互斥在 team 锁之外（锁序 turn → team）。证据门是锁外
         // 慢操作（sha256 现算），一并纳入 turn 临界区——「回报」这个写操作从校验到
         // 落盘对同一 sessionId 只允许一个回合在做。
@@ -685,6 +727,22 @@ export function createTaskCore(deps: ToolDeps): TaskCore {
                 workspace: wsRoot,
                 message: `evidence file "${e.path}" resolves outside the workspace (${wsRoot}); ` +
                   `evidence must live inside the shared workspace (§2.6 evidence gate, v0.5.2 containment)`,
+              });
+            }
+            // v0.9.2（B2）：符号链接/junction 逃逸闸——词法 containment 之后、stat 之前。
+            // stat 跟随链接，词法前缀判定看不出 `<ws>/escape → 外部目录` 这种形态；
+            // realpath 归一后越界即拒（错误码与词法闸相同，message 如实说明经链接逃逸）。
+            // 闸本体在 core/paths.ts（V092-10 起 journal 读取面/检查点同用，锚点=工作区）。
+            const linkGate = await checkLinkContainment(wsRoot, abs);
+            if (linkGate.escaped) {
+              throw new ToolError({
+                error: "evidence_path_outside_workspace",
+                path: e.path,
+                workspace: wsRoot,
+                message: `evidence file "${e.path}" escapes the workspace via `
+                  + `${linkGate.viaLink ? "symlink/junction" : "resolved path"}: it resolves to `
+                  + `"${linkGate.real}", outside "${wsRoot}" — `
+                  + "evidence must be a real file under the shared workspace (§2.6 evidence gate, v0.9.2 B2 link containment)",
               });
             }
             let stats;

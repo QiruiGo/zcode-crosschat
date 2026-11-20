@@ -20,15 +20,15 @@
 
 ### 第 1 步：下载并解包
 
-1. 打开 <https://github.com/QiruiGo/zcode-crosschat/releases>，下载资产 **`zcode-crosschat-0.9.1-prebuilt-slim.tar.gz`**（约 4–5MB）。**保留原文件名**——随包发布的 `.sha256` 校验和按原名录，改名后校验会失败。
-2. （可选）校验完整性：在文件所在目录执行 `sha256sum -c zcode-crosschat-0.9.1-prebuilt-slim.tar.gz.sha256`（PowerShell 可用 `Get-FileHash` 对照 `.sha256` 文件里的值），期望输出 `OK`。
+1. 打开 <https://github.com/QiruiGo/zcode-crosschat/releases>，下载资产 **`zcode-crosschat-0.9.2-prebuilt-slim.tar.gz`**（约 4–5MB）。**保留原文件名**——随包发布的 `.sha256` 校验和按原名录，改名后校验会失败。
+2. （可选）校验完整性：在文件所在目录执行 `sha256sum -c zcode-crosschat-0.9.2-prebuilt-slim.tar.gz.sha256`（PowerShell 可用 `Get-FileHash` 对照 `.sha256` 文件里的值），期望输出 `OK`。
 3. 解包（Windows 10+ 自带 tar，PowerShell / Git Bash 均可）：
 
    ```bash
-   tar -xzf zcode-crosschat-0.9.1-prebuilt-slim.tar.gz
+   tar -xzf zcode-crosschat-0.9.2-prebuilt-slim.tar.gz
    ```
 
-   得到目录 `zcode-crosschat-0.9.1/`（下称「解包目录」，其下应有 `marketplace.json`）。
+   得到目录 `zcode-crosschat-0.9.2/`（下称「解包目录」，其下应有 `marketplace.json`）。
 
 ### 第 2 步：安装
 
@@ -43,11 +43,11 @@ zcode 命令行**不在系统 PATH 里**（它是桌面版内置的入口），�
 ```bash
 ZC() { ELECTRON_RUN_AS_NODE=1 "<安装目录>/ZCode.exe" "<安装目录>/resources/<variant>/zcode.cjs" "$@"; }
 
-ZC plugins marketplace add "<解包目录>/zcode-crosschat-0.9.1"
+ZC plugins marketplace add "<解包目录>/zcode-crosschat-0.9.2"
 # 期望：Added marketplace dev-zcode-crosschat (1 plugins)
 
 ZC plugins install zcode-crosschat@dev-zcode-crosschat
-# 期望：Installed plugin zcode-crosschat@dev-zcode-crosschat (0.9.1) [enabled]
+# 期望：Installed plugin zcode-crosschat@dev-zcode-crosschat (0.9.2) [enabled]
 ```
 
 **PowerShell**：
@@ -55,7 +55,7 @@ ZC plugins install zcode-crosschat@dev-zcode-crosschat
 ```powershell
 function ZC { $env:ELECTRON_RUN_AS_NODE = "1"; & "<安装目录>\ZCode.exe" "<安装目录>\resources\<variant>\zcode.cjs" @args }
 
-ZC plugins marketplace add "<解包目录>/zcode-crosschat-0.9.1"
+ZC plugins marketplace add "<解包目录>/zcode-crosschat-0.9.2"
 ZC plugins install zcode-crosschat@dev-zcode-crosschat
 ```
 
@@ -265,7 +265,7 @@ npm install && npm run build
 19. **撤回通知无频控（V090-14，不修行为）**——每次成功撤回各投一条 `withdrawal-notice`，通知帧不受入站限速/频控约束，失误或恶意成员可制造通知噪音；但每条通知都必须对应真实撤回的未读件（无消息即无通知），且通知帧自身不可撤回（v0.9.2 起链式撤回封死、对账锚点保留）。
 20. **持续伪造引擎证言可无限期豁免清扫（V090-01 处置，不修行为）**——清扫豁免的活性输入是引擎证言（`registry/witness/<sid>.json`，只由引擎进程写：hook 回合边界 + 工具调用心跳），**一次**本地文件写伪造自述记录造不出证言（不豁免），但同机进程**持续重写**证言文件（活跃攻击）可让名下任务一直停在豁免态——这是威胁模型边界（v0.6 口径：同机进程可伪造状态文件；产品 doctrine 不做对抗级防伪护城河，签名/哈希链一律不引入）。既有防线如实：豁免**有界**（证言停止 2×stale 阈值后照扫）、`pid-dead` 硬证据立即失效、C8 离线转交通知照发（豁免不壅蔽）；可观测性兜底：任务板带 `sweepExemptPeriods`（「豁免 N×阈值」）与 `Exempt:` 文本行、`task-sweep-deferred` 审计逐周期留痕、成员行 `liveness.witness` 并列展示自述与证言——lead 可见异常长豁免并人工介入（cancel/改派）。
 21. **投递盖章 ≠ 消费确认，中间有 limbo 静默区（v0.9.1 G-12v3，机制 B 收口）**——spawn 成功瞬间盖 `deliveredAt`（fire-and-forget），子进程可能在成员回合**消费内容前**死亡（内存红线 OOM / 宿主重启杀无头子进程）→ 消息已盖章、从未被读、且因不再是 unread 而永不被未读注入钩子呈现（生产 4 实例收方零动作）。现补口：spawn 即写 wake-child 生命周期头行、退出写尾行；成员真实消费（hook 注入 / `xc_read` / `xc_claim`）回写 `consumedAt`；盖章后 `XC_LIMBO_TIMEOUT_MS`（缺省 10min）无消费确认 → 自动打回可重新投递态（重新可注入/可 pull）+ `message-limbo` 事件 + urgent 告知 lead；spawn 后 5min 无 session-start → `wake-slow` 告知。**0 字节日志永不出现也永不作失败判据**（慢写瞬态可 12min+，只有「≥5min 且无 session-start」才判慢）。
-22. **容量闸挡唤醒不拦投递，且只到 spawn 前（v0.9.1 G-12-b）**——水位低于硬底或单回合预估 > 可用内存时 `attemptWake` 不 spawn、直接 `deliver=mailbox` + `wake-deferred{reason:"capacity-red"}` + 冷却（`XC_MEM_WAKE_COOLDOWN_MS` 缺省 120s；`XC_MEM_WAKE_GATE=off` 关闸）。消息照常落邮箱、收方自己的回合随时可读（pull 兜底不丢）；闸**不**取消任务、不撤回消息、不拦压缩（同第 14/16 条的平台边界）。派单面的「RED 期排队拒绝」需在派单工具面接线，本版只在 wake 层给出 deferral 块与冷却窗、派单回执经 `note` 透出原因与重试窗口。容量采样意外时闸 fail-open（不因观测故障永久挡唤醒）并落 `wake-capacity-probe-failed` 事件。
+22. **容量闸挡唤醒不拦投递，且只到 spawn 前（v0.9.1 G-12-b；v0.9.2 收口五条 mustFix）**——水位低于硬底或单回合预估 > 可用内存时 `attemptWake` 不 spawn、直接 `deliver=mailbox` + `wake-deferred{reason:"capacity-red"}` + 冷却（`XC_MEM_WAKE_COOLDOWN_MS` 缺省 120s、**上钳 1h**，非法值回落缺省并在 detail 明示；`XC_MEM_WAKE_GATE=off` 关闸，事件带 `gateEnv` 原值）。消息照常落邮箱、收方自己的回合随时可读（pull 兜底不丢）；闸**不**取消任务、不撤回消息、不拦压缩（同第 14/16 条的平台边界）。派单面的「RED 期排队拒绝」需在派单工具面接线，本版只在 wake 层给出 deferral 块与冷却窗、派单回执经 `note` 透出原因与重试窗口。容量采样意外时闸 fail-open（不因观测故障永久挡唤醒）并落 `wake-capacity-probe-failed` 事件；**CIM 进程采样不可用**（采样成功但拿不到进程树）时进程类规则（session-limit/turn-concurrency）不评、面板显示 `n/a`，且放行路径也落 `wake-capacity-degraded` 事件——不静默、不声称已评。v0.9.2 起冷却记录按 `teamId+收方+紧急度` 分域（一个成员的 RED 不再把全队唤醒含紧急 relay 一并静默转 mailbox），窗内命中在 detail 明示「沿用旧判据（未重采样、快照时刻可对账）」；进程归类只认唤醒子标记（`XC_WAKE_CHILD=1` env 标记 + 命令行可见的唤醒回执前缀），README 文档化的用户 CLI 不再被误判成无头回合而误触 session-limit。
 23. **文件引用是引用不是内容，且 peer 管道帧不带它（v0.9.1 G-10）**——`xc_relay({refs})` 只传工作区内真实普通文件的 path+sha256（+可选 mime/note；复用 evidence 三道硬闸与 sha256 现算），接收面渲染「用 Read 打开该路径」提示：**不内联内容、不做 base64**（消息通道是纯文本 JSON，内联会撑爆帧闸与注入预算）。因此引用**不随消息历史永存**——文件被移动/删除后引用即失效（sha256 仍可对账「曾经存在过这个版本」）。peer 轴另有载体边界：管道 MsgFrame 白名单冻结，refs 只随**文件退化**队列项抵达，`via=pipe` 时 payload `refsCarried:false` 如实说明（urgent 同款纪律）。G-17（无头回合 MCP 子集加载 = 宿主层能力）只出可行性结论与平台反馈建议，本版不自造实现，见 PROTOCOL §15.4。
 
 ## 威胁模型（v0.6 口径）
@@ -284,6 +284,7 @@ npm install && npm run build
 
 ## 版本记录（摘要）
 
+- **v0.9.2**（2026-11-20，v0.9.1 对抗轮 15 项 confirmed + 用户现场反馈「进程断了主控应当收到新消息」；三组并行；工具面仍恰 10、命令 8、0 新增必填配置；新 env 与新 engine 事件冻结键集见 [docs/PROTOCOL.md](docs/PROTOCOL.md) §15.5）。**主动告警链（组 A）**：A1 同步启动确认——spawn 后 `XC_START_CONFIRM_MS`（缺省 5s）内观察 wake-child 启动证据 → 回执 `startConfirmed`，未见则如实措辞「已发起但未见启动证据」（非送达确认也非失败；`wake-start-confirm` 事件 + wake-child 生命周期账双通道披露）；A2 成员看门狗——lead 的 MCP server 内轻量定时器（`XC_WATCHDOG_MS` 缺省 60s，0=关）扫成员 pid / 在途 nonce / limbo 三类判据，**仅状态迁移时发**（状态真源 `capacity/watchdog-state.json` + 跨进程认领锁，同一次事故只有一个通告者），发 = `member-dead` / `wake-orphan-nonce` / `watchdog-wake` 事件 + lead 邮箱 urgent + 尝试唤醒 lead（受容量闸约束）；lead 自己死 → 通知其余在册成员（不通知崩溃者自己的邮箱）；A3 回合开始事故摘要（自上次回合 `lastTurnTs`：N 个成员死亡 / M 条 limbo 降级 / K 次唤醒失败）作看门狗全部随进程死亡时的兜底；A4 limbo 校准（锁竞争宽限重试不降级、wake prompt 已内嵌消息全文记 `injectedConsumed`、按 `(messageId, 轮次)` 节流；`message-limbo` 自此双生产者）。**存储与遏制（组 B）**：锁身份 realpath 规范化（junction/8.3/UNC 拼法归一到同一锁）、refs/evidence 拒符号链接/junction 逃逸、`xc_read` 的 id 与 `xc_claim` 的 taskId 长度上限（512）回显截断、journal 体积闸（8 MiB）。**容量闸与观测口径（组 C）**：进程归类只认唤醒子标记（`XC_WAKE_CHILD=1` env 标记 + 命令行可见的唤醒回执前缀，README 文档化的用户 CLI 不再被误判成无头回合）、CIM 不可用时进程类规则不评且放行路径也落 `wake-capacity-degraded`（不静默、不声称已评）、冷却记录按 `teamId+收方+紧急度` 分域且窗内命中在 detail 明示「沿用旧判据」+ `XC_MEM_WAKE_COOLDOWN_MS` 上钳 1h、panel 任务三桶改七态计数、`wake-deferred` 事件补 `gateEnv` 原值。唤醒分层口径不变（引擎成员免开关、交互会话可选开启）。
 - **v0.9.1**（2026-11-19，v0.8.1 首日生产实战第二批教训；三组并行；工具面仍恰 10、命令 8、0 新增必填配置；协议冻结示例与契约测试见 [docs/PROTOCOL.md](docs/PROTOCOL.md) §15）。**组 C 传输与容量**：文件引用（G-10）`xc_relay` 增可选 `refs:[{path,sha256?,mime?,note?}]`——只传工作区内真实普通文件的引用（复用 evidence 三道硬闸 + sha256 缺省现算），接收面信封渲染「用 Read 打开该路径」提示，不内联内容、不做 base64（已知限制 23）；spawn 前容量闸（G-12-b）——`attemptWake` 读 capacity verdict，水位低于硬底或单回合预估 > 可用内存即不 spawn、`deliver=mailbox` + `wake-deferred{reason:"capacity-red"}` + 冷却（`XC_MEM_WAKE_COOLDOWN_MS` 缺省 120s，`XC_MEM_WAKE_GATE=off` 可关闸；已知限制 22）；G-17 结论——无头回合 MCP 子集加载属宿主层，插件无法控制，只出可行性结论与平台反馈建议（PROTOCOL §15.4）。**并行组增量**：消息可靠性（组 A，G-12v3 机制 B + G-11）——投递盖章与消费确认分离（`consumedAt` 回写 + 超时未消费自动降级 unread + `message-limbo`/`wake-slow` urgent 告知 lead + wake-child 生命周期日志；已知限制 21），wake-resume 回合继承 `voiceOwner`；软约束硬化（组 B，G-13/G-14/G-16）——派单同 assignee 同票查重硬闸、回合开始未读强提醒（平台上界=醒目重复注入）、双回合并发文件锁互斥。唤醒分层口径不变（引擎成员免开关、交互会话可选开启）。
 - **v0.9.0**（2026-11-19，lims2.0 首日实战九缺口修复，三组并行；工具面仍恰 10、命令 8、0 新增必填配置；G-3 撤回/G-2 软中断见 [docs/PROTOCOL.md](docs/PROTOCOL.md) §2/§3/§7 冻结示例——文档即测试契约）。**组 C 消息控制与软中断**：撤回原语（G-3）`xc_relay` 增可选 `withdrawMessageIds`（仅队内轴）——只撤自己发给该目标且**仍未读**的消息（整行删除 + 给收方投 `withdrawal-notice` 通知帧 + engine 事件 + 尽力唤醒），含已读/非本人/不存在件整单拒绝并逐条报状态；软中断（G-2）`interrupt:true` 发结构化 INTERRUPT 信封（消息元数据 + 读取面横幅，urgent 置顶语义不变），收方按安全点纪律消费（完成当前原子操作、不开新步骤、回确认），payload 如实回报；平台缺口如实声明（G-1）——回合中注入为宿主层能力，插件侧上界=软中断（已知限制 3）。**并行组增量**：唤醒分层口径变更（组 B，G-4/G-7/G-6/G-8）——旧口径「团队自动开工必须开 wake_enabled」改为「**引擎成员免开关，交互会话可选开启**」，工作区 `.crosschat/config.json` 一行开启（file > env > 默认，改文件即生效），sessionNotFound 投递自动重绑重试一次；活性与清扫联动（组 A，G-9/G-5）——活性状态机（running/idle/dead）进 `xc_overview` 成员行，任务 in_progress 且属主 running 暂停清扫倒计时、引擎事件即心跳代理。
 - **v0.8.1**（2026-11-16，29-v080 能力反向检验 28 项修复；工具面仍恰 10、0 新增工具、0 新增必填配置——`xc_doctor` 多一个可选 `action:"repair-team"` 写面，新旋钮只走既有高级 env 的披露）：**身份重绑与队内真源（P1×1 / P2×3）**——改名两轴前置拒（M01，P1）：新花名已是队内花名册另一位成员、或 peer 轴上被另一个活会话占着时，改名在任何状态变更之前显式拒（`team_rename_blocked` / `peer_axis_failed`，零副作用），v0.8.0 会把队内轴先写成重复成员键、team.json 与 .bak 双中毒；中毒 team.json 自愈（`xc_doctor({action:"repair-team"})` 确定性修复：names 权威索引保留原持有者行、残损字节保全为 `team.json.corrupt`、真源与 .bak 一并重写；其他缺陷形态不猜）；takeover 失败无副作用（C6-BUG-1）；改名守卫只挡活引用（C6-BUG-6：终态任务引用不再永挡改名，未读而非全史才挡邮箱）。**观测面判据与口径（P2×2 / P3×22）**——handoff 身份章（M02）、lead 渲染跨面同源（M05，五处同源）、timeline（M03/M04 + C3-B2/B3/B4/B5/B7/B8：actor 链补 `approvedBy`/`from`/`member`、按 `ts` 降序、`skippedEvents` 跳过披露、文本视图控制字符折空格、非字符串 `taskId` 归一 `null`、续读 offset 位置游标语义披露、预算刻度接 `contextChars`、尾窗截断每页披露 `olderEventsOmitted`）、handoff 截断口径（C2-B5/B8/B9：`cappedItems.shown` 恒等于 payload 数组长度、pool 项 `priority` 恒在、checkpoint payload 恰四键）、年龄取数与粒度（C2-B4 / C5-BUG-C5-02：取 front-matter `createdAt`、status 文本按精确分钟）、阈值披露拉齐（C4-F1/F2/O1：offline/stall/mem 三族钳制/非法回落/越界在 status 与 team 两视图都给 payload 键 + WARNING）、checkpoint 行列（C4-F3：`me` + 全部花名册成员，无检查点记 `(none)`）、并发与残留（C1-B01/B02）、C8 lead 崩溃转交通知改投其他在册成员（C6-BUG-4）、钩子零块仍输出一行 JSON 单键（C1-B03）、`name_taken` 文案自带 `takeover:true` 指引（C2-B7）。
@@ -301,7 +302,6 @@ npm install && npm run build
 - **v0.7.0**（2026-11-15）：C6 转办授权 / C7 审批最小集 / C8 离线任务转交 / C9 压缩联动 + 旧名移除——转办与审批走 `xc_relay` 帧与 `xc_review` 扩展（工具面仍恰 10，0 新增）；未审批 `tool_request` 在两个读取面结构性遮蔽；审批文件为用户/lead 落盘的授权锚点；离线判定复用 peer 活性/心跳与 stale sweeper（240min 阈值 env 可配，不把空闲当离线）；容量标红附 `compress-advice` 建议行（longtask checklist + lead 操作序，建议级非拦截级）；**22 个旧名弃用垫片与 `/xc-agents`、`/xc-member` 命令存根按 MIGRATION §5 承诺移除**（breaking：调用旧名得 `Tool <name> not found`）。设计 [docs/DESIGN-V0.7.md](docs/DESIGN-V0.7.md)；迁移表 [docs/MIGRATION.md](docs/MIGRATION.md)。
 - **v0.6.1**（2026-11-14）：红队四番战 P0/P1 安全修复（对齐 peer 轴既有语义，工具面仍 10）——队内轴注册/改名/接管补 sessionId 归属与活性硬闸（`session_id_in_use`，堵零凭据用他人公开 sid 冒名串号，P0 安全对-1）；花名严格文法 + 保留名两轴合一（全角/同形/路径符/控制符等碰撞写法与 `system/user/main/team-lead` 一律拒绝，P1 安全对-2 + P2 安全对-5/边界-2）；`xc_claim` 仅限派单受领人认领（`not_assignee`，与 `xc_report` 同闸，P1 安全对-3）；`takeover:true` 对活成员拒（`takeover_live_holder`，P1 安全对-4）；lead/founder 改名 key 随动（不再悬空锁死 transfer/release/init，P1 边界-1）。未恢复 v0.6 砍掉的归一/哈希链/regToken 对抗面。
 - **v0.6.0**（2026-11-14）：面向多会话长期协作重定位——工具面 26→10（旧名弃用可调一个版本）；C1 用户介入传导（urgent/interrupt）、C2 blocked 态 + 优先级、C3 内存水位采样与卸载留档、C4 longtask 技能与 archive、C5 停滞检测；砍邮箱哈希链/零宽同形字归一/forwardOf 溯源/regToken 硬闸（威胁模型边界见上节）。迁移表 [docs/MIGRATION.md](docs/MIGRATION.md)；协议细则 [docs/PROTOCOL.md](docs/PROTOCOL.md)；设计 [docs/DESIGN-V0.6.md](docs/DESIGN-V0.6.md)。
-- **v0.5.x**：队长角色可指派可移交（v0.5.0）；观测面注入预算/peer 队列 1024/证据工作区遏制（v0.5.2）；身份锚定令牌与邮箱哈希链/同形字归一（v0.5.3——其中哈希链与同形字归一已在 v0.6 移除，记录见 MIGRATION §4）。
-- v0.1–v0.4 与全部工程档案：见 [docs/](docs/)（ACCEPTANCE / DEMO / IMPLEMENTATION / PLATFORM / RELEASING 及历代 DESIGN）。
+- **v0.5.x**：队长角色可指派可移交（v0.5.0）；观测面注入预算/peer 队列 1024/证据工作区遏制（v0.5.2）；身份锚定令牌与邮箱哈希链/同形字归一（v0.5.3——其中哈希链与同形字归一已在 v0.6 移除，记录见 MIGRATION §4）。v0.1–v0.4 与全部工程档案：见 [docs/](docs/)（ACCEPTANCE / DEMO / IMPLEMENTATION / PLATFORM / RELEASING 及历代 DESIGN）。
 
 License: [MIT](./LICENSE)
