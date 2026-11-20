@@ -57,7 +57,7 @@ describe('readJsonl (半行 JSONL 跳过 + onMalformed)', () => {
   });
 });
 
-describe('appendJsonl (追加前尾行截断)', () => {
+describe('appendJsonl (追加前尾行分隔; v0.9.3 有界探针)', () => {
   it('creates the file and appends lines', async () => {
     const file = join(dir, 'box.jsonl');
     await appendJsonl(file, [JSON.stringify(msg('1')), JSON.stringify(msg('2'))]);
@@ -73,15 +73,17 @@ describe('appendJsonl (追加前尾行截断)', () => {
     expect(raw).toBe(`${JSON.stringify(msg('1'))}\n${JSON.stringify(msg('2'))}\n`);
   });
 
-  it('truncates an incomplete tail fragment before appending (DESIGN §2.7-5)', async () => {
+  it('newline-separates an incomplete tail fragment before appending (v0.9.3 P0)', async () => {
     const file = join(dir, 'box.jsonl');
     const good = JSON.stringify(msg('1'));
-    writeFileSync(file, `${good}\n{"id":"2","from":"a","to":"b","cont`, 'utf8');
+    const fragment = '{"id":"2","from":"a","to":"b","cont';
+    writeFileSync(file, `${good}\n${fragment}`, 'utf8');
     await appendJsonl(file, [JSON.stringify(msg('3'))]);
     const items = await readJsonl<TeamMessage>(file, isTeamMessage);
-    // The unreadable fragment is gone; the good line and the new line remain.
+    // v0.9.3：半行不再被截掉（截断判定需要整文件读）——用 \n 隔开后作为坏行留在盘上，
+    // 读取面照旧跳过；好行与新行完整。
     expect(items.map((m) => m.id)).toEqual(['1', '3']);
-    expect(readFileSync(file, 'utf8').endsWith('\n')).toBe(true);
+    expect(readFileSync(file, 'utf8')).toBe(`${good}\n${fragment}\n${JSON.stringify(msg('3'))}\n`);
   });
 
   it('leaves nothing behind when appending to a missing nested directory', async () => {

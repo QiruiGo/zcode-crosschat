@@ -1,6 +1,5 @@
 /**
  * v0.9.2（A2/A4-c，方案 §二 组A）：**看门狗状态真源**（`.crosschat/capacity/watchdog-state.json`）。
- *
  * 为什么必须有落盘状态：看门狗是 lead MCP server 进程内的定时器——进程死亡后内存里的
  * 「已告警过」标记随之消失，重启后的新一轮会把**同一次死亡**再告警一次（惊动 lead 的
  * 噪音）。A2 的硬口径「仅 alive→dead 迁移发一次」因此以本文件为真源：每轮扫完把成员
@@ -11,6 +10,12 @@
  * 对同一条消息降级；轮次键 = 该消息**本次盖章**的 deliveredAt——同一 (messageId,
  * stampedAt) 只告警一次，重新盖章（新一轮投递）才重新告警。多条降级在各自面内合并成
  * 一条 urgent 告知（不按条轰炸 lead 邮箱）。
+ *
+ * v0.9.3 打回第 1 轮（V093-04）：成员条目新增**告知阶段**三字段（notify / notifyAttempts /
+ * lastNotifyAttemptAt）——「认领死亡」与「通知落地」由此分成两段：锁内只认领
+ * （notify:'pending'），通知发出后才改 'sent'；进程崩在两者之间时，下一轮按 pending
+ * 重发（有间隔与次数上限）。没有这两段时，台账里一句 `state:'dead'` 会把告警链变成
+ * **永不再发**的静音开关（adv-3 C7 实测：零错误面的永久静音）。
  *
  * 纪律（与 capacity/wake-deferred.json 同族）：
  * - 位置在 capacity/ 目录（方案原文指定），与容量采样缓存同目录、同写法（原子整文件）；
@@ -43,6 +48,20 @@ export interface WatchdogMemberState {
   liveness?: string;
   /** dead 时的证据短语（process-dead）。 */
   evidence?: string;
+  /**
+   * v0.9.3 打回第 1 轮（V093-04）：死亡**告知**的阶段（认领与通知两段式的第二段）。
+   * - `pending`：台账已认领这次死亡，但通知（lead 邮箱 urgent + 尽力唤醒）尚未确认落地；
+   * - `sent`：通知已发出（或本成员无需通知——首见存量死记录）；
+   * - `failed`：重发次数用尽仍无人可通知（已落 `watchdog-notify-failed` 事件）。
+   * absent（旧版本/手写文件/陈旧备份恢复）= 按 `pending` 读——**无从证明通知发过就按没发过
+   * 处理**，补发一次（adv-3 C7.1 的「台账说 dead 但通知从未发出」正是这个形态）；补发后
+   * 立刻转 `sent`，不会重复惊动 lead。
+   */
+  notify?: 'pending' | 'sent' | 'failed';
+  /** 重发尝试次数（V093-04；达 WATCHDOG_NOTIFY_MAX_ATTEMPTS 即置 failed）。 */
+  notifyAttempts?: number;
+  /** 最近一次重发尝试时刻（epoch ms）。 */
+  lastNotifyAttemptAt?: number;
 }
 
 /** 一条 limbo 告警节流记录。 */

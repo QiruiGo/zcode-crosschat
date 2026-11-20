@@ -17,6 +17,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import {
+  CHECKPOINT_JOURNAL_MAX_BYTES,
   CHECKPOINT_JOURNAL_TAIL_LINES,
   CHECKPOINT_KEEP_MAX,
   CHECKPOINT_NOTE_MAX_CHARS,
@@ -469,6 +470,88 @@ describe('readTaskJournalTail：末 N 行 / 缺失 / 读取失败都在场', () 
     mkdirSync(join(root, 'tasks', 't-x', 'journal.md'), { recursive: true });
     const tail = await readTaskJournalTail(root, 't-x');
     expect(tail.status).toBe('error');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.9.3（C3）：journal 体积闸——readTaskJournalTail 复用 8 MiB 上限（与 xc_read
+// scope=journal / member-stop 留档同口径），超限不整读、只留占位 + warning。
+// ---------------------------------------------------------------------------
+describe('readTaskJournalTail：体积闸（v0.9.3 C3，34 MiB journal 不整读）', () => {
+  const MIB = 1024 * 1024;
+
+  it('34 MiB journal → status=skipped、lines 空、sizeBytes 如实（一个字节都不读入）', async () => {
+    const taskDir = join(root, 'tasks', 't-huge');
+    mkdirSync(taskDir, { recursive: true });
+    // 34 MiB：方案验收锚点的量级（远超 8 MiB 上限；分块写避免一次 34MB 字符串拼接）。
+    const chunk = Buffer.alloc(MIB, 0x61); // 'a'
+    const { appendFileSync } = await import('node:fs');
+    const file = join(taskDir, 'journal.md');
+    for (let i = 0; i < 34; i += 1) appendFileSync(file, chunk);
+    expect((await import('node:fs')).statSync(file).size).toBe(34 * MIB);
+
+    const tail = await readTaskJournalTail(root, 't-huge');
+    expect(tail.status).toBe('skipped');
+    expect(tail.lines).toEqual([]);
+    expect(tail.sizeBytes).toBe(34 * MIB);
+    expect(tail.displayPath).toBe('.crosschat/tasks/t-huge/journal.md');
+    // 金丝雀不在返回里（没读就是没读）。
+    expect(JSON.stringify(tail)).not.toContain('aaaa');
+  });
+
+  it('边界：恰 8 MiB 仍读（闸不过度遏制）；超 1 字节即跳过', async () => {
+    const { appendFileSync, statSync } = await import('node:fs');
+    const canary = '- 末行金丝雀\n';
+    const canaryBytes = Buffer.byteLength(canary, 'utf8');
+    //  filler 与金丝雀之间必须换行：末 N 行取的是「行」，粘在一起就成了同一行。
+    const okDir = join(root, 'tasks', 't-edge');
+    mkdirSync(okDir, { recursive: true });
+    const okFile = join(okDir, 'journal.md');
+    appendFileSync(okFile, Buffer.alloc(CHECKPOINT_JOURNAL_MAX_BYTES - canaryBytes - 1, 0x62));
+    appendFileSync(okFile, '\n');
+    appendFileSync(okFile, canary);
+    expect(statSync(okFile).size).toBe(CHECKPOINT_JOURNAL_MAX_BYTES); // 恰在上限（<= 放行）
+    const ok = await readTaskJournalTail(root, 't-edge');
+    expect(ok.status).toBe('ok');
+    expect(ok.lines).toContain('- 末行金丝雀');
+
+    const overDir = join(root, 'tasks', 't-over');
+    mkdirSync(overDir, { recursive: true });
+    const overFile = join(overDir, 'journal.md');
+    appendFileSync(overFile, Buffer.alloc(CHECKPOINT_JOURNAL_MAX_BYTES - canaryBytes - 1, 0x62));
+    appendFileSync(overFile, '\n');
+    appendFileSync(overFile, canary);
+    appendFileSync(overFile, 'x'); // +1 byte → 恰超上限 1 字节
+    const over = await readTaskJournalTail(root, 't-over');
+    expect(over.status).toBe('skipped');
+    expect(over.sizeBytes).toBe(CHECKPOINT_JOURNAL_MAX_BYTES + 1);
+  });
+
+  it('writeCheckpoint：超限 journal 不进 markdown（只渲染占位）+ 结果带 journalSkips', async () => {
+    const taskDir = join(root, 'tasks', '86e8b61a-t1');
+    mkdirSync(taskDir, { recursive: true });
+    const { appendFileSync } = await import('node:fs');
+    appendFileSync(join(taskDir, 'journal.md'), Buffer.alloc(CHECKPOINT_JOURNAL_MAX_BYTES + 1024, 0x63));
+
+    const result = await writeCheckpoint(root, data({ journalTails: undefined }));
+    expect(result.journalSkips).toEqual(['86e8b61a-t1']);
+    const markdown = readFileSync(result.path, 'utf8');
+    expect(markdown).toContain('journal 读入被跳过');
+    expect(markdown).toContain('8 MiB 体积上限');
+    expect(markdown).not.toContain('cccc'); // 内容一个字节都没进检查点
+    // 占位不破坏第 4 章结构与七章完整性（写盘事实保持成功）。
+    expect(markdown).toContain('## 4. 最近 journal（每任务末 5 行 + 路径）');
+    expect(markdown).toContain('### 86e8b61a-t1（.crosschat/tasks/86e8b61a-t1/journal.md）');
+    expect(result.bytes).toBeGreaterThan(0);
+  });
+
+  it('正常 journal 不受影响（闸不过度遏制；既有 ok 路径回归）', async () => {
+    const taskDir = join(root, 'tasks', '86e8b61a-t1');
+    mkdirSync(taskDir, { recursive: true });
+    writeFileSync(join(taskDir, 'journal.md'), '- 2026-11-15 17:40 | 完成骨架\n');
+    const result = await writeCheckpoint(root, data({ journalTails: undefined }));
+    expect(result.journalSkips).toBeUndefined();
+    expect(readFileSync(result.path, 'utf8')).toContain('- 2026-11-15 17:40 | 完成骨架');
   });
 });
 

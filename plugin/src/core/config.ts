@@ -31,6 +31,12 @@
  * sessionId、保留 identity），该行此后恒被无头唤醒——G-4/G-7 为交互会话建立的默认
  * 防打扰被文档化恢复流程完全绕开。判据见 {@link engineHolderIsHeadless}。
  *
+ * v0.9.3 增量（reports/37-v093方案.md §一 组B B1）：config.json 增 **capacity 段**
+ * `{warn_watermark, turn_estimate_bytes, wake_gate}`——容量闸三旋钮的 file 层。
+ * 逐键校验（与 wake_enabled 同纪律：非法=该键忽略 + WARNING 披露，绝不静默吞），
+ * 未知键静默忽略（扩展位）；分层解析（file > env > 内置默认）在 core/capacity.ts
+ * {@link resolveCapacityThresholds}（本模块只做文件层解析，不 import 容量阈值面）。
+ *
  * 依赖纪律：本模块只 import M1（core/paths、core/types）——钩子（M4）与引擎
  * （M2）都可安全引用（DESIGN.md §8.1 rule 1 同款）。
  *
@@ -78,8 +84,33 @@ export interface WorkspaceConfigFile {
   present: boolean;
   /** 文件层生效的 wake_enabled（仅布尔合法时收录；畸形/缺省 = undefined）。 */
   wakeEnabled?: boolean;
+  /**
+   * v0.9.3（B1）：文件层生效的 capacity 段（三键各自合法才收录；段缺省 = undefined）。
+   * 逐键畸形披露在 {@link WorkspaceCapacitySection.warnings}（与顶层 warning 分开：
+   * 顶层管整文件/ wake_enabled，段内管三个容量键——「逐层披露」不混通道）。
+   */
+  capacity?: WorkspaceCapacitySection;
   /** 畸形披露（JSON/根形状/键类型错误；正常文件 = undefined）。 */
   warning?: string;
+}
+
+/**
+ * v0.9.3（B1）：config.json `capacity` 段的文件层解析结果。
+ *
+ * 三键与容量闸旋钮一一对应（core/capacity.ts 的 env 名在括号内）：
+ * - `warnWatermark`：red1 可用内存占比预警线（`XC_MEM_WARN_WATERMARK`），合法域 **(0,1)**；
+ * - `turnEstimateBytes`：单回合预估字节（`XC_TURN_ESTIMATE_BYTES`），**>0** 合法；
+ * - `wakeGate`：spawn 前容量闸开关（`XC_MEM_WAKE_GATE`），布尔（false = 关闸）。
+ *
+ * 每个键独立判定：非法值只忽略**该键**（其余键与 wake_enabled 不受影响），并产出一条
+ * WARNING（段整体非对象时只产一条、整段忽略）。未知键静默忽略（扩展位，向前兼容）。
+ */
+export interface WorkspaceCapacitySection {
+  warnWatermark?: number;
+  turnEstimateBytes?: number;
+  wakeGate?: boolean;
+  /** 逐键畸形 WARNING（每条自带 `WARNING ` 前缀，与顶层 warning 同款自标注）。 */
+  warnings?: string[];
 }
 
 /**
@@ -91,6 +122,8 @@ export interface WorkspaceConfigFile {
  * - 根不是 JSON 对象（数组/标量）→ 同上；
  * - `wake_enabled` 在场但非布尔（如字符串 "true"）→ 该键忽略 + WARNING，
  *   其余扩展位键不影响；
+ * - **capacity 段**（v0.9.3 B1）：段缺省 = 未配置（非畸形）；段非对象 → 整段忽略 +
+ *   一条 WARNING；三个键各自校验（非法 = 该键忽略 + 一条 WARNING）；段内未知键静默忽略；
  * - 未知键 → 静默忽略（扩展位，向前兼容）；
  * - 读文件抛出非 ENOENT 的 IO 错误（权限/占用）→ 按畸形回落 + WARNING
  *   （与引擎审计日志不可写的披露口径一致：可观测，不阻断）。
@@ -128,15 +161,80 @@ export function readWorkspaceConfigFile(stateRoot: string): WorkspaceConfigFile 
     };
   }
   const record = parsed as Record<string, unknown>;
+  // v0.9.3（B1）：capacity 段与 wake_enabled 独立解析——段内畸形只波及容量三键，
+  // 顶层畸形（JSON/根形状）整层忽略（两者都可能同时在场，各自披露）。
+  const capacity = parseCapacitySection(record["capacity"]);
   const rawWake = record["wake_enabled"];
-  if (rawWake === undefined) return { present: true }; // 键缺省：文件层不表态（扩展位照读不拒）
+  if (rawWake === undefined) {
+    // 键缺省：文件层不表态（扩展位照读不拒）
+    return { present: true, ...(capacity !== undefined ? { capacity } : {}) };
+  }
   if (typeof rawWake !== "boolean") {
     return {
       present: true,
       warning: `WARNING ${WORKSPACE_CONFIG_FILENAME} 的 wake_enabled 必须是布尔（得到 ${wakeValueKind(rawWake)}）；该键忽略，回落 env/内置默认`,
+      ...(capacity !== undefined ? { capacity } : {}),
     };
   }
-  return { present: true, wakeEnabled: rawWake };
+  return { present: true, wakeEnabled: rawWake, ...(capacity !== undefined ? { capacity } : {}) };
+}
+
+/**
+ * v0.9.3（B1）：capacity 段解析（纯函数；逐键校验 + 逐键披露）。
+ *
+ * - 段缺省（undefined）→ 返回 undefined（未配置，不算畸形——与顶层「文件不存在」同语义）；
+ * - 段非对象（数组/标量/null）→ 整段忽略 + 一条 WARNING（回落 env/内置默认）；
+ * - 三键各自校验，非法值只忽略该键并产出一条 WARNING；未知键静默忽略（扩展位）；
+ * - 返回的 section 恒带至少一个键或一条 warning（全空 = 未配置，由调用方按 undefined 处理）。
+ */
+function parseCapacitySection(raw: unknown): WorkspaceCapacitySection | undefined {
+  if (raw === undefined) return undefined;
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    return {
+      warnings: [
+        `WARNING ${WORKSPACE_CONFIG_FILENAME} 的 capacity 必须是 JSON 对象（得到 ${Array.isArray(raw) ? "数组" : raw === null ? "null" : typeof raw}）；该段忽略，回落 env/内置默认`,
+      ],
+    };
+  }
+  const record = raw as Record<string, unknown>;
+  const section: WorkspaceCapacitySection = {};
+  const warnings: string[] = [];
+  const rawWatermark = record["warn_watermark"];
+  if (rawWatermark !== undefined) {
+    if (typeof rawWatermark === "number" && Number.isFinite(rawWatermark) && rawWatermark > 0 && rawWatermark < 1) {
+      section.warnWatermark = rawWatermark;
+    } else {
+      warnings.push(
+        `WARNING ${WORKSPACE_CONFIG_FILENAME} 的 capacity.warn_watermark 须为 (0,1) 内的有限数（得到 ${wakeValueKind(rawWatermark)}）；该键忽略，回落 env/内置默认`,
+      );
+    }
+  }
+  const rawEstimate = record["turn_estimate_bytes"];
+  if (rawEstimate !== undefined) {
+    if (typeof rawEstimate === "number" && Number.isFinite(rawEstimate) && rawEstimate > 0) {
+      section.turnEstimateBytes = rawEstimate;
+    } else {
+      warnings.push(
+        `WARNING ${WORKSPACE_CONFIG_FILENAME} 的 capacity.turn_estimate_bytes 须为 >0 的有限数（得到 ${wakeValueKind(rawEstimate)}）；该键忽略，回落 env/内置默认`,
+      );
+    }
+  }
+  const rawWakeGate = record["wake_gate"];
+  if (rawWakeGate !== undefined) {
+    if (typeof rawWakeGate === "boolean") {
+      section.wakeGate = rawWakeGate;
+    } else {
+      warnings.push(
+        `WARNING ${WORKSPACE_CONFIG_FILENAME} 的 capacity.wake_gate 必须是布尔（得到 ${wakeValueKind(rawWakeGate)}）；该键忽略，回落 env/内置默认`,
+      );
+    }
+  }
+  if (warnings.length > 0) section.warnings = warnings;
+  if (section.warnWatermark === undefined && section.turnEstimateBytes === undefined
+    && section.wakeGate === undefined && warnings.length === 0) {
+    return undefined; // 纯未知键的段 = 未配置（扩展位，不算畸形）
+  }
+  return section;
 }
 
 /** wake_enabled 非法值的人类可读类型名（WARNING 文案用，不暴露原始值——防撞出长串）。 */

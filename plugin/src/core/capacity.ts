@@ -36,6 +36,12 @@
  * 路径注意：缓存路径由调用方传入；`capacityCacheFile(stateRoot)` 产出
  * `<.crosschat>/capacity/sample.json`（paths.ts 本版不动，构建器放本模块）。
  *
+ * v0.9.3（37-v093 方案 §一 组B B1/B4）增量：容量三旋钮（warn_watermark /
+ * turn_estimate_bytes / wake_gate）的**分层生效值**（file=config.json capacity 段 >
+ * env > 内置默认；每次现读、畸形逐层披露）与配置生效值状态真源
+ * （`capacity/config-state.json`，B4 变更事件的对拍基线）——见本模块
+ * {@link resolveCapacityThresholds} / {@link diffCapacityConfigState}。
+ *
  * @module core/capacity
  */
 import { spawn, type SpawnOptions } from 'node:child_process';
@@ -45,6 +51,9 @@ import { dirname, join } from 'node:path';
 import { writeFileAtomic } from './atomic.js';
 // v0.9.2（C1）：唤醒子命令行标记 = 唤醒 prompt 的冻结回执前缀（单一真源，不另抄字面量）。
 import { RECEIPT_PREFIX } from './mailbox.js';
+// v0.9.3（B1）：capacity 分层配置的 file 层解析（core/config.ts 只依赖 M1 paths/types，
+// 无反向依赖——不成环）。
+import { readWorkspaceConfigFile } from './config.js';
 
 // --- 阈值缺省值（DESIGN §3.3 公式注释；方案 C3 阈值）-------------------------
 
@@ -116,6 +125,245 @@ export function turnEstimateBytesFromEnv(env: NodeJS.ProcessEnv = process.env): 
 export function memSampleMinMsFromEnv(env: NodeJS.ProcessEnv = process.env): number {
   const n = envNumber(env, 'XC_MEM_SAMPLE_MIN_MS');
   return n !== undefined && n >= 0 ? n : MEM_SAMPLE_MIN_MS_DEFAULT;
+}
+
+// --- v0.9.3（B1）capacity 分层配置：file（config.json capacity 段）> env > 内置默认 ----------
+
+/**
+ * v0.9.3（37-v093 方案 §一 组B B1）：容量闸三旋钮的**分层生效值**解析。
+ *
+ * 三键与 config.json `capacity` 段、既有 env 一一对应（键名用配置文件的 snake_case，
+ * 与事件/状态文件的机器可读面一致）：
+ * - `warn_watermark`：red1 预警线（env `XC_MEM_WARN_WATERMARK`，合法域 (0,1)，缺省 0.15）；
+ * - `turn_estimate_bytes`：单回合预估（env `XC_TURN_ESTIMATE_BYTES`，>0，缺省 1.5GB）；
+ * - `wake_gate`：容量闸开关（env `XC_MEM_WAKE_GATE`，`off`=关，缺省开）。
+ *
+ * 纪律（与唤醒分层 file > env > 默认同款）：
+ * - **每次现读**（config.json 无缓存）——改文件即热生效，不需要重启（G-6 核心诉求）；
+ * - **畸形逐层披露**：file 层逐键畸形（core/config.ts 已判）+ env 层越界/非法
+ *   （`fellBack` 家族同款两级口径的第一级）都进 {@link CapacityThresholds.warnings}，
+ *   由唤醒闸面落 engine 事件、观测面进 payload——绝不静默；
+ * - **0 新增必填**：三段全部可选，任何一层缺席都照默认工作。
+ */
+export type CapacityConfigSource = 'file' | 'env' | 'default';
+
+/** capacity 配置键名（config.json 段内的 snake_case；事件与状态文件同款）。 */
+export type CapacityConfigKey = 'warn_watermark' | 'turn_estimate_bytes' | 'wake_gate';
+
+export interface CapacityThresholds {
+  /** red1 生效预警线（占比）。 */
+  warnWatermark: number;
+  /** 单回合预估生效字节。 */
+  turnEstimateBytes: number;
+  /** spawn 前容量闸生效开关（false = 关闸，回到「只警不拦」）。 */
+  wakeGate: boolean;
+  /** 每个键的生效来源（诊断：这次判定听谁的）。 */
+  sources: Record<CapacityConfigKey, CapacityConfigSource>;
+  /** 逐层畸形/越界披露（file 键畸形 + env 非法；空数组 = 各层都干净）。 */
+  warnings: string[];
+  /** 仅 file 层披露（capacity 段逐键畸形）——容量闸面落 `config-malformed` 事件用，
+   * 与 env 层披露分开（后者在观测面已有 memWarnWatermarkFallback 两级通道）。 */
+  fileWarnings: string[];
+  /** env 原值（未设/空串 = null——「没配」与「配错」可分辨，V091-18 同款口径）。 */
+  envRaw: Record<CapacityConfigKey, string | null>;
+  /** file 层 capacity 段是否在场（含畸形在场；诊断用）。 */
+  fileCapacityPresent: boolean;
+}
+
+/** 容量键的人可读来源标签（detail 文案用：值来自哪一层就写哪一层，不虚标 env 名）。 */
+export function capacityThresholdLabel(key: CapacityConfigKey, source: CapacityConfigSource): string {
+  const envName = key === 'warn_watermark' ? 'XC_MEM_WARN_WATERMARK'
+    : key === 'turn_estimate_bytes' ? 'XC_TURN_ESTIMATE_BYTES'
+      : 'XC_MEM_WAKE_GATE';
+  return source === 'file' ? `config.json capacity.${key}` : envName;
+}
+
+/** env 层的 turn_estimate_bytes 信息（合法 >0 才生效；非法/未设回落缺省并标记）。 */
+export function turnEstimateBytesInfoFromEnv(env: NodeJS.ProcessEnv = process.env): { value: number; fellBack: boolean } {
+  const raw = env['XC_TURN_ESTIMATE_BYTES'];
+  const provided = typeof raw === 'string' && raw.trim() !== '';
+  const n = provided ? Number(raw) : Number.NaN;
+  const valid = Number.isFinite(n) && n > 0;
+  return { value: valid ? n : TURN_ESTIMATE_DEFAULT_BYTES, fellBack: provided && !valid };
+}
+
+/**
+ * 分层解析容量三旋钮（每次现读；唤醒闸与 overview 挂载共用同一真源）。
+ *
+ * env 层判据与既有纯 env 函数**逐字一致**（`memWarnWatermarkInfoFromEnv` /
+ * `turnEstimateBytesInfoFromEnv` / `wakeCapacityGateEnabledFromEnv` 的语义平移）——
+ * 本函数只叠加 file 层与披露，不改变任何一层的既有取值行为。
+ */
+export function resolveCapacityThresholds(
+  stateRoot: string,
+  env: NodeJS.ProcessEnv = process.env,
+): CapacityThresholds {
+  const file = readWorkspaceConfigFile(stateRoot);
+  const section = file.capacity;
+  const fileWarnings: string[] = [...(section?.warnings ?? [])];
+  const warnings: string[] = [...fileWarnings];
+
+  // warn_watermark：file > env > 0.15
+  const envWatermark = memWarnWatermarkInfoFromEnv(env);
+  const warnWatermark = section?.warnWatermark ?? envWatermark.watermark;
+  const watermarkSource: CapacityConfigSource =
+    section?.warnWatermark !== undefined ? 'file' : envWatermark.fellBack ? 'default' : env['XC_MEM_WARN_WATERMARK'] !== undefined && String(env['XC_MEM_WARN_WATERMARK']).trim() !== '' ? 'env' : 'default';
+  if (section?.warnWatermark === undefined && envWatermark.fellBack) warnings.push(MEM_WATERMARK_FALLBACK_WARNING);
+
+  // turn_estimate_bytes：file > env > 1.5GB
+  const envEstimate = turnEstimateBytesInfoFromEnv(env);
+  const turnEstimateBytes = section?.turnEstimateBytes ?? envEstimate.value;
+  const estimateSource: CapacityConfigSource =
+    section?.turnEstimateBytes !== undefined ? 'file' : envEstimate.fellBack ? 'default' : env['XC_TURN_ESTIMATE_BYTES'] !== undefined && String(env['XC_TURN_ESTIMATE_BYTES']).trim() !== '' ? 'env' : 'default';
+  if (section?.turnEstimateBytes === undefined && envEstimate.fellBack) {
+    warnings.push(
+      `WARNING XC_TURN_ESTIMATE_BYTES 非法（须为 >0 的有限数；0/负数/非数字不被接受）`
+      + `——已回落内置缺省 ${TURN_ESTIMATE_DEFAULT_BYTES}（单回合预估字节；v0.9.1 起兼作容量闸边际预估判据）；如只想用缺省值请取消该 env 设置`,
+    );
+  }
+
+  // wake_gate：file > env（off=关）> 默认开
+  const rawGate = env['XC_MEM_WAKE_GATE'];
+  const gateProvided = typeof rawGate === 'string' && rawGate.trim() !== '';
+  const envGate = gateProvided ? rawGate.trim().toLowerCase() !== 'off' : undefined;
+  const wakeGate = section?.wakeGate ?? envGate ?? true;
+  const gateSource: CapacityConfigSource =
+    section?.wakeGate !== undefined ? 'file' : envGate !== undefined ? 'env' : 'default';
+
+  const envRaw = (key: CapacityConfigKey): string | null => {
+    const raw = env[key === 'warn_watermark' ? 'XC_MEM_WARN_WATERMARK' : key === 'turn_estimate_bytes' ? 'XC_TURN_ESTIMATE_BYTES' : 'XC_MEM_WAKE_GATE'];
+    return raw === undefined || raw.trim() === '' ? null : raw;
+  };
+
+  return {
+    warnWatermark,
+    turnEstimateBytes,
+    wakeGate,
+    sources: {
+      warn_watermark: watermarkSource,
+      turn_estimate_bytes: estimateSource,
+      wake_gate: gateSource,
+    },
+    warnings,
+    fileWarnings,
+    envRaw: {
+      warn_watermark: envRaw('warn_watermark'),
+      turn_estimate_bytes: envRaw('turn_estimate_bytes'),
+      wake_gate: envRaw('wake_gate'),
+    },
+    fileCapacityPresent: section !== undefined,
+  };
+}
+
+// --- v0.9.3（B4）配置生效值状态真源（capacity/config-state.json）---------------------------
+
+/**
+ * B4 的状态文件：`<stateRoot>/capacity/config-state.json`——上次现读的容量三键生效值。
+ * 用途 = 变更对拍的基线（防刷屏）：每次现读与上次比对，只在实际变化时落事件。
+ * 与 wake-deferred.json / watchdog-state.json 同族：capacity/ 目录内、原子整文件、
+ * 损坏按「无历史」重立基线（观测面永不因状态文件坏掉而停止工作）。
+ */
+export function capacityConfigStateFile(stateRoot: string): string {
+  return join(dirname(capacityCacheFile(stateRoot)), 'config-state.json');
+}
+
+/** config-state.json 形状（version 1）。 */
+export interface CapacityConfigState {
+  version: 1;
+  /** 上次观测时刻（epoch ms）。 */
+  observedAt: number;
+  /** 三键上次生效值（缺失键 = 从未收录，按 undefined 处理）。 */
+  values: Record<CapacityConfigKey, number | boolean | undefined>;
+  /** 三键上次生效来源。 */
+  sources: Record<CapacityConfigKey, CapacityConfigSource | undefined>;
+}
+
+/** 一条生效值变更（B4 事件 `config-effective-changed` 的字段来源）。 */
+export interface CapacityConfigChange {
+  key: CapacityConfigKey;
+  /** 上次生效值（null = 状态文件里没有该键的历史）。 */
+  from: number | boolean | null;
+  /** 本次生效值。 */
+  to: number | boolean;
+  /** 本次生效来源（file/env/default）。 */
+  source: CapacityConfigSource;
+}
+
+/** 读状态（损坏/版本不匹配/缺字段 → null = 无历史）。永不抛。 */
+export async function readCapacityConfigState(stateRoot: string): Promise<CapacityConfigState | null> {
+  try {
+    const parsed = JSON.parse(await readFile(capacityConfigStateFile(stateRoot), 'utf8')) as Record<string, unknown>;
+    if (parsed['version'] !== 1) return null;
+    const values = parsed['values'];
+    const sources = parsed['sources'];
+    if (values === null || typeof values !== 'object' || Array.isArray(values)) return null;
+    return {
+      version: 1,
+      observedAt: Number.isFinite(Number(parsed['observedAt'])) ? Number(parsed['observedAt']) : 0,
+      values: values as CapacityConfigState['values'],
+      sources: (sources !== null && typeof sources === 'object' && !Array.isArray(sources)
+        ? sources
+        : {}) as CapacityConfigState['sources'],
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** 写状态（原子整文件；best-effort——失败不阻断唤醒判定，最坏下次重立基线）。 */
+export async function writeCapacityConfigState(stateRoot: string, state: CapacityConfigState): Promise<void> {
+  try {
+    await mkdir(dirname(capacityConfigStateFile(stateRoot)), { recursive: true });
+    await writeFileAtomic(capacityConfigStateFile(stateRoot), `${JSON.stringify(state, null, 2)}\n`);
+  } catch {
+    /* best-effort 台账 */
+  }
+}
+
+/**
+ * B4：现读生效值 ↔ 上次状态比对（防刷屏的真源）。
+ *
+ * 语义：
+ * - **无历史**（缺文件/损坏/版本不匹配）→ 静默立基线（写当前值、返回空数组）——
+ *   首次观测不是「变更」，不惊动运营面；
+ * - 有历史且某键生效值不同 → 该键进 {@link CapacityConfigChange}（from/to/source），
+ *   状态整体前移（observedAt=now）；
+ * - 无变化 → 不写文件、返回空数组（零事件零 IO）。
+ *
+ * 调用方（engine/wake.ts 容量闸段）把返回的 changes 逐条落
+ * `config-effective-changed{key, from, to, source}` 事件。
+ */
+export async function diffCapacityConfigState(
+  stateRoot: string,
+  thresholds: CapacityThresholds,
+  now: number = Date.now(),
+): Promise<CapacityConfigChange[]> {
+  const previous = await readCapacityConfigState(stateRoot);
+  const current: CapacityConfigState = {
+    version: 1,
+    observedAt: now,
+    values: {
+      warn_watermark: thresholds.warnWatermark,
+      turn_estimate_bytes: thresholds.turnEstimateBytes,
+      wake_gate: thresholds.wakeGate,
+    },
+    sources: { ...thresholds.sources },
+  };
+  if (previous === null) {
+    await writeCapacityConfigState(stateRoot, current); // 首访立基线，无事件
+    return [];
+  }
+  const changes: CapacityConfigChange[] = [];
+  for (const key of ['warn_watermark', 'turn_estimate_bytes', 'wake_gate'] as const) {
+    const to = current.values[key];
+    const from = previous.values[key];
+    if (to === undefined) continue;
+    if (from === to) continue;
+    changes.push({ key, from: from ?? null, to, source: current.sources[key] ?? 'default' });
+  }
+  if (changes.length === 0) return []; // 不变更：零事件、零写入
+  await writeCapacityConfigState(stateRoot, current);
+  return changes;
 }
 
 // --- 进程行与分类（E3 ps-procs.ps1 口径的 TS 平移）---------------------------
@@ -355,20 +603,31 @@ export interface CapacityVerdict {
 
 /**
  * 预警公式（DESIGN §3.3；纯函数，只吃样本不触 os）：
- * - red1：watermark < XC_MEM_WARN_WATERMARK（缺省 0.15）
- * - red2：max(headless-turn 单进程 WS) > XC_MEM_SESSION_LIMIT_BYTES（缺省 800MB）
- * - red3：headlessTurnCount × XC_TURN_ESTIMATE_BYTES > freeBytes（缺省 1.5GB/回合）
+ * - red1：watermark < 预警线（缺省 0.15）
+ * - red2：max(headless-turn 单进程 WS) > 上限（缺省 800MB）
+ * - red3：headlessTurnCount × 单回合预估 > freeBytes（缺省 1.5GB/回合）
  * degraded 样本只评 red1（进程类规则无数据不评），detail 说明降级。
+ *
+ * v0.9.3（B1）：`thresholds` 可选传入分层生效值（`resolveCapacityThresholds` 的产物）——
+ * 传入时 red1/red3 的阈值与 detail 里的来源标签都听分层的（file 层在场时写
+ * config.json 而不是 env 名，不虚标）；缺省 = 既有 env 口径（零行为变化）。
  */
-export function judgeCapacity(s: CapacitySample, env: NodeJS.ProcessEnv = process.env): CapacityVerdict {
+export function judgeCapacity(
+  s: CapacitySample,
+  env: NodeJS.ProcessEnv = process.env,
+  thresholds?: Pick<CapacityThresholds, 'warnWatermark' | 'turnEstimateBytes' | 'sources'>,
+): CapacityVerdict {
   const violated: CapacityViolatedRule[] = [];
   const detail: string[] = [];
-  const warn = memWarnWatermarkFromEnv(env);
+  const warn = thresholds?.warnWatermark ?? memWarnWatermarkFromEnv(env);
+  const warnLabel = thresholds === undefined
+    ? 'XC_MEM_WARN_WATERMARK'
+    : capacityThresholdLabel('warn_watermark', thresholds.sources.warn_watermark);
   if (s.watermark < warn) {
     violated.push('watermark');
     detail.push(
       `watermark: 可用内存 ${(s.watermark * 100).toFixed(1)}% < 预警线 ${(warn * 100).toFixed(1)}%`
-        + `（XC_MEM_WARN_WATERMARK；可用 ${formatBytes(s.freeBytes)} / 总 ${formatBytes(s.totalBytes)}）`,
+        + `（${warnLabel}；可用 ${formatBytes(s.freeBytes)} / 总 ${formatBytes(s.totalBytes)}）`,
     );
   }
   if (s.degraded === null && s.headlessTurnMaxRssBytes !== null) {
@@ -382,12 +641,15 @@ export function judgeCapacity(s: CapacitySample, env: NodeJS.ProcessEnv = proces
     }
   }
   if (s.degraded === null && s.headlessTurnCount > 0) {
-    const estimate = turnEstimateBytesFromEnv(env);
+    const estimate = thresholds?.turnEstimateBytes ?? turnEstimateBytesFromEnv(env);
+    const estimateLabel = thresholds === undefined
+      ? 'XC_TURN_ESTIMATE_BYTES'
+      : capacityThresholdLabel('turn_estimate_bytes', thresholds.sources.turn_estimate_bytes);
     if (s.headlessTurnCount * estimate > s.freeBytes) {
       violated.push('turn-concurrency');
       detail.push(
         `turn-concurrency: 并发 headless 回合 ${s.headlessTurnCount} × 单回合预估 ${formatBytes(estimate)}`
-        + ` > 可用 ${formatBytes(s.freeBytes)}（XC_TURN_ESTIMATE_BYTES；建议减少并发回合或让成员休眠）`,
+        + ` > 可用 ${formatBytes(s.freeBytes)}（${estimateLabel}；建议减少并发回合或让成员休眠）`,
       );
     }
   }
