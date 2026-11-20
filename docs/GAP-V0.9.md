@@ -200,3 +200,24 @@ master 雷达会话（被 cron/wake 反复无头唤醒）4 次用户语音盖章
 - CreateSession「Project is unavailable」与 ReadSession「App control failed」疑同根=**appserver 项目/会话路由表重启后未恢复**（ListProjects 读静态配置所以正常→路由表与配置两个源，重启后分歧）；⑧ 的 11:46 静默→11:47 续上符合 appserver 中途回收重建；34 个 ZCode.exe 命令行无 appserver 字样（appserver 大概率是 13 个 node 之一）。
 - SendToSession queued/accepted 对 idle 会话不触发回合（G-1 同根）：④ 实证（model-io 11:51:44 一条 2.9s 回合）；③ 跑过一轮（11:41 合并 !8432）但 model-io 无文件=记录丢失疑点，待查。
 - 恢复序列（监督侧建议）：UI 手动踢是唯一确认可用路径但延迟大（④ 40min）；内存抬过 15% 后 wake 自动恢复（120s 重判，无需人工）；确认聋掉的会话 xc_identify 重绑或重建成员。
+
+
+---
+
+## 第十批勘误（2026-11-20 12:3x，用户令「不能完全基于主控的判断走，需先审核现状有自己的判断」——监督侧对总调度 11 时段通报逐条取证的结论）
+
+**审核方法**：引擎日志（事件时序）+ 邮箱文件（deliveredAt/readAt/consumedAt 三态）+ git 实迹（提交者身份+时间戳）+ rollout model-io。7 条 headline claims 分级：**2 条被推翻、1 条关键前提无证据支持且 git 反向、2 条证实、2 条无法验证**。
+
+| 主控叙述 | 审核结论 | 证据 |
+|---|---|---|
+| ④重启后零模型调用 | **推翻** | model-io-sess_c5fa1521.jsonl 有 1 条：11:51:44、2.9s、glm-5.3（主控查得早） |
+| ③仅一轮（11:41 止，即误合 !8432 那轮） | **推翻** | form-fix-3 11:57:38 又报 t94 in_progress，并非 11:41 后静默 |
+| ③在停止令到达前合入 !8432 | **无证据支持，git 反向** | 内容提交"母版加浓度兜底公式+升版 v2.1.1"作者=**吕其睿（人类）**：MR 分支 10:52:58 + deploy-dev 侧 12:00:54；**deploy-dev 在 11:41 前后零合并**（最早 12:07 liute）；11:33-11:52 全网提交全人类身份，无任何会话身份提交/合并 |
+| takeover 干净 | **证实** | member-takeover 事件 revokedTasks:[] |
+| 停止令（urgent relay 未读） | **证实且更严重** | 11:37:59 急令 + 11:41:53 返工令均为 **claimed 未投递**（deliveryClaimedAt 有/deliveredAt 无/readAt 无）= 根本没投送，不是"到迟" |
+| 重启清空排队指令 | 无法验证 | 无引擎可见性（宿主侧队列） |
+| CreateSession/ReadSession 病灶 | 无法验证 | 宿主层，维持"疑 appserver 路由表"假设 |
+
+**对 G-20 及整改方向的影响**：主控"控制指令时效第三次实锤"叙事建立在未证实的"先合后停"前提上，应降级；今天真正证实的机制是 **claimed 未投递态急令永久丢失**（与 11-19 E100 POC 6 条同态；v0.9.1 容量闸拦 wake 后"wake 子进程认领即死"成为新触发路径——G-19 的又一实例）。整改应从"控制令时效纪律"转向：①claimed 未投递消息的补投/重发机制（t94/t96 两条仍卡在 form-fix-3 邮箱）；②v0.9.1 的 consumedAt ack 不覆盖 claimed 态，需明确该态的超时降级规则；③对会话自述（in_progress 回报声称"已合入"类）需 git 对账后才可入台账。
+
+**流程教训（已入监督纪律）**：被监督会话的事实性叙述须先对 ground-truth 取证再采纳，分级标注（已证实/未证实/已推翻），整改建议只建立在已证实前提上。
