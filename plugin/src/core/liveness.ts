@@ -31,6 +31,11 @@
  * 口径——state + stateAgeMin + lastEventAgeMin（三视图同源同形，跨面一致性由
  * 本模块单一实现保证）。
  *
+ * v0.9.3（C1 活性四判据合判）：视图增 `livenessSources`——hooks/pid、registry
+ * lastSeen、engine 事件（证言）、mailbox 写入 mtime 四判据各自独立可判活，合成结论
+ * 如实列出依据；全静默 = 空列表（unknown，`state` 落保守 idle），`dead` 仍只认
+ * pid-dead。合判只服务展示面：清扫豁免输入不变（仍只认证言，sweepOwnerGuard）。
+ *
  * @module core/liveness
  */
 import { memberLiveness } from './offline.js';
@@ -81,6 +86,34 @@ export function applyLivenessTransition(
   };
 }
 
+/**
+ * v0.9.3（C1）：活性四判据的判据来源标识（固定序，跨面稳定可对拍）。
+ *
+ * 判据与读取面（本模块纯函数不做 I/O，落盘读取在调用方）：
+ * 1. `hooks-pid`：第①判据——hooks 自述（`registry/sessions/<sid>.json` 的 `liveness`）
+ *    + peer 扫描的进程事实（`endpointLive` / `pid-dead`）；v0.9 起就有的那一项；
+ * 2. `registry-lastSeen`：第②判据——会话记录的 `lastSeen`（`registry/sessions/<sid>.json`，
+ *    SessionStart / UserPromptSubmit 钩子经 refreshSessionLastSeen 刷新的「上次见过」；
+ *    `team.json` 花名册的 `lastSeen` 是建员/注册时刻的粗粒度值，**不作**新鲜度判据）；
+ * 3. `engine-events`：第③判据——引擎证言 `registry/witness/<sid>.json`（与清扫豁免
+ *    **同一读取路径**、同一文件；豁免仍只认证言，见 {@link sweepOwnerGuard}）；
+ * 4. `mailbox-mtime`：第④判据——成员邮箱文件（`teams/<teamId>/inbox/<key>.jsonl`）
+ *    的写入 mtime：投递、消费确认回写都在动这个文件。
+ */
+export type LivenessCriterion =
+  | 'hooks-pid'
+  | 'registry-lastSeen'
+  | 'engine-events'
+  | 'mailbox-mtime';
+
+/**
+ * 第②③④判据的新鲜窗（ms）——与 stale 清扫阈值的内置缺省同宽（30min，
+ * `core/snapshot.ts DEFAULT_STALE_TASK_MINUTES`）。**只服务活性合判的展示面**：
+ * 清扫豁免仍由 {@link sweepOwnerGuard} 用自己的 2×阈值上界裁决（口径不变），本窗
+ * 不是豁免输入。调用方（mcp/tools-overview.ts）按 env 解析后注入，core 不解析 env。
+ */
+export const LIVENESS_EVIDENCE_FRESH_MS = 30 * 60_000;
+
 /** 三视图统一口径的成员活性视图（team/panel/status 同形，跨面一致）。 */
 export interface SessionLivenessView {
   state: SessionLivenessState;
@@ -95,6 +128,29 @@ export interface SessionLivenessView {
    * 裁决 case1r3/case7br3 实证）。保留字段供 lead 观测「自述 vs 端点」的并列事实。
    */
   endpointLive: boolean;
+  /**
+   * v0.9.3（C1）：**四判据合判**——本次结论实际依据的**新鲜**证据来源（固定序）。
+   *
+   * - 四判据各自单独可判活：任一判据有新鲜证据即出现在列表里（G-9 的本体诉求——
+   *   `lastSeen` 停滞不再等同于「没有证据」，邮箱还在被写也不再看不见）；
+   * - **空列表 = 全静默（unknown）**：四判据全无声 → 既不自称 running，也不判 dead，
+   *   `state` 按保守口径落 `idle`（不给清扫豁免，见 {@link sweepOwnerGuard}）；
+   * - `dead`（pid-dead 硬证据）压过一切活证据：判死时列表为空——pid-dead 是「不活」
+   *   的证据，不是活证据；
+   * - 列表是**展示面合成**：不清扫豁免、不改 `state` 语义（`state` 仍是 hooks 回合
+   *   三态的自述），只回答「这个结论是拿什么判据合出来的」。
+   */
+  livenessSources: LivenessCriterion[];
+}
+
+/** v0.9.3（C1）：四判据合判的注入输入（第③④判据的落盘读取在调用方；本模块无 I/O）。 */
+export interface LivenessJudgeInput {
+  /** 引擎证言（`registry/witness/<sid>.json`；第③判据；undefined = 无证言）。 */
+  witness?: SessionWitness;
+  /** 成员邮箱文件的写入 mtime（epoch ms；第④判据；undefined = 读不到/不判）。 */
+  mailboxMtimeMs?: number;
+  /** 第②③④判据的新鲜窗（ms；缺省 {@link LIVENESS_EVIDENCE_FRESH_MS}）。 */
+  freshMs?: number;
 }
 
 /** 分钟取整展示（仅可信时刻；未来值不钳 0 展示——伪造的 lastEventTs 不进观测面）。 */
@@ -104,7 +160,8 @@ function ageMin(now: number, ts: number | undefined): number | null {
 }
 
 /**
- * 成员活性视图组装（纯函数；记录与 peer 扫描由调用方读取——本模块不做 I/O）。
+ * 成员活性视图组装（纯函数；记录、peer 扫描、证言与邮箱 mtime 由调用方读取——本模块
+ * 不做 I/O）。
  *
  * - `dead` 判据复用 C8（offline.memberLiveness 的 pid-dead；scan 缺失 = 扫描面
  *   不可用，退化按记录状态呈现——观测面永不为难，不猜进程死）；
@@ -113,25 +170,51 @@ function ageMin(now: number, ts: number | undefined): number | null {
  *   恒由 applyLivenessTransition 同步落状态时刻）——`running` 而无时刻/时刻在未来
  *   = 伪造或损坏，按 `idle` 呈现与豁免判定（保守：不给清扫豁免）；
  * - `endpointLive`：peer 注册表端点心跳证词（state 的自述 vs 进程事实并列展示，
- *   伪造 running 在三视图可见）。
+ *   伪造 running 在三视图可见）；
+ * - v0.9.3（C1）：`livenessSources` 四判据合判（见该字段注释）——判活证据的**展示面**
+ *   合成，`state` 与清扫豁免口径均不变（豁免只认证言，见 {@link sweepOwnerGuard}）。
+ *   证言判据不继承自述的 5min 未来容差（r4 V090-02：证言与判定同机同钟，`ts > now`
+ *   即拒）。
  */
 export function memberLivenessView(
   member: TeamMember,
   record: SessionRecord | undefined,
   scan: PeerScanResult | undefined,
   now: number,
+  judge: LivenessJudgeInput = {},
 ): SessionLivenessView {
   const liveness = scan !== undefined ? memberLiveness(member, scan, now) : null;
   const dead = liveness === 'pid-dead';
   const endpointLive = liveness === 'live';
   const runningTrusted = record?.liveness === 'running' && plausibleLivenessTs(record.livenessTs, now);
   const state: SessionLivenessState = dead ? 'dead' : runningTrusted ? 'running' : 'idle';
+  const freshMs = judge.freshMs ?? LIVENESS_EVIDENCE_FRESH_MS;
+  // 时间型判据的可信度前置（与自述字段同纪律：有限正数、非未来值），防伪造未来时刻
+  // 制造「恒新鲜」的假证据。
+  const fresh = (ts: number | undefined): boolean =>
+    plausibleLivenessTs(ts, now) && now - ts! <= freshMs;
+  const sources: LivenessCriterion[] = [];
+  if (!dead) {
+    // 第①判据：hooks 自述 running（带可信时刻）或 peer 扫描端点活。
+    if (runningTrusted || endpointLive) sources.push('hooks-pid');
+    // 第②判据：registry 会话记录的 lastSeen 新鲜（SessionStart/UserPromptSubmit 钩子
+    // 经 refreshSessionLastSeen 刷新的「上次见过」——不是「正在运转」，只作判活证据）。
+    if (fresh(record?.lastSeen)) sources.push('registry-lastSeen');
+    // 第③判据：引擎证言在窗内（容差 0——证言是引擎写入时刻，同机同钟无漂移场景）。
+    if (judge.witness !== undefined && judge.witness.ts <= now && now - judge.witness.ts <= freshMs) {
+      sources.push('engine-events');
+    }
+    // 第④判据：邮箱文件写入新鲜（投递/消费确认都在动它；他人投递不算属主心跳的
+    // §12.4 口径不变——这里只作展示面判活证据，不作豁免输入）。
+    if (fresh(judge.mailboxMtimeMs)) sources.push('mailbox-mtime');
+  }
   return {
     state,
     // dead 是扫描时刻的派生事实，无落盘进入时刻；可信的 record 状态才可算年龄。
     stateAgeMin: dead || !runningTrusted ? null : ageMin(now, record?.livenessTs),
     lastEventAgeMin: ageMin(now, record?.lastEventTs),
     endpointLive,
+    livenessSources: sources,
   };
 }
 

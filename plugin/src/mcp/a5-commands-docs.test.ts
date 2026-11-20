@@ -326,14 +326,17 @@ describe('A5 文档：无 PreCompact，故用提醒+一键（ACCEPT15-1 文档�
 // 8. 版本五处统一（AC6 静态面）
 // ---------------------------------------------------------------------------
 
-describe('A5 版本五处统一 0.9.2', () => {
-  it('package.json / plugin.json / marketplace.json / server.ts 四处 = 0.9.2', () => {
-    expect(JSON.parse(readRel('plugin/package.json')).version).toBe('0.9.2');
-    expect(JSON.parse(readRel('plugin/.zcode-plugin/plugin.json')).version).toBe('0.9.2');
-    expect(JSON.parse(readRel('marketplace.json')).plugins[0].version).toBe('0.9.2');
-    expect(readRel('plugin/src/mcp/server.ts')).toContain('const SERVER_VERSION = "0.9.2"');
+describe('A5 版本五处统一 0.9.3', () => {
+  it('package.json / plugin.json / marketplace.json / server.ts 四处 = 0.9.3', () => {
+    expect(JSON.parse(readRel('plugin/package.json')).version).toBe('0.9.3');
+    expect(JSON.parse(readRel('plugin/.zcode-plugin/plugin.json')).version).toBe('0.9.3');
+    expect(JSON.parse(readRel('marketplace.json')).plugins[0].version).toBe('0.9.3');
+    expect(readRel('plugin/src/mcp/server.ts')).toContain('const SERVER_VERSION = "0.9.3"');
   });
 
+  // v0.9.3 集成注：第五处（README 安装段/版本记录）仍钉 0.9.2——README 未随本次版本
+  // 冻结改写（发布 lane 的活：就地改资产名与版本记录 bullet，并同步本断言为 0.9.3）。
+  // 四处版本文件已 0.9.3，本断言与 README 现状相符故绿；改 README 必须同步改这里。
   it('README 安装段与版本记录指向 0.9.2（第五处）', () => {
     const readme = readRel('README.md');
     expect(readme).toContain('zcode-crosschat-0.9.2-prebuilt-slim.tar.gz');

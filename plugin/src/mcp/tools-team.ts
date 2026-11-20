@@ -38,6 +38,7 @@ import { getTask, leadKeyOf, memberOpenTasks, newTeamState, readTeam, sortTasksF
 import { taskJournalPath, writeArchive } from "../core/archive.js";
 // v0.8.0（A1，DESIGN-V0.8.md §3）：checkpoint 服务端落盘 + 容量水位推导（与 handoff/status 共用同一助手）。
 import {
+  CHECKPOINT_JOURNAL_MAX_BYTES,
   capacityViewOf,
   checkpointStamp,
   checkpointUnreadRef,
@@ -1527,6 +1528,14 @@ export async function handleTeamCheckpoint(deps: ToolDeps, args: { note?: string
         pruned: result.pruned,
         pruneError: result.pruneError,
       });
+    }
+    // v0.9.3（C3）：journal 体积超限未读入——检查点第 4 章只留占位，此处把同一条 warning
+    // 透出到 payload `warnings[]`（与 unread 读取失败同渠道；§14.1 既有可选键，不增键）。
+    if (result.journalSkips !== undefined && result.journalSkips.length > 0) {
+      warnings.push(
+        `journal 读入被跳过：超过 ${CHECKPOINT_JOURNAL_MAX_BYTES / 1048576} MiB 体积上限`
+        + `（task ${result.journalSkips.join(", ")}）——请切分/归档该 journal 后再写检查点`,
+      );
     }
     // v0.8.1（C1-B01）：排他落盘实际撞名进位——同毫秒并发的可见信号（payload 不加键：
     // §14.1 冻结形状不增不减，披露走审计事件）。

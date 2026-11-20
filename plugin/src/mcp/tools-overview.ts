@@ -28,6 +28,7 @@
  * - 无需注册即可调用（只读纪律，SKILL §1 保留）。
  */
 
+import { stat } from "node:fs/promises";
 import { z } from "zod";
 import { invalidParamsError, okResult, ToolError, type ToolResult } from "./protocol.js";
 import {
@@ -41,7 +42,9 @@ import {
   type StatusSnapshot,
 } from "./render.js";
 import { identityStore } from "./identity.js";
-import { engineLogFile, isValidTeamId } from "../core/paths.js";
+import { engineLogFile, inboxFile, isValidTeamId } from "../core/paths.js";
+// v0.9.3（A2）：唤醒三级指标（判据与取数的单一真源在 engine/wake.ts）。
+import { readWakeTierCounts, wakeTierCountsLine } from "../engine/wake.js";
 import { readTeam } from "../core/teamstate.js";
 import { sortTasksForBoard } from "../core/teamstate.js";
 import { orphanTaskIds, readMailbox, staleCompletedReceiptTaskIds } from "../core/mailbox.js";
@@ -70,10 +73,14 @@ import {
   judgeCapacity,
   memWarnWatermarkInfoFromEnv,
   MEM_WATERMARK_FALLBACK_WARNING,
+  resolveCapacityThresholds,
   sampleCapacity,
   type CapacitySample,
+  type CapacityThresholds,
   type CapacityVerdict,
 } from "../core/capacity.js";
+// v0.9.3（B2）：闸状态读数（engine/wake.ts 容量闸段的单一真源——team/status/panel 同源）。
+import { wakeGateStatus, type WakeGateStatus } from "../engine/wake.js";
 // v0.8.0（A3/A4）：时间线尾部窗口读 + 事件族归一化；checkpoint 年龄/容量 level 推导助手。
 // v0.8.1（C3-B4）：timelineTextField——文本视图控制字符清洗（JSON payload 不洗）。
 import { readTimeline, timelineTextField } from "../core/timeline.js";
@@ -89,6 +96,11 @@ void invalidParamsError;
 // C3 容量挂载（M6）：惰性采样 + 判定（DESIGN-V0.6.md §3.3）。
 // 只在 overview 调用时采样（无定时器）；采样/判定任何意外都降级为「不挂载」——
 // 观测面永不为难任务板（安全底线：不崩）。
+//
+// v0.9.3（B2）：挂载补**闸状态**（唤醒闸读数 wakeGateStatus，engine/wake.ts 容量闸段）——
+// 当前水位/单回合预估/阻塞原因（哪个条件命中）/下次重判时刻/本窗 wake-deferred 计数，
+// team/status/panel 三视图同源（同一份读数进同一份 payload 与同一行文本）。
+// 分层阈值（config.json capacity 段 > env > 缺省）同时进判定与展示——改文件即热生效。
 // ---------------------------------------------------------------------------
 
 interface CapacityMount {
@@ -96,12 +108,47 @@ interface CapacityMount {
   lines: string[];
 }
 
+/** 闸状态摘要行片段（拼在 capacity 行尾；GREEN 不显示阻塞——只报未阻塞与计数）。 */
+function wakeGateLineSuffix(gate: WakeGateStatus): string {
+  const estimate = `单回合预估 ${formatBytesShort(gate.thresholds.turnEstimateBytes)}`;
+  const count = `本窗 wake-deferred ${gate.deferredWindowCount}/${gate.deferredAlertThreshold}`;
+  if (!gate.enabled) {
+    return ` | 唤醒闸 关闭（wake_gate 生效值 false）| ${estimate}`;
+  }
+  let suffix: string;
+  if (gate.blocked && gate.nextRetryAt !== null) {
+    const conditions = gate.conditions.length > 0 ? gate.conditions.join(", ") : "原因见 wake-deferred 记录";
+    suffix = ` | 唤醒闸 阻塞（${conditions}）下次重判 ${new Date(gate.nextRetryAt).toISOString()} | ${estimate} | ${count}`;
+  } else {
+    suffix = ` | 唤醒闸 开启·未阻塞 | ${estimate} | ${count}`;
+  }
+  // B3②：wake 关闭持续态（与容量闸正交的另一维度）在行尾披露，不另起行。
+  if (gate.wakeOffSince !== null) {
+    const offMin = Math.max(0, Math.round((Date.now() - gate.wakeOffSince) / 60_000));
+    suffix += ` | wake 关闭持续 ${offMin}min（阈值 ${Math.round(gate.wakeOffAlertMs / 60_000)}min）`;
+  }
+  return suffix;
+}
+
+function formatBytesShort(n: number): string {
+  if (!Number.isFinite(n) || n < 0) return String(n);
+  if (n >= 1024 ** 3) return `${(n / 1024 ** 3).toFixed(2)}GB`;
+  if (n >= 1024 ** 2) return `${(n / 1024 ** 2).toFixed(1)}MB`;
+  return `${Math.round(n)}B`;
+}
+
 async function capacityMount(deps: ToolDeps): Promise<CapacityMount | null> {
   let sample: CapacitySample;
   let verdict: CapacityVerdict;
+  let gate: WakeGateStatus;
+  let thresholds: CapacityThresholds;
   try {
+    // v0.9.3（B1）：分层阈值现读（config.json capacity 段 > env > 内置默认）——判定与
+    // 展示同源；闸状态读数同源（engine/wake.ts wakeGateStatus：活跃冷却 + 累积窗）。
+    thresholds = resolveCapacityThresholds(deps.stateRoot, deps.env);
     sample = await sampleCapacity(deps.env, capacityCacheFile(deps.stateRoot), Date.now());
-    verdict = judgeCapacity(sample, deps.env);
+    verdict = judgeCapacity(sample, deps.env, thresholds);
+    gate = await wakeGateStatus(deps.stateRoot, deps.env, Date.now());
   } catch {
     return null;
   }
@@ -109,6 +156,7 @@ async function capacityMount(deps: ToolDeps): Promise<CapacityMount | null> {
   // 不再静默按缺省判定——payload 附 memWarnWatermarkFallback + 文本附 WARNING
   // （与 offline/stall 家族的回落披露同款两级）。
   const watermark = memWarnWatermarkInfoFromEnv(deps.env);
+  const baseLines = formatCapacityLines(sample, verdict);
   return {
     payload: {
       capacity: {
@@ -125,15 +173,34 @@ async function capacityMount(deps: ToolDeps): Promise<CapacityMount | null> {
         violated: verdict.violated,
         detail: verdict.detail,
         ...(watermark.fellBack ? { memWarnWatermarkFallback: true } : {}),
+        // v0.9.3（B2）：闸状态块（键集冻结见 PROTOCOL §15.6；三视图同源）。
+        wakeGate: {
+          enabled: gate.enabled,
+          blocked: gate.blocked,
+          conditions: gate.conditions,
+          blockedScopes: gate.blockedScopes,
+          nextRetryAt: gate.nextRetryAt,
+          deferredWindowCount: gate.deferredWindowCount,
+          deferredAlertThreshold: gate.deferredAlertThreshold,
+          wakeOffSince: gate.wakeOffSince,
+          wakeOffAlertMs: gate.wakeOffAlertMs,
+          thresholds: gate.thresholds,
+          thresholdSources: gate.thresholdSources,
+          ...(gate.warnings.length > 0 ? { warnings: gate.warnings } : {}),
+        },
       },
     },
+    // 闸摘要拼在容量行尾（status 视图只取 lines[0]——并入首行三视图才都看得见；
+    // 不加新行：status 行序冻结 team/tasks/capacity/checkpoint/unread）。
     lines: [
-      ...formatCapacityLines(sample, verdict),
+      `${baseLines[0]}${wakeGateLineSuffix(gate)}`,
+      ...baseLines.slice(1),
       ...(watermark.fellBack ? [MEM_WATERMARK_FALLBACK_WARNING] : []),
+      // 分层畸形/越界披露（file 键畸形 + env 非法；wakeGate.warnings 同内容进 payload）。
+      ...(thresholds.warnings.length > 0 ? [...new Set(thresholds.warnings)] : []),
     ],
   };
 }
-
 // ---------------------------------------------------------------------------
 // v0.7（C8，M4）离线成员挂载（DESIGN-V0.7.md §4.3）：只读 peer 扫描 + 离线判据。
 // 与 capacityMount 同纪律：任何意外（peer 根不可读/扫描失败）→ 返回 null = 不挂载，
@@ -176,9 +243,14 @@ async function offlineMembersMount(deps: ToolDeps, team: TeamState, now: number,
  * v0.9.1 r4（V090-01 观测 + 口径统一）：挂载同时读**引擎证言**（registry/witness/<sid>.json，
  * 与清扫豁免同一读取路径），成员行展示 `liveness.witness`——「自述 state」与「豁免真实
  * 输入」在同一行并列，lead 一眼看出「展示 running 但证言缺失/陈旧」的异常长豁免形态。
+ *
+ * v0.9.3（C1 活性四判据合判）：挂载补第③④判据的落盘读取——证言（已有，witnessMap）
+ * 与**成员邮箱文件写入 mtime**（inboxFile 的 stat；读失败 = 该判据无声），一并注入
+ * memberLivenessView 的合判输入，成员行新增 `liveness.livenessSources`（四判据各自
+ * 可判活；空 = 全静默）。新鲜窗按 env 解析后注入（core 不解析 env），与 stale 阈值同源。
  */
 interface LivenessMount {
-  /** 成员键 → 活性视图（三视图同形；r4 起含 witness 快照）。 */
+  /** 成员键 → 活性视图（三视图同形；r4 起含 witness 快照，v0.9.3 起含判据来源）。 */
   views: Map<string, MemberLivenessRow>;
   /** 成员键 → 引擎证言（豁免判定的真实输入；undefined = 无证言）。 */
   witness: Map<string, SessionWitness | undefined>;
@@ -186,7 +258,7 @@ interface LivenessMount {
   counts: { running: number; idle: number; dead: number };
 }
 
-/** 三视图成员行的活性块（r4：自述视图 + 引擎证言快照）。 */
+/** 三视图成员行的活性块（r4：自述视图 + 引擎证言快照；v0.9.3 C1：+ 判据来源）。 */
 interface MemberLivenessRow extends SessionLivenessView {
   /** 引擎证言快照（清扫豁免的真实输入）；null = 无证言（不豁免）。 */
   witness: { kind: SessionWitnessKind; ageMin: number } | null;
@@ -196,6 +268,8 @@ async function livenessMount(deps: ToolDeps, team: TeamState, now: number, scan:
   const views = new Map<string, MemberLivenessRow>();
   const witnessMap = new Map<string, SessionWitness | undefined>();
   const counts = { running: 0, idle: 0, dead: 0 };
+  // v0.9.3（C1）：四判据新鲜窗 = stale 清扫阈值的生效值（core 纯函数不解析 env）。
+  const freshMs = staleThresholdMsFromEnv(deps.env);
   for (const member of team.members) {
     let record;
     try {
@@ -210,7 +284,19 @@ async function livenessMount(deps: ToolDeps, team: TeamState, now: number, scan:
       witness = undefined; // 证言读失败 = 无证言（保守：不豁免）
     }
     witnessMap.set(member.key, witness);
-    const view = memberLivenessView(member, record, scan ?? undefined, now);
+    // 第④判据：成员邮箱文件写入 mtime（投递/消费确认都在动它）。读失败/文件缺失 =
+    // 该判据无声（不猜）——stat 失败与「很久没写」是两件事，只有前者静默。
+    let mailboxMtimeMs: number | undefined;
+    try {
+      mailboxMtimeMs = (await stat(inboxFile(deps.stateRoot, team.teamId, member.key))).mtimeMs;
+    } catch {
+      mailboxMtimeMs = undefined;
+    }
+    const view = memberLivenessView(member, record, scan ?? undefined, now, {
+      freshMs,
+      ...(witness !== undefined ? { witness } : {}),
+      ...(mailboxMtimeMs !== undefined ? { mailboxMtimeMs } : {}),
+    });
     views.set(member.key, {
       ...view,
       witness: witness === undefined
@@ -234,6 +320,40 @@ async function scanPeersSafe(deps: ToolDeps, now: number): Promise<PeerScanResul
 /** 紧凑活性文本行（team/panel 文本面统一格式；status 文本行序冻结，活性只在 payload）。 */
 function livenessTextLine(counts: LivenessMount["counts"]): string {
   return `liveness: running ${counts.running} / idle ${counts.idle} / dead ${counts.dead}`;
+}
+
+// ---------------------------------------------------------------------------
+// v0.9.3（A2）：唤醒三级指标挂载（spawn-ok / child-alive / consumed）。
+// 判据与实现单一真源在 engine/wake.ts（readWakeTierCounts 读 engine.jsonl 尾部窗口）——
+// 本文件只做**统计行**（取数 + payload 块 + 文本行），不复制任何判据。
+// 与 capacityMount/offlineMembersMount 同纪律：任何读取意外 → null = 不挂载
+// （观测面永不为难任务板）。全零 = 不挂载（没有唤醒发生过，不必占一行）。
+// ---------------------------------------------------------------------------
+
+interface WakeTierMount {
+  payload: Record<string, unknown>;
+  line: string;
+}
+
+async function wakeTierMount(deps: ToolDeps): Promise<WakeTierMount | null> {
+  try {
+    const counts = await readWakeTierCounts(deps.stateRoot);
+    if (counts.spawnOk === 0 && counts.childAlive === 0 && counts.consumed === 0) return null;
+    return {
+      payload: {
+        wake: {
+          spawnOk: counts.spawnOk,
+          childAlive: counts.childAlive,
+          consumed: counts.consumed,
+          windowBytes: counts.windowBytes,
+          windowMs: counts.windowMs,
+        },
+      },
+      line: wakeTierCountsLine(counts),
+    };
+  } catch {
+    return null;
+  }
 }
 
 export const OverviewShape = {
@@ -399,6 +519,8 @@ export function createTeamOverviewCore(deps: ToolDeps): TeamOverviewCore {
         const peerScan = team !== undefined ? await scanPeersSafe(deps, now) : null;
         const offlineMount = team !== undefined ? await offlineMembersMount(deps, team, now, peerScan) : null;
         const liveness = team !== undefined ? await livenessMount(deps, team, now, peerScan) : null;
+        // v0.9.3（A2）：唤醒三级指标计数（engine.jsonl 尾部窗口；无唤醒不挂载）。
+        const wakeTiers = await wakeTierMount(deps);
         // v0.9.1 r4（V090-01 观测，V090-GUIDANCE-R4）：清扫豁免连续 defer 的**累计期数**
         // （「豁免 N×阈值」）——与 sweepOwnerGuard 同一证言读取路径（livenessMount.witness），
         // lead 在任务板可见异常长豁免（自述 running 但证言缺失/陈旧另在豁免审计留痕）。
@@ -480,6 +602,8 @@ export function createTeamOverviewCore(deps: ToolDeps): TeamOverviewCore {
                 ...(offlineMount.fellBack ? { offlineThresholdFallback: true } : {}),
               }
             : {}),
+          // v0.9.3（A2）挂载点：唤醒三级指标计数（spawn-ok / child-alive / consumed）。
+          ...(wakeTiers !== null ? wakeTiers.payload : {}),
         };
         if (staleCompletedReceipts !== undefined) {
           const parts = Object.entries(staleCompletedReceipts)
@@ -533,6 +657,8 @@ export function createTeamOverviewCore(deps: ToolDeps): TeamOverviewCore {
             : "")
           // v0.9（G-9）：活性计数行（成员细节在 payload members[].liveness）。
           + (liveness !== null ? `\n${livenessTextLine(liveness.counts)}` : "")
+          // v0.9.3（A2）：唤醒三级指标计数行（spawn-ok / child-alive / consumed）。
+          + (wakeTiers !== null ? `\n${wakeTiers.line}` : "")
           // r4（V090-01 观测）：豁免期数文本行（任务板对人可见「豁免 N×阈值」）。
           + (exemptPeriods.size > 0
             ? `\nExempt: ${[...exemptPeriods].map(([id, ex]) => `${id}(${ex.reason}, 豁免 ${ex.periods}×阈值)`).join(", ")}`
@@ -647,6 +773,8 @@ export async function overviewPanel(deps: ToolDeps): Promise<ToolResult> {
   };
   // C3 挂载（M6）：panel 同样携带 capacity 块（采样失败只丢观测块）。
   const capacity = await capacityMount(deps);
+  // v0.9.3（A2）：唤醒三级指标计数（panel 与 team/status 同源同形）。
+  const wakeTiers = await wakeTierMount(deps);
   // v0.9.2（C4）：任务计数文本与 payload **同源**——同一份 `panel.tasks` 七态计数渲染，
   // 不再有「文本三桶 / payload 七态」两套口径（与 status 视图 tasks 行同格式，可对账）。
   const tasksLine = `tasks: ${TASK_STATUSES.map((s) => `${s} ${panel.tasks[s] ?? 0}`).join(' / ')}`;
@@ -658,6 +786,8 @@ export async function overviewPanel(deps: ToolDeps): Promise<ToolResult> {
     stalledLine,
     // v0.9（G-9）：活性计数行（成员细节在 payload members[].liveness）。
     ...(liveness !== null ? [livenessTextLine(liveness.counts)] : []),
+    // v0.9.3（A2）：唤醒三级指标计数行（spawn-ok / child-alive / consumed）。
+    ...(wakeTiers !== null ? [wakeTiers.line] : []),
     panel.inboundPolicy !== undefined
       ? `inboundPolicy: ${panel.inboundPolicy.mode} (${panel.inboundPolicy.decidedBy})`
         + (panel.inboundPolicy.sessionLevelQuery !== undefined
@@ -675,6 +805,7 @@ export async function overviewPanel(deps: ToolDeps): Promise<ToolResult> {
       ...windowed,
       members: panelWithLiveness.members,
       ...(liveness !== null ? { liveness: { ...liveness.counts } } : {}),
+      ...(wakeTiers !== null ? wakeTiers.payload : {}),
       ...(stalled.length > 0 ? { stalled: stalled.map((flag) => ({ ...flag, suggestion: stallSuggestion(flag.kind, flag.status) })) } : {}),
       ...(peersTruncated
         ? { peersTruncated: { shown: shownPeers, total: panel.peers.length, budgetChars: budget.total } }
@@ -938,6 +1069,9 @@ export async function statusView(deps: ToolDeps, connectionKey: string): Promise
     const offlineMount = await offlineMembersMount(deps, team, now, peerScan);
     const offlineCount = offlineMount === null ? null : offlineMount.members.length;
     const liveness = await livenessMount(deps, team, now, peerScan);
+    // v0.9.3（A2）：唤醒三级指标计数。status 的文本行序归 render.ts（本组只碰统计行），
+    // 故此处**只进 payload**（team/panel 两视图的文本行已挂，三视图 payload 同源同形）。
+    const wakeTiers = await wakeTierMount(deps);
 
     // C5 停滞（复用 stalledTasks；钳制披露）
     const stall = stallThresholdMs(deps.env, staleThresholdMsFromEnv(deps.env));
@@ -1051,6 +1185,8 @@ export async function statusView(deps: ToolDeps, connectionKey: string): Promise
       },
       taskCounts: counts,
       stalled: stalled.length,
+      // v0.9.3（A2）：唤醒三级指标计数块（team/panel 文本行同源；status 文本行序归 render.ts）。
+      ...(wakeTiers !== null ? wakeTiers.payload : {}),
       ...(stall.clamped ? { stalledThresholdClamped: true } : {}),
       ...(stall.fellBack ? { stalledThresholdFallback: true } : {}),
       ...(offlineMount !== null && offlineMount.clamped ? { offlineThresholdClamped: true } : {}),
@@ -1090,9 +1226,9 @@ export function registerOverviewTools(
   registry: PrimaryRegistry,
 ): void {
   const description =
-    "Observation snapshot (task board / members / peers / capacity / stall in one tool). view=team (default): members with isLead + session liveness (running/idle/dead, PROTOCOL §12.4), priority-ordered task board (budget-windowed with boardTruncated pointer), unread counts, orphan/stale-receipt warnings, stalled flags (C5); " +
+    "Observation snapshot (task board / members / peers / capacity / stall in one tool). view=team (default): members with isLead + session liveness (running/idle/dead + livenessSources 四判据来源, PROTOCOL §12.4), priority-ordered task board (budget-windowed with boardTruncated pointer), unread counts, orphan/stale-receipt warnings, stalled flags (C5); " +
     "history:true appends leadHistory; view=peers: addressable cross-session peers (self/member/session rows, rowsTruncated pointer); " +
-    "view=panel: self + peers + members (+ liveness per member row) + task counts + inbound policy; " +
+    "view=panel: self + peers + members (+ liveness per member row, 含 livenessSources) + task counts + inbound policy; " +
     "view=timeline: engine.jsonl timeline ordered by ts descending (limit defaults 20, max 100 with limitClamped disclosure; offset is a positional cursor skipping back N from the newest event — drifts under live appends; budget window with truncated pointer; skippedEvents counts unnormalizable lines; olderEventsOmitted disclosed on every page when the tail window truncates the file); " +
     "view=status: compact status block (task counts by status / stalled / capacity level + watermark / offline members / member liveness in payload liveness block / checkpoint ages / unread counts — the no-statusline substitute). Does not require registration; writes snapshot.json (always the full board) only for view=team.";
   const handler = async (args: Record<string, unknown>, extra: unknown): Promise<ToolResult> =>

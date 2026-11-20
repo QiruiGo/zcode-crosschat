@@ -105,6 +105,32 @@ export function classifyFrame(content: string): FrameClassification {
 /** A crashed delivery attempt becomes retryable after this interval (state.js:26). */
 export const MAILBOX_DELIVERY_LEASE_MS = 60_000;
 
+/**
+ * v0.9.3（A1）：**claimed-未投递**的租约超时阈值默认值（ms）——一次投递尝试盖了
+ * `deliveryClaimedAt` 却始终没走到 `deliveredAt` 盖章，超过这么久即视为被无声放弃：
+ * 看门狗释放租约（消息回 pending 可重投）+ `delivery-lease-expired` 事件 + urgent lead。
+ *
+ * 与 {@link MAILBOX_DELIVERY_LEASE_MS}（60s）**不是同一个计时**，刻意保留两个常量：
+ * - 60s = 「重试资格」：`readPendingMailbox`/`isWakeDeliveryPending` 的放行线——租约
+ *   到期后消息即可被再次推送尝试（既有语义，dsh state.js:26 移植，不变）；
+ * - 10min = 「放弃认定」：超过这么久仍未盖章，说明那次尝试已不可能成功（引擎进程死在
+ *   「盖租约 → spawn」之间，或补盖章始终没抢到锁），需要**显式释放 + 告警**——只看
+ *   重试资格的话，这类放弃是无声的（没有任何事件告诉 lead 有一次投递没有发生）。
+ */
+export const DELIVERY_LEASE_EXPIRY_DEFAULT_MS = 600_000;
+
+/**
+ * v0.9.3（A1）：租约超时阈值 env 解析（`XC_DELIVERY_LEASE_MS`，正整数 ms；
+ * 未设/空串/非正/不可解析 → 缺省 10min）。与 limbo/wake-slow 家族同口径（监视类阈值
+ * 不接受「关闭用 0」——要停看门狗用 XC_WATCHDOG_MS=0）。
+ */
+export function deliveryLeaseMsFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env['XC_DELIVERY_LEASE_MS'];
+  if (raw === undefined || raw.trim() === '') return DELIVERY_LEASE_EXPIRY_DEFAULT_MS;
+  const n = Number(raw);
+  return Number.isSafeInteger(n) && n > 0 ? n : DELIVERY_LEASE_EXPIRY_DEFAULT_MS;
+}
+
 /** Machine-parseable wake-prompt receipt prefix (DESIGN.md §2.4; dsh mailbox.js:5). */
 export const RECEIPT_PREFIX = '[CrossChat inbox receipt: ';
 const RECEIPT_SUFFIX = ']';
@@ -226,11 +252,44 @@ export function staleCompletedReceiptTaskIds(team: TeamState, messages: readonly
   return stale;
 }
 
-/** Default malformed-line sink: skip + audit-log (DESIGN.md §2.7-5). */
-function defaultOnMalformed(stateRoot: string, file: string): (malformed: MalformedLine) => void {
-  return (malformed) => {
-    void logEngineEvent(stateRoot, { event: 'malformed-line', file, lineNo: malformed.lineNo, error: malformed.error });
-  };
+/**
+ * v0.9.3（P0，审计洪泛 OOM）：坏行审计的**进程内节流窗**——同一文件 60 秒内最多
+ * 一条汇总审计。持续坏行是状态而不是事件：每拍 sweep 都写一条只会把 engine.jsonl
+ * 刷成噪声并（与 appendJsonl 的旧全文件读叠加）拖垮 MCP server。口径参考
+ * engine/wake.ts 的 degradedDisclosedRoots：进程内 Map（重启即重披露，engine.jsonl
+ * 是跨进程权威）+ 有界台账（超限丢最早插入的键，防长命进程无界增长）。
+ */
+const MALFORMED_AUDIT_WINDOW_MS = 60_000;
+const MALFORMED_AUDIT_MEMO_LIMIT = 1024;
+const malformedAuditedAt = new Map<string, number>();
+
+/**
+ * v0.9.3（P0）：一次读取中同一文件的坏行合并为**一条**汇总审计
+ * `malformed-lines{file,count,firstLineNo,firstError}`（不是每行一条），并按
+ * 「文件 × 60s 窗」节流。计数与首个坏行位置保留在事件里——可观测性不降级。
+ */
+async function auditMalformedLines(
+  stateRoot: string,
+  file: string,
+  malformed: readonly MalformedLine[],
+): Promise<void> {
+  if (malformed.length === 0) return;
+  const now = Date.now();
+  const last = malformedAuditedAt.get(file);
+  if (last !== undefined && now - last < MALFORMED_AUDIT_WINDOW_MS) return;
+  malformedAuditedAt.set(file, now);
+  if (malformedAuditedAt.size > MALFORMED_AUDIT_MEMO_LIMIT) {
+    const oldest = malformedAuditedAt.keys().next();
+    if (!oldest.done) malformedAuditedAt.delete(oldest.value);
+  }
+  const first = malformed[0]!;
+  await logEngineEvent(stateRoot, {
+    event: 'malformed-lines',
+    file,
+    count: malformed.length,
+    firstLineNo: first.lineNo,
+    firstError: first.error,
+  });
 }
 
 function mailboxPath(stateRoot: string, teamId: string, agentKey: string): string {
@@ -251,7 +310,8 @@ export interface MailboxRead {
  * named frames. Rejected frames are audited `{event:"frame-rejected"}`
  * (best-effort) while not yet disposed on disk; after the team-locked sweep in
  * readCurrentMailboxLocked stamps them discardedAt, re-reads stay silent.
- * v0.5.1（故障注-3 修复）：不可解析行照旧跳过+走原 sink（缺省=审计），同时
+ * v0.5.1（故障注-3 修复）：不可解析行照旧跳过+走原 sink（缺省=汇总审计
+ * `malformed-lines`，v0.9.3 P0 起按文件×60s 窗节流），同时
  * 收集进返回值，让工具面能把「N 条不可读」披露给调用方而不是静默吞掉。
  */
 async function readMailboxDetailed(
@@ -261,13 +321,15 @@ async function readMailboxDetailed(
   onMalformed?: (malformed: MalformedLine) => void,
 ): Promise<MailboxRead> {
   const file = mailboxPath(stateRoot, teamId, agentKey);
-  const sink = onMalformed ?? defaultOnMalformed(stateRoot, file);
   const malformed: MalformedLine[] = [];
   const collectingSink = (info: MalformedLine): void => {
     malformed.push(info);
-    sink(info);
+    onMalformed?.(info);
   };
   const messages = (await readJsonl<TeamMessage>(file, isTeamMessage, collectingSink)).map(normalizeMessage);
+  // v0.9.3（P0）：缺省坏行汇报 = 一次读取一条汇总审计 + 文件×60s 窗节流；调用方
+  // 自带 onMalformed 时仍走原逐行回调（诊断面不变，审计由调用方负责）。
+  if (onMalformed === undefined) await auditMalformedLines(stateRoot, file, malformed);
   const kept: TeamMessage[] = [];
   const rejected: TeamMessage[] = [];
   for (const message of messages) {
@@ -276,7 +338,8 @@ async function readMailboxDetailed(
       rejected.push(message);
       if (message.discardedAt === undefined) {
         // await：读侧的「丢弃 + 审计」原子化——读返回时审计行已落盘（engine.jsonl
-        // 是 O_APPEND 追加，await 的代价可控；malformed 汇报仍保持 v0.1.0 的尽力而为）。
+        // 是 O_APPEND 追加，v0.9.3 起追加成本有界；malformed 汇总审计同样 await，
+        // 且按文件×60s 窗节流）。
         await logEngineEvent(stateRoot, {
           event: 'frame-rejected',
           teamId,
@@ -501,6 +564,98 @@ export async function sweepLimboDeliveriesLocked(
   });
   return limbo.map((message) => {
     const { deliveryClaimedAt: _claimed, deliveredAt: _delivered, ...rest } = message;
+    return rest;
+  });
+}
+
+/**
+ * v0.9.3（A1）：**claimed-未投递**的租约超时候选（纯函数；sweep 与锁外预读共用同一定义，
+ * 与 {@link limboCandidateMessages} 同纪律——复制的判据必然漂移）。
+ *
+ * 形态：`deliveryClaimedAt` 有（一次投递尝试开始了：attemptWake 步骤 4 盖租约）、
+ * `deliveredAt` 无（那次尝试从未走到盖章——引擎进程在「盖租约 → spawn」之间死掉、
+ * 或补盖章没抢到团队锁），租约超时后仍挂在消息上 ⇒ 投递尝试被**无声放弃**：
+ * `isWakeDeliveryPending` 要等 60s 投递租约才放行重试，而没有任何事件告知 lead
+ * 「有一次投递没有发生」。
+ *
+ * 与 limbo 判据**互斥**（方案 §一 A1 硬口径）：limbo 要求 `deliveredAt` 在场（盖了章
+ * 没消费），本判据要求它缺席（从未盖章）——同一条消息不可能同时命中两者，两个检测器
+ * 不会对同一条消息叠加告警。
+ *
+ * v0.9.3 打回第 1 轮（V093-01）补 `consumedAt === undefined`：`deliveryClaimedAt` 是
+ * **三重写入面共用**的字段（attemptWake 的真实投递尝试 / 派单信封与引擎自写帧出生即带 /
+ * toolgate 审批门帧），而 `markMailboxConsumed`（只写 consumedAt，不清 claimed）正是
+ * hook 未读注入 / xc_claim / xc_read / limbo injectedConsumed 的消费回写面。若不看
+ * consumedAt，「推送尝试死在补盖章前、但成员已从注入/认领面消费过」这条真实形态会在
+ * 10min 后被读成「投递尝试被无声放弃」⇒ 假告警 + 租约被清 ⇒ **已消费的消息回 pending，
+ * 可被再次注入/再次投递**（与 limbo 判据的姊妹条件对齐，两边都不看漏）。
+ *
+ * 条件：claimed ∧ ¬delivered ∧ **¬consumed** ∧ 未读 ∧ 未作废 ∧ 租约超时 ∧ 仍现行。
+ * （「这次租约是否真对应一次 attemptWake 尝试」不可能是邮箱行条件——那是跨源判据，
+ *  由看门狗在释放前用盘上的 nonce/生命周期账证据校验，见 engine/watchdog.ts 的
+ *  deliveryAttemptVerdict 门；本函数只回答「这行的租约形态是否已过期且未被任何面结清」。）
+ */
+export function expiredDeliveryClaimMessages(
+  messages: readonly TeamMessage[],
+  team: TeamState,
+  now: number,
+  leaseMs: number,
+): TeamMessage[] {
+  return messages.filter((message) =>
+    message.deliveryClaimedAt !== undefined
+    && message.deliveredAt === undefined
+    && message.consumedAt === undefined
+    && message.readAt === undefined
+    && message.discardedAt === undefined
+    && now - message.deliveryClaimedAt >= leaseMs
+    && isCurrentMail(team, message));
+}
+
+/**
+ * v0.9.3（A1）：**释放超时的投递租约**（清 `deliveryClaimedAt`）——消息回 pending，
+ * 重新可注入（未读钩子按 readAt 判）/ 可 pull（xc_read）/ 可重投（投递面对
+ * deliveredAt 的条件）。与 limbo 降级同构：那次清 `deliveredAt`，这次清
+ * `deliveryClaimedAt`。
+ *
+ * 幂等（同一次放弃只释放一次）：判据要求 `deliveryClaimedAt` 在场，而释放恰好清掉它
+ * ——第二遍扫不到同一条；重投后再超时构成**新的**一轮（正确语义，非重复释放）。
+ * 竞态：调用方持团队锁，与 claim/markDelivered/消费回写互斥；锁内复判（
+ * {@link sweepLimboDeliveriesLocked} 同款——消费或投递先到则条件自然不再成立）。
+ *
+ * v0.9.3 打回第 1 轮（V093-02/V093-03）：`deliveryClaimedAt` 被多个写入面共用，其中
+ * 只有 attemptWake 的盖章代表「一次投递尝试真的发生了」；且尝试可能仍在途（15min
+ * nonce 窗）。这两个判据都不是邮箱行条件（要读 registry/wake 与 logs/ 生命周期账），
+ * 故由调用方（engine/watchdog.ts）预校验后经 `onlyIds` 把**已放行**的 id 传进来——
+ * 本函数仍旧在锁内复判邮箱行形态（自销性不变），只是不再对「从未尝试/仍在途」的租约
+ * 下手。缺省（不传 onlyIds）= **一条都不放行**（安全侧缺省：漏传门的调用方不会把全部
+ * 超时候选一次性释放；要按纯邮箱形态释放须显式传全集 id）。
+ *
+ * @returns 本次释放的消息（**释放后形状**：`deliveryClaimedAt` 已随释放剥掉——判据自销；
+ * 空 = 无放行的超时候选或锁内复判已变化）。
+ *
+ * v0.9.3 打回第 2 轮（验收四 V093-05）防复发注记：调用方若要**如实在事件里记计时**
+ * （claimedAt/waitedMs 之类），必须在**扫前候选**里捕获再从查表取——从本返回读
+ * `deliveryClaimedAt` 恒为 undefined（`?? 0` 兜底会把 waitedMs 退化成纪元量级）。
+ * 同款范式见 engine/watchdog.ts 的 limbo 路径（limboCandidates 扫前捕获 deliveredAt）。
+ */
+export async function sweepExpiredDeliveryClaimsLocked(
+  stateRoot: string,
+  team: TeamState,
+  agentKey: string,
+  now: number,
+  leaseMs: number,
+  onlyIds?: ReadonlySet<string>,
+): Promise<TeamMessage[]> {
+  const all = await readMailbox(stateRoot, team.teamId, agentKey);
+  const expired = expiredDeliveryClaimMessages(all, team, now, leaseMs)
+    .filter((message) => onlyIds !== undefined && onlyIds.has(message.id));
+  if (expired.length === 0) return [];
+  await mutateMailbox(stateRoot, team.teamId, agentKey, expired.map((m) => m.id), (message) => {
+    const { deliveryClaimedAt: _claimed, ...rest } = message;
+    return rest;
+  });
+  return expired.map((message) => {
+    const { deliveryClaimedAt: _claimed, ...rest } = message;
     return rest;
   });
 }

@@ -76,6 +76,20 @@ export const CHECKPOINT_JOURNAL_TAIL_LINES = 5;
 /** 第 4 章覆盖任务数上限。 */
 export const CHECKPOINT_JOURNAL_MAX_TASKS = 10;
 
+/**
+ * v0.9.3（C3）：第 4 章 journal 读入的**体积闸**（8 MiB）——与 `mcp/tools-read.ts` 的
+ * `xc_read({scope:"journal"})` 体积闸（同值 8 MiB；该处是整文件读入再分页）和
+ * `mcp/tools-team.ts` member-stop 留档的体积闸**同口径**（core 不 import mcp 面，故此处
+ * 自带一份同值常量并在注释钉死三处一致）。
+ *
+ * 缺口事实：`readTaskJournalTail` 是 `readFile` 整文件读入——一个被写爆的 journal（长任务
+ * 全程追加进同一文件 / 存储被灌）会把数百 MiB 一次拉进内存与字符串切分路径，再整段渲染进
+ * **团队共享**检查点（任何成员经 handoff/检查点读取面可见）。闸在 readFile **之前** stat：
+ * 超限不读入内存、不进 markdown，只留占位 + warning（与 tools-team 留档的
+ * `skippedJournals`/`warnings` 同措辞族）。
+ */
+export const CHECKPOINT_JOURNAL_MAX_BYTES = 8 * 1024 * 1024;
+
 /** 第 6 章建议条数上限（超出披露「另有 N 条」，不静默丢）。 */
 export const CHECKPOINT_SUGGESTIONS_MAX = 5;
 
@@ -193,10 +207,15 @@ export interface CheckpointJournalTail {
   taskId: string;
   /** 相对 stateRoot 的展示路径（.crosschat/tasks/<taskId>/journal.md）。 */
   displayPath: string;
-  /** 末 N 个非空行；缺失/失败时为空。 */
+  /** 末 N 个非空行；缺失/失败/超限跳过时为空。 */
   lines: string[];
-  /** missing=文件不存在；error=读取失败。 */
-  status: 'ok' | 'missing' | 'error';
+  /**
+   * missing=文件不存在；error=读取失败（含链接逃逸）；**skipped=v0.9.3（C3）体积超限
+   * 未读入**（一个字节都不读，也不进 markdown——只留占位 + warning）。
+   */
+  status: 'ok' | 'missing' | 'error' | 'skipped';
+  /** v0.9.3（C3）：status=skipped 时的实际体积（bytes；warning 文案用）。 */
+  sizeBytes?: number;
 }
 
 /** 身份章的花名册记录快照（null = 不在册——仍可写，如实记 (not on roster)）。 */
@@ -267,6 +286,12 @@ export interface CheckpointWriteResult {
   tmpRemoved?: number;
   /** v0.8.1（C1-B02）：.tmp 清扫失败原因（写盘事实保持成功；best-effort 卫生）。 */
   tmpSweepError?: string;
+  /**
+   * v0.9.3（C3）：因体积超限而未读入的 journal 任务 id（空/缺省 = 无跳过）。markdown
+   * 第 4 章只留占位，本字段让工具层把同一条 warning 透出到 payload `warnings[]`
+   * （与 unread 读取失败同渠道）——「留档缺节不静默」。
+   */
+  journalSkips?: readonly string[];
 }
 
 // --- 小工具 -------------------------------------------------------------------
@@ -406,6 +431,13 @@ export function buildCheckpointMarkdown(data: CheckpointData): string {
         out.push(`（无 journal：${tail.displayPath} 不存在）`);
       } else if (tail.status === 'error') {
         out.push(`（journal 读取失败：${tail.displayPath}）`);
+      } else if (tail.status === 'skipped') {
+        // v0.9.3（C3）：体积超限未读入——占位 + warning（一个字节都没进检查点）。
+        out.push(
+          `（journal 读入被跳过：${tail.displayPath} 超过 ${CHECKPOINT_JOURNAL_MAX_BYTES / 1048576} MiB `
+          + `体积上限（${tail.sizeBytes ?? 0} bytes）——检查点不整读，请切分/归档后再看；`
+          + '该任务 journal 未列入本节）',
+        );
       } else if (tail.lines.length === 0) {
         out.push('（journal 为空）');
       } else {
@@ -583,7 +615,11 @@ export async function sweepCheckpointTmpFiles(
  * 文件内容经本函数持久化进**团队共享**检查点（`.crosschat/checkpoints/<key>/*.md`，
  * 任何成员经 handoff/检查点读取面可见）——泄密 + 提示注入通道。逃逸 → 归 `error`
  * （lines 空）：单任务 journal 坏不毁掉整份检查点（§3.6 同口径），但一个字节都不进
- * markdown（buildCheckpointMarkdown 对 error 只渲染「journal 读取失败」占位）。 */
+ * markdown（buildCheckpointMarkdown 对 error 只渲染「journal 读取失败」占位）。
+ *
+ * v0.9.3（C3）：加**体积闸**（{@link CHECKPOINT_JOURNAL_MAX_BYTES}，8 MiB，与
+ * xc_read journal / member-stop 留档同口径）——stat 先于 readFile，超限不读入内存、
+ * 不进 markdown，归 `status:'skipped'` + `sizeBytes`（渲染层出占位，工具层出 warning）。 */
 export async function readTaskJournalTail(
   stateRoot: string,
   taskId: string,
@@ -600,6 +636,17 @@ export async function readTaskJournalTail(
     const linkGate = await checkLinkContainment(stateRoot, journalPath);
     if (linkGate.escaped) {
       return { taskId, displayPath, lines: [], status: 'error' };
+    }
+    // v0.9.3（C3）：体积闸先于 readFile（与 xc_read journal / member-stop 留档同口径）。
+    let sizeBytes: number;
+    try {
+      sizeBytes = (await stat(journalPath)).size;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      return { taskId, displayPath, lines: [], status: code === 'ENOENT' ? 'missing' : 'error' };
+    }
+    if (sizeBytes > CHECKPOINT_JOURNAL_MAX_BYTES) {
+      return { taskId, displayPath, lines: [], status: 'skipped', sizeBytes };
     }
     raw = await readFile(journalPath, 'utf8');
   } catch (error) {
@@ -670,6 +717,9 @@ export async function writeCheckpoint(stateRoot: string, data: CheckpointData): 
   const prune = await pruneCheckpointFiles(dir, CHECKPOINT_KEEP_MAX);
   // v0.8.1（C1-B02）：被杀进程残留的 .tmp 按年龄清扫（在途写只毫秒级，60s 阈值安全）。
   const tmp = await sweepCheckpointTmpFiles(dir);
+  // v0.9.3（C3）：体积超限未读入的 journal（第 4 章已留占位，此处把任务 id 交工具层
+  // 透出到 payload warnings[]——缺节不静默）。
+  const journalSkips = journalTails.filter((tail) => tail.status === 'skipped').map((tail) => tail.taskId);
   return {
     path,
     createdAt: effectiveNow,
@@ -683,6 +733,7 @@ export async function writeCheckpoint(stateRoot: string, data: CheckpointData): 
     ...(collisions > 0 ? { stampCollisions: collisions } : {}),
     ...(tmp.removed > 0 ? { tmpRemoved: tmp.removed } : {}),
     ...(tmp.error !== undefined ? { tmpSweepError: tmp.error } : {}),
+    ...(journalSkips.length > 0 ? { journalSkips } : {}),
   };
 }
 

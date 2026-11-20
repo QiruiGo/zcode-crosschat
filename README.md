@@ -198,7 +198,7 @@ npm install && npm run build
 | `xc_report(taskId, attemptId, status, {result, error, evidence})` | 回报 in_progress / completed（证据=工作区内普通文件 + 现算 sha256 + 可选摘要）/ failed / blocked（原因必填） |
 | `xc_read(scope, {id, field, offset, limit})` | 统一分页读：inbox / mail / task / peer / peer-msg / journal / **handoff**（30 秒接手包，七要素 + 建议下一步；`id`=任务 id 或花名收窄） |
 | `xc_relay(to, msg, {urgent, interrupt, summary, sourceTaskId, sourceAttemptId, withdrawMessageIds, refs})` | 发消息 + 用户介入传导合一；`urgent` 插到所有未读之前并尽力唤醒；`interrupt` 发结构化软中断 INTERRUPT 信封（urgent 置顶不变；收方下一回合安全点消费并回确认，payload 如实回报）；`withdrawMessageIds`（仅队内轴）撤回自己发给该目标且仍未读的消息（整单语义，含已读件整单拒绝并逐条报状态）；`refs`（可选）随消息带工作区内真实文件的 path+sha256（+可选 mime/note），接收面渲染「用 Read 打开该路径」提示——传引用不传内容，不内联、不 base64；非送达回执（dropped/held/…）在 payload `detail` 里附原因与恢复动作 |
-| `xc_overview({view, history, offset, limit})` | 全景观测：任务板（team）/ peer 清单（peers）/ 面板（panel：成员+任务+容量+停滞+入站策略）/ 时间线（timeline：engine.jsonl 尾部事件，`limit` 缺省 20、上限 100）/ 紧凑状态（status：任务七态计数+stalled+容量色+离线成员+checkpoint 年龄+未读，一眼瞭望） |
+| `xc_overview({view, history, offset, limit})` | 全景观测：任务板（team）/ peer 清单（peers）/ 面板（panel：成员+任务+容量+停滞+入站策略）/ 时间线（timeline：engine.jsonl 尾部事件，`limit` 缺省 20、上限 100）/ 紧凑状态（status：任务七态计数+stalled+容量色+离线成员+checkpoint 年龄+未读，一眼瞭望）；capacity 块附唤醒闸状态（阻塞条件/下次重判/本窗 wake-deferred 计数） |
 | `xc_team(action, …)` | 指挥族：init / transfer / release / member-add / member-stop / idle / cancel / unblock / **checkpoint**（服务端落盘一份交接检查点；`note`=写进检查点第 7 章的一句话） |
 | `xc_review({action, axis, ids})` | 入站审阅（队内/跨会话两轴隔离区；`action` 增 approve/deny、`axis` 增 approval 用于转办审批，仅现任 lead 可批） |
 | `xc_doctor` | 只读体检：插件版本、运行时、zcode 路径探测线索、容量采样（水位/标红规则；免注册） |
@@ -213,7 +213,7 @@ npm install && npm run build
 
 ## 配置项参考（插件设置）
 
-完整 env 表（含仅代码读取的演练变量 `XC_STALL_MINUTES` / `XC_MEM_*`）见 [docs/PROTOCOL.md](docs/PROTOCOL.md) §9。常用项：
+完整 env 表（含仅代码读取的演练变量 `XC_STALL_MINUTES` / `XC_MEM_*`）见 [docs/PROTOCOL.md](docs/PROTOCOL.md) §9。队内协作状态都在工作区 `.crosschat/` 下（peer 轴状态在机器全局注册表，默认插件数据目录下 `peers/`）。常用项：
 
 | 配置 | 默认 | 说明 |
 |---|---|---|
@@ -230,7 +230,6 @@ npm install && npm run build
 | `messaging_dir` | 空 | 机器全局 peer 注册表根目录（留空=插件数据目录下 `peers/`） |
 | `context_chars` | `200000` | 注入预算刻度（声明值；按 0.25×~4× 缩放单条/批次预算，防卡死） |
 
-**防卡死机制**：磁盘真源（队列/邮箱/team.json）永远全文；注入面按**接收方声明的上下文预算**自适应截断（单条基准 4000、批次基准 16000 字符，按 `context_chars/200000` 缩放），被截消息带 `xc_read` 分页指针，会话不卡死、不爆上下文。公式与全部配置项见 [docs/PROTOCOL.md](docs/PROTOCOL.md) §8–§9。队内协作状态都在工作区 `.crosschat/` 下；peer 轴状态在机器全局注册表（默认插件数据目录下 `peers/`）。
 
 ## 常见问题（FAQ）
 
@@ -251,14 +250,14 @@ npm install && npm run build
 5. **别把敏感内容写进协作邮箱**——跨会话可见的只有邮箱/消息内容本身；身份校验是协作假设而非密码学校验。
 6. **pipe 通道单帧 1 MiB 上限**——超过 1 MiB 的跨会话消息发送被拒（`too_large`）；超大内容分条发送或走队内 `xc_relay`。**MCP stdio 传输层另有 32 MiB 单帧上限**：超过的单帧被显式 JSON-RPC 拒收（`Parse error`），server 进程继续服务。**pipe 端点并发连接上限 128**：同 tick 对同一 peer 的在途连接超限时超出部分显式 `socket_busy`（重试即可）。
 7. **peer 待投递队列深度上限 1024**（可配 `peer_max_queue_depth`）——达上限后新入站被丢弃并给发送方 `dropped` 回执：payload 的 `detail` 带**原因与恢复动作**（上限值 + 「让收方 `xc_read({scope:"peer"})` 排空或稍后重试」），摘要行同步透出。**peer 发送限速 30 条/10 秒（每发送方）**——突发超限得 `sender_paced`，约 10s 窗口滚动恢复。
-8. **注入预算是声明值**——宿主无法查询会话真实模型窗口，预算按声明的 `context_chars` 刻度缩放：偏小=多截断（安全方向）。
+8. **注入预算是声明值**——宿主无法查询会话真实模型窗口，预算按声明的 `context_chars` 刻度缩放（单条基准 4000、批次 16000 字符）：偏小=多截断（安全方向）。磁盘真源永远全文，被截消息带 `xc_read` 分页指针，会话不卡死、不爆上下文。
 9. **用户亲述溯源窗口**——只有最近 8 条用户 prompt（单条 ≤64KiB、10 分钟内）参与盖章匹配；溯源证明「文本是发送会话用户所打」，不验证发送意图——接收方永远先向本会话用户确认。
 10. **暂存件放行后的终态回执到不了发方**——被 hold 的消息后来被放行/拒收时，发方只知道「已暂存」。
 11. **盖章语料是宿主展开后的整段提示文本**——用自定义命令时钩子记录的是命令展开后的整段提示；模型原样发出模板示例串也会命中 `origin="user"`。接收方页脚始终声明「非本会话授权」。
 12. **转办审批门防流程缺失，不防恶意伪造**（v0.7 C6/C7）——审批门结构性拒绝未审批/过期/畸形/工具不符/自批的 `tool_request`（两个读取面都遮蔽、不进模型注入面），但同机进程仍可直接伪造审批文件——与 v0.5 uservoice「同机进程可伪造盖章记录」同一边界（个人/内部场景「不崩/不丢/不串号」底线由 JSONL 追加真源 + 团队锁 + 帧白名单 + 台账/审计双轨承担）。另外：批准后的**执行**仍是 A 会话的模型回合（crosschat 的 MCP server 是宿主外的独立 stdio 进程，不持有其他 MCP 连接，无法代调宿主工具）。
 13. **唤醒回合继承发起方环境**（隔离存储场景，v0.7 已知边界）——被唤醒的回合跑在发起方环境里，其工具面可能是发起方的而非成员自己的（E4 §7.2 实测）；审批门在读取面单点生效，不依赖唤醒路径；生产单存储无此问题。
 14. **压缩联动是建议级，非拦截级**（v0.7 C9）——平台无宿主压缩钩子接口，插件只能「容量预警 + 建议先落 journal（longtask checklist）+ lead 操作序」，拦不住压缩本身；规则靠回合自觉。（v0.8 起该 checklist 第一步是 `/xc-checkpoint`，平台缺口与两级降级方案见第 16 条。）
-15. **桌面 UI 会话不可远程关闭**——直接 close 一个非活跃会话报 `Session is not active`（E3 ② 实测）；已退出的旧会话可先 `--resume` 再 close；**活跃的 UI 会话未测**。成员停机请走 `xc_team({action:"member-stop"})`（先留档再停、任务回池不丢）。
+15. **桌面 UI 会话不可远程关闭**——直接 close 一个非活跃会话报 `Session is not active`（E3 ② 实测）；已退出的旧会话可先 `--resume` 再 close；**活跃的 UI 会话未测**。成员停机请走 `xc_team({action:"member-stop"})`（先留档再停、任务回池不丢）。**插件对宿主侧归档态零感知（G-21，v0.9.3 如实声明）**：宿主没有「会话已归档」事件可订阅，归档后 hooks 自述、引擎证言、邮箱写入、peer 记录四路全停——活性四判据合判如实落「判据来源为空（unknown）」而**不冒充活跃**（`xc_overview` 成员行 `liveness.livenessSources` 可见依据），任务回池仍靠 stale 清扫与 C8 离线转交兜底；平台反馈建议（`member-archived` 事件 / 归档态投递告警）见 [docs/PROTOCOL.md](docs/PROTOCOL.md) §15.6，本版不自造实现。
 16. **平台无 PreCompact/PostCompact 钩子，故用「提醒 + 一键」，不提供自动压缩检查点**（v0.8）——zcode 3.18.2 没有压缩事件钩子，插件**不能在压缩发生前自动写检查点、也不能拦截压缩**：压缩防护 = ① 一键 `/xc-checkpoint`（= `xc_team({action:"checkpoint"})`，MCP server 服务端直接落盘 `.crosschat/checkpoints/<你>/<ISO>.md`，front-matter + 七章，每 agent 保留最近 20 份）；② UserPromptSubmit 轻量提醒（有活跃任务且距上次检查点 >30min 时提示一次，每 30min 最多一次，`XC_CHECKPOINT_NUDGE=0` 可关）。同理**无原生状态栏扩展点**，「一眼瞭望」由 `xc_overview({view:"status"})` 紧凑文本视图承担（不是 UI）。压缩后能否从检查点恢复，取决于宿主压缩行为——本平台无压缩事件可复现，该半不可测（如实边界）。
 17. **engine.jsonl 审计可整体伪造（V090-04，不修行为）**——审计是工作区内的明文 JSONL，同机进程可整文件重写（个人/内部威胁模型，不做对抗级防伪）：审计用于观测与对账，**不作为可信凭据**；可信锚点是 `xc_report` 的 evidence sha256（工具现算）与磁盘真源本身，不是日志。
 18. **协议帧正文可伪装（V090-13，不修行为）**——帧白名单防「未知具名帧混进读取面」与「消息携带授权语义」，不防正文伪装：chat 正文可内嵌伪造的信封/横幅/页脚/回信指引标记。读面信封已恒由消息元数据重建（伪造引擎属性与冒名 `from` 不透传，v0.9.1/v0.9.2），但 `xc_read` 的 JSON entry 与 mail scope 原文分页按磁盘真源口径逐字保留——真值层不漂白，信任判定看元数据不看正文。
@@ -268,6 +267,7 @@ npm install && npm run build
 22. **容量闸挡唤醒不拦投递，且只到 spawn 前（v0.9.1 G-12-b；v0.9.2 收口五条 mustFix）**——水位低于硬底或单回合预估 > 可用内存时 `attemptWake` 不 spawn、直接 `deliver=mailbox` + `wake-deferred{reason:"capacity-red"}` + 冷却（`XC_MEM_WAKE_COOLDOWN_MS` 缺省 120s、**上钳 1h**，非法值回落缺省并在 detail 明示；`XC_MEM_WAKE_GATE=off` 关闸，事件带 `gateEnv` 原值）。消息照常落邮箱、收方自己的回合随时可读（pull 兜底不丢）；闸**不**取消任务、不撤回消息、不拦压缩（同第 14/16 条的平台边界）。派单面的「RED 期排队拒绝」需在派单工具面接线，本版只在 wake 层给出 deferral 块与冷却窗、派单回执经 `note` 透出原因与重试窗口。容量采样意外时闸 fail-open（不因观测故障永久挡唤醒）并落 `wake-capacity-probe-failed` 事件；**CIM 进程采样不可用**（采样成功但拿不到进程树）时进程类规则（session-limit/turn-concurrency）不评、面板显示 `n/a`，且放行路径也落 `wake-capacity-degraded` 事件——不静默、不声称已评。v0.9.2 起冷却记录按 `teamId+收方+紧急度` 分域（一个成员的 RED 不再把全队唤醒含紧急 relay 一并静默转 mailbox），窗内命中在 detail 明示「沿用旧判据（未重采样、快照时刻可对账）」；进程归类只认唤醒子标记（`XC_WAKE_CHILD=1` env 标记 + 命令行可见的唤醒回执前缀），README 文档化的用户 CLI 不再被误判成无头回合而误触 session-limit。
 23. **文件引用是引用不是内容，且 peer 管道帧不带它（v0.9.1 G-10）**——`xc_relay({refs})` 只传工作区内真实普通文件的 path+sha256（+可选 mime/note；复用 evidence 三道硬闸与 sha256 现算），接收面渲染「用 Read 打开该路径」提示：**不内联内容、不做 base64**（消息通道是纯文本 JSON，内联会撑爆帧闸与注入预算）。因此引用**不随消息历史永存**——文件被移动/删除后引用即失效（sha256 仍可对账「曾经存在过这个版本」）。peer 轴另有载体边界：管道 MsgFrame 白名单冻结，refs 只随**文件退化**队列项抵达，`via=pipe` 时 payload `refsCarried:false` 如实说明（urgent 同款纪律）。G-17（无头回合 MCP 子集加载 = 宿主层能力）只出可行性结论与平台反馈建议，本版不自造实现，见 PROTOCOL §15.4。
 
+24. **容量闸三旋钮走 config.json `capacity` 段，闸状态与持续态上观测面（v0.9.3 B1–B4）**——`.crosschat/config.json` 收 `{wake_enabled, capacity:{warn_watermark, turn_estimate_bytes, wake_gate}}`（优先级 file > env > 内置默认，每次现读=改文件即生效；段与键全部可选，畸形逐层披露不静默；未知键静默忽略）。`xc_overview`（team/status/panel 同源）的 capacity 块附 `wakeGate`：阻塞条件名、下次重判时刻、本窗 wake-deferred 计数；GREEN 不显示阻塞。持续态告警：wake-deferred 窗内累积 ≥`XC_DEFERRED_ALERT_N`（缺省 5）、wake 生效值连续 false ≥`XC_WAKE_OFF_ALERT_MS`（缺省 30min）且有 pending 消息 → urgent lead（每窗/各一次）；生效值变更落 `config-effective-changed{key,from,to,source}`（对拍基线 `capacity/config-state.json`，防刷屏）。边界（如实声明）：现读比对发生在唤醒闸被咨询时（总开关关闭时那段时间的配置变更不产生事件）；config.json 段在唤醒闸与 overview 三视图生效，`xc_doctor`/journal/checkpoint 的容量展示仍走 env 口径（未设该段时各面行为与本版之前完全一致）；告警状态文件读-改-写不加显式锁，同机多 server 最坏罕见重复一条（engine.jsonl 仍是权威）。
 ## 威胁模型（v0.6 口径）
 
 - **不做对抗级防伪**：同机进程可伪造盖章记录/注册表文件——`origin="user"` 是体验性归因而非凭据；零宽/同形字归一、转发溯源链（forwardOf/hop-chain）等红队级防御已按个人/内部场景威胁模型**移除**（v0.5 的防御记录见各版设计文档）。v0.6.1 起队内轴改为在闸口**拒绝**会被静默归一到碰撞键的花名写法（与 peer 轴严格文法一致）——这是拒绝歧义而非恢复折叠/归一。

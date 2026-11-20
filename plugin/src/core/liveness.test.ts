@@ -22,6 +22,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  LIVENESS_EVIDENCE_FRESH_MS,
   SESSION_IDLE_EVENT,
   SESSION_RUNNING_EVENT,
   applyLivenessTransition,
@@ -212,9 +213,17 @@ describe("memberLivenessView（三视图统一口径）", () => {
       liveness: "running", livenessTs: now - 90_000, lastEventTs: now - 119_500,
     };
     const view = memberLivenessView(member(), record, EMPTY_SCAN, now);
-    expect(view).toEqual({ state: "running", stateAgeMin: 2, lastEventAgeMin: 2, endpointLive: false });
+    expect(view).toEqual({
+      state: "running",
+      stateAgeMin: 2,
+      lastEventAgeMin: 2,
+      endpointLive: false,
+      // v0.9.3（C1）：hooks 自述 running + registry lastSeen 刚刷（lastSeen=now）。
+      livenessSources: ["hooks-pid", "registry-lastSeen"],
+    });
     expect(memberLivenessView(member(), record, liveScan("sess_w1", now), now)).toEqual({
       state: "running", stateAgeMin: 2, lastEventAgeMin: 2, endpointLive: true,
+      livenessSources: ["hooks-pid", "registry-lastSeen"],
     });
     // 时钟回拨 → 钳 0（不出负数）。
     const future: SessionRecord = { ...record, lastEventTs: now + 60_000 };
@@ -228,8 +237,123 @@ describe("memberLivenessView（三视图统一口径）", () => {
       stateAgeMin: null,
       lastEventAgeMin: null,
       endpointLive: false,
+      // lastSeen 恰在 now（新鲜）→ 第②判据可判活，但 state 仍保守 idle（无 hooks running）。
+      livenessSources: ["registry-lastSeen"],
     });
     expect(memberLivenessView(member(), undefined, EMPTY_SCAN, 1_000)).toMatchObject({ state: "idle", endpointLive: false });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.9.3（C1）：活性四判据合判——四判据各自单独可判活 / 全静默 unknown / dead 只认 pid
+// ---------------------------------------------------------------------------
+
+describe("memberLivenessView：四判据合判（v0.9.3 C1）", () => {
+  const NOW = 10 * 60_000;
+  const FRESH = 30 * 60_000;
+  /** 无证言、无邮箱、会话记录 lastSeen 在窗外——四判据全无声的「白板」基线。 */
+  const bare = (): TeamMember => ({ key: "b", sessionId: "sess_b", role: "worker", joinedAt: 1, lastSeen: 1 });
+  const bareRecord = (): SessionRecord => ({ sessionId: "sess_b", cwd: "", startedAt: 1, lastSeen: NOW - FRESH - 1 });
+
+  it("四判据各自单独在场 → 各自单独判活（其余判据全静默）", () => {
+    // ① hooks/pid：自述 running（带可信时刻）。
+    expect(memberLivenessView(bare(), { ...bareRecord(), liveness: "running", livenessTs: NOW - 1_000 }, EMPTY_SCAN, NOW).livenessSources)
+      .toEqual(["hooks-pid"]);
+    // ① hooks/pid：peer 扫描端点活（pid 活 + 心跳新鲜）。
+    expect(memberLivenessView(bare(), undefined, liveScan("sess_b", NOW), NOW).livenessSources)
+      .toEqual(["hooks-pid"]);
+    // ② registry lastSeen：会话记录 lastSeen 新鲜。
+    expect(memberLivenessView(bare(), { ...bareRecord(), lastSeen: NOW - 5 * 60_000 }, EMPTY_SCAN, NOW).livenessSources)
+      .toEqual(["registry-lastSeen"]);
+    // ③ engine 事件：引擎证言在窗内。
+    expect(memberLivenessView(bare(), undefined, EMPTY_SCAN, NOW, { witness: { sessionId: "sess_b", kind: "heartbeat", ts: NOW - 60_000 } }).livenessSources)
+      .toEqual(["engine-events"]);
+    // ④ mailbox 写入 mtime：邮箱文件刚被写过。
+    expect(memberLivenessView(bare(), undefined, EMPTY_SCAN, NOW, { mailboxMtimeMs: NOW - 2 * 60_000 }).livenessSources)
+      .toEqual(["mailbox-mtime"]);
+  });
+
+  it("多判据同时在场 → 按固定序合并（ hooks-pid → registry-lastSeen → engine-events → mailbox-mtime ）", () => {
+    const record: SessionRecord = { ...bareRecord(), lastSeen: NOW - 60_000, liveness: "running", livenessTs: NOW - 60_000 };
+    const view = memberLivenessView(bare(), record, liveScan("sess_b", NOW), NOW, {
+      witness: { sessionId: "sess_b", kind: "running", ts: NOW - 30_000 },
+      mailboxMtimeMs: NOW - 10_000,
+    });
+    expect(view.livenessSources).toEqual(["hooks-pid", "registry-lastSeen", "engine-events", "mailbox-mtime"]);
+    expect(view.state).toBe("running");
+  });
+
+  it("全静默 → 判据来源空（unknown）：不自称 running、也不判 dead，state 落保守 idle", () => {
+    const view = memberLivenessView(bare(), undefined, EMPTY_SCAN, NOW);
+    expect(view.livenessSources).toEqual([]);
+    expect(view.state).toBe("idle");
+    expect(view.endpointLive).toBe(false);
+    // 全部判据过期（窗外的 lastSeen / 邮箱 mtime / 证言）同样是全静默。
+    const stale = memberLivenessView(bare(), { ...bareRecord(), lastSeen: NOW - FRESH - 1 }, EMPTY_SCAN, NOW, {
+      witness: { sessionId: "sess_b", kind: "idle", ts: NOW - FRESH - 1 },
+      mailboxMtimeMs: NOW - FRESH - 1,
+    });
+    expect(stale.livenessSources).toEqual([]);
+    expect(stale.state).toBe("idle");
+  });
+
+  it("dead 仍只认 pid-dead：判死时判据来源为空（pid-dead 不是活证据），活判据压不过它", () => {
+    const deadScan: PeerScanResult = {
+      active: [], foreign: [], skipped: 0,
+      dead: [{
+        record: {
+          pid: 2_147_483_645,
+          sessionId: "sess_b",
+          messagingSocketPath: "\\\\.\\pipe\\LOCAL\\xc-liveness-dead",
+          pidDomain: localPidDomain(),
+          peerProtocol: 1,
+          peerFeatures: [],
+          kind: "bg",
+          formerNames: [],
+          startedAt: NOW - 3_600_000,
+          lastSeen: NOW,
+        },
+        reason: "pid-dead",
+      }],
+    };
+    const record: SessionRecord = { ...bareRecord(), lastSeen: NOW, liveness: "running", livenessTs: NOW - 1_000 };
+    const view = memberLivenessView(bare(), record, deadScan, NOW, {
+      witness: { sessionId: "sess_b", kind: "running", ts: NOW - 1_000 },
+      mailboxMtimeMs: NOW,
+    });
+    expect(view.state).toBe("dead");
+    expect(view.livenessSources).toEqual([]);
+  });
+
+  it("未来值不判活：lastSeen / 邮箱 mtime / 证言在未来一律不计（可信度前置）", () => {
+    const yearMs = 365 * 24 * 60 * 60_000;
+    const view = memberLivenessView(bare(), { ...bareRecord(), lastSeen: NOW + yearMs }, EMPTY_SCAN, NOW, {
+      witness: { sessionId: "sess_b", kind: "running", ts: NOW + yearMs }, // 证言容差 0（r4）
+      mailboxMtimeMs: NOW + yearMs,
+    });
+    expect(view.livenessSources).toEqual([]);
+    // 证言恰在 now（同机同钟）仍算新鲜——对照：容差只对自述字段开放。
+    expect(memberLivenessView(bare(), undefined, EMPTY_SCAN, NOW, { witness: { sessionId: "sess_b", kind: "idle", ts: NOW } }).livenessSources)
+      .toEqual(["engine-events"]);
+  });
+
+  it("新鲜窗由调用方注入（env 解析在 mcp 面；core 保持无 env）", () => {
+    // 5min 前的 lastSeen：缺省 30min 窗内 → 判活；注入 1min 窗 → 窗外 → 不判。
+    const record: SessionRecord = { ...bareRecord(), lastSeen: NOW - 5 * 60_000 };
+    expect(memberLivenessView(bare(), record, EMPTY_SCAN, NOW).livenessSources).toEqual(["registry-lastSeen"]);
+    expect(memberLivenessView(bare(), record, EMPTY_SCAN, NOW, { freshMs: 60_000 }).livenessSources).toEqual([]);
+    expect(LIVENESS_EVIDENCE_FRESH_MS).toBe(30 * 60_000); // 与 stale 内置缺省同宽
+  });
+
+  it("合判不改清扫豁免输入：同证言下判据来源不同，豁免结论相同（仍只认证言）", () => {
+    const witness: SessionWitness = { sessionId: "sess_b", kind: "heartbeat", ts: NOW - 60_000 };
+    const withEvidence = memberLivenessView(bare(), { ...bareRecord(), lastSeen: NOW }, EMPTY_SCAN, NOW, { witness, mailboxMtimeMs: NOW });
+    const without = memberLivenessView(bare(), undefined, EMPTY_SCAN, NOW, { witness });
+    expect(withEvidence.livenessSources).toEqual(["registry-lastSeen", "engine-events", "mailbox-mtime"]);
+    expect(without.livenessSources).toEqual(["engine-events"]);
+    // 豁免判据（sweepOwnerGuard）只吃证言——两侧相同。
+    expect(sweepOwnerGuard(witness, NOW, FRESH)).toBe(sweepOwnerGuard(witness, NOW, FRESH));
+    expect(sweepOwnerGuard(witness, NOW, FRESH)).toBe("heartbeat");
   });
 });
 

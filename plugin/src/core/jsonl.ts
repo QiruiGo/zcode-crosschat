@@ -5,8 +5,9 @@
  * writes (O_APPEND, never rename) and therefore read-tolerant by contract
  * (DESIGN.md §2.7-5): a crash can leave a half-written tail line; parse
  * failures are skipped and reported through an onMalformed callback, and an
- * incomplete tail is truncated before the next append. This is the dsh
- * original behavior (readMailbox's onMalformed callback, mailbox.js:29-40;
+ * incomplete tail is newline-separated before the next append (v0.9.3 P0:
+ * bounded tail probe, never a whole-file read). This is the dsh original
+ * behavior (readMailbox's onMalformed callback, mailbox.js:29-40;
  * appendMailbox separator handling, state.js:381-395), made explicit.
  *
  * Mutations that rewrite existing lines (ack/discard/lease) go through
@@ -15,7 +16,8 @@
  *
  * @module core/jsonl
  */
-import { mkdir, open, readFile, truncate } from 'node:fs/promises';
+import { mkdir, open, readFile } from 'node:fs/promises';
+import type { FileHandle } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { writeFileAtomic, stripLeadingBom } from './atomic.js';
 
@@ -90,40 +92,60 @@ export async function readJsonl<T>(
 }
 
 /**
- * Append records as JSON lines.
+ * `appendJsonl` 尾行探针窗口（字节）：只读文件末尾这么多字节判断是否以 `\n`
+ * 结尾。v0.9.3（P0，审计洪泛 OOM）：追加成本必须与文件大小无关——旧实现每次
+ * 追加前 `readFile` 整个文件，一条审计 = 一次全文件读，M 条坏行 × 每拍 sweep
+ * 就能把 MCP server 进程打到 heap limit。
+ */
+const APPEND_TAIL_PROBE_BYTES = 4096;
+
+/**
+ * 尾部是否需要先补一个 `\n` 分隔符：open + fstat 取 size，定点 read 末尾
+ * ≤{@link APPEND_TAIL_PROBE_BYTES} 字节，只看最后一个字节。文件不存在/为空/
+ * 以 `\n` 结尾 → false（无需分隔符）。只读有界尾窗，绝不整文件读。
+ */
+async function tailNeedsSeparator(file: string): Promise<boolean> {
+  let handle: FileHandle;
+  try {
+    handle = await open(file, 'r');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
+  try {
+    const { size } = await handle.stat();
+    if (size === 0) return false;
+    const length = Math.min(APPEND_TAIL_PROBE_BYTES, size);
+    const buffer = Buffer.allocUnsafe(length);
+    const { bytesRead } = await handle.read(buffer, 0, length, size - length);
+    if (bytesRead === 0) return false;
+    return buffer[bytesRead - 1] !== 0x0a;
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * Append records as JSON lines (constant / bounded cost).
  *
  * Tail handling before appending:
- * - file missing or ends with `\n` -> plain O_APPEND of the new lines;
- * - tail is a complete JSON object line without trailing newline -> append a
- *   separating `\n` first (dsh appendMailbox separator rule, state.js:393);
- * - tail is an incomplete (unparseable) fragment -> truncate it away first
- *   (DESIGN.md §2.7-5: "追加前若尾行不完整先截断").
+ * - probe only the last ≤4 KiB via open+fstat+positional read (v0.9.3 P0);
+ *   the file size never enters memory and the cost does not grow with it;
+ * - file missing, empty, or ending with `\n` -> plain O_APPEND of the new lines;
+ * - tail lacks the trailing newline (half-written fragment, or a complete line
+ *   written without its separator) -> write a separating `\n` first, then the
+ *   new lines. The fragment stays on disk as an unparseable line: readers skip
+ *   it and the (throttled) malformed audit reports it; it is NOT truncated
+ *   away anymore, because deciding "truncate vs separate" would require the
+ *   whole-file read this change removes (dsh appendMailbox separator rule,
+ *   state.js:393, preserved).
+ *
+ * The O_APPEND write itself is unchanged: one atomic write of prefix+payload.
  */
 export async function appendJsonl(file: string, lines: readonly string[]): Promise<void> {
   if (lines.length === 0) return;
   await mkdir(dirname(file), { recursive: true });
-  let raw = '';
-  try {
-    raw = await readFile(file, 'utf8');
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-  }
-  let prefix = '';
-  if (raw !== '' && !raw.endsWith('\n')) {
-    const tail = stripLeadingBom(raw.slice(raw.lastIndexOf('\n') + 1));
-    let tailIsCompleteLine = false;
-    try {
-      tailIsCompleteLine = JSON.parse(tail) !== null && typeof JSON.parse(tail) === 'object';
-    } catch {
-      tailIsCompleteLine = false;
-    }
-    if (tailIsCompleteLine) {
-      prefix = '\n';
-    } else {
-      const keepUpTo = raw.lastIndexOf('\n') + 1; // 0 when the whole file is the fragment
-      if (keepUpTo !== raw.length) await truncate(file, Buffer.byteLength(raw.slice(0, keepUpTo), 'utf8'));
-    }
-  }
+  const prefix = (await tailNeedsSeparator(file)) ? '\n' : '';
   const payload = lines.map((line) => `${line}\n`).join('');
   const handle = await open(file, 'a');
   try {
