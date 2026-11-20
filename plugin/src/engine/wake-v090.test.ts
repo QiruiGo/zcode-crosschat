@@ -508,14 +508,24 @@ describe("V090-07 attemptWake：失败侦听窗口与回执 note 的如实边界
     await seedTeamWithMember("engine");
     await seedSessionRecord("sess_b", "b");
     const messageId = await seedMailbox();
+    // 证据刻意取**非** sessionNotFound 形态（ENOENT）：本锚点测的是「侦听窗口抓到
+    // 迟到的失败证据 → wake-failed + 租约释放」。sessionNotFound 证据会额外触发
+    // 自动重绑重试，而重试路径会**重新盖同一消息的投递租约**（重试也是一次投递尝试，
+    // wake.ts retryOnceAfterSessionNotFound 的 claimMailboxDelivery）——于是
+    // 「租约已释放」只是 release 与 retry-claim 之间的**瞬态**，断言它与重试赛跑：
+    // 全量并行负载下偶发红（wake-failed 已落账、重试已重盖租约，observed 1/6  Standalone）。
+    // 重试链路由下方「首次 --resume 命中 sessionNotFound → 重绑重试恰一次」「重试仍
+    // sessionNotFound → wake-retry-failed」「removed 成员不重试」三例覆盖，此处不重复测它。
     await attemptWake(baseReq({
       receiptIds: [messageId],
       watchWindowMs: 2000,
       watchPollMs: 20,
-      spawn: spawnThenLog([], 300, "Error: Session not found: sess_b"),
+      spawn: spawnThenLog([], 300, "Error: spawn ZCode.exe ENOENT"),
     }));
     const sawFailure = await waitUntil(() => readEngineEvents().some((e) => e["event"] === "wake-failed"));
     expect(sawFailure).toBe(true);
+    // 非 sessionNotFound 证据不触发重试（FI-7 既有语义）⇒ 租约释放是稳态而非瞬态
+    expect(readEngineEvents().some((e) => e["event"] === "wake-retry")).toBe(false);
     const box = await readMailbox(root, "default", "b");
     expect(box[0]!.deliveryClaimedAt).toBeUndefined(); // 租约已释放
   });

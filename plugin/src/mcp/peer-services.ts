@@ -106,7 +106,7 @@ import {
 import { resolvePeerMessage, storedMessageCorruptFile, storePeerMessageFull } from "../core/msgstore.js";
 import { uservoiceMatchAndConsume, verifyUservoiceStampAuthority } from "../core/uservoice.js";
 import { identityStore } from "./identity.js";
-import { RESERVED_MEMBER_KEYS } from "../core/types.js";
+import { RESERVED_MEMBER_KEYS, TASK_STATUSES, type TaskStatus } from "../core/types.js";
 import { leadKeyOf } from "./tools-team.js";
 import {
   defaultPeerSocketPath,
@@ -238,7 +238,14 @@ export interface PeerAgentsPanel {
   peers: PeerRow[];
   /** v0.5（R-7）：成员行增 isLead（现算字段 `m.key===leadKeyOf(team)`，不入盘不入快照）。 */
   members: { key: string; role: string; state: string; unread: number; isLead: boolean }[];
-  tasks: { pending: number; inProgress: number; done: number };
+  /**
+   * v0.9.2（C4）：任务计数改**七态全量**（`TASK_STATUSES` 逐一为键），与 `xc_overview`
+   * view:"status" 的 `taskCounts`、team 板面同口径——三桶时代（pending/in_progress/done）
+   * 把 completed+failed+cancelled 并成 `done`、claimed 与 blocked 无键可落，panel 与
+   * status/team 面对不上账（验收锚点「panel 与 team/status 面数值可对账」）。
+   * 键集恒为七态（缺的记 0），不按出现过的状态动态增减——形状稳定才能跨面对拍。
+   */
+  tasks: Record<TaskStatus, number>;
   inboundPolicy?: {
     mode: string;
     decidedBy: string;
@@ -1212,11 +1219,10 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
         unread: 0,
         isLead: team !== undefined && member.key === leadKeyOf(team),
       }));
-      const tasks = { pending: 0, inProgress: 0, done: 0 };
+      // v0.9.2（C4）：七态全量计数（一个不漏；键集恒为 TASK_STATUSES，缺的记 0）。
+      const tasks = Object.fromEntries(TASK_STATUSES.map((s) => [s, 0])) as Record<TaskStatus, number>;
       for (const task of team?.tasks ?? []) {
-        if (task.status === "pending") tasks.pending += 1;
-        else if (task.status === "in_progress") tasks.inProgress += 1;
-        else tasks.done += 1;
+        if (task.status in tasks) tasks[task.status] += 1;
       }
       let inboundPolicy: PeerAgentsPanel["inboundPolicy"];
       if (self !== undefined) {

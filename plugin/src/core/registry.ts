@@ -95,6 +95,8 @@ export async function writeSession(stateRoot: string, record: SessionRecord): Pr
  * 的引擎事件都刷新 `lastEventTs`（G-5 心跳代理的数据基础）。状态**迁移**（含
  * 无状态 → running 的首标）写 engine.jsonl `session-running` / `session-idle`
  * 事件（core/liveness.ts 冻结命名；best-effort，写失败不影响记录本身）。
+ * v0.9.2（A3）：同一点盖写 `lastTurnTs`（回合开始时刻）——UserPromptSubmit 的
+ * 「回合开始事故摘要」以此为窗口起点，见函数体末与 hooks/prompt-submit.ts。
  */
 export async function refreshSessionLastSeen(
   stateRoot: string,
@@ -114,6 +116,12 @@ export async function refreshSessionLastSeen(
   if (options.ensureRegToken === true && record.regToken === undefined) {
     record.regToken = randomUUID();
   }
+  // v0.9.2（A3）：回合开始时刻——本函数的全部调用点（SessionStart / UserPromptSubmit
+  // 钩子，hooks/shared.ts refreshSessionRegistration）都是回合边界，因此「盖写
+  // lastTurnTs」在此单点完成，不需要新的写入面。A3 的 UserPromptSubmit 事故摘要在
+  // 盖写**之前**读旧值当窗口起点（hooks/prompt-submit.ts），故「自上次回合」的口径
+  // 由数据本身保证，不依赖调用序记忆。存量记录首回合写入后即具备窗口。
+  record.lastTurnTs = now;
   await writeSession(stateRoot, record);
   await logLivenessTransition(stateRoot, sessionId, record, applied.transition);
   // v0.9.1 r3（V090-01）：同步写引擎证言（豁免输入与自述记录分路）。

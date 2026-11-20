@@ -57,6 +57,30 @@ export type WakeSpawnMode = "helper" | "direct";
 export const WAKE_HELPER_TIMEOUT_MS = 5000;
 
 /**
+ * v0.9.2（C1，V091-13 修复）：**唤醒子进程 env 标记** `XC_WAKE_CHILD=1`。
+ *
+ * 为什么需要：容量采样器（core/capacity.ts）此前靠命令行形态猜「哪个是无头唤醒回合」，
+ * 而 README 文档化的 `ZC`/`zc` 壳函数让用户随手跑的 `zcode.cjs --resume … -p --mode yolo`
+ * 与唤醒子命令行逐字节同形 → 单个 >800MB 的用户 CLI 就把 session-limit 判红、合法唤醒被
+ * 静默转 mailbox。现在由 spawn 侧给唤醒子盖一个专属标记，分类规则只认标记
+ * （core/capacity.ts 的 `WAKE_CHILD_COMMAND_MARKER` 注释说明：CIM 读不到 env，故采样面
+ * 取命令行可见的同族证据=唤醒回执前缀；本 env 标记是进程内可验证的真值，两者指向同一个
+ * 子进程）。
+ *
+ * 传播路径：helper 形态下本 env 随 `spawn(process.execPath, …)` 进 helper，helper 以
+ * `{...process.env}` 转发给 ZCode.exe 唤醒子（wake-helper.ts 不改即达）；direct 形态下
+ * 直接进唤醒子。**恒注入**（不随 opts.env 缺省而消失）——它描述的是「这次 spawn 的性质」，
+ * 不是运维旋钮；无新增必填配置。
+ */
+export const WAKE_CHILD_ENV_KEY = 'XC_WAKE_CHILD';
+export const WAKE_CHILD_ENV_VALUE = '1';
+
+/** 组装子进程 env：基底 env + 唤醒子标记（direct/helper 两形态共用）。 */
+function childEnvOf(opts: SpawnResumeOptions): NodeJS.ProcessEnv {
+  return { ...(opts.env ?? process.env), [WAKE_CHILD_ENV_KEY]: WAKE_CHILD_ENV_VALUE };
+}
+
+/**
  * 解析 wake-helper 产物路径（DESIGN-V0.2 §4.2）：ZCODE_PLUGIN_ROOT 由 plugin.json
  * mcpServers.env 注入（§10.1）。root 为空/文件缺失由 spawnResume 判定——同步抛错、
  * 降级 mailbox（fail closed，不回退 direct）。
@@ -92,7 +116,8 @@ export interface SpawnResumeOptions {
   /** stdout/stderr 落盘文件（<stateRoot>/logs/wake-<to>-<ts>.json），父目录不存在则创建。 */
   logFile: string;
   /** 基底 env（默认 process.env）；direct 形态下 ELECTRON_RUN_AS_NODE=1 恒定注入，
-   * helper 形态下原样转发给 helper（ELECTRON 由 helper 注入到唤醒子进程）。 */
+   * helper 形态下原样转发给 helper（ELECTRON 由 helper 注入到唤醒子进程）。
+   * v0.9.2（C1）：无论哪种形态，唤醒子标记 `XC_WAKE_CHILD=1` 都恒注入（childEnvOf）。 */
   env?: NodeJS.ProcessEnv;
   /** 测试注入点；生产用 node:child_process.spawn。 */
   spawnImpl?: (cmd: string, args: string[], opts: SpawnOptions) => ChildProcess;
@@ -157,7 +182,8 @@ function spawnDirect(opts: SpawnResumeOptions): SpawnResumeResult {
   mkdirSync(dirname(logFile), { recursive: true });
   // 追加写；子进程与异步 error 处理器共用该 fd，父进程写完即关。
   const fd = openSync(logFile, "a");
-  const env: NodeJS.ProcessEnv = { ...(opts.env ?? process.env), ELECTRON_RUN_AS_NODE: "1" };
+  // v0.9.2（C1）：基底 env + ELECTRON_RUN_AS_NODE + 唤醒子标记 XC_WAKE_CHILD=1。
+  const env: NodeJS.ProcessEnv = { ...childEnvOf(opts), ELECTRON_RUN_AS_NODE: "1" };
   // 参数一律走数组（不经 shell），prompt 中的引号/换行无需转义。
   const args = [
     cfg.zcodeCjs,
@@ -270,7 +296,9 @@ function spawnViaHelper(opts: SpawnResumeOptions): SpawnResumeResult {
   // 树之前早已退出并孤儿化了唤醒子进程）；stdio 用 pipe 以读取单行 JSON 协议。
   const child = spawn(process.execPath, args, {
     cwd,
-    env: { ...(opts.env ?? process.env) },
+    // v0.9.2（C1）：唤醒子标记随 helper env 转发给唤醒子（wake-helper.ts 的
+    // `{...process.env}` 原样带过去，helper 无需改）。
+    env: childEnvOf(opts),
     detached: false,
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,

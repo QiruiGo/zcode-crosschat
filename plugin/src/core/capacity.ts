@@ -16,8 +16,12 @@
  * 1. PowerShell 5.1 读无 BOM UTF-8 ps1 按 GBK 解码 → Get-CimInstance 静默空结果。
  *    本模块不落 ps1 文件：命令经 argv 传入且**纯 ASCII**（const CIM_COMMAND）。
  * 2. （tasklist `"178,600 K"` 剥 K 后缀问题）本采样器不走 tasklist 口径。
- * 3. `--resume` 无头树命令行无 `--type`，会被误归 main → 用
- *    `zcode.cjs ∧ ¬app-server ∧ ¬--surface` 判定 headless-turn（分类规则第 6 步）。
+ * 3. v0.9.2（C1，V091-13 修复）：`--resume` 无头树的归类**不再用命令行形态猜**
+ *    （原第⑥步 `zcode.cjs ∧ ¬app-server ∧ ¬--surface` 把 README 文档化的用户 CLI
+ *    一并误归 headless-turn，单个 >800MB 的用户 CLI 即把 session-limit 判红、
+ *    合法唤醒被静默转 mailbox）——改认**唤醒子标记**（见 {@link WAKE_CHILD_COMMAND_MARKER}
+ *    与 {@link WAKE_CHILD_ENV_MARKER} 注释：env 标记由 spawnResume 注入、CIM 读不到，
+ *    故归类判据取命令行可见的同族证据）。
  *
  * 无定时器纪律：只在 xc_overview/xc_doctor 调用时惰性采样，缓存文件
  * `.crosschat/capacity/sample.json` 最小间隔 XC_MEM_SAMPLE_MIN_MS（缺省 60s），
@@ -39,6 +43,8 @@ import { mkdir, readFile } from 'node:fs/promises';
 import os from 'node:os';
 import { dirname, join } from 'node:path';
 import { writeFileAtomic } from './atomic.js';
+// v0.9.2（C1）：唤醒子命令行标记 = 唤醒 prompt 的冻结回执前缀（单一真源，不另抄字面量）。
+import { RECEIPT_PREFIX } from './mailbox.js';
 
 // --- 阈值缺省值（DESIGN §3.3 公式注释；方案 C3 阈值）-------------------------
 
@@ -157,24 +163,55 @@ export interface ClassifiedTree {
 }
 
 /**
+ * 唤醒子进程的 **env 标记键/值**（v0.9.2 C1）：`spawnResume`
+ * （engine/resume-cli.ts）注入 `XC_WAKE_CHILD=1`，经 helper 的 env 转发直达无头
+ * `--resume` 唤醒子进程。它是「这是唤醒子」的进程内可验证凭据（同进程可读子进程 env），
+ * **但不是采样器的判据**——见 {@link WAKE_CHILD_COMMAND_MARKER} 的平台事实。
+ */
+export const WAKE_CHILD_ENV_MARKER = 'XC_WAKE_CHILD';
+export const WAKE_CHILD_ENV_VALUE = '1';
+
+/**
+ * 唤醒子进程的**命令行标记**（v0.9.2 C1；归类判据取它，不取 env 标记）。
+ *
+ * 平台事实：`Win32_Process`（CIM）读不到别的进程的环境变量——env 标记对采样器不可见，
+ * 按 env 归类在本平台做不到（不签名、不注入、不读他人内存，均越出威胁模型与权限面）。
+ * 而同一次唤醒的 prompt 恒以 DESIGN §2.4 冻结的回执前缀开头（core/mailbox.ts
+ * `RECEIPT_PREFIX`，只由唤醒路径组装），该前缀随 `--prompt` 进命令行 → CIM 可见。
+ * 两层标记指向同一个进程、同一个语义，故命令行标记是 env 标记在采样面的投影。
+ *
+ * 与原第⑥步（`zcode.cjs ∧ ¬app-server ∧ ¬--surface`）的差别是**方向相反的失败模式**：
+ * 旧规则把 README 文档化的用户 CLI（`zc/zc` 壳函数随手跑的 `zcode.cjs --resume … -p`、
+ * `zcode.cjs --version`）误判成回合树 → session-limit 误红、合法唤醒被静默转 mailbox
+ * （V091-13 实测）；新规则对无标记的 `--resume` 命令行归 main（漏计并发回合），
+ * 只削弱 red2/red3 的灵敏度，不再制造假红——容量闸的失败方向必须是「漏」不是「误伤」。
+ */
+export const WAKE_CHILD_COMMAND_MARKER = RECEIPT_PREFIX;
+
+/** 命令行是否带唤醒子标记（{@link WAKE_CHILD_COMMAND_MARKER}；供测试与诊断复用）。 */
+export function isWakeChildCommandLine(commandLine: unknown): boolean {
+  return typeof commandLine === 'string' && commandLine.includes(WAKE_CHILD_COMMAND_MARKER);
+}
+
+/**
  * 单进程分类（E3 ps-procs.ps1 判定顺序 1:1 平移；顺序即语义，勿重排）：
- * ①默认 main → ②`--type=` 归 shell（renderer/gpu/utility/…）→ ③
- * `--utility-sub-type=` 归 cli-utility → ④`__zcode-plugin-host` 归 plugin-host →
- * ⑤`app-server` 归 appserver（带 `--surface`=desktop-appserver，否则
- * headless-appserver=provision 临时 keeper）→ ⑥仍为 main 且含 `zcode.cjs` 且
- * ¬app-server ∧ ¬--surface → headless-turn（E3 踩坑 3）。
+ * ①**唤醒子标记优先**（v0.9.2 C1：命令行带唤醒回执前缀即 headless-turn，先于一切
+ *    形态规则——标记是结论，不参与后续比较）→ ②默认 main → ③`--type=` 归 shell
+ *    （renderer/gpu/utility/…）→ ④`--utility-sub-type=` 归 cli-utility →
+ *    ⑤`__zcode-plugin-host` 归 plugin-host → ⑥`app-server` 归 appserver（带
+ *    `--surface`=desktop-appserver，否则 headless-appserver=provision 临时 keeper）。
+ *    v0.9.2 起**删除**原第⑥步之后的「`zcode.cjs ∧ ¬app-server ∧ ¬--surface` 猜回合树」
+ *    规则（V091-13：用户 CLI 与唤醒子命令行同形，猜错即误伤合法唤醒）。
  */
 export function classifyProcess(row: ProcRow): CapacityKind {
   const cl = typeof row.commandLine === 'string' ? row.commandLine : '';
+  if (isWakeChildCommandLine(cl)) return 'headless-turn';
   let kind: CapacityKind = 'main';
   if (/--type=([\w.-]+)/.test(cl)) kind = 'shell';
   if (/--utility-sub-type=([\w.]+)/.test(cl)) kind = 'cli-utility';
   if (cl.includes('__zcode-plugin-host')) kind = 'plugin-host';
   if (cl.includes('app-server')) {
     kind = cl.includes('--surface') ? 'desktop-appserver' : 'headless-appserver';
-  }
-  if (kind === 'main' && cl.includes('zcode.cjs') && !cl.includes('app-server') && !cl.includes('--surface')) {
-    kind = 'headless-turn';
   }
   return kind;
 }
@@ -296,7 +333,8 @@ export interface CapacitySample {
   watermark: number;
   /** 常驻树 WS 合计；CIM 失败时 null（不虚报）。 */
   steadyTreeBytes: number | null;
-  /** 瞬态回合树进程数；CIM 失败时 0（degraded 标记真实状态）。 */
+  /** 瞬态回合树进程数；CIM 失败时 0 **且** degraded 在场——此 0 不是「此刻没有回合」的
+   *  断言（面板文本同口径显示 n/a，见 {@link formatCapacityLines}）。 */
   headlessTurnCount: number;
   /** 回合树单进程 WS 峰值；无回合树或 CIM 失败时 null。 */
   headlessTurnMaxRssBytes: number | null;
@@ -372,12 +410,19 @@ export const COMPRESS_ADVICE_LINE =
 
 /** 单行 panel 摘要 + violated detail 行 + C9 压缩建议行（tools-overview/doctor 直接拼用）。 */
 export function formatCapacityLines(s: CapacitySample, verdict: CapacityVerdict): string[] {
-  const turnPart = s.headlessTurnMaxRssBytes === null
-    ? `${s.headlessTurnCount}`
-    : `${s.headlessTurnCount}（峰值 ${formatBytes(s.headlessTurnMaxRssBytes)}）`;
+  // v0.9.2（C2）：degraded 样本的并发回合显示 n/a 而不是 0——「并发回合 0」会被读成
+  // 「此刻没有无头回合」的断言，而 CIM 失败时这个数根本不可知（不虚报口径）。
+  const turnPart = s.degraded !== null
+    ? 'n/a（CIM 进程采样不可用，未评）'
+    : s.headlessTurnMaxRssBytes === null
+      ? `${s.headlessTurnCount}`
+      : `${s.headlessTurnCount}（峰值 ${formatBytes(s.headlessTurnMaxRssBytes)}）`;
+  const steadyPart = s.degraded !== null
+    ? 'n/a（CIM 进程采样不可用，未评）'
+    : s.steadyTreeBytes === null ? 'n/a' : formatBytes(s.steadyTreeBytes);
   const lines = [
     `capacity: ${verdict.red ? 'RED' : 'GREEN'} | 水位 ${(s.watermark * 100).toFixed(1)}% 可用`
-      + ` | 常驻树 ${s.steadyTreeBytes === null ? 'n/a' : formatBytes(s.steadyTreeBytes)}`
+      + ` | 常驻树 ${steadyPart}`
       + ` | 并发回合 ${turnPart}`
       + ` | sampledAt ${new Date(s.sampledAt).toISOString()}`
       + (s.degraded === null ? '' : ` | degraded=${s.degraded}`),

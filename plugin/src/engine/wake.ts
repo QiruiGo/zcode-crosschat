@@ -69,6 +69,23 @@
  * - 键名保持不变（PROTOCOL §15.3 冻结键集只对拍键名），值从令牌变摘要——运维
  *   对账仍可做（同一次唤醒的各行摘要相同），但拿不到可消费的令牌。
  *
+ * v0.9.2 增量（reports/35-v092方案.md §二 组A：主动告警链 + limbo 校准）：
+ * - **A1 同步启动确认**：spawn 成功后不再以「fire-and-forget 已发起」结案——在
+ *   `XC_START_CONFIRM_MS`（缺省 5000ms，正整数；0/负/非法回落缺省）内观察 wake-child
+ *   的**启动证据**（helper 经 onHelperSpawned 汇报的唤醒子 pid，即唤醒子真正被拉起）
+ *   → `WakeResult.startConfirmed` 两态。未见 → `false` + 措辞「已发起但未见启动证据」
+ *   （仍不是送达确认、也不是失败：失败语义由 wake-failed 事件与邮箱 pull 兜底）。
+ *   等待有**提前出口**：helper 进程已退出而未汇报 = 不可能再有证据，立即结算（不白等
+ *   满窗）；direct 形态没有汇报通道，如实按未见处理（该形态仅测试/对照保留）。
+ * - **A4 limbo 校准**（机制 B 判据的三处误报收口）：
+ *   (a) 锁竞争回写失败 → **宽限重试**：目标 sid 自盖章后有会话活动（复用 wake-slow 的
+ *       sessionStartedSince/lastSeen 投影）时，缺失的 consumedAt 可能只是 hook 的注入
+ *       回写没抢到团队锁（2s 预算）——宽限一个 limboGraceMs 再判，不立即判未消费；
+ *   (b) wake prompt 已**内嵌消息全文**（message/withdrawal 场景）且回合确已开跑 →
+ *       记 `injectedConsumed`（consumedAt 回写），不因成员没调 xc_read 而误判 limbo；
+ *   (c) 降级告警按 **(messageId, 轮次=stampedAt)** 节流、同轮多条合并为一条 urgent
+ *       告知（台账 engine/watchdog-state.ts，与看门狗清扫共用同一真源）。
+ *
  * dsh 原版参照（dsh-agent-teams 0.1.29，lib/ 目录）：
  * - tools.js:2088-2093  duplicate 幂等判定（from+content+taskId/attemptId+source* 全等 ∧
  *   isCurrentMail ∧（有任务绑定 ∨ 未读））——本文件导出 findDuplicateMail 供工具面复用
@@ -91,7 +108,10 @@ import {
   claimMailboxDelivery,
   formatReceipt,
   isCurrentMail,
+  limboCandidateMessages,
+  markMailboxConsumed,
   markMailboxDelivered,
+  readMailbox,
   releaseMailboxDelivery,
   appendMailbox,
   createMessage,
@@ -104,7 +124,7 @@ import { mkdir, readFile, rm as rmAsync } from "node:fs/promises";
 import { logEngineEvent } from "../core/log";
 import { pidAlive, withTeamLock } from "../core/lock";
 import { wakeLifecycleFile, wakeLogFile } from "../core/paths";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { writeFileAtomic } from "../core/atomic.js";
 import {
   capacityCacheFile,
@@ -112,6 +132,7 @@ import {
   sampleCapacity,
   turnEstimateBytesFromEnv,
   type CapacitySample,
+  type CapacityVerdict,
 } from "../core/capacity";
 import {
   resolveWakeGate,
@@ -132,6 +153,13 @@ import { sanitizeKey } from "../core/sanitize";
 import { memberState, memberIdentity, type TeamMember, type TeamMessage, type TeamState } from "../core/types";
 import { spawnResume, type WakeSpawnConfig } from "./resume-cli";
 import { explicitSpawnConfigError, resolveZcodeSpawnConfig, type ResolvedSpawnConfig } from "./zcode-locate";
+// v0.9.2（A4-c）：limbo 告警节流台账（与 engine/watchdog.ts 的看门狗清扫共用真源）。
+import {
+  limboAlertAlreadySent,
+  markLimboAlertSent,
+  readWatchdogState,
+  writeWatchdogState,
+} from "./watchdog-state";
 
 /** v0.4（DESIGN-V0.4 §2.4）：req.cfg 测试注入（WakeSpawnConfig）与自动探测结果
  * （ResolvedSpawnConfig）的判别——`in` 收窄会给缺属性分支补 unknown（TS18046），
@@ -513,7 +541,7 @@ export function buildWakePrompt(input: WakePromptInput, maxChars: number = WAKE_
   return prompt;
 }
 
-// ─────────────────────────── spawn 前容量闸（v0.9.1 G-12-b） ───────────────────────────
+// ─────────────────────────── spawn 前容量闸（v0.9.1 G-12-b；v0.9.2 C2/C3/C5 收口） ───────────────────────────
 
 /**
  * v0.9.1（G-12-b）：spawn 前容量闸——「容量只警不拦 = 死亡螺旋」的收口。
@@ -534,6 +562,20 @@ export function buildWakePrompt(input: WakePromptInput, maxChars: number = WAKE_
  * 再来的唤醒不重复采样、不 spawn（RED 期的重试风暴本身是放大器）；窗到期后重新采样，
  * 转 GREEN 即清掉冷却标记、下次唤醒立即通行。
  *
+ * v0.9.2 增量（34-v091验收 V091-13/14/15/18/19 五条 mustFix，全部落在本闸）：
+ * - **C3 冷却键分域**：冷却记录按 `teamId|收方|紧急度` 分域（V091-15：此前只按 stateRoot，
+ *   一个进程的 RED 把全队唤醒——含紧急 relay——一并静默转 mailbox）；
+ * - **C3 窗内沿用明示**：窗内命中时 detail 追加 `cooldown-reuse` 行，写明「未重采样、
+ *   detail/水位是首次判定时刻的快照」（V091-19：五个观测面全绿而唤醒决策面称 capacity-red
+ *   的跨面矛盾，根因是窗内原样返回落盘记录而不说明它是旧快照）；
+ * - **C3 冷却 env 上钳**：`XC_MEM_WAKE_COOLDOWN_MS` ≤ 1h，越界/非法/超钳都不静默
+ *   （V091-15 实测 999999999999 → 277777.78h 照收）；
+ * - **C2 degraded 披露**：CIM 不可用时**放行路径**也落 `wake-capacity-degraded` 事件
+ *   （V091-14：此前「进程类规则未评」的 detail 只在判红时随 wake-deferred 落盘，GREEN 时
+ *   被整体丢弃——宿主 CIM 坏了而闸静默放行，运维零线索）；
+ * - **C5 gateEnv 原值**：wake-deferred 事件补 `gateEnv`（V091-18：注释承诺「非法值不静默、
+ *   事件带 gateEnv 原值」实际只落布尔 `wakeGateEnabled`，运维分不清「没配」与「配错」）。
+ *
  * 边界（如实声明）：闸门只挡**唤醒**（spawn），不拦 pull——消息照常落邮箱，收方自己
  * 的回合随时可读（§2.5 mailbox 行兜底不变）。派单面的「RED 期排队拒绝」需在派单工具
  * 面接线（非本文件域），本版在 wake 层给出 deferral 块与冷却窗供其消费（PROTOCOL §15.2）。
@@ -542,23 +584,59 @@ export function buildWakePrompt(input: WakePromptInput, maxChars: number = WAKE_
 /** 容量闸冷却窗缺省值（ms）——RED deferral 后的静默窗，窗内不重复采样/spawn。 */
 export const WAKE_CAPACITY_COOLDOWN_MS_DEFAULT = 120_000;
 
+/**
+ * 冷却窗 env 上钳（v0.9.2 C3，V091-15）：≤ 1h。
+ * 无上钳时一个笔误（`999999999999`）等于把唤醒通道关 277777 小时——观测旋钮不该有
+ * 「永久」档位；超钳按上钳生效并在 deferral detail 明示（不静默）。
+ */
+export const WAKE_CAPACITY_COOLDOWN_MS_MAX = 3_600_000;
+
+/** 冷却窗 env 解析结果（v0.9.2 C3：分辨「没配」「配错了」「超钳」三种情况，不静默）。 */
+export interface WakeCooldownEnvInfo {
+  /** 生效窗长（ms）。 */
+  cooldownMs: number;
+  /** env 原值（未设/空串 = null）。 */
+  raw: string | null;
+  /** null = 原值生效；'invalid' = 非法值已回落内置缺省；'clamped' = 超上钳已钳制。 */
+  fellBack: 'invalid' | 'clamped' | null;
+}
+
 /** 冷却窗 env：`XC_MEM_WAKE_COOLDOWN_MS`（ms，>=0 合法；0=不冷却=每次投递都重新判定）。 */
-export function wakeCapacityCooldownMsFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+export function wakeCapacityCooldownInfoFromEnv(env: NodeJS.ProcessEnv = process.env): WakeCooldownEnvInfo {
   const raw = env["XC_MEM_WAKE_COOLDOWN_MS"];
-  if (raw === undefined || raw.trim() === "") return WAKE_CAPACITY_COOLDOWN_MS_DEFAULT;
+  if (raw === undefined || raw.trim() === "") {
+    return { cooldownMs: WAKE_CAPACITY_COOLDOWN_MS_DEFAULT, raw: null, fellBack: null };
+  }
   const n = Number(raw);
-  return Number.isFinite(n) && n >= 0 ? n : WAKE_CAPACITY_COOLDOWN_MS_DEFAULT;
+  if (!Number.isFinite(n) || n < 0) {
+    return { cooldownMs: WAKE_CAPACITY_COOLDOWN_MS_DEFAULT, raw, fellBack: 'invalid' };
+  }
+  if (n > WAKE_CAPACITY_COOLDOWN_MS_MAX) {
+    return { cooldownMs: WAKE_CAPACITY_COOLDOWN_MS_MAX, raw, fellBack: 'clamped' };
+  }
+  return { cooldownMs: n, raw, fellBack: null };
+}
+
+export function wakeCapacityCooldownMsFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+  return wakeCapacityCooldownInfoFromEnv(env).cooldownMs;
 }
 
 /**
  * 容量闸开关 env：`XC_MEM_WAKE_GATE`。`"off"` = 关闭容量闸（回到 v0.9.0「只警不拦」
- * 行为）；其余值/未设 = 开启。非法值不静默——按开启处理并在事件里带 `gateEnv` 原值，
+ * 行为）；其余值/未设 = 开启。非法值不静默——按开启处理并在事件里带 `gateEnv` 原值
+ * （v0.9.2 C5/V091-18：兑现本注释的承诺，此前只落布尔 `wakeGateEnabled`），
  * 运维可分辨「我没配」与「我配错了」。
  */
 export function wakeCapacityGateEnabledFromEnv(env: NodeJS.ProcessEnv = process.env): boolean {
   const raw = env["XC_MEM_WAKE_GATE"];
   if (raw === undefined || raw.trim() === "") return true;
   return raw.trim().toLowerCase() !== "off";
+}
+
+/** `XC_MEM_WAKE_GATE` 原值（未设/空串 = null）——wake-deferred 事件 `gateEnv` 字段用。 */
+export function wakeCapacityGateEnvRaw(env: NodeJS.ProcessEnv = process.env): string | null {
+  const raw = env["XC_MEM_WAKE_GATE"];
+  return raw === undefined || raw.trim() === "" ? null : raw;
 }
 
 /** 冷却状态文件（与 capacity 采样缓存同目录）：`<stateRoot>/capacity/wake-deferred.json`。 */
@@ -582,9 +660,45 @@ export interface WakeDeferral {
   cooldownActive: boolean;
 }
 
-/** 落盘的冷却记录（比块多一个 `until` 绝对时刻）。 */
+/**
+ * 冷却记录的**分域键**（v0.9.2 C3，V091-15）：teamId + 收方 + 紧急度。
+ *
+ * 为什么要分域：冷却记录落 `capacity/wake-deferred.json`（状态根级、进程间共享），
+ * 而闸的语义却是「这一次唤醒先别 spawn」。v0.9.1 只按 stateRoot 一个键——成员 A 的 RED
+ * deferral 会把**全队**（含紧急 relay、含别的 team）后续唤醒在窗内一并静默转 mailbox，
+ * 且窗内连 judgeCapacity 都不跑，运维在五个观测面看到全绿却不知道唤醒为何没发生。
+ * 分域后一个进程的 RED 只静默它自己那一格；紧急度单列使紧急 relay 不被普通消息的
+ * 冷却挡下（它仍会被重新判定——RED 期照样 defer，但那是当次判定的结论，不是别人的）。
+ */
+export interface WakeCooldownScope {
+  teamId: string;
+  to: string;
+  urgent: boolean;
+}
+
+/** 分域键的字符串形态（`<teamId>|<收方>|<urgent|normal>`；teamId/to 已是 sanitize 后的键）。 */
+export function wakeCooldownKeyOf(scope: WakeCooldownScope): string {
+  return `${scope.teamId}|${scope.to}|${scope.urgent ? "urgent" : "normal"}`;
+}
+
+/**
+ * 落盘的冷却记录（比块多 `until` 绝对时刻、首次判定时刻与分域键）。
+ * `sampledAt` = detail/水位快照的产生时刻——窗内沿用据此标注「这是旧快照」（V091-19）。
+ */
 interface WakeDeferralRecord extends WakeDeferral {
   until: number;
+  sampledAt: number;
+  scope: WakeCooldownScope;
+}
+
+/**
+ * 冷却记录文件形态（v0.9.2 C3 起为 version 2：`entries` 按分域键索引）。
+ * v0.9.1 的平铺记录（无 `version`/`entries`）**不迁移**：按损坏处理→重新判定
+ * （最坏多采样一次，绝不会把旧格式误读成另一个键域的挡门）。
+ */
+interface WakeDeferralStore {
+  version: 2;
+  entries: Record<string, WakeDeferralRecord>;
 }
 
 function formatBytesLabel(n: number): string {
@@ -594,24 +708,45 @@ function formatBytesLabel(n: number): string {
   return `${Math.round(n)}B`;
 }
 
-/** 读冷却记录；过期/损坏/未来时钟 → undefined（重新判定）。 */
-async function readWakeDeferral(file: string, now: number): Promise<WakeDeferralRecord | undefined> {
+/** 读指定键域的冷却记录；过期/损坏/未来时钟/异格式 → undefined（重新判定）。 */
+async function readWakeDeferral(
+  file: string,
+  now: number,
+  key: string,
+): Promise<WakeDeferralRecord | undefined> {
   try {
-    const rec = JSON.parse(await readFile(file, "utf8")) as Record<string, unknown>;
-    const until = Number(rec["until"]);
+    const store = JSON.parse(await readFile(file, "utf8")) as Record<string, unknown>;
+    if (store["version"] !== 2 || typeof store["entries"] !== "object" || store["entries"] === null) {
+      return undefined; // v0.9.1 平铺格式或损坏 → 重新判定（不误读成别域的挡门）
+    }
+    const rec = (store["entries"] as Record<string, unknown>)[key];
+    if (rec === null || typeof rec !== "object") return undefined;
+    const record = rec as Record<string, unknown>;
+    const until = Number(record["until"]);
     if (!Number.isFinite(until) || until <= now) return undefined;
-    const detail = Array.isArray(rec["detail"])
-      ? (rec["detail"] as unknown[]).filter((d): d is string => typeof d === "string")
+    const detail = Array.isArray(record["detail"])
+      ? (record["detail"] as unknown[]).filter((d): d is string => typeof d === "string")
       : [];
+    const scopeRaw = record["scope"];
+    const scope: WakeCooldownScope =
+      scopeRaw !== null && typeof scopeRaw === "object"
+        ? {
+            teamId: String((scopeRaw as Record<string, unknown>)["teamId"] ?? ""),
+            to: String((scopeRaw as Record<string, unknown>)["to"] ?? ""),
+            urgent: (scopeRaw as Record<string, unknown>)["urgent"] === true,
+          }
+        : { teamId: "", to: "", urgent: false };
     return {
       reason: "capacity-red",
       detail,
-      watermark: Number(rec["watermark"]) || 0,
-      freeBytes: Number(rec["freeBytes"]) || 0,
-      cooldownMs: Number(rec["cooldownMs"]) || 0,
+      watermark: Number(record["watermark"]) || 0,
+      freeBytes: Number(record["freeBytes"]) || 0,
+      cooldownMs: Number(record["cooldownMs"]) || 0,
       retryAfterMs: Math.max(0, until - now),
       cooldownActive: true,
       until,
+      sampledAt: Number(record["sampledAt"]) || 0,
+      scope,
     };
   } catch {
     return undefined; // 缺文件/损坏 JSON → 重新判定（不因冷却文件坏掉而永久挡唤醒）
@@ -619,13 +754,56 @@ async function readWakeDeferral(file: string, now: number): Promise<WakeDeferral
 }
 
 /**
+ * 已披露过 CIM 降级的 stateRoot 集合（v0.9.2 C2，V091-14 修复的节流件）。
+ *
+ * CIM 不可用是**持续性状态**（宿主限制进程枚举就一直坏），每次唤醒都落一条
+ * `wake-capacity-degraded` 会把 engine.jsonl 刷成噪声、把真信号淹掉。故每个状态根在
+ * 持续降级期间只披露一次；采样恢复（非 degraded 样本）即从集合除名，下次降级重新披露。
+ * 进程内去重（重启即重披露；engine.jsonl 是跨进程权威）与 `mcp/task-edges.ts` 的
+ * `anomalyAuditMemo` 同款口径——含同一式有界台账（超限丢最早插入的键，防长命进程无界增长）。
+ */
+const degradedDisclosedRoots = new Set<string>();
+const DEGRADED_DISCLOSURE_MEMO_LIMIT = 1024;
+
+function memoAddBounded(set: Set<string>, key: string, limit: number): void {
+  set.add(key);
+  if (set.size > limit) {
+    const oldest = set.values().next();
+    if (!oldest.done) set.delete(oldest.value);
+  }
+}
+
+/** CIM 降级披露（放行路径）：不声称已评进程类规则，也不静默放行。 */
+async function discloseCapacityDegraded(
+  stateRoot: string,
+  sample: CapacitySample,
+  verdict: CapacityVerdict,
+): Promise<void> {
+  const key = resolve(stateRoot);
+  if (degradedDisclosedRoots.has(key)) return;
+  memoAddBounded(degradedDisclosedRoots, key, DEGRADED_DISCLOSURE_MEMO_LIMIT);
+  await logEngineEvent(stateRoot, {
+    event: "wake-capacity-degraded",
+    degraded: sample.degraded,
+    watermark: sample.watermark,
+    freeBytes: sample.freeBytes,
+    detail: verdict.detail,
+    note: "CIM 进程采样不可用——本轮只评 os 水位（watermark），进程类规则（session-limit/turn-concurrency）未评；"
+      + "唤醒照常放行（fail-open 同族：观测故障不挡协作），但进程类容量事实此刻不可知",
+  });
+}
+
+/**
  * 容量闸判定（spawn 前调用；返回 undefined = 放行）。
  *
- * 顺序：开关 → 冷却窗（窗内直接 deferred，不采样）→ 真采样 → 判定 → 写冷却记录。
+ * 顺序：开关 → 冷却窗（**本键域**窗内直接 deferred，不采样）→ 真采样 → 判定 → 写冷却记录。
  * 采样意外（os 读数异常等）**fail-open**：不因观测故障永久挡住协作唤醒，但落
  * `wake-capacity-probe-failed` 事件如实披露（与「只警不拦」的旧行为相比仍是净增益：
- * 正常情况下闸在工作）。
+ * 正常情况下闸在工作）。CIM 降级（采样成功但拿不到进程树）是另一种故障：照样 fail-open
+ * 放行，但落 `wake-capacity-degraded` 明示「进程类规则未评」（v0.9.2 C2）。
  *
+ * @param scope 冷却键域（teamId + 收方 + 紧急度；v0.9.2 C3）——必填，不设默认值：
+ *   默认值会让漏传的调用方悄悄掉进一个共享键域，正是 V091-15 的缺陷形态。
  * @param sampleOverride 测试注入的容量样本（缺省=真采样 `sampleCapacity`）——与
  *   `req.cfg`/`req.spawn` 同一注入纪律：注入即信任，生产路径永不传。
  */
@@ -633,14 +811,25 @@ export async function capacityWakeDeferral(
   stateRoot: string,
   env: NodeJS.ProcessEnv,
   now: number,
+  scope: WakeCooldownScope,
   sampleOverride?: CapacitySample,
 ): Promise<WakeDeferral | undefined> {
   if (!wakeCapacityGateEnabledFromEnv(env)) return undefined;
-  const cooldownMs = wakeCapacityCooldownMsFromEnv(env);
+  const cooldownInfo = wakeCapacityCooldownInfoFromEnv(env);
+  const cooldownMs = cooldownInfo.cooldownMs;
   const file = wakeDeferralFile(stateRoot);
+  const key = wakeCooldownKeyOf(scope);
   if (cooldownMs > 0) {
-    const active = await readWakeDeferral(file, now);
-    if (active !== undefined) return active;
+    const active = await readWakeDeferral(file, now, key);
+    if (active !== undefined) {
+      // v0.9.2（C3/V091-19）：窗内沿用旧判据。窗内**不重采样**（RED 期的重试风暴本身
+      // 是放大器，这是冷却窗存在的理由），但 detail 必须明示「这是首次判定时刻的快照」
+      // ——否则同一时刻五个容量观测面全绿、唤醒决策面却称 capacity-red 并引用至多 120s
+      // 前的陈旧 freeBytes，跨面对账直接矛盾。
+      const reuseLine = `cooldown-reuse: 冷却窗内沿用旧判据（键 ${key}；未重采样）——detail 与水位是 ${new Date(active.sampledAt).toISOString()}`
+        + " 首次判定时刻的快照（按当时 env 阈值与水位判定），不是此刻读数；窗到期或转 GREEN 即重新判定";
+      return { ...active, detail: [...active.detail, reuseLine] };
+    }
   }
   let sample: CapacitySample;
   if (sampleOverride !== undefined) {
@@ -661,8 +850,13 @@ export async function capacityWakeDeferral(
   const estimate = turnEstimateBytesFromEnv(env);
   const marginalExceeded = estimate > sample.freeBytes;
   if (!verdict.red && !marginalExceeded) {
-    // GREEN：清掉可能存在的过期冷却标记，下次唤醒立即通行（不留残挡）。
-    await rmAsync(file, { force: true }).catch(() => undefined);
+    // v0.9.2（C2）：degraded 样本的放行路径也要披露（V091-14：此前「进程类规则未评」
+    // 只在判红时随 wake-deferred 落盘，GREEN 时被整体丢弃 → 宿主 CIM 坏了而闸静默
+    // 放行，运维零线索）。采样恢复即除名，下次降级重新披露（节流见 degradedDisclosedRoots）。
+    if (sample.degraded !== null) await discloseCapacityDegraded(stateRoot, sample, verdict);
+    else degradedDisclosedRoots.delete(resolve(stateRoot));
+    // GREEN：清掉本键域的冷却条目，下次唤醒立即通行（不留残挡；别的键域不受影响）。
+    await clearWakeCooldownEntry(file, now, key);
     return undefined;
   }
   const detail = [...verdict.detail];
@@ -670,6 +864,17 @@ export async function capacityWakeDeferral(
     detail.push(
       `marginal-estimate: 单回合预估 ${formatBytesLabel(estimate)} > 可用 ${formatBytesLabel(sample.freeBytes)}`
         + "（XC_TURN_ESTIMATE_BYTES；再起一个无头回合也放不下）",
+    );
+  }
+  // v0.9.2（C3）：冷却 env 的非法值/超上钳都不静默——写进 detail，随 deferral 块到
+  // 回执、到 wake-deferred 事件、到 panel（运维可分辨「没配」与「配错了」）。
+  if (cooldownInfo.fellBack === "clamped") {
+    detail.push(
+      `cooldown-clamped: XC_MEM_WAKE_COOLDOWN_MS=${cooldownInfo.raw} 超过上钳 ${WAKE_CAPACITY_COOLDOWN_MS_MAX}ms（1h），已按上钳生效`,
+    );
+  } else if (cooldownInfo.fellBack === "invalid") {
+    detail.push(
+      `cooldown-env: XC_MEM_WAKE_COOLDOWN_MS=${JSON.stringify(cooldownInfo.raw)} 非法（须为 >=0 的有限数），已回落内置缺省 ${WAKE_CAPACITY_COOLDOWN_MS_DEFAULT}ms`,
     );
   }
   const deferral: WakeDeferral = {
@@ -682,11 +887,207 @@ export async function capacityWakeDeferral(
     cooldownActive: false,
   };
   if (cooldownMs > 0) {
-    const record: WakeDeferralRecord = { ...deferral, until: now + cooldownMs };
+    const record: WakeDeferralRecord = { ...deferral, until: now + cooldownMs, sampledAt: now, scope };
+    const store = await readWakeDeferralStore(file);
+    store.entries[key] = record;
     await mkdir(dirname(file), { recursive: true });
-    await writeFileAtomic(file, `${JSON.stringify(record, null, 2)}\n`).catch(() => undefined);
+    await writeFileAtomic(file, `${JSON.stringify(store, null, 2)}\n`).catch(() => undefined);
   }
   return deferral;
+}
+
+/** 读冷却记录文件（version 2）；缺文件/损坏/旧平铺格式 → 空 store（重新判定，不误读）。 */
+async function readWakeDeferralStore(file: string): Promise<WakeDeferralStore> {
+  try {
+    const parsed = JSON.parse(await readFile(file, "utf8")) as Record<string, unknown>;
+    if (parsed["version"] !== 2 || parsed["entries"] === null || typeof parsed["entries"] !== "object") {
+      return { version: 2, entries: {} };
+    }
+    return { version: 2, entries: parsed["entries"] as Record<string, WakeDeferralRecord> };
+  } catch {
+    return { version: 2, entries: {} };
+  }
+}
+
+/**
+ * 清掉指定键域的冷却条目（v0.9.2 C3）：其余键域原样保留；顺手剔掉已过期条目（文件有界）；
+ * 条目清空 → 删文件（不留空壳，也不留残挡）。
+ */
+async function clearWakeCooldownEntry(file: string, now: number, key: string): Promise<void> {
+  const store = await readWakeDeferralStore(file);
+  delete store.entries[key];
+  const live = Object.entries(store.entries).filter(([, rec]) => Number(rec?.until) > now);
+  if (live.length === 0) {
+    await rmAsync(file, { force: true }).catch(() => undefined);
+    return;
+  }
+  await writeFileAtomic(file, `${JSON.stringify({ version: 2, entries: Object.fromEntries(live) }, null, 2)}\n`)
+    .catch(() => undefined);
+}
+
+// ─────────────────────────── 同步启动确认（v0.9.2 A1） ───────────────────────────
+
+/**
+ * v0.9.2（A1）：启动确认窗口缺省值（ms）——spawn 成功后等待 wake-child 启动证据的上限。
+ *
+ * 取值依据：helper（node 跳板）拉起 detached 唤醒子并写单行 stdout 报告，实测毫秒级；
+ * 5000ms 覆盖宿主冷启动/杀软扫描下的慢形态（与 WAKE_HELPER_TIMEOUT_MS 同量级），又不把
+ * 每次投递的同步成本放大到不可用（正常路径几十毫秒即结算）。
+ */
+export const START_CONFIRM_DEFAULT_MS = 5_000;
+
+/** 启动确认轮询间隔（ms）——等待循环的步长（同时是 helper 存活检查的频率）。 */
+export const START_CONFIRM_POLL_MS = 25;
+
+/**
+ * 启动确认窗口 env：`XC_START_CONFIRM_MS`（正整数 ms；0/负/非整数/不可解析 → 回落缺省，
+ * 与 XC_LIMBO_TIMEOUT_MS / XC_WAKE_SLOW_MS 的 positiveIntFromEnv 同口径——监视类阈值
+ * 不接受「关闭用 0」，关闭唤醒请用分层闸 XC_WAKE_ENABLED / config.json）。
+ */
+export function startConfirmMsFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+  return positiveIntFromEnv(env, "XC_START_CONFIRM_MS", START_CONFIRM_DEFAULT_MS);
+}
+
+/** 一次启动确认的结算（两态 + 观测字段）。 */
+export interface WakeStartConfirmOutcome {
+  /** true = 窗内见到 wake-child 启动证据（helper 汇报的唤醒子 pid）。 */
+  confirmed: boolean;
+  /** 实际等待时长（ms；提前出口时远小于窗口）。 */
+  waitedMs: number;
+  /** 启动证据携带的唤醒子 pid（confirmed 时在场）。 */
+  pid?: number;
+}
+
+/**
+ * wake-child **启动证据闩**（A1 的同步面）。
+ *
+ * 证据定义（如实、可观测）：helper 经 `onHelperSpawned` 汇报「已 detached 拉起唤醒子并
+ * 拿到 pid」——这是「spawn 已发起」（本进程拿到 helper pid）与「唤醒子真的起来了」之间
+ * 唯一的机器可分辨界。没有更强的证据可用：孤儿化唤醒子的退出码/首行输出对本进程不可
+ * 观测（V9 边界），而首行输出在宿主冷启动下可迟到 25s+，不能当启动判据。
+ */
+export interface WakeStartLatch {
+  /** 已到的启动证据（未到 = undefined）。 */
+  readonly evidence: { pid: number; at: number } | undefined;
+  /** helper 汇报唤醒子 pid 时置位（resume-cli.ts onHelperSpawned 回调内调用）。 */
+  signal(pid: number): void;
+  /**
+   * 有界等待启动证据。
+   *
+   * 提前出口（不白等满窗）：`helperAlive` 判定 helper 仍在跑时继续等；helper 已退出而
+   * 仍未汇报 = 不可能再有证据，立即按未见结算（生产 helper 路径的失败面已由 onAsyncError
+   * 走 releaseOnFailure，这里只负责「启动确认」这一个语义）。
+   */
+  confirm(thresholdMs: number, helperAlive?: () => boolean): Promise<WakeStartConfirmOutcome>;
+}
+
+/** 建一个启动证据闩（每次 spawn 一份）。 */
+export function createWakeStartLatch(): WakeStartLatch {
+  let evidence: { pid: number; at: number } | undefined;
+  let wake: (() => void) | undefined;
+  const arrived = new Promise<void>((resolve) => {
+    wake = resolve;
+  });
+  // 显式标注返回类型的读取函数：arrived 回调里的突变对 TS 的控制流分析不可见（闭包
+  // 变量不会被 narrow），直接读 evidence 会被推成 never。
+  const snapshot = (): { pid: number; at: number } | undefined => evidence;
+  return {
+    get evidence() {
+      return evidence;
+    },
+    signal(pid: number) {
+      if (evidence !== undefined) return; // 单发：只认第一份证据
+      evidence = { pid, at: Date.now() };
+      wake?.();
+    },
+    async confirm(thresholdMs: number, helperAlive?: () => boolean): Promise<WakeStartConfirmOutcome> {
+      const startedAt = Date.now();
+      const already = snapshot();
+      if (already !== undefined) {
+        return { confirmed: true, waitedMs: 0, pid: already.pid };
+      }
+      if (thresholdMs > 0) {
+        const deadline = startedAt + thresholdMs;
+        let helperGone = false;
+        // 轮询等待：证据到达（arrived）∨ 窗满 ∨ helper 已退出（提前出口）三者先到先结算。
+        while (Date.now() < deadline) {
+          const remaining = deadline - Date.now();
+          const timeout = new Promise<"timeout">((resolve) => {
+            const timer = setTimeout(() => resolve("timeout"), Math.max(1, Math.min(START_CONFIRM_POLL_MS, remaining)));
+            timer.unref?.();
+          });
+          const winner = await Promise.race([arrived.then(() => "evidence" as const), timeout]);
+          if (winner === "evidence") break;
+          if (helperAlive !== undefined && !helperAlive()) {
+            helperGone = true;
+            break;
+          }
+        }
+        if (helperGone) {
+          // helper「退出」与「stdout 报告落库」之间有毫秒级竞态（exit 事件要到下一轮事件
+          // 循环才被处理，而 pid 已经死了）——退出后再等一个轮询步长，给已排队的报告一次
+          // 落地机会，不把竞态误报成「未见启动证据」。
+          await new Promise<void>((resolve) => {
+            const timer = setTimeout(resolve, START_CONFIRM_POLL_MS);
+            timer.unref?.();
+          });
+        }
+      }
+      const seen = snapshot();
+      return seen !== undefined
+        ? { confirmed: true, waitedMs: Date.now() - startedAt, pid: seen.pid }
+        : { confirmed: false, waitedMs: Date.now() - startedAt };
+    },
+  };
+}
+
+/**
+ * 启动确认落账（生命周期账 + engine.jsonl，双通道披露口径）。
+ *
+ * 生命周期账（logs/wake-lifecycle-<to>-<ts>.jsonl）记 `wake-child-start-confirmed` /
+ * `wake-child-start-unconfirmed` 行——与 spawn 前的 `wake-child-start` 头行并排，运维
+ * 一眼看出「发起了」与「起来了」的差别；engine.jsonl 记 `wake-start-confirm` 事件供
+ * 时间线查询（A3 的事故计数不消费它，唤醒失败另有 wake-failed 事件）。
+ */
+async function recordWakeStartConfirm(
+  stateRoot: string,
+  lifecycleFile: string,
+  input: {
+    teamId: string;
+    to: string;
+    scene: string;
+    sid: string;
+    nonceToken: string;
+    outcome: WakeStartConfirmOutcome;
+    thresholdMs: number;
+  },
+): Promise<void> {
+  const base = {
+    nonce: wakeNonceDigest(input.nonceToken),
+    sid: input.sid,
+    to: input.to,
+    scene: input.scene,
+    teamId: input.teamId,
+    waitedMs: input.outcome.waitedMs,
+    thresholdMs: input.thresholdMs,
+    ...(input.outcome.pid !== undefined ? { pid: input.outcome.pid } : {}),
+  };
+  appendWakeLifecycle(lifecycleFile, {
+    event: input.outcome.confirmed ? "wake-child-start-confirmed" : "wake-child-start-unconfirmed",
+    ...base,
+  });
+  await logEngineEvent(stateRoot, {
+    event: "wake-start-confirm",
+    ...base,
+    startConfirmed: input.outcome.confirmed,
+  });
+}
+
+/** A1 回执措辞（两态；都保留「非送达确认」与有界窗口的既有承诺短语）。 */
+function startConfirmNote(outcome: WakeStartConfirmOutcome, thresholdMs: number): string {
+  return outcome.confirmed
+    ? `启动确认：已见到 wake-child 启动证据（pid ${outcome.pid}，${outcome.waitedMs}ms；仍非送达确认——消费与否由 consumedAt/readAt 说话）`
+    : `启动确认：已发起但未见启动证据（${Math.round(thresholdMs / 1000)}s 内 helper 未汇报唤醒子 pid；非送达确认，也非失败——失败由 wake-failed 事件与邮箱 pull 兜底）`;
 }
 
 // ─────────────────────────── wake-child 生命周期 + limbo/wake-slow 信号（v0.9.1 G-12v3） ───────────────────────────
@@ -727,6 +1128,12 @@ export const LIMBO_TIMEOUT_DEFAULT_MS = 10 * 60_000;
 export const WAKE_SLOW_DEFAULT_MS = 5 * 60_000;
 /** 生命周期监视轮询间隔默认值（ms）。 */
 export const WAKE_LIFECYCLE_POLL_MS = 5_000;
+/**
+ * v0.9.2（A4-a）：limbo 宽限窗默认值（ms）——目标 sid 自盖章后有会话活动时，缺失的
+ * consumedAt 可能只是 hook 注入回写的锁竞争未落盘：宽限这么久再判「未消费」。
+ * 不做 env 化（校准参数而非运维旋钮；测试经 WakeLifecycleWatchConfig.limboGraceMs 注入）。
+ */
+export const LIMBO_GRACE_DEFAULT_MS = 120_000;
 
 /**
  * v0.9.1 打回第 1 轮（V091-01）：wake nonce 的**不可反查摘要**（落共享日志用）。
@@ -836,8 +1243,33 @@ export interface WakeLifecycleWatchConfig {
   limboTimeoutMs: number;
   wakeSlowMs: number;
   windowMs: number;
+  /**
+   * v0.9.2（A4-a）：limbo 宽限窗（ms）——目标 sid 自盖章后有会话活动时，缺失的
+   * consumedAt 可能是 hook 注入回写锁竞争未落盘：宽限这么久再判，不立即降级。
+   * 缺省 {@link LIMBO_GRACE_DEFAULT_MS}（测试注入小值）。
+   */
+  limboGraceMs?: number;
+  /**
+   * v0.9.2（A4-b）：本次唤醒 prompt 是否**内嵌消息全文**（message/withdrawal 场景）
+   * 与携带的消息 id——回合确已开跑时据此记 injectedConsumed，不因未调 xc_read 误判。
+   */
+  promptEmbedsBody?: boolean;
+  receiptIds?: readonly string[];
   /** 测试注入：pid 存活判定（缺省 core/lock 的 pidAlive）。 */
   pidAliveProbe?: (pid: number) => boolean;
+}
+
+/**
+ * v0.9.2（A4-b）：唤醒 prompt 是否内嵌消息全文（scene → 判据，纯函数）。
+ *
+ * `message`（xc_relay 自由消息：ticket = 消息正文）与 `withdrawal`（撤回通知：ticket =
+ * 通知正文）两个场景的唤醒 prompt 把消息实体交到模型手上——成员回合开跑即「已消费」，
+ * 不因它没另调 xc_read 而误判 limbo。其余场景（dispatch/post-provision/unblock/idle/
+ * cancel/report/shutdown/stale-sweep/task-offline…）的 ticket 是指令/摘要/任务票，
+ * 不构成消息全文，判据保持原样（必须 xc_read / hook 注入回写才算消费）。
+ */
+export function wakePromptEmbedsMessageBody(scene: string): boolean {
+  return scene === "message" || scene === "withdrawal";
 }
 
 /**
@@ -913,7 +1345,64 @@ export function startWakeLifecycleWatch(cfg: WakeLifecycleWatchConfig): void {
       }
 
       // ③ limbo：盖章超时无消费确认 → 团队锁内降级 + 事件 + urgent lead（一个轮次恰一次）。
+      // v0.9.2（A4）判据校准三处：(a) 活性交叉校验 + 宽限（锁竞争回写未落盘不立即判）；
+      // (b) prompt 内嵌全文且回合已开跑 → 记 injectedConsumed；(c) 告警按
+      // (messageId, 轮次) 节流、同轮多条合并。
       if (!limboHandled && now - cfg.stampedAt >= cfg.limboTimeoutMs) {
+        // 目标 sid 自盖章后是否有会话活动（hook 注入/lastSeen 投影）——(a)(b) 两个判据
+        // 的共用输入，一次读取两用。
+        const targetActive = await sessionStartedSince(cfg.stateRoot, cfg.sid, cfg.stampedAt);
+        const graceMs = cfg.limboGraceMs ?? LIMBO_GRACE_DEFAULT_MS;
+        const embedsBody = cfg.promptEmbedsBody ?? wakePromptEmbedsMessageBody(cfg.scene);
+
+        // (b) injectedConsumed（**先于**宽限判）：wake prompt 已把消息全文交到模型手上
+        // （message/withdrawal 场景），且回合确已开跑（上面的 targetActive）⇒ 成员已
+        // 「消费」，这是**正向证据**，不需要等宽限。锁内回写 consumedAt（幂等）；锁忙则
+        // 留给下轮（下面的宽限会接住，不会误降级）。
+        if (embedsBody && targetActive) {
+          const ids = [...(cfg.receiptIds ?? [])];
+          if (ids.length > 0) {
+            try {
+              await withTeamLock(cfg.stateRoot, cfg.teamId, async () => {
+                await markMailboxConsumed(cfg.stateRoot, cfg.teamId, cfg.to, ids, now);
+              });
+              appendWakeLifecycle(cfg.lifecycleFile, {
+                event: "injected-consumed",
+                messageIds: ids,
+                sid: cfg.sid,
+                scene: cfg.scene,
+                note: "wake prompt 内嵌消息全文且回合已开跑 → consumedAt 回写（不因未调 xc_read 误判 limbo）",
+              });
+            } catch {
+              /* 锁忙/IO：下轮再写（宽限期内不会误降级） */
+            }
+          }
+          limboHandled = true; // 本 stamp 已按 injectedConsumed 处理，无 limbo 可判
+          return;
+        }
+
+        // (a) 宽限重试：会话活着且被知会过 ⇒ 缺失的 consumedAt 可能只是 hook 的注入
+        // 回写没抢到团队锁（HOOK_LOCK_WAIT_MS 2s 预算）尚未落盘。宽限窗内不判未消费
+        // （回写落地即自然不降级）；宽限过后仍无消费确认才继续走判据。
+        if (targetActive && now - cfg.stampedAt < cfg.limboTimeoutMs + graceMs) {
+          return;
+        }
+
+        // 锁外预读：候选消息 + 每条**本次盖章**的 deliveredAt = (messageId, 轮次) 节流键
+        // （A4-c；判据与 sweep 共用 core/mailbox.ts 的纯函数，避免两处漂移）。
+        const stamps = new Map<string, number | undefined>();
+        try {
+          const team = await readTeam(cfg.stateRoot, cfg.teamId);
+          if (team !== undefined) {
+            const all = await readMailbox(cfg.stateRoot, cfg.teamId, cfg.to);
+            for (const candidate of limboCandidateMessages(all, team, now, cfg.limboTimeoutMs)) {
+              stamps.set(candidate.id, candidate.deliveredAt);
+            }
+          }
+        } catch {
+          /* 预读失败：无节流键（按「无从证明已告警」处理，见 watchdog-state 注释） */
+        }
+
         let downgraded: TeamMessage[] = [];
         let examined = false;
         try {
@@ -930,6 +1419,16 @@ export function startWakeLifecycleWatch(cfg: WakeLifecycleWatchConfig): void {
         }
         if (examined) {
           limboHandled = true;
+          const watchdogState = await readWatchdogState(cfg.stateRoot);
+          // (c) 节流：同一 (messageId, 轮次) 只告警一次（per-spawn 监视器与看门狗清扫
+          // 两个面、或两把锁的竞态，都不得对同一次失效重复惊动 lead）。
+          const fresh = downgraded.filter(
+            (message) => !limboAlertAlreadySent(watchdogState, message.id, stamps.get(message.id)),
+          );
+          for (const message of fresh) {
+            markLimboAlertSent(watchdogState, message.id, stamps.get(message.id), now);
+          }
+          await writeWatchdogState(cfg.stateRoot, watchdogState);
           for (const message of downgraded) {
             await logEngineEvent(cfg.stateRoot, {
               event: "message-limbo",
@@ -947,20 +1446,20 @@ export function startWakeLifecycleWatch(cfg: WakeLifecycleWatchConfig): void {
               timeoutMs: cfg.limboTimeoutMs,
             });
           }
-          if (downgraded.length > 0) {
+          if (fresh.length > 0) {
             appendWakeLifecycle(cfg.lifecycleFile, {
               event: "limbo-downgrade",
-              messageIds: downgraded.map((m) => m.id),
+              messageIds: fresh.map((m) => m.id),
               waitedMs: now - cfg.stampedAt,
             });
             const waitedMin = Math.round((now - cfg.stampedAt) / 60000);
             await notifyLeadUrgent(
               cfg.stateRoot,
               cfg.teamId,
-              `[zcode-crosschat 引擎信号] limbo：${downgraded.length} 条消息盖投递章后 ${waitedMin} 分钟无消费确认，`
+              `[zcode-crosschat 引擎信号] limbo：${fresh.length} 条消息盖投递章后 ${waitedMin} 分钟无消费确认，`
               + `已自动降级回 unread（重新可注入/可 pull）。目标 "${cfg.to}"（sid ${cfg.sid}）的唤醒回合`
               + `疑似在消费前死亡（内存红线 OOM / 宿主重启杀无头子进程）。消息 id：`
-              + `${downgraded.map((m) => m.id).join(", ")}。可重发，或让成员 xc_read({scope:"inbox"}) 兜底。`,
+              + `${fresh.map((m) => m.id).join(", ")}。可重发，或让成员 xc_read({scope:"inbox"}) 兜底。`,
             );
           }
           // 收工：本轮次已处理（有降级=已告知 lead；无降级=都已消费/无 limbo）。
@@ -1047,6 +1546,13 @@ export interface WakeRequest {
    * `req.cfg`/`req.spawn` 同一注入纪律：注入即信任，生产路径永不传。
    */
   capacitySample?: CapacitySample;
+  /**
+   * v0.9.2（A1）：启动确认窗口（ms）；缺省 env `XC_START_CONFIRM_MS` 或内置默认 5000。
+   * 测试注入小值（或不注入而依赖 helper 存活提前出口）。
+   */
+  startConfirmMs?: number;
+  /** v0.9.2（A4-a）：limbo 宽限窗（ms）；缺省 LIMBO_GRACE_DEFAULT_MS。测试注入小值。 */
+  limboGraceMs?: number;
 }
 
 export interface WakeResult {
@@ -1062,6 +1568,13 @@ export interface WakeResult {
   wakeDeferred?: WakeDeferral;
   /** 本次写下的 wake nonce 令牌（wake 态才有）。 */
   nonce?: string;
+  /**
+   * v0.9.2（A1）：**启动确认**（wake 态才有；两态）——spawn 成功后是否在
+   * XC_START_CONFIRM_MS 内观察到 wake-child 启动证据（helper 汇报的唤醒子 pid）。
+   * `false` = 「已发起但未见启动证据」：不是送达确认、也不是失败（失败语义由
+   * wake-failed 事件与邮箱 pull 兜底，见 note）。
+   */
+  startConfirmed?: boolean;
 }
 
 /** 短暂重取 team 锁做邮箱补盖章（dsh tools.js:2150 形态）；失败不阻断主流程。 */
@@ -1200,7 +1713,14 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
   //     前置闸之后、createWakeNonce 之前：前面的门（分层闸/在途/状态/spawn 配置）都不
   //     触发时才值得采样（采样有 60s 缓存窗，成本是一次文件读 + os.freemem()）。
   //     消息已在邮箱（调用方锁内已 append），pull 兜底不丢——闸只挡唤醒不拦投递。
-  const capacityDeferral = await capacityWakeDeferral(stateRoot, req.env, now, req.capacitySample);
+  const capacityDeferral = await capacityWakeDeferral(
+    stateRoot,
+    req.env,
+    now,
+    // v0.9.2（C3）：冷却键域 = teamId + 收方 + 紧急度——一个成员的 RED 不再静默挡全队。
+    { teamId: req.teamId, to: toKey, urgent: req.urgent === true },
+    req.capacitySample,
+  );
   if (capacityDeferral !== undefined) {
     const reason = `capacity-red: 内存容量预警（${capacityDeferral.detail.join("；")}）——不 spawn 无头回合，消息留邮箱（pull 兜底），${Math.round(capacityDeferral.retryAfterMs / 1000)}s 后重新判定`;
     await logEngineEvent(stateRoot, {
@@ -1216,6 +1736,11 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
       retryAfterMs: capacityDeferral.retryAfterMs,
       cooldownActive: capacityDeferral.cooldownActive,
       wakeGateEnabled: wakeCapacityGateEnabledFromEnv(req.env),
+      // v0.9.2（C5/V091-18）：兑现 wakeCapacityGateEnabledFromEnv 注释里的承诺——
+      // 带 XC_MEM_WAKE_GATE **原值**（未设=null）。布尔值分不清「我没配」与「我配错了」，
+      // 原值可以；与 cooldown detail 的 clamp/invalid 披露同族两级口径。
+      gateEnv: wakeCapacityGateEnvRaw(req.env),
+      urgent: req.urgent === true,
     });
     return {
       delivered: "mailbox",
@@ -1318,6 +1843,9 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
   });
   // 唤醒子 pid（helper 汇报后才拿得到）——生命周期监视的退出观察经此 ref 读取。
   const childPidRef: { pid: number | undefined } = { pid: undefined };
+  // v0.9.2（A1）：启动证据闩——helper 汇报的唤醒子 pid 即「wake-child 起来了」的
+  // 机器可分辨证据（spawn 返回的 pid 只是 helper 的 pid，只证明「已发起」）。
+  const startLatch = createWakeStartLatch();
   let pid: number | undefined;
   // v0.4（DESIGN-V0.4 §2.4）：spawn 配置解析改为「env → 自动探测」，结果落审计。
   // req.cfg 测试注入优先级不变：注入时零探测（不触发任何子进程），审计行 source 记 test_injected。
@@ -1346,6 +1874,8 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
       // v0.9.1 打回第 1 轮（V091-01）：pid 行只记 nonce 摘要（共享日志无真值）。
       onHelperSpawned: (childPid) => {
         childPidRef.pid = childPid;
+        // v0.9.2（A1）：启动证据到闩（同步确认面的等待在此刻结算）。
+        startLatch.signal(childPid);
         void logEngineEvent(stateRoot, {
           event: "wake-child", pid: childPid, scene: req.reason, teamId: req.teamId, to: toKey,
           nonce: wakeNonceDigest(token),
@@ -1398,9 +1928,40 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
     getChildPid: () => childPidRef.pid,
     pollMs: req.lifecyclePollMs ?? WAKE_LIFECYCLE_POLL_MS,
     limboTimeoutMs: req.limboTimeoutMs ?? limboTimeoutFromEnv(req.env),
+    // v0.9.2（A4-a）：limbo 宽限窗（会话活着而被知会时，锁竞争回写未落盘不立即判未消费）。
+    ...(req.limboGraceMs !== undefined ? { limboGraceMs: req.limboGraceMs } : {}),
     wakeSlowMs: req.wakeSlowMs ?? wakeSlowFromEnv(req.env),
     windowMs: req.lifecycleWindowMs ?? WAKE_INFLIGHT_MS,
+    // v0.9.2（A4-b）：prompt 是否内嵌消息全文由 scene 判定（wakePromptEmbedsMessageBody），
+    // 携带的消息 id = 本次回执 ids。
+    receiptIds: ids,
     ...(req.pidAliveProbe !== undefined ? { pidAliveProbe: req.pidAliveProbe } : {}),
+  });
+
+  // v0.9.2（A1）：**同步启动确认**——spawn 成功只证明「已发起」（本进程拿到的是 helper
+  // 的 pid）。在 XC_START_CONFIRM_MS 内观察 wake-child 的启动证据（helper 汇报的唤醒子
+  // pid）；helper 已退出而未汇报 = 不可能再有证据，提前结算（不白等满窗）。
+  // 用户核心诉求「消息发出去后主控不能自以为进程启动了」的正面回答：两态进 payload，
+  // 配合 note 的如实措辞（「已发起但未见启动证据」），不再以 fire-and-forget 结案。
+  //
+  // 不等候的两种情形（都如实按未见结算，不空等）：
+  // ① `req.spawn` 注入（测试）——注入实现没有 helper 汇报通道（onHelperSpawned 由
+  //    resume-cli 的 helper 协议调用），等也等不到；与 req.cfg 同一注入纪律；
+  // ② helper 进程已退出而未汇报——提前出口（见 createWakeStartLatch.confirm）。
+  // 边界（如实声明）：direct spawn 形态同样没有汇报通道，启动确认恒为 false 且要等满窗
+  // ——该形态仅测试/对照保留（生产恒走 helper）。
+  const startConfirmThresholdMs = req.startConfirmMs ?? startConfirmMsFromEnv(req.env);
+  const startOutcome = req.spawn !== undefined
+    ? await startLatch.confirm(0)
+    : await startLatch.confirm(startConfirmThresholdMs, () => pidAlive(pid!));
+  await recordWakeStartConfirm(stateRoot, lifecycleFile, {
+    teamId: req.teamId,
+    to: toKey,
+    scene: req.reason,
+    sid: req.toSessionId,
+    nonceToken: token,
+    outcome: startOutcome,
+    thresholdMs: startConfirmThresholdMs,
   });
 
   // v0.9（G-8）：sessionNotFound 的单次自动重试（方案 §一 G-8「投递遇 sessionNotFound →
@@ -1438,7 +1999,13 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
     // v0.9.1（G-12-b）：容量闸对重试同等有效——重试也是一次 spawn，内存红线期重试
     // 只会放大 OOM（事故当日「重试波 = 主控重发消息的新 spawn，本身是内存放大器」）。
     // 复检不过 → 不 spawn、不重开租约，落 wake-retry-skipped（冷却原因写进 reason）。
-    const retryCapacity = await capacityWakeDeferral(stateRoot, req.env, retryNow);
+    const retryCapacity = await capacityWakeDeferral(
+      stateRoot,
+      req.env,
+      retryNow,
+      // v0.9.2（C3）：重试与原始尝试同一键域（同 teamId/收方/紧急度）——冷却语义一致。
+      { teamId: req.teamId, to: toKey, urgent: req.urgent === true },
+    );
     if (retryGateState !== undefined || !retryGate.enabled || retryInflight !== undefined || retryCapacity !== undefined) {
       const reason = retryGateState !== undefined
         ? `member-state:${retryGateState}: 重试前复检命中成员状态门，不再唤醒（V090-06：removed 成员不被重试唤醒）`
@@ -1483,6 +2050,8 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
     const retryLogFile = wakeLogFile(stateRoot, toKey, retryNow);
     // v0.9.1（G-12v3）：重试轮次的唤醒子 pid ref（生命周期监视的退出观察）。
     const retryChildPidRef: { pid: number | undefined } = { pid: undefined };
+    // v0.9.2（A1）：重试轮次的启动证据闩（与主路径的 startLatch 各自独立）。
+    const retryStartLatch = createWakeStartLatch();
     let retryPid: number | undefined;
     try {
       const spawned = (req.spawn ?? spawnResume)({
@@ -1500,6 +2069,8 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
         },
         onHelperSpawned: (childPid) => {
           retryChildPidRef.pid = childPid;
+          // v0.9.2（A1）：重试轮次的启动证据（闩由下方异步确认消费）。
+          retryStartLatch.signal(childPid);
           void logEngineEvent(stateRoot, {
             event: "wake-child", pid: childPid, scene: req.reason, teamId: req.teamId, to: toKey,
             // v0.9.1 打回第 1 轮（V091-01）：只记 nonce 摘要。
@@ -1508,6 +2079,19 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
         },
       });
       retryPid = spawned.pid;
+      // v0.9.2（A1）：重试轮次同样做启动确认（异步面：只落账，不进任何 payload——
+      // 重试没有同步回执面；「重试后启动证据未见」以 lifecycle 账与 engine 事件为准）。
+      // 注入 spawn 时同样没有汇报通道，按未见结算（与主路径同一注入纪律）。
+      void (async () => {
+        const threshold = req.startConfirmMs ?? startConfirmMsFromEnv(req.env);
+        const outcome = req.spawn !== undefined
+          ? await retryStartLatch.confirm(0)
+          : await retryStartLatch.confirm(threshold, () => pidAlive(retryPid!));
+        await recordWakeStartConfirm(stateRoot, wakeLifecycleFile(stateRoot, toKey, retryNow), {
+          teamId: req.teamId, to: toKey, scene: req.reason, sid,
+          nonceToken: retryToken, outcome, thresholdMs: threshold,
+        });
+      })().catch(() => undefined);
     } catch (err) {
       await releaseOnFailure("retry-spawn", err,
         { nonce: retryToken, sid, ids: retryIds, now: retryNow },
@@ -1606,6 +2190,8 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
   // 回执宣称自动检测 = 语义必然背离）。
   // v0.9.1 r3（V090-08）：畸形 config.json 的 WARNING 随 note 披露（放行路径与
   // skip 路径同口径——「调用方必须披露：engine.jsonl 事件与工具回执 note」双通道）。
+  // v0.9.2（A1）：note 追加**启动确认**两态措辞——「已发起」不再与「起来了」混写：
+  // 未见启动证据时如实说「已发起但未见启动证据」（仍非送达确认、也非失败）。
   const warningNote = gate.warning !== undefined ? `；${gate.warning}` : "";
   return {
     delivered: "wake",
@@ -1614,11 +2200,13 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
       `失败由本进程在 ${Math.round(WAKE_WATCH_WINDOW_MS / 1000)}s 有界窗口内侦听 wake 日志并记 engine.jsonl wake-failed/wake-retry/wake-retry-failed、释放投递租约，` +
       "sessionNotFound 时自动重绑重试恰一次；超窗或本进程退出则以邮箱 pull 兜底（消息不丢，在途 nonce 最多滞留 15min））"
       + wakeFallbackNote(req.env, resolvedCfg)
-      + warningNote,
+      + warningNote
+      + `；${startConfirmNote(startOutcome, startConfirmThresholdMs)}`,
     wakeLog: logFile,
     pid,
     receiptIds: ids,
     nonce: token,
+    startConfirmed: startOutcome.confirmed,
   };
 }
 

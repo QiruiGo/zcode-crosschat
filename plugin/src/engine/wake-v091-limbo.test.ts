@@ -89,16 +89,19 @@ function readLifecycleLines(agentKey: string): Array<Record<string, unknown>> {
   return lines;
 }
 
-function waitUntil(check: () => boolean, timeoutMs = 3000, stepMs = 20): Promise<boolean> {
+/**
+ * 轮询直到条件成立（每 stepMs 一次，deadline 后返回 false=硬失败）。
+ * 判据可以是异步的（读邮箱/读盘）：负载无关地等**事实**成立，不猜固定 sleep。
+ */
+function waitUntil(check: () => boolean | Promise<boolean>, timeoutMs = 3000, stepMs = 20): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
-  return new Promise((resolve) => {
-    const tick = (): void => {
-      if (check()) resolve(true);
-      else if (Date.now() > deadline) resolve(false);
-      else setTimeout(tick, stepMs);
-    };
-    tick();
-  });
+  return (async (): Promise<boolean> => {
+    for (;;) {
+      if (await check()) return true;
+      if (Date.now() > deadline) return false;
+      await new Promise((resolve) => setTimeout(resolve, stepMs));
+    }
+  })();
 }
 
 /** 起一个真活进程（peer 注册表活性判据要吃真 pid）。 */
@@ -213,6 +216,10 @@ describe("v0.9.1 组A：limbo 降级（G-12v3 机制 B）", () => {
     expect(Object.keys(limbo).filter((k) => k !== "ts").sort()).toEqual(
       ["downgradedAt", "event", "from", "messageId", "nonce", "scene", "sid", "stampedAt", "teamId", "timeoutMs", "to", "waitedMs"],
     );
+    // 告知在事件**之后**落账（降级 → message-limbo 事件 → urgent 告知 lead）：等「lead
+    // 已被告知」这个事实本身，而不是等事件后猜一段固定时间——全量并行负载下事件与告知
+    // 之间的间隔会拉宽，等事件即读邮箱曾偶发读到空箱（round8 实测复现）。
+    expect(await waitUntil(async () => (await readMailbox(root, "default", "a")).length === 1)).toBe(true);
     const leadBox = await readMailbox(root, "default", "a");
     expect(leadBox).toHaveLength(1);
     expect(leadBox[0]!.from).toBe("engine");
@@ -239,6 +246,8 @@ describe("v0.9.1 组A：limbo 降级（G-12v3 机制 B）", () => {
     // 越过后再等两轮轮询：不重复降级、不重复告知
     await new Promise((r) => setTimeout(r, 400));
     expect(readEngineEvents().filter((e) => e["event"] === "message-limbo")).toHaveLength(1);
+    // 告知晚于事件落账：等事实而非猜时间（400ms 只是幂等性观察窗，不承担告知可达性）
+    expect(await waitUntil(async () => (await readMailbox(root, "default", "a")).length === 1)).toBe(true);
     expect(await readMailbox(root, "default", "a")).toHaveLength(1);
   });
 
@@ -444,6 +453,10 @@ describe("v0.9.1 组A：wake-child 生命周期日志与引擎信号", () => {
     expect(Object.keys(slow).filter((k) => k !== "ts").sort()).toEqual(
       ["event", "nonce", "pid", "scene", "sid", "teamId", "thresholdMs", "to", "waitedMs"],
     );
+    // 告知在事件**之后**落账（wake-slow 事件 → urgent 告知 lead，wake.ts:1325→1336）：
+    // 等「lead 已被告知」这个事实，而不是等事件后猜固定时间（负载下两者间隔拉宽，
+    // 等事件即读邮箱曾偶发红——round8 负载复现实测）。
+    expect(await waitUntil(async () => (await readMailbox(root, "default", "a")).length === 1)).toBe(true);
     const leadBox = await readMailbox(root, "default", "a");
     expect(leadBox).toHaveLength(1);
     expect(leadBox[0]!.urgent).toBe(true);
