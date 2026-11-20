@@ -180,3 +180,23 @@ master 雷达会话（被 cron/wake 反复无头唤醒）4 次用户语音盖章
 - 晨间 2 个无名新会话（sess_9df96df8 / sess_70e97813）零 register 不可寻址；form-mods-4 09:49:07 hook 层已见 master 消息未读提示仍不消费（行为性失聪延续）
 - uservoice 累计 41 未动；lims2.0 侧插件仍 0.8.1（v0.9.0/v0.9.1 未装）；engine maxMembers=8 而团队 13 人（超配 5 人）
 - **unread 口径自我修正（cron-27）**：游标=ts>maxReadAt 且无 readAt，**不盲**——此前"instrument 全盲"判断作废；master 真未读=6（E100 POC 6 条；16fdc0d3 已被 11-19 17:44:15 唤醒轮暗消费，不计）
+
+
+---
+
+## 第十批输入（2026-11-20 11 时段，桌面重启后多会话调度故障，总调度 sess_70e97813 通报+监督取证）——G-20
+
+> 背景：v0.9.1 已于本日装上（本地缓存+清单+marketplace 源，sha256 校验通过），用户 ~11:0x 重启桌面后新引擎上线——`session-running`/`wake-deferred` 等新事件类型首现，G-9 活性状态机确认在跑。
+
+**事故链**：重启→所有排队 SendToSession 指令被清空→crosschat takeover 干净完成（member-takeover：sess_0a772889→sess_70e97813，revokedTasks:[]）→但 wake 被 v0.9.1 新容量闸全拦（wake-deferred ×7）→重启后 5 次派单（t93~t97）**全部 delivered:mailbox**→仅 3 次 claim 靠交互回合完成→内存跌至 4.2%→③ 在停止令（urgent relay 未读）到达前合入 !8432（外审否决件，控制令时效第三次实锤）→CreateSession「Project is unavailable」+ReadSession「App control failed」→④ 三次踢达（2 queued+1 accepted）40min 后才拉起一个 2.9s 回合（model-io 11:51:44 实证）。
+
+**G-20 容量闸阈值无 file 层配置位（v0.9.1 容量闸的配置面缺口）**：
+- **事实**：`.crosschat/config.json` 只收 `wake_enabled` 一个键（config.ts 源码确认"键只收 wake_enabled，未知键静默忽略"）；容量阈值 `XC_MEM_WARN_WATERMARK`（默认 0.15）/`XC_TURN_ESTIMATE_BYTES`（默认 1.5GB）/逃生口 `XC_MEM_WAKE_GATE=off` 全是**进程启动级 env**——运行中改不了、重启后不持久（G-6 同款病，容量参数是新增暴露面）。
+- **今天后果**：水位 4.2%（0.66GB/总 15.84GB）下双条件独立成立（水位<15% 且 1.5GB>可用 1.31GB），wake 全拦；运维方既不能调闸（env 启动级）也不能用 config.json 调（schema 不含），只能关闲置会话等水位自愈——而水位在跌（7.7%→8.3%→4.2%），不会自愈。
+- **口径澄清（旧账仲裁）**：1.5GB vs 实测 350MB 的"4 倍失真"不成立——350MB 是主进程单点值（采样器 headlessTurnMaxRssBytes），含树实测 ~1GB（290MB 主+7-9 plugin host×85-100MB），对 1.5GB 是 **1.5 倍余量**；且水位线条件独立成立，**校准预估并不能开闸**。
+- **改进方向**：①config.json 增加 capacity 段（warn_watermark/turn_estimate_bytes/wake_gate），file>env>default 同款分层；②闸状态在 xc_overview/snapshot 暴露当前水位+预估+阻塞原因+下次重判时刻（今天全靠翻 engine.jsonl 的 wake-deferred 事件才看到）；③wake-deferred 累积超 T 分钟→urgent 告知 lead（今天静默累积 7 条无任何告警通道）；④水位恢复自动恢复已有（120s 冷却重判），保留。
+
+**宿主层疑点（转平台侧素材，非插件可解）**：
+- CreateSession「Project is unavailable」与 ReadSession「App control failed」疑同根=**appserver 项目/会话路由表重启后未恢复**（ListProjects 读静态配置所以正常→路由表与配置两个源，重启后分歧）；⑧ 的 11:46 静默→11:47 续上符合 appserver 中途回收重建；34 个 ZCode.exe 命令行无 appserver 字样（appserver 大概率是 13 个 node 之一）。
+- SendToSession queued/accepted 对 idle 会话不触发回合（G-1 同根）：④ 实证（model-io 11:51:44 一条 2.9s 回合）；③ 跑过一轮（11:41 合并 !8432）但 model-io 无文件=记录丢失疑点，待查。
+- 恢复序列（监督侧建议）：UI 手动踢是唯一确认可用路径但延迟大（④ 40min）；内存抬过 15% 后 wake 自动恢复（120s 重判，无需人工）；确认聋掉的会话 xc_identify 重绑或重建成员。
