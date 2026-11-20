@@ -152,3 +152,31 @@ master 雷达会话（被 cron/wake 反复无头唤醒）4 次用户语音盖章
 1. **原始数据**：`docs/trial-data/2026-11-18-lims2.0-records.jsonl`（监督快照持续更新，字段说明见 `docs/TRIAL-DATA-2026-11-18-lims2.0.md`）；复现环境为 lims2.0 工作区 `.crosschat/`（生产数据，未随仓库提交）。
 2. **对照阅读**：G-1/G-2 属宿主能力（zcode 平台），需评估「插件可做到什么程度」（如软中断=注入+安全点自检，纯插件可实现）；G-4/G-5/G-7 是插件引擎配置/机制，可直接进 v0.9.0；G-3 优先撤回原语；G-6 建议文件级配置持久位（`.crosschat/config.json` 或 `~/.zcode/cli/config.json` 挂载）；G-8 需宿主 SendToSession 改进或插件侧 peer 注册表联动重绑。
 3. **正交数据**：全天工具面 0 失败、dispatch→claim→report 全链路 47 任务无丢失——**核心机制不需要动**，v0.9.0 应聚焦本清单而非重构。
+
+---
+
+## 第九批输入（2026-11-19 深夜~11-20 晨，cron-27/28 监督发现）——G-18/G-19 + 协作轴冻结事故
+
+> v0.9.1（b2fbd06）已落地 limbo ack / 派单查重闸 / 容量闸（对应 G-12v3/G-13/G-12-b）——以下两项为 v0.9.1 之后生产续测新发现。
+
+**事故全貌**：11-19 17:54:09 末次协作事件后，lims2.0 十会话团队协作轴完全冻结，至 11-20 09:54 已 **16 小时**零 dispatch/claim/report/message/wake；引擎进程本身存活（晨间 5 次 hook-session-start、2 次 probe、2 次 snapshot 均正常落盘）——是协作/唤醒双轴停摆，非引擎死亡。
+
+**G-18 wake 开关静默翻转（G-6 的恶化形态，源码实锤）**：
+- **事实**：snapshot.engine.wakeEnabled 于 11-19 17:54:09→18:53:59 之间翻转为 false，此后 16h 无任何唤醒尝试、无重开痕迹；引擎零事件记录该变化。
+- **源码定位（0.8.1）**：缓存 plugin.json 第 28 行 `"XC_WAKE_ENABLED": "${user_config.wake_enabled}"`——**注入的是生效值不是 default**；用户 11-18 23:05 改的 default=true 至今完好（文件 mtime 11-18 21:54，未回滚）。wake.ts:499 每次 attemptWake 现读 `req.env["XC_WAKE_ENABLED"]`；snapshot.ts:144 `wakeEnabledFromEnv` 严格等于字符串 "true" 才为开（"TRUE"/缺省均关）。
+- **结论**：翻转发生在**生效值层**（应用侧插件设置存储内的值被改为非 "true"，或插件重载于一个生效值为 false 的上下文），缓存文件无辜；生效值无落盘可查（G-6 全盘搜索零命中）、无变更事件、无回滚手段——**运维上完全不可观测**。
+- **附**：17:27-38 / 17:44-54 两个 inflight-nonce 15min 黑域（累计 87 次 nonce 跳过中 76 次砸 master）约 17:59:15 已自然过期——当前唯一阻塞因素就是全局开关本身，具备"一键恢复"条件但无人操作。
+- **改进方向**：①生效值落盘（`.crosschat/config.json`，v0.9.0 已有雏形）+ 变更写 engine.jsonl 事件；②wake-disabled 持续超 T 分钟主动告知 lead（现在只有提示词软提醒）；③提供 config 查询/修改工具让 lead 可查可改开关状态。
+
+**G-19 wake 成功≠消息被消费（provider 限流致死无侦测，cron-27 定量）**：
+- **事实**：163 次成功 wake 中 **44 次（27%）**子进程死于 provider 限流（wake 日志内 litellm RateLimitError / GLM-5.3 池，43 次集中在 11-19 15-16 点内存危机时段），但引擎只记 wake/wake-child 成功事件、**wake-failed 零记录**——wake-failed 指标严重低估真实失败率；仅 70.6%（115/163）唤醒轮有有效响应。
+- **与 G-12 的分工**：G-12 系列解决"spawn 前容量闸 / 0 字节判据 / limbo 盖戳"；G-19 解决"spawn 成功后子进程快速死亡"——证据就在引擎自己的 `logs/wake-*.json` 里，但引擎从不回读。v0.9.1 的 limbo ack（consumedAt 回写+超时降级 unread）可覆盖本条的后果侧，但**致死原因回读与指标拆分仍缺**。
+- **叠加后果**：E100 POC 6 条收尾情报（qc-forms-7 17:44-54 → master）claimed 未投递卡死 16h19m；master 三态消费零变化；inbox-check 断档 16h（末次 11-19 17:45:10）；容量采样器同步停摆（末样 17:58:42）——疑似均依赖唤醒/协作循环驱动。
+- **改进方向**：①wake 子进程退出必写 exit 行（G-12 v2-a 同款）+ 引擎回读 wake 日志识别 RateLimitError 类死亡 → wake-failed/degraded 事件 + urgent 告知 lead；②provider 限流死亡自动重投邮箱（mailbox 兜底本就存在，缺触发）；③wake 成功率指标拆成 spawn-ok / child-alive / consumed 三级。
+
+**冻结期其他实况（供升级会话参考）**：
+- t63（E243 平台 docx 补 1/3/9.5mm 三列）无主 24.12h，任务板 92 项零 in_progress；sweep 累计 9 例不增（冻结期无新扫）
+- master 未退休未换绑，checkpoint 仍仅 11-19 10:14 那 1 个（全团队最后 checkpoint 事件为 form-mods-4 13:45:55）
+- 晨间 2 个无名新会话（sess_9df96df8 / sess_70e97813）零 register 不可寻址；form-mods-4 09:49:07 hook 层已见 master 消息未读提示仍不消费（行为性失聪延续）
+- uservoice 累计 41 未动；lims2.0 侧插件仍 0.8.1（v0.9.0/v0.9.1 未装）；engine maxMembers=8 而团队 13 人（超配 5 人）
+- **unread 口径自我修正（cron-27）**：游标=ts>maxReadAt 且无 readAt，**不盲**——此前"instrument 全盲"判断作废；master 真未读=6（E100 POC 6 条；16fdc0d3 已被 11-19 17:44:15 唤醒轮暗消费，不计）
