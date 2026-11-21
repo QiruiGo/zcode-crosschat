@@ -46,7 +46,12 @@ const PLUGIN_ROOT = join(SRC, '..');
 const REPO_ROOT = join(PLUGIN_ROOT, '..');
 
 const PROTOCOL = readFileSync(join(REPO_ROOT, 'docs', 'PROTOCOL.md'), 'utf8');
-const README = readFileSync(join(REPO_ROOT, 'README.md'), 'utf8');
+// v0.9.4 B3：README 瘦身——「已知限制」/「威胁模型」整段搬 docs/LIMITATIONS.md、「版本记录」搬
+// CHANGELOG.md（README 正文 ≤220 行，内容零丢失）。本文件的用户文档面口径锁随之改查并集：
+// 原句必须仍在用户可见文档中（条目搬家不丢锁），三面对拍改为 用户文档面/PROTOCOL/SKILL。
+const README = ['README.md', 'docs/LIMITATIONS.md', 'CHANGELOG.md']
+  .map((rel) => readFileSync(join(REPO_ROOT, rel), 'utf8'))
+  .join('\n');
 const SKILL = readFileSync(join(PLUGIN_ROOT, 'skills', 'crosschat', 'SKILL.md'), 'utf8');
 
 /** v0.7 工具面（恰 10；黑盒核数用精确集合——参数扩展不得增面）。 */

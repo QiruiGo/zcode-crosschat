@@ -61,11 +61,6 @@ export async function withProcessLock<T>(key: string, fn: () => Promise<T> | T):
   }
 }
 
-/** Keys with an in-process lock queue (held or waiting), for diagnostics. */
-export function processLockQueueKeys(): string[] {
-  return [...processLocks.keys()];
-}
-
 // ---------------------------------------------------------------------------
 // 2. Cross-process lockfile
 // ---------------------------------------------------------------------------

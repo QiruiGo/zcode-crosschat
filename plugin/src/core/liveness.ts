@@ -38,7 +38,8 @@
  *
  * @module core/liveness
  */
-import { memberLiveness } from './offline.js';
+import { memberLiveness, deriveSessionPidEvidence } from './offline.js';
+import { pidAlive } from './lock.js';
 import type { PeerScanResult } from './peerregistry.js';
 import { plausibleLivenessTs, type SessionRecord, type SessionWitness, type SessionWitnessKind, type TeamMember } from './types.js';
 
@@ -151,6 +152,26 @@ export interface LivenessJudgeInput {
   mailboxMtimeMs?: number;
   /** 第②③④判据的新鲜窗（ms；缺省 {@link LIVENESS_EVIDENCE_FRESH_MS}）。 */
   freshMs?: number;
+  /**
+   * v0.9.4（A1）：会话记录 pid 的**存活探测结果**（调用方读 sessions/<sid>.json 的
+   * `pid` 并用 core/lock.ts pidAlive 探测后注入；本模块无盘 I/O）。`turnInProgress`
+   * 由本模块从记录自述推导（liveness==='running' 且 livenessTs 可信）——只有回合
+   * 中的死进程才判 pid-dead（回合间隙零进程是正常形态，见 offline.ts 同款判据）。
+   *
+   * v0.9.4 打回第 1 轮（V094-13）：**缺省不再「不参与」**——未显式注入时本模块按
+   * `record.pid` + `pidAlive` 现场派生（见 {@link LivenessJudgeInput.pidAliveProbe}）。
+   * 旧行为「不注入 = 判据不参与」正是 V094-13 的根因：看门狗（显式注入）判
+   * pid-dead 并落 member-dead，而 xc_overview 的展示面未注入 → 三视图仍报 running，
+   * 同一死亡在两个面对不上账。派生点单一化后，凡拿到会话记录的展示面自动同判据。
+   */
+  sessionPid?: { pid: number; alive: boolean };
+  /**
+   * v0.9.4 打回第 1 轮（V094-13）：pid 存活探测的注入面（测试用；缺省 core/lock.ts
+   * 的 `pidAlive`，即真实 `process.kill(pid, 0)`）。**无盘 I/O**：唯一副作用是一次
+   * 进程存在性系统调用，与既有 peer 扫描的 pidAlive 同族；纯函数纪律的例外在此显式
+   * 声明（本模块仍是「无盘 I/O、无时钟副作用、无定时器」）。
+   */
+  pidAliveProbe?: (pid: number) => boolean;
 }
 
 /** 分钟取整展示（仅可信时刻；未来值不钳 0 展示——伪造的 lastEventTs 不进观测面）。 */
@@ -183,7 +204,19 @@ export function memberLivenessView(
   now: number,
   judge: LivenessJudgeInput = {},
 ): SessionLivenessView {
-  const liveness = scan !== undefined ? memberLiveness(member, scan, now) : null;
+  // v0.9.4（A1）：pid 证据（记录 pid + 存活探测 + 本模块推导的回合中自述）
+  // ——注入 memberLiveness 的 pid 判据。
+  // v0.9.4 打回第 1 轮（V094-13）：**未显式注入时按记录现场派生**（单一派生点
+  // core/offline.ts deriveSessionPidEvidence）——看门狗判死与三视图展示由此必然同判据，
+  // 修掉「看门狗 member-dead 而 overview 仍报 running」的跨面矛盾。
+  const sessionPid = judge.sessionPid !== undefined
+    ? {
+        pid: judge.sessionPid.pid,
+        alive: judge.sessionPid.alive,
+        turnInProgress: record?.liveness === 'running' && plausibleLivenessTs(record.livenessTs, now),
+      }
+    : deriveSessionPidEvidence(record, now, judge.pidAliveProbe ?? pidAlive);
+  const liveness = scan !== undefined ? memberLiveness(member, scan, now, { sessionPid }) : null;
   const dead = liveness === 'pid-dead';
   const endpointLive = liveness === 'live';
   const runningTrusted = record?.liveness === 'running' && plausibleLivenessTs(record.livenessTs, now);

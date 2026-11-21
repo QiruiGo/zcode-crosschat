@@ -736,6 +736,18 @@ export interface WakePromptInput {
    * urgentFirst（M3）同一规则在 wake 携带段的投影。
    */
   urgent?: boolean;
+  /**
+   * v0.9.4（A6）：唤醒场景标签（WakeRequest.reason 透传）——行动行据此分流：
+   * message/withdrawal 场景正文即消息本体（「不要 xc_read，直接按正文处理」），
+   * 其余场景正文是摘要/通知（保留 xc_read 指引）。缺省 = 旧行为（xc_read 指引）。
+   */
+  scene?: string;
+  /**
+   * v0.9.4（A6）：本批回执消息携带的**任务 id**（派单唤醒；attemptWake 从邮箱消息
+   * 的 taskId 字段解析，单一 taskId 时才给）。在场 ⇒ 行动行写「任务票 taskId=…：
+   * 直接 xc_claim」——不 xc_read 也能开工（唤醒一次到位的核心判据）。
+   */
+  taskId?: string;
 }
 
 /**
@@ -745,10 +757,13 @@ export interface WakePromptInput {
  * 与 §3.4 比仅去掉两处纯设计内引用（§6.2 ③ / scheduler.js:178），语义零改动。
  * W2 的成员欢迎 prompt（xc_team member-add 步骤③）经本导出复用同一文本（§9.1 依赖方向）。
  * v0.7（M6）：守则内工具名随旧名移除同步改新名（xc_identify/xc_read/xc_team/xc_overview）。
+ *
+ * v0.9.4（A6）：守则组装改为「规则 1 可替换」——欢迎回合（跑在 app-server 里、无钩子）
+ * 用原规则 1（显式 xc_identify + xc_read）；唤醒回合用 {@link MEMBER_RULES_V2_WAKE}
+ * 的规则 1（身份已由钩子自动绑定、正文已内嵌不 xc_read、有票直接 claim）。
+ * MEMBER_RULES_V2 本体的逐字文本不变（既有契约/测试不回归）。
  */
-export const MEMBER_RULES_V2 = [
-  "成员守则 v2（多任务自驱版）：",
-  "1) 身份：先 xc_identify（本 prompt 已给出 name/sessionId/wakeToken），再 xc_read({scope:\"inbox\"}) 读消息。",
+const MEMBER_RULES_V2_TAIL = [
   "2) 工作循环（一个回合可以做多单，做完一单领下一单）：",
   "   a. 取一单：优先看收件箱未读的 task-assignment / unblock-notice；",
   "   b. xc_claim(taskId) 拿 attemptId → xc_report(in_progress) → 执行；",
@@ -767,7 +782,31 @@ export const MEMBER_RULES_V2 = [
   "   unblock-notice 里也会带上游结果摘要（有截断预算）。",
   "7) 收到 shutdown-request 帧 → 不再领取新任务，把手头单报告（或直接 failed）后结束回合。",
   "8) 一切与协作有关的状态只经 xc_* 工具读写；.crosschat/ 状态目录是只读诊断面。",
-].join("\n");
+];
+
+/** 守则 v2 组装（规则 1 注入；其余条固定）——欢迎/唤醒两个变体共用同一尾部，零漂移。 */
+function composeMemberRulesV2(rule1: string): string {
+  return ["成员守则 v2（多任务自驱版）：", rule1, ...MEMBER_RULES_V2_TAIL].join("\n");
+}
+
+export const MEMBER_RULES_V2 = composeMemberRulesV2(
+  "1) 身份：先 xc_identify（本 prompt 已给出 name/sessionId/wakeToken），再 xc_read({scope:\"inbox\"}) 读消息。",
+);
+
+/**
+ * v0.9.4（A6）：**唤醒回合**的守则 v2（规则 1 按「唤醒一次到位」改写，第 2-8 条逐字
+ * 不变）。与欢迎回合版（{@link MEMBER_RULES_V2}）的唯一差别在规则 1：
+ * - 身份：SessionStart 钩子在会话启动时消费唤醒票据已自动绑定（队内轴 + peer 轴），
+ *   **不需要**模型调 xc_identify；自动绑定未生效时才用本 prompt 的 wakeToken 调一次
+ *   兜底（兜底路径保留 v0.9.3 的全部校验：一次性/目标 sid/活性闸）；
+ * - 取消息：正文已内嵌的场景（任务票 / 消息正文）**不要** xc_read，有任务票直接
+ *   xc_claim(taskId)；正文只是摘要/通知的场景才 xc_read({scope:"inbox"}) 查收。
+ */
+export const MEMBER_RULES_V2_WAKE = composeMemberRulesV2(
+  "1) 身份：本会话启动时引擎钩子已自动绑定（不要再调 xc_identify；未生效时用本 prompt 给出的 wakeToken 调一次兜底）。"
+  + "取消息：正文已内嵌时（任务票/消息正文）不要 xc_read，有任务票直接 xc_claim(taskId)；"
+  + "正文只是摘要/通知时才 xc_read({scope:\"inbox\"}) 查收。",
+);
 
 /**
  * v0.2 唤醒场景标签全集（§9.1 新增场景 unblock/idle/post-provision/shutdown 的 prompt
@@ -787,7 +826,6 @@ export const WAKE_SCENES = [
   "shutdown",
   "stale-sweep",
 ] as const;
-export type WakeScene = (typeof WAKE_SCENES)[number];
 
 /**
  * 守则附加白名单（§9.1「buildWakePrompt 白名单兼容」）：这些场景的唤醒 prompt 内嵌
@@ -831,12 +869,25 @@ function truncateBody(body: string, budget: number): string {
  */
 export function buildWakePrompt(input: WakePromptInput, maxChars: number = WAKE_PROMPT_MAX_CHARS): string {
   const receipt = formatReceipt(input.teamId, input.recipientKey, input.receiptIds);
+  // v0.9.4（A6）：身份行改为「钩子已自动绑定」口径——SessionStart 钩子消费唤醒票据时
+  // 就把队内轴 + peer 轴身份落盘（不经模型回合），唤醒 prompt 因此不再要求先调
+  // xc_identify；自动绑定未生效（票据已被消费/不匹配/钩子未跑）时保留 wakeToken
+  // 兜底路径（一次性/目标 sid 校验与 v0.9.3 完全一致）。
   const identity =
     `你是 zcode 会话 "${input.recipientKey}"，sessionId=${input.recipientSessionId}。` +
-    `本连接是新的：先调用 xc_identify 绑定本连接身份（name 填 "${input.recipientKey}"，` +
-    `sessionId 填 "${input.recipientSessionId}"，wakeToken 填 "${input.wakeToken}"），` +
-    `注册成功后调用 xc_read({scope:"inbox"}) 读取回执对应的消息。`;
-  const rules = input.includeMemberRules === true ? MEMBER_RULES_V2 : undefined;
+    `身份已由引擎在会话启动时自动绑定（SessionStart 钩子消费唤醒票据，不经模型回合）——不要再调 xc_identify；` +
+    `若自动绑定未生效，用 wakeToken 填 "${input.wakeToken}" 调一次 xc_identify 兜底（name/sessionId 同上）。`;
+  // v0.9.4（A6）：行动行按「正文是否内嵌 + 是否带任务票」分流——任务票场景直接
+  // xc_claim(taskId)（一次到位的核心判据）；消息正文场景不 xc_read 直接按正文处理；
+  // 摘要/通知场景（post-provision 未读清单、idle/cancel/unblock…）才需要 xc_read 查收。
+  const action = input.taskId !== undefined && input.taskId !== ""
+    ? `任务票 taskId=${input.taskId}：正文已内嵌——不要 xc_read，直接 xc_claim("${input.taskId}") 拿 attempt 开工。`
+    : input.scene !== undefined && wakePromptEmbedsMessageBody(input.scene)
+      ? `正文已内嵌——不要 xc_read({scope:"inbox"})，直接按正文处理。`
+      : `调用 xc_read({scope:"inbox"}) 读取回执对应的消息。`;
+  // v0.9.4（A6）：唤醒回合附加的守则用 WAKE 变体（规则 1 = 已自动绑定/正文内嵌/直接
+  // claim）；欢迎回合（provision.ts）仍用 MEMBER_RULES_V2 原版（无钩子、须显式 identify）。
+  const rules = input.includeMemberRules === true ? MEMBER_RULES_V2_WAKE : undefined;
 
   // v0.6（C1）：urgent 唤醒 → 正文携带段首位插横幅（横幅 + 原正文合计受正文预算
   // 约束；横幅固定短行，超长时先压正文再压横幅尾部——truncateBody 作用于合计文本，
@@ -846,14 +897,14 @@ export function buildWakePrompt(input: WakePromptInput, maxChars: number = WAKE_
     : input.bodyText;
 
   // 分隔符开销：parts 以 "\n\n" 连接。
-  const sepCount = (rules === undefined ? 2 : 3) * 2;
+  const sepCount = (rules === undefined ? 3 : 4) * 2;
   const bodyBudget = Math.max(
     0,
-    maxChars - receipt.length - identity.length - (rules?.length ?? 0) - sepCount,
+    maxChars - receipt.length - identity.length - action.length - (rules?.length ?? 0) - sepCount,
   );
   const parts = rules === undefined
-    ? [receipt, identity, truncateBody(body, bodyBudget)]
-    : [receipt, identity, truncateBody(body, bodyBudget), rules];
+    ? [receipt, identity, action, truncateBody(body, bodyBudget)]
+    : [receipt, identity, action, truncateBody(body, bodyBudget), rules];
   let prompt = parts.join("\n\n");
   if (prompt.length > maxChars) {
     // 兜底硬切（结构性部分自身超限时才会走到这里）。
@@ -1997,6 +2048,20 @@ export interface WakeLifecycleWatchConfig {
   lifecycleFile: string;
   /** 投递盖章时刻（spawn 成功；limbo/wake-slow 两个计时都从它起算）。 */
   stampedAt: number;
+  /**
+   * v0.9.4（A4）：**真正发起 spawn 的时刻**（attemptWake 在调 spawnResume 前取
+   * `Date.now()`）。与 stampedAt 的差 = 本次唤醒的 spawn 前开销（分层闸/在途 nonce/
+   * 状态门/容量闸/nonce 落盘/租约/prompt 组装）。wake-consumed 的两个计时窗口
+   * （waitedFromSpawnMs / waitedFromDeliveredMs）分别以它为起点，两者之差即 spawn
+   * 延迟——「spawn 已发起」与「已盖章」之间的耗时从此在指标面可见，不再混为一个数。
+   */
+  spawnedAt: number;
+  /**
+   * v0.9.4（A2）：启动确认结算的读取器（attemptWake 在 startLatch.confirm 落账后置位）。
+   * exit 尾行的「是否确认」字段据此如实记：true/false = 已结算；undefined = 监视器
+   * 观察到退出时确认尚未落账 → 记 null（不猜、不伪造）。
+   */
+  getStartConfirmed?: () => boolean | undefined;
   /** 唤醒子 pid（helper 汇报后才拿得到；取不到 = 无法观察退出，其余信号不受影响）。 */
   getChildPid: () => number | undefined;
   /** 轮询间隔 / limbo 超时 / wake-slow 阈值 / 假成功阈值 / 总窗（ms）。 */
@@ -2037,6 +2102,45 @@ export interface WakeLifecycleWatchConfig {
  */
 export function wakePromptEmbedsMessageBody(scene: string): boolean {
   return scene === "message" || scene === "withdrawal";
+}
+
+/**
+ * v0.9.4（A6）：从本批回执消息解析**唯一**的 taskId（best-effort；直读邮箱 JSONL，
+ * 不走读取面审计——与生命周期监视的轮询读同口径）。
+ *
+ * 为什么需要它：派单消息的 taskId 只在邮箱消息的 extras 里（任务票正文按 DESIGN
+ * 刻意不含 taskId，保重复派发幂等判据稳定），而「唤醒一次到位」要求成员**不调
+ * xc_read** 就能 xc_claim——taskId 必须由唤醒 prompt 的结构段带上。attemptWake 在
+ * 组装 prompt 前读一次邮箱，把回执 id 映射到 taskId：
+ * - 恰一个不同的 taskId → 返回它（派单唤醒的常态）；
+ * - 零个 / 多个不同 taskId（批量回执混单、非任务消息）→ undefined：行动行回落
+ *   「按正文/邮箱处理」，**不猜**哪一个（混单时猜错=领错单）。
+ * 读失败 → undefined（观测/提示面永不因盘读失败抛）。
+ */
+async function resolveReceiptTaskId(
+  stateRoot: string,
+  teamId: string,
+  toKey: string,
+  receiptIds: readonly string[],
+): Promise<string | undefined> {
+  if (receiptIds.length === 0) return undefined;
+  try {
+    const rows = await readJsonl<TeamMessage>(
+      inboxFile(stateRoot, teamId, sanitizeKey(toKey)),
+      isTeamMessage,
+      () => undefined, // 轮询读不审计坏行（审计归读取面）
+    );
+    const wanted = new Set(receiptIds);
+    const taskIds = new Set<string>();
+    for (const message of rows) {
+      if (!wanted.has(message.id)) continue;
+      if (typeof message.taskId === 'string' && message.taskId.trim() !== '') taskIds.add(message.taskId);
+    }
+    if (taskIds.size !== 1) return undefined; // 0 = 非任务消息；>1 = 混单不猜
+    return [...taskIds][0];
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -2098,11 +2202,16 @@ export function startWakeLifecycleWatch(cfg: WakeLifecycleWatchConfig): void {
             });
           }
         }
+        // v0.9.4（A2）：exit 尾行补「是否确认」——启动确认（XC_START_CONFIRM_MS 窗内
+        // 是否见到 helper 汇报的唤醒子 pid）的结算值。监视器观察到退出时确认可能尚未
+        // 落账（提前退出竞态）→ undefined → 如实记 null（不猜、不伪造）。
+        const startConfirmed = cfg.getStartConfirmed?.() ?? null;
         appendWakeLifecycle(cfg.lifecycleFile, {
           event: "wake-child-exit",
           pid,
           durationMs: now - cfg.stampedAt,
           exitCode: null, // 孤儿化唤醒子（V9）的退出码对引擎进程不可观测——如实记 null
+          startConfirmed,
           ...(evidence !== undefined ? { evidence } : {}),
         });
       }
@@ -2191,6 +2300,14 @@ export function startWakeLifecycleWatch(cfg: WakeLifecycleWatchConfig): void {
           });
           if (settled) {
             consumedSignaled = true;
+            // v0.9.4（A4）：双计时窗口——waitedFromSpawnMs 从 spawn 时刻起算（唤醒
+            // 「发起」到「消费」的真实时延，含 spawn 前开销之外的等待），
+            // waitedFromDeliveredMs 从投递盖章时刻起算（旧 waitedMs 的口径）。
+            // 两者之差 = spawnedAt − stampedAt = spawn 前开销（闸门/nonce/租约/prompt）。
+            // waitedMs 保留旧字段名（方案「保留旧字段名兼容」），取值与
+            // waitedFromSpawnMs 一致（方案「waitedMs 从 spawn 起算」）。
+            const waitedFromSpawnMs = Math.max(0, now - cfg.spawnedAt);
+            const waitedFromDeliveredMs = Math.max(0, now - cfg.stampedAt);
             await logEngineEvent(cfg.stateRoot, {
               event: WAKE_TIER_EVENT_CONSUMED,
               scene: cfg.scene,
@@ -2199,14 +2316,18 @@ export function startWakeLifecycleWatch(cfg: WakeLifecycleWatchConfig): void {
               nonce: wakeNonceDigest(cfg.nonce),
               sid: cfg.sid,
               receiptIds: [...cfg.receiptIds],
-              waitedMs: now - cfg.stampedAt,
+              waitedFromSpawnMs,
+              waitedFromDeliveredMs,
+              waitedMs: waitedFromSpawnMs,
             });
             appendWakeLifecycle(cfg.lifecycleFile, {
               event: "wake-consumed",
               messageIds: [...cfg.receiptIds],
               sid: cfg.sid,
               scene: cfg.scene,
-              waitedMs: now - cfg.stampedAt,
+              waitedFromSpawnMs,
+              waitedFromDeliveredMs,
+              waitedMs: waitedFromSpawnMs,
             });
             stop(); // 消费确认到齐：本轮投递的生命周期职责已尽
           }
@@ -2486,6 +2607,21 @@ async function readWakeTargetMember(stateRoot: string, teamId: string, agentKey:
 }
 
 /**
+ * v0.9.4（A3）：**邮箱降级回执的如实后缀**——wake-skipped（分层闸/在途 nonce/成员状态/
+ * spawn 配置）、容量闸 deferral、spawn 失败等一切「没有真正发起唤醒」的路径，回执 note
+ * 都必须带这一句：消息只是落了邮箱，既没有唤醒、更不存在送达/消费。
+ *
+ * 为什么单独立一个函数：这些路径旧文案只给原因行（如 `wake-disabled: …`），调用方与
+ * 运维容易把 `delivered:"mailbox"` 混读成「已投递」；A3 要求 wake-skipped 场景的
+ * 回执/通知**禁止**出现「已送达/已消费」，改为显式的「仅落邮箱（未唤醒）」。wake
+ * 成功路径（delivered:"wake"）的回执仍写「已发起」且明示非送达确认（attemptWake
+ * 成功回执既有措辞）——「送达」只在唤醒成功后才可写。
+ */
+export function mailboxOnlyNote(reason: string): string {
+  return `${reason}——仅落邮箱（未唤醒）：消息未送达也未消费，收方下回合或 xc_read({scope:"inbox"}) pull 兜底`;
+}
+
+/**
  * 推送唤醒编排（DESIGN §2.5；**必须在团队锁外调用**——慢操作 spawn 不持锁，§2.7-4；
  * 本函数内部对邮箱的补盖章会各自短暂重取锁，调用方持锁时调用会死锁）：
  *
@@ -2546,7 +2682,8 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
       ...(gate.takenOver === true ? { takenOver: true } : {}),
       ...(gate.warning !== undefined ? { configWarning: gate.warning } : {}),
     });
-    return { delivered: "mailbox", note: pre.reason };
+    // v0.9.4（A3）：降级回执如实写「仅落邮箱（未唤醒）」——禁出现已送达/已消费。
+    return { delivered: "mailbox", note: mailboxOnlyNote(pre.reason) };
   }
   // v0.9.3（B3②）：生效值恢复 true——清掉关闭持续态（下一次持续关闭重新起算）。
   // 位置在预判通过处：此刻 gate.enabled 恒 true（engine-member 免开关同算恢复）。
@@ -2562,7 +2699,8 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
       // registry/wake/ 真源与唤醒 prompt，共享日志不给人可消费的令牌。
       inflightNonce: wakeNonceDigest(inflight.token),
     });
-    return { delivered: "mailbox", note: d.reason };
+    // v0.9.4（A3）：降级回执如实写「仅落邮箱（未唤醒）」——禁出现已送达/已消费。
+    return { delivered: "mailbox", note: mailboxOnlyNote(d.reason) };
   }
 
   // 2.5 v0.2 成员状态门控（DESIGN-V0.2 §6.3 双向门控 + §7.3.3「E-a/E-b/E-c 唤醒路径
@@ -2581,7 +2719,8 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
     await logEngineEvent(stateRoot, {
       event: "wake-skipped", reason, scene: req.reason, teamId: req.teamId, to: toKey, memberState: gateState,
     });
-    return { delivered: "mailbox", note: reason };
+    // v0.9.4（A3）：降级回执如实写「仅落邮箱（未唤醒）」——禁出现已送达/已消费。
+    return { delivered: "mailbox", note: mailboxOnlyNote(reason) };
   }
 
   // 3.7 v0.5.3（A5 修复）：显式 spawn 配置无效（XC_ZCODE_EXE/XC_ZCODE_CJS 配置了但路径
@@ -2595,7 +2734,8 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
       await logEngineEvent(stateRoot, {
         event: "wake-skipped", reason, scene: req.reason, teamId: req.teamId, to: toKey,
       });
-      return { delivered: "mailbox", note: reason };
+      // v0.9.4（A3）：降级回执如实写「仅落邮箱（未唤醒）」——禁出现已送达/已消费。
+      return { delivered: "mailbox", note: mailboxOnlyNote(reason) };
     }
   }
 
@@ -2637,7 +2777,8 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
     });
     return {
       delivered: "mailbox",
-      note: reason
+      // v0.9.4（A3）：降级回执如实写「仅落邮箱（未唤醒）」——禁出现已送达/已消费。
+      note: mailboxOnlyNote(reason)
         + `（容量闸 v0.9.1 G-12-b；冷却 ${Math.round(capacityDeferral.cooldownMs / 1000)}s，env XC_MEM_WAKE_COOLDOWN_MS 可调，XC_MEM_WAKE_GATE=off 可关闸）`,
       wakeDeferred: capacityDeferral,
     };
@@ -2658,6 +2799,8 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
 
   // 5. prompt + spawn（fire-and-forget）。守则附加按场景白名单（v0.2 §9.1 白名单兼容）。
   // v0.6（C1）：urgent 唤醒（xc_relay）→ 正文首位 URGENT 横幅。
+  // v0.9.4（A6）：本批回执消息的 taskId（单一才给）→ prompt 行动行「直接 xc_claim」。
+  const receiptTaskId = await resolveReceiptTaskId(stateRoot, req.teamId, toKey, ids);
   const prompt = buildWakePrompt({
     teamId: req.teamId,
     recipientKey: toKey,
@@ -2666,6 +2809,8 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
     receiptIds: ids,
     bodyText: req.ticket,
     includeMemberRules: includeRulesForScene(req.reason),
+    scene: req.reason,
+    ...(receiptTaskId !== undefined ? { taskId: receiptTaskId } : {}),
     ...(req.urgent === true ? { urgent: true } : {}),
   });
   const logFile = wakeLogFile(stateRoot, toKey, now);
@@ -2707,12 +2852,15 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
       ...(recovery !== undefined ? { recovery } : {}),
     });
     // 同步 spawn 失败：子进程从未存在——生命周期账补 exit 尾行（start 头行已写）。
+    // v0.9.4（A2）：「是否确认」= false（子进程从未被拉起，启动确认无从成立——如实记
+    // false，不与「确认未结算」的 null 混写）。
     if (where === "spawn" || where === "retry-spawn") {
       appendWakeLifecycle(lifecycleFile, {
         event: "wake-child-exit",
         pid: null,
         durationMs: 0,
         exitCode: null,
+        startConfirmed: false,
         spawnError: String(err),
       });
     }
@@ -2741,10 +2889,16 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
   });
   // 唤醒子 pid（helper 汇报后才拿得到）——生命周期监视的退出观察经此 ref 读取。
   const childPidRef: { pid: number | undefined } = { pid: undefined };
+  // v0.9.4（A2）：启动确认结算值（下方 startLatch.confirm 落账后置位）——生命周期
+  // 监视的 exit 尾行经 getStartConfirmed 读它；未置位 = 确认尚未结算（记 null）。
+  const startConfirmedRef: { value: boolean | undefined } = { value: undefined };
   // v0.9.2（A1）：启动证据闩——helper 汇报的唤醒子 pid 即「wake-child 起来了」的
   // 机器可分辨证据（spawn 返回的 pid 只是 helper 的 pid，只证明「已发起」）。
   const startLatch = createWakeStartLatch();
   let pid: number | undefined;
+  // v0.9.4（A4）：spawn 时刻——try 内赋真值（调 spawnResume 前）；spawn 同步失败时
+  // 保持 stampedAt（该轮没有发起，两个窗口同起点，差值 0，不虚构 spawn 开销）。
+  let spawnedAt = now;
   // v0.4（DESIGN-V0.4 §2.4）：spawn 配置解析改为「env → 自动探测」，结果落审计。
   // req.cfg 测试注入优先级不变：注入时零探测（不触发任何子进程），审计行 source 记 test_injected。
   const resolvedCfg = req.cfg ?? resolveZcodeSpawnConfig(req.env);
@@ -2755,6 +2909,9 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
     exe: resolvedCfg.zcodeExe, cjs: resolvedCfg.zcodeCjs, to: toKey, scene: req.reason,
   });
   try {
+    // v0.9.4（A4）：spawn 时刻——在调用 spawnResume **之前**取（提交发起的瞬间）。
+    // 与 stampedAt（盖章时刻）之差 = spawn 前开销，wake-consumed 的双窗口据此拆分。
+    spawnedAt = Date.now();
     const spawned = (req.spawn ?? spawnResume)({
       cfg: isResolvedSpawnConfig(resolvedCfg)
         ? { zcodeExe: resolvedCfg.zcodeExe, zcodeCjs: resolvedCfg.zcodeCjs }
@@ -2792,7 +2949,9 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
       delivered: "mailbox",
       // v0.9.1 r3（V090-08）：降级路径的 note 同样携带畸形 config.json 的 WARNING
       // （与 wake 态 note、wake-skipped 原因行同一披露口径）。
-      note: `spawn-failed: ${err instanceof Error ? err.message : String(err)}（消息留邮箱，pull 兜底，租约到期可重试）`
+      // v0.9.4（A3）：同样带「仅落邮箱（未唤醒）」——spawn 失败也是没唤醒成功，
+      // 回执不得被读成已送达/已消费。
+      note: mailboxOnlyNote(`spawn-failed: ${err instanceof Error ? err.message : String(err)}（消息留邮箱，pull 兜底，租约到期可重试）`)
         + (gate.warning !== undefined ? `；${gate.warning}` : ""),
       wakeLog: logFile,
       receiptIds: ids,
@@ -2838,6 +2997,11 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
     wakeLog: logFile,
     lifecycleFile,
     stampedAt: now,
+    // v0.9.4（A4）：spawn 时刻（与 stampedAt 之差 = spawn 前开销）——wake-consumed
+    // 双计时窗口的起点之一。
+    spawnedAt,
+    // v0.9.4（A2）：exit 尾行的「是否确认」经此读取（确认落账后置位；未落账 = null）。
+    getStartConfirmed: () => startConfirmedRef.value,
     getChildPid: () => childPidRef.pid,
     pollMs: req.lifecyclePollMs ?? WAKE_LIFECYCLE_POLL_MS,
     limboTimeoutMs: req.limboTimeoutMs ?? limboTimeoutFromEnv(req.env),
@@ -2878,6 +3042,9 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
     outcome: startOutcome,
     thresholdMs: startConfirmThresholdMs,
   });
+  // v0.9.4（A2）：确认结算落账——exit 尾行的「是否确认」自此有真值（落账前观察到的
+  // 退出仍记 null：不猜）。
+  startConfirmedRef.value = startOutcome.confirmed;
 
   // v0.9（G-8）：sessionNotFound 的单次自动重试（方案 §一 G-8「投递遇 sessionNotFound →
   // 复用既有唤醒机械（resume/OpenSession 跳板）自动重试恰一次 + engine 事件留痕；
@@ -2952,6 +3119,8 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
     const retryIds = [...ids];
     await withLockBestEffort(stateRoot, req.teamId, () =>
       claimMailboxDelivery(stateRoot, req.teamId, toKey, retryIds, retryNow));
+    // v0.9.4（A6）：重试轮次同样解析 taskId（幂等：同一批消息，taskId 不变）。
+    const retryReceiptTaskId = await resolveReceiptTaskId(stateRoot, req.teamId, toKey, retryIds);
     const retryPrompt = buildWakePrompt({
       teamId: req.teamId,
       recipientKey: toKey,
@@ -2960,15 +3129,22 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
       receiptIds: retryIds,
       bodyText: req.ticket,
       includeMemberRules: includeRulesForScene(req.reason),
+      scene: req.reason,
+      ...(retryReceiptTaskId !== undefined ? { taskId: retryReceiptTaskId } : {}),
       ...(req.urgent === true ? { urgent: true } : {}),
     });
     const retryLogFile = wakeLogFile(stateRoot, toKey, retryNow);
     // v0.9.1（G-12v3）：重试轮次的唤醒子 pid ref（生命周期监视的退出观察）。
     const retryChildPidRef: { pid: number | undefined } = { pid: undefined };
+    // v0.9.4（A4）：重试轮次的 spawn 时刻与（A2）确认结算读取位。
+    const retryStartConfirmedRef: { value: boolean | undefined } = { value: undefined };
+    let retrySpawnedAt = retryNow;
     // v0.9.2（A1）：重试轮次的启动证据闩（与主路径的 startLatch 各自独立）。
     const retryStartLatch = createWakeStartLatch();
     let retryPid: number | undefined;
     try {
+      // v0.9.4（A4）：spawn 时刻（调 spawnResume 前取；与 stampedAt 之差 = spawn 前开销）。
+      retrySpawnedAt = Date.now();
       const spawned = (req.spawn ?? spawnResume)({
         cfg: isResolvedSpawnConfig(resolvedCfg)
           ? { zcodeExe: resolvedCfg.zcodeExe, zcodeCjs: resolvedCfg.zcodeCjs }
@@ -3011,6 +3187,8 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
           teamId: req.teamId, to: toKey, scene: req.reason, sid,
           nonceToken: retryToken, outcome, thresholdMs: threshold,
         });
+        // v0.9.4（A4）：重试轮次的确认结算（exit 尾行的「是否确认」读取位）。
+        retryStartConfirmedRef.value = outcome.confirmed;
       })().catch(() => undefined);
     } catch (err) {
       await releaseOnFailure("retry-spawn", err,
@@ -3048,6 +3226,10 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
       wakeLog: retryLogFile,
       lifecycleFile: wakeLifecycleFile(stateRoot, toKey, retryNow),
       stampedAt: retryNow,
+      // v0.9.4（A4）：重试轮次的 spawn 时刻（双窗口起点；与 stampedAt 之差 = 重试的
+      // spawn 前开销）。v0.9.4（A2）：确认结算读取位（exit 尾行「是否确认」）。
+      spawnedAt: retrySpawnedAt,
+      getStartConfirmed: () => retryStartConfirmedRef.value,
       getChildPid: () => retryChildPidRef.pid,
       pollMs: req.lifecyclePollMs ?? WAKE_LIFECYCLE_POLL_MS,
       limboTimeoutMs: req.limboTimeoutMs ?? limboTimeoutFromEnv(req.env),

@@ -71,7 +71,11 @@ const SRC = join(dirname(fileURLToPath(import.meta.url)), '..');
 const PLUGIN_ROOT = join(SRC, '..');
 const REPO_ROOT = join(PLUGIN_ROOT, '..');
 const PROTOCOL = readFileSync(join(REPO_ROOT, 'docs', 'PROTOCOL.md'), 'utf8');
-const README = readFileSync(join(REPO_ROOT, 'README.md'), 'utf8');
+// v0.9.4 B3：README 瘦身——已知限制/威胁模型搬 docs/LIMITATIONS.md、版本记录搬 CHANGELOG.md。
+// 用户文档面口径锁改查并集（原句必须仍在用户可见文档中；条目搬家不丢锁）。
+const README = ['README.md', 'docs/LIMITATIONS.md', 'CHANGELOG.md']
+  .map((rel) => readFileSync(join(REPO_ROOT, rel), 'utf8'))
+  .join('\n');
 
 /** v0.7 工具面（恰 10；黑盒核数用精确集合——参数扩展不得增面）。 */
 const EXPECTED_TOOLS = [

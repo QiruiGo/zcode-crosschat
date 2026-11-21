@@ -56,7 +56,9 @@ export type ProvisionMode = "fresh" | "auto";
 export interface ProvisionSpec {
   /** 成员 key（调用方已 sanitizeKey）。 */
   key: string;
-  /** 模型 id 覆盖；缺省用 XC_MEMBER_MODEL，再缺省用枚举首个（§6.2 步骤②）。 */
+  /** 模型 id 覆盖；缺省用 XC_MEMBER_MODEL，再缺省用枚举首个（§6.2 步骤②）。
+   *  v0.9.4（A7）：显式指定（本参数或 XC_MEMBER_MODEL）而枚举里匹配不到 → 显式报错
+   *  （附可用 modelId 列表），不再静默取枚举首个。 */
   model?: string;
   /** 推理档位覆盖；缺省用 XC_MEMBER_REASONING，再缺省取模型档位表末位或 "max"。 */
   reasoningLevel?: string;
@@ -134,7 +136,19 @@ function optionalEnv(env: NodeJS.ProcessEnv, key: string): string | undefined {
   return raw !== undefined && raw.trim() !== "" ? raw : undefined;
 }
 
-/** 模型选择（§6.2 步骤②：provider 过滤 → model 精确命中否则首个；档位显式优先，末位兜底）。 */
+/** 可用 modelId 列表的展示上限（回执 detail 另有 500 字符截断，这里先防刷屏）。 */
+const MODEL_LIST_DISPLAY_MAX = 20;
+
+/** 模型选择（§6.2 步骤②：provider 过滤 → model 精确命中否则首个；档位显式优先，末位兜底）。
+ *
+ * v0.9.4（A7）：**显式 model 匹配不到 → 显式报错**（附可用 modelId 列表），不再静默取
+ * 枚举首个。旧行为（`?? pool[0]!`）把「配错了 model」呈现成「用了一个别的模型」：
+ * 建员回执写的还是请求的 model 名（ProvisionResult.modelId 取 chosen），调用方无从
+ * 知道实际跑的不是他要的那个——红队/验收口径的「静默回落」同款缺陷（v0.5.3 A5 的
+ * spawn 配置回落、v0.9.1 V090-04 的 boundName 自签都循此收口）。入参 preferModel 的
+ * 两个来源（member-add 的 model 参数 / XC_MEMBER_MODEL 配置）都是**显式意图**，
+ * 同一把闸；未传（undefined/空白）= 没有意图，维持「枚举首个」缺省。
+ */
 export function pickModel(
   models: readonly ModelRef[],
   options: { preferModel?: string; preferProvider?: string; preferReasoning?: string },
@@ -150,9 +164,30 @@ export function pickModel(
     const filtered = models.filter((m) => m.providerId === options.preferProvider);
     if (filtered.length > 0) pool = filtered;
   }
-  const chosen =
-    (options.preferModel !== undefined ? pool.find((m) => m.modelId === options.preferModel) : undefined)
-    ?? pool[0]!;
+  const preferModel = options.preferModel?.trim();
+  if (preferModel !== undefined && preferModel !== "") {
+    const hit = pool.find((m) => m.modelId === preferModel);
+    if (hit === undefined) {
+      const available = [...new Set(pool.map((m) => m.modelId))];
+      const shown = available.slice(0, MODEL_LIST_DISPLAY_MAX).join(", ");
+      const more = available.length > MODEL_LIST_DISPLAY_MAX
+        ? `…等 ${available.length} 个`
+        : "";
+      throw new ProvisionError(
+        "model",
+        `member model "${preferModel}" 在 app-server 枚举结果中不存在`
+        + (options.preferProvider !== undefined ? `（provider 过滤 "${options.preferProvider}" 后）` : "")
+        + `：可用 modelId = ${shown}${more}。`
+        + "不再静默取枚举首个——请修正 member-add 的 model 参数或 member_model(XC_MEMBER_MODEL) 配置"
+        + "（可用列表也可经 xc_doctor 查看）。",
+      );
+    }
+    const levels = hit.reasoningLevels;
+    const reasoningLevel =
+      options.preferReasoning ?? (levels.length > 0 ? levels[levels.length - 1]! : "max");
+    return { providerId: hit.providerId, modelId: hit.modelId, reasoningLevel };
+  }
+  const chosen = pool[0]!;
   const levels = chosen.reasoningLevels;
   const reasoningLevel =
     options.preferReasoning ?? (levels.length > 0 ? levels[levels.length - 1]! : "max");

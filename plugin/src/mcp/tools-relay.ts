@@ -102,7 +102,6 @@ import {
   mapToolError,
   okResult,
   ToolError,
-  type ToolPayload,
   type ToolResult,
 } from "./protocol.js";
 import { renderMessage } from "./render.js";
@@ -1053,14 +1052,6 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
 // peer 轴发送（v0.5.3 peer 发送路径平移 + urgent 文件退化标注）
 // ---------------------------------------------------------------------------
 
-export interface RelayPeerSendResult {
-  msgId: string;
-  to: string;
-  /** 六态回执（peerenvelope 同词表；无 status 回复 = delivered）。 */
-  receipt: string;
-  via: "pipe" | "file";
-}
-
 /**
  * peer 轴发送实现（不进 ToolCore 组装链——peer 轴有自己的注册/档类/回执语义）。
  *
@@ -1562,9 +1553,3 @@ export function registerRelay(
   server.tool("xc_relay", description, RelayShape, handler);
   registry?.set("xc_relay", { description, shape: RelayShape, handler });
 }
-
-// ---------------------------------------------------------------------------
-// 工具载荷类型（供 M1 家族注册器复用；保持与 protocol.js 的 ToolPayload 同形）
-// ---------------------------------------------------------------------------
-
-export type RelayPayload = ToolPayload;

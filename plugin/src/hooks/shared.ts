@@ -161,18 +161,26 @@ export async function auditHookFailure(
  * regToken 时铸造锚定令牌并随记录返回，调用方把它同步写进机器全局基记录并注入
  * 本会话上下文。锁忙（超 2s）时返回 undefined——本回合拿不到令牌就不注入，
  * 下次 SessionStart 再补，hook 永不因它失败。
+ *
+ * v0.9.4（A1）：`options.pid`（SessionStart 传入的宿主进程 pid）透传给
+ * refreshSessionLastSeen——成员 pid 证据与 lastSeen/活性状态同一原子写落盘
+ * （core/registry.ts / core/offline.ts 的 pid 判据）。undefined = 不写。
  */
 export async function refreshSessionRegistration(
   stateRoot: string,
   sessionId: string,
   cwd: string,
-  options: { ensureRegToken?: boolean } = {},
+  options: { ensureRegToken?: boolean; pid?: number } = {},
 ): Promise<SessionRecord | undefined> {
   let upserted: SessionRecord | undefined;
   await withRegistryLock(
     stateRoot,
     async () => {
-      upserted = await refreshSessionLastSeen(stateRoot, sessionId, { cwd, ensureRegToken: options.ensureRegToken });
+      upserted = await refreshSessionLastSeen(stateRoot, sessionId, {
+        cwd,
+        ensureRegToken: options.ensureRegToken,
+        ...(options.pid !== undefined ? { pid: options.pid } : {}),
+      });
     },
     { waitMs: HOOK_LOCK_WAIT_MS },
   );

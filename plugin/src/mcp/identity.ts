@@ -39,12 +39,13 @@ import {
   consumeWakeNonce,
   readNames,
   readSession,
+  readSessionByHostPidSync,
   readWakeNonce,
   unbindName,
   writeSession,
 } from "../core/registry.js";
 import { readPeerBaseRecord, writePeerBaseRecord } from "../core/peerdir.js";
-import { teamFile } from "../core/paths.js";
+import { resolveStateRoot, teamFile } from "../core/paths.js";
 import { newTeamState, noteTeamReset, readTeam, writeTeam } from "../core/teamstate.js";
 import { logEngineEvent } from "../core/log.js";
 import { DEFAULT_TEAM_ID, memberState } from "../core/types.js";
@@ -114,11 +115,23 @@ export class IdentityStore {
     return this.#byConnection.get(connectionKey);
   }
 
-  /** 身份类工具入口：未注册连接一律硬拒（§2.8）。 */
+  /**
+   * 身份类工具入口：未注册连接一律硬拒（§2.8）。
+   *
+   * v0.9.4（A6）：硬拒前先试**盘上自动采纳**（{@link adoptHookBoundIdentity}）——
+   * 唤醒一次到位：SessionStart 钩子已把身份落盘（票据一次性消费 + 队内轴/peer 轴
+   * 绑定），MCP 连接无需再调一次 xc_identify 才能开工。采纳失败/不满足护栏 →
+   * 照旧 not_registered（模型回合按 wake prompt 的 wakeToken 兜底路径自证）。
+   */
   require(connectionKey: string): BoundIdentity {
     const bound = this.#byConnection.get(connectionKey);
-    if (!bound) throw notRegisteredError();
-    return bound;
+    if (bound) return bound;
+    const adopted = adoptHookBoundIdentity();
+    if (adopted !== undefined) {
+      this.bind(connectionKey, adopted);
+      return adopted;
+    }
+    throw notRegisteredError();
   }
   /**
    * v0.7.1（边界-4 修复）：解绑一条连接的持有身份（注册回滚用）。
@@ -144,6 +157,56 @@ export class IdentityStore {
 
 /** 进程级单例：stdio 下一进程=一连接（见类注释，DESIGN §2.3-2）。 */
 export const identityStore = new IdentityStore();
+
+/**
+ * v0.9.4（A6）：连接身份的**盘上自动采纳**（「唤醒一次到位」的 MCP 侧收口）。
+ *
+ * 背景：SessionStart 钩子消费唤醒票据后已把队内轴/peer 轴身份写进会话记录
+ * （sessions/<sid>.json 的 boundName + pid，A1），而 MCP server 与钩子同父进程
+ * （都是宿主会话拉的子进程）——本函数按 `process.ppid` 反查「本连接所属会话」的
+ * 记录，把钩子已写好的身份采纳进内存缓存，成员被唤醒后的首回合因此只需
+ * xc_claim（wake prompt 的行动行同步改口径，见 engine/wake.ts）。
+ *
+ * 四道护栏（主会话裁决，2026-11-21；按 ppid 采纳身份有误绑风险，缺一不可）：
+ * 1. **唯一性才采纳**：恰有一条会话记录 pid == process.ppid ∧ 该记录 cwd == 本
+ *    server 工作区 ∧ boundName 非空。零条/多条（一个宿主进程承载多个会话）→ 不
+ *    采纳（宁可多一次调用，不许错绑身份）；
+ * 2. **只增不改**：只在「当前连接无身份」的路径上调用（IdentityStore.require），
+ *    已绑定身份绝不覆盖；采纳只写内存缓存，**不写盘、不改 team.json**；
+ * 3. **不绕过任何既有闸**：name_taken / session_already_bound / session_id_in_use /
+ *    takeover_live_holder / member_removed 门一律在 xc_identify（xcRegister）路径
+ *    原样生效；采纳不是注册、不消费任何票据（票据已由钩子一次性消费），也不设
+ *    voiceOwner（uservoice 盖章面的唤醒续跑证明只认 wakeToken 路径，不放松）；
+ * 4. 任何盘读异常 → 不采纳（保持 not_registered，由调用方按旧路径显式 identify）。
+ *
+ * 边界（如实声明）：同机进程可写会话记录（README 已知限制 12 同族威胁模型边界，
+ * 不做签名/哈希链）；采纳面只服务「钩子刚绑好的身份让本进程的连接可见」，不扩大
+ * 任何信任假设。若实测发现真实宿主里 ppid 不唯一（如所有会话共用一个 app-server），
+ * 本函数自然退化为 not_registered（护栏 1 的多条命中分支），调用面回 2 次调用。
+ */
+export function adoptHookBoundIdentity(workspace: string = process.cwd()): BoundIdentity | undefined {
+  try {
+    const stateRoot = resolveStateRoot(workspace);
+    const record = readSessionByHostPidSync(stateRoot, process.ppid);
+    if (record === undefined) return undefined; // 护栏 1：零条/多条命中
+    if (record.cwd !== workspace) return undefined; // 护栏 1：cwd 不一致（别的会话）
+    const name = record.boundName;
+    if (name === undefined || name.trim() === '') return undefined; // 护栏 1：无绑定名
+    return {
+      sessionKey: `xc:${DEFAULT_TEAM_ID}:${name}`,
+      teamId: DEFAULT_TEAM_ID,
+      name,
+      agentKey: name,
+      sessionId: record.sessionId,
+      // 采纳身份的角色：与 member-add 供给绑定一致取 worker（唯一消费点 xc_team init
+      // 的 founder 行；成员的队内角色以 roster 行为准）。
+      role: 'worker',
+      boundAt: Date.now(),
+    };
+  } catch {
+    return undefined; // 护栏 4：盘读异常不采纳
+  }
+}
 
 /** 从 SDK 请求 extra 提取连接键（stdio：undefined → "__stdio__"）。 */
 export function connectionKeyOf(extra: unknown): string {

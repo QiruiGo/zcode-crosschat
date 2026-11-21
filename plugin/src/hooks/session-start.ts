@@ -12,6 +12,15 @@
  *    它是 mode-parity 自动档的档类真源（收方档类 + 发方档类都出自这里）。
  * 2. 注入文案追加一行 peer 注册指引（xc_identify）。
  *
+ * v0.9.4 增量（39-v094 方案 §二 组A）：
+ * - **A1 成员 pid 证据**：会话记录与 peer 基记录补 `pid`（宿主进程 pid，见
+ *   {@link hookSessionPid} 的取值口径）——memberLiveness 的 pid 判据（pid-dead）
+ *   与看门狗的成员死亡检测据此在「无 peer 注册记录的引擎成员」上也能成立；
+ * - **A6 唤醒一次到位（机制合并）**：本钩子消费以本 sid 为目标的**唤醒票据**
+ *   （registry/wake/<nonce>.json，一次性、非目标 sid 拒）并**自动绑定身份**
+ *   （队内轴 names.json/roster + peer 轴基记录 boundName 盖章），不经模型回合；
+ *   成员被唤醒后的首回合因此只需 xc_claim（wake prompt 的行动行同步改口径）。
+ *
  * 降级规则不变：无 sessionId → 不锚定（静默 exit 0）；任何异常 → engine.jsonl 审计 → exit 0。
  *
  * Build entry: dist/hooks/session-start.mjs (scripts/build.mjs).
@@ -29,21 +38,216 @@ import {
   resolveHookContext,
   writePeerBaseRecord,
 } from './shared.js';
+// v0.9.4（A6）：票据消费 + 身份绑定的 M1 原语（M4 → M1 纪律：只 import core）。
+import { createHash } from 'node:crypto';
+import {
+  consumeWakeTicketForSession,
+  readNames,
+  readSession,
+  writeNames,
+  writeSession,
+} from '../core/registry.js';
+import { readTeam, writeTeam } from '../core/teamstate.js';
+import { withRegistryThenTeamLocks } from '../core/lock.js';
+import { DEFAULT_TEAM_ID, memberState, type NameBindings } from '../core/types.js';
+import { logEngineEvent } from '../core/log.js';
 
-async function main(): Promise<void> {
+/**
+ * v0.9.4（A1）：本会话的**宿主进程 pid**（写进会话记录/基记录的 pid 证据）。
+ *
+ * 取值口径（写死，勿改）：钩子进程自身是短命的——hooks.json `type:"process"` +
+ * timeoutMs 10000，写完 additionalContext 即退出。记它自己的 pid，秒级之后就是
+ * 「进程已亡」，memberLiveness 的 pid 判据会把每个**活**会话误判成 pid-dead
+ * （成员死亡告警全面误报）。因此记的是**拉起本钩子的宿主会话进程**（钩子的父进程）：
+ * 桌面会话的宿主进程 / 无头 --resume 的 CLI 进程——杀它即会话亡，正是 A1 验收
+ * 「kill 该 pid 后 90s 内 member-dead 恰一条」要观测的对象。
+ * 取不到（ppid 非法/0）→ undefined（无 pid 证据，判据不参与，不猜）。
+ */
+export function hookSessionPid(): number | undefined {
+  const ppid = process.ppid;
+  return Number.isSafeInteger(ppid) && ppid > 0 ? ppid : undefined;
+}
+
+/** v0.9.4（A6）：一次票据消费 + 自动绑定的结局（审计/测试用）。 */
+export interface WakeTicketBindingOutcome {
+  /** true = 票已消费且身份绑定落地；false = 无票可消或状态冲突（模型回合兜底）。 */
+  bound: boolean;
+  /** 票据签发的花名（无票时缺省）。 */
+  name?: string;
+  /** 结局细目（审计事件 reason 同值）。 */
+  detail: 'bound' | 'no-ticket' | 'name-bound-elsewhere' | 'bound-name-conflict' | 'lock-busy';
+}
+
+/**
+ * v0.9.4（A6）：**唤醒票据一次性消费 + 身份自动绑定**（SessionStart 钩子专用，
+ * 不经模型回合——「唤醒一次到位」的机制本体）。
+ *
+ * 顺序（消费先行，绑定随后）：
+ * 1. {@link consumeWakeTicketForSession} 按 sid 找票并原子置 used（registry 锁内）——
+ *    只认 sid/issuedToSid 都指向本会话的票（非目标 sid 拒）；无票 = 普通会话启动，
+ *    零副作用返回；
+ * 2. 冲突预检（只读）：花名已被**别的 sid**持有、或本会话记录已有**别的** boundName
+ *    → 不绑（与 xc_identify 的 name_taken/session_already_bound 同口径，但钩子不抛，
+ *    只留审计——模型回合随后会拿到明确错误而非静默错绑）；
+ * 3. 落盘（registry → team 固定锁序）：names.json 缺绑才绑（同 sid 幂等刷新）、
+ *    roster 行 sid 刷新（仅 ready 态的在册行；不新建行——钩子不虚构成员）、
+ *    会话记录 boundName（缺才写，不覆盖别人的身份）；
+ * 4. peer 轴盖章：机器全局基记录 boundName + pid（xc_identify 的同款盖章面）。
+ *
+ * 边界（如实声明）：票据消费属同机信任域（PROTOCOL §10/§11.5：同机进程可读写状态
+ * 文件，不做签名/哈希链）；本机制把身份绑定从模型回合前移到钩子，不防同机伪造。
+ */
+async function bindWakeTicketIdentity(input: {
+  stateRoot: string;
+  sessionId: string;
+  /** A1 的宿主进程 pid（一并盖章进基记录）。 */
+  pid: number | undefined;
+  peerRoot: string;
+  now: number;
+}): Promise<WakeTicketBindingOutcome> {
+  const consumed = await consumeWakeTicketForSession(input.stateRoot, { sid: input.sessionId, now: input.now });
+  if (consumed === undefined) return { bound: false, detail: 'no-ticket' };
+  const name = consumed.nonce.name ?? consumed.nonce.agentKey;
+
+  // 2. 冲突预检（只读两步，随后锁内复判——预检只为提前给出审计原因）。
+  const namesBefore = await readNames(input.stateRoot).catch((): NameBindings => ({}));
+  const holder = namesBefore[name];
+  if (holder !== undefined && holder.sessionId !== input.sessionId) {
+    await logEngineEvent(input.stateRoot, {
+      event: 'wake-ticket-binding-skipped',
+      reason: 'name-bound-elsewhere',
+      name,
+      sessionId: input.sessionId,
+      boundSessionId: holder.sessionId,
+      note: '唤醒票据的花名已被别的 sid 持有——不抢绑，交由模型回合的 xc_identify 显式处理',
+    });
+    return { bound: false, name, detail: 'name-bound-elsewhere' };
+  }
+  const recordBefore = await readSession(input.stateRoot, input.sessionId).catch(() => undefined);
+  if (recordBefore?.boundName !== undefined && recordBefore.boundName !== name) {
+    await logEngineEvent(input.stateRoot, {
+      event: 'wake-ticket-binding-skipped',
+      reason: 'bound-name-conflict',
+      name,
+      sessionId: input.sessionId,
+      boundName: recordBefore.boundName,
+      note: '本会话记录已绑定别的花名——不覆盖既有身份，交由模型回合显式处理',
+    });
+    return { bound: false, name, detail: 'bound-name-conflict' };
+  }
+
+  // 3. 落盘（registry → team 固定锁序；钩子 2s 锁预算，锁忙即放弃——票据已消费，
+  //    模型回合可经 wakeToken 兜底路径自证（注：兜底会撞 "already used"，故锁忙时
+  //    只丢「免 identify」的优化，不丢消息——消息本就在邮箱，pull 不依赖身份绑定）。
+  const locked = await withRegistryThenTeamLocks(
+    input.stateRoot,
+    DEFAULT_TEAM_ID,
+    async () => {
+      const names = await readNames(input.stateRoot).catch((): NameBindings => ({}));
+      const current = names[name];
+      if (current === undefined || current.sessionId === input.sessionId) {
+        names[name] = {
+          sessionId: input.sessionId,
+          role: current?.role ?? 'worker',
+          registeredAt: input.now,
+        };
+        await writeNames(input.stateRoot, names);
+      }
+      const team = await readTeam(input.stateRoot, DEFAULT_TEAM_ID);
+      if (team !== undefined) {
+        const row = team.members.find((m) => m.key === name);
+        // 仅刷新在册 ready 行的 sid（wake 路径同语义：无头回合身份以票据为准）；
+        // 不新建行（钩子不虚构成员）、不动 provisioning/failed/removed 行。
+        if (row !== undefined && row.sessionId !== input.sessionId
+          && memberState(row) !== 'removed' && memberState(row) !== 'provisioning' && memberState(row) !== 'failed') {
+          row.sessionId = input.sessionId;
+          row.lastSeen = input.now;
+          await writeTeam(input.stateRoot, team);
+        }
+      }
+      const record = await readSession(input.stateRoot, input.sessionId).catch(() => undefined);
+      if (record !== undefined) {
+        const next = {
+          ...record,
+          ...(record.boundName === undefined ? { boundName: name } : {}),
+          ...(input.pid !== undefined ? { pid: input.pid } : {}),
+        };
+        if (next.boundName !== record.boundName || next.pid !== record.pid) {
+          await writeSession(input.stateRoot, next);
+        }
+      }
+      return true;
+    },
+    { waitMs: 2_000 },
+  ).catch((error: unknown) => {
+    // 锁忙/IO：绑定落盘放弃（票据已一次性消费）。审计留痕——本会话首回合需自行
+    // xc_identify（hook 路径）；消息不依赖身份绑定（邮箱 pull 照常）。
+    void logEngineEvent(input.stateRoot, {
+      event: 'wake-ticket-binding-skipped',
+      reason: 'lock-busy',
+      name,
+      sessionId: input.sessionId,
+      error: error instanceof Error ? error.message : String(error),
+      note: '票据已一次性消费但绑定落盘遇锁忙/IO——本会话首回合需自行 xc_identify（hook 路径）',
+    }).catch(() => undefined);
+    return false;
+  });
+  if (!locked) {
+    return { bound: false, name, detail: 'lock-busy' };
+  }
+
+  // 4. peer 轴基记录盖章（队内绑定标记 + A1 的 pid 投影；与 xc_identify 的盖章同面）。
+  try {
+    const base = await readPeerBaseRecord(input.peerRoot, input.sessionId);
+    await writePeerBaseRecord(input.peerRoot, {
+      sessionId: input.sessionId,
+      cwd: base?.cwd ?? process.cwd(),
+      source: base?.source ?? null,
+      startedAt: base?.startedAt ?? input.now,
+      lastSeen: input.now,
+      ...(base?.permissionMode !== undefined ? { permissionMode: base.permissionMode } : {}),
+      ...(base?.regToken !== undefined ? { regToken: base.regToken } : {}),
+      ...(input.pid !== undefined ? { pid: input.pid } : {}),
+      boundName: name,
+    });
+  } catch (error) {
+    await auditHookFailure(input.stateRoot, 'session-start-wake-ticket-peer-base', error);
+  }
+  await logEngineEvent(input.stateRoot, {
+    event: 'wake-ticket-bound',
+    name,
+    sessionId: input.sessionId,
+    // v0.9.1（V091-01）同款纪律：nonce 真值不进共享日志——只落不可反查摘要
+    // （sha256 前 12 hex），运维对账可做、收割不可行。
+    nonce: createHash('sha256').update(consumed.token).digest('hex').slice(0, 12),
+    note: 'SessionStart 钩子一次性消费唤醒票据并自动绑定身份（队内轴 + peer 轴），不经模型回合',
+  });
+  return { bound: true, name, detail: 'bound' };
+}
+
+/**
+ * SessionStart 钩子主体（v0.9.4：与 stop.ts 同款形态导出——模块加载自启 +
+ * 单测可显式驱动；`hookSessionPid` 经测试注入父进程 pid 的替代通道见其注释）。
+ */
+export async function runSessionStartHook(): Promise<void> {
   const stdin = readStdinPayload();
   const ctx = resolveHookContext('SessionStart', stdin);
 
   if (ctx.sessionId === undefined) return;
 
+  // v0.9.4（A1）：宿主进程 pid（钩子父进程；钩子自身短命不能当会话进程证据）。
+  const pid = hookSessionPid();
+
   // v0.5.3（安全对-1/a6 修复）：SessionStart 铸造/延续锚定令牌 regToken——
   // (name, sessionId) 对可经 xc_overview 公开读到，不构成凭据；重绑队内身份或
   // 认领已绑定队内身份的 sid（xc_identify）时必须出示本令牌。令牌只进
   // 本会话上下文（additionalContext）与两份锚定记录，不出现在任何工具输出里。
+  // v0.9.4（A1）：同一点写入 pid 证据（读改写单点落盘，与 lastEventTs 同一原子写）。
   let regToken: string | undefined;
   try {
     const upserted = await refreshSessionRegistration(ctx.stateRoot, ctx.sessionId, ctx.workspace, {
       ensureRegToken: true,
+      ...(pid !== undefined ? { pid } : {}),
     });
     regToken = upserted?.regToken;
   } catch (error) {
@@ -54,6 +258,7 @@ async function main(): Promise<void> {
   // v0.5.3（a6/a8）：同步锚定令牌（与 workspace 侧 sessions/<sid>.json 同值），
   // 并保留既有 boundName（xc_identify 盖的队内绑定标记）——基记录每次
   // SessionStart 全量重写，不保留就会把绑定标记抹掉。
+  // v0.9.4（A1）：同步 pid 证据（与 workspace 侧同值同口径）。
   try {
     const peerRoot = peerRootFromEnv(process.env);
     const existing = await readPeerBaseRecord(peerRoot, ctx.sessionId);
@@ -69,9 +274,25 @@ async function main(): Promise<void> {
       lastSeen: Date.now(),
       ...(baseToken !== undefined ? { regToken: baseToken } : {}),
       ...(existing?.boundName !== undefined ? { boundName: existing.boundName } : {}),
+      ...(pid !== undefined ? { pid } : {}),
     });
   } catch (error) {
     await auditHookFailure(ctx.stateRoot, 'session-start-peer-base', error);
+  }
+
+  // v0.9.4（A6）：唤醒票据一次性消费 + 身份自动绑定（队内轴 + peer 轴，不经模型回合）。
+  // 无票据（普通会话启动）= 零副作用；任何异常只审计不阻断（钩子永不失败）。
+  try {
+    const peerRoot = peerRootFromEnv(process.env);
+    await bindWakeTicketIdentity({
+      stateRoot: ctx.stateRoot,
+      sessionId: ctx.sessionId,
+      pid,
+      peerRoot,
+      now: Date.now(),
+    });
+  } catch (error) {
+    await auditHookFailure(ctx.stateRoot, 'session-start-wake-ticket', error);
   }
 
   let names: string[] = [];
@@ -91,7 +312,7 @@ async function main(): Promise<void> {
     `[zcode-crosschat] 跨会话消息轴（peer）：如需与本机其他会话直接对话，调用 xc_identify（name=<短小写英文名>，sessionId=${ctx.sessionId}）；之后用 xc_overview({view:"peers"}) 找地址、xc_relay 发信。`,
   ];
   // v0.5.3（a6/a8）：把锚定令牌注入本会话上下文——这是攻击者拿不到的唯一凭据面
-  //（注册表文件里的令牌需要文件读权限，超出「纯 MCP API」威胁模型，README 限制 5/12）。
+  // （注册表文件里的令牌需要文件读权限，超出「纯 MCP API」威胁模型，README 限制 5/12）。
   if (regToken !== undefined) {
     lines.push(
       `[zcode-crosschat] 本会话锚定令牌 regToken=${regToken}：xc_identify 重绑身份（队内轴与 peer 轴同一入口）时须原样携带；它只属于本会话，不外传。`,
@@ -101,9 +322,16 @@ async function main(): Promise<void> {
   await logHookEvent(ctx.stateRoot, { event: 'hook-session-start', sessionId: ctx.sessionId, names });
 }
 
-main().catch(async (error: unknown) => {
-  // Final guard: a hook must never exit non-zero (would mark the run failed).
-  const stdin = readStdinPayload();
-  const ctx = resolveHookContext('SessionStart', stdin);
-  await auditHookFailure(ctx.stateRoot, 'session-start', error);
-});
+/** guarded 自启包装（与 stop.ts 同款：钩子永不因异常退出非零）。 */
+export async function runSessionStartHookGuarded(): Promise<void> {
+  try {
+    await runSessionStartHook();
+  } catch (error: unknown) {
+    // Final guard: a hook must never exit non-zero (would mark the run failed).
+    const stdin = readStdinPayload();
+    const ctx = resolveHookContext('SessionStart', stdin);
+    await auditHookFailure(ctx.stateRoot, 'session-start', error);
+  }
+}
+
+void runSessionStartHookGuarded();

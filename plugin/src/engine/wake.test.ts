@@ -238,10 +238,15 @@ describe("buildWakePrompt", () => {
     });
     expect(p).toContain('[CrossChat inbox receipt: {"teamId":"default","recipient":"b","ids":["m1"]}]');
     expect(p).toContain("sessionId=sess_b");
-    expect(p).toContain('wakeToken 填 "tok-123"');
+    // v0.9.4（A6）：身份行改「钩子已自动绑定」口径——wakeToken 退居兜底（一次性消费/
+    // 目标 sid 校验不变），不再要求首调用 xc_identify。
+    expect(p).toContain("身份已由引擎在会话启动时自动绑定");
+    expect(p).toContain("不要再调 xc_identify");
+    expect(p).toContain('wakeToken 填 "tok-123"'); // 兜底路径仍在
     expect(p).toContain("计算 17*23");
     expect(p).toContain("成员守则");
-    expect(p).toContain("xc_identify");
+    // 非任务场景（无 taskId）保留 xc_read 指引；任务票场景的「不要 xc_read、直接
+    // xc_claim」由 wake-v094-a6 定向测试锁。
     expect(p).toContain('xc_read({scope:"inbox"})');
     expect(p.length).toBeLessThanOrEqual(WAKE_PROMPT_MAX_CHARS);
   });

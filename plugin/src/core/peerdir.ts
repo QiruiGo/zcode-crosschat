@@ -248,6 +248,15 @@ export interface PeerBaseRecord {
    * 未入队的普通会话）。
    */
   boundName?: string;
+  /**
+   * v0.9.4（A1）：本会话**宿主进程** pid（SessionStart 钩子写入，与 workspace 侧
+   * sessions/<sid>.json 的 pid 同值同口径——钩子的父进程：桌面宿主/无头 CLI；
+   * 钩子自身短命，记它自己的 pid 会秒级变「已亡」误判活会话）。absent = 存量基记录
+   * / 非钩子写入路径。peer 轴的进程事实仍以 sessions/<pid>.json 注册记录为准
+   * （pidAlive + 心跳双判据），本字段是会话记录的 pid 证据在机器全局面的同步投影，
+   * 供跨工作区读取方（红队/运维对账）一并看到。
+   */
+  pid?: number;
 }
 
 function isPeerBaseRecord(value: unknown): value is PeerBaseRecord {

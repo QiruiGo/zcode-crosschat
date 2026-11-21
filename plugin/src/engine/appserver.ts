@@ -32,19 +32,6 @@ export interface AppServerSpawnConfig {
   zcodeCjs: string;
 }
 
-/**
- * 从进程 env 组装配置（与 resume-cli.wakeSpawnConfigFromEnv 同纪律：空白按缺失，
- * DESIGN §9-V7 防御；缺失时 start() 同步抛错，调用方据此得 member_provision_failed）。
- */
-export function appServerConfigFromEnv(env: NodeJS.ProcessEnv = process.env): AppServerSpawnConfig {
-  const exe = env["XC_ZCODE_EXE"];
-  const cjs = env["XC_ZCODE_CJS"];
-  return {
-    zcodeExe: exe && exe.trim() !== "" ? exe : "",
-    zcodeCjs: cjs && cjs.trim() !== "" ? cjs : "",
-  };
-}
-
 /** 一个可用模型引用（P1：来自 create 结果 settings.model.available[].ref 或 state.updated）。 */
 export interface ModelRef {
   providerId: string;

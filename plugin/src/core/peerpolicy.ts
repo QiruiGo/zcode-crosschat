@@ -139,17 +139,6 @@ export type HoldCause =
   | 'mode-mismatch'
   | 'no-mode-asserted';
 
-export const HOLD_CAUSES: readonly HoldCause[] = [
-  'explicit-setting',
-  'managed-setting',
-  'repo-setting',
-  'invalid-setting',
-  'bypass-default',
-  'mode-unknown',
-  'mode-mismatch',
-  'no-mode-asserted',
-];
-
 /** 裁决归因（= DESIGN §6.1 第 3 步的 decidedBy 词表 + 自动档标记）。 */
 export type PeerPolicySource =
   | 'explicit-setting'

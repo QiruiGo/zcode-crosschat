@@ -93,7 +93,7 @@ export const TeamShape = {
   takeover: z.boolean().optional().describe("仅 action=init：接管现任 lead（用户明确指令时；R-1/F-4）"),
   to: z.string().min(1).optional().describe("action=transfer：移交目标"),
   name: z.string().min(1).optional().describe("action=member-add/member-stop：成员名"),
-  model: z.string().optional().describe("action=member-add：模型 id"),
+  model: z.string().optional().describe("action=member-add：模型 id（缺省用 member_model 配置，再缺省用枚举首个；显式指定但枚举里不存在 → 显式报错并列可用 modelId，不静默取首个）"),
   reasoningLevel: z.string().optional().describe("action=member-add：推理档位"),
   note: z.string().optional().describe("action=member-add：备注（仅审计）；action=checkpoint：写进检查点第 7 章的一句话"),
   contextChars: z.number().int().positive().optional().describe("action=member-add：该成员上下文字符数声明（预算刻度，R-18；缺省 XC_CONTEXT_CHARS/200k）"),
@@ -107,41 +107,6 @@ export const TeamShape = {
   result: z.string().optional().describe("action=idle：最终答案全文"),
   archive: z.boolean().optional().describe("action=member-stop：停止前先写留档（缺省 true，C4）"),
   unblockNote: z.string().optional().describe("action=unblock：解除说明（回投给认领者）"),
-} as const;
-
-// 旧工具的独立 shape（createLeadToolCore / 单测直接驱动沿用旧形态）。
-export const TeamInitShape = {
-  takeover: z.boolean().optional().describe("接管现任 lead（仅在用户明确指令时使用）：通知旧 lead、写 leadHistory(reason=takeover)、全程审计"),
-} as const;
-export const IdleShape = {
-  summary: z.string().min(1).describe("最终答案/空闲原因摘要（守则 v2 第 3 条：必填）"),
-  idleReason: z.enum(IDLE_REASONS).optional().describe("缺省 no-claimable-task"),
-  completedTaskId: z.string().optional().describe("刚完成的任务 id（守则 v2：附上）"),
-  completedStatus: z.string().optional().describe("刚完成任务的状态（completed/failed/…）"),
-  failureReason: z.string().optional().describe("失败原因（对齐 CC idle_notification 结构）"),
-  result: z.string().optional().describe("最终答案全文/结果摘要"),
-} as const;
-export const CancelShape = { taskId: z.string().min(1).describe("要取消的任务 id") } as const;
-export const LeadTransferShape = {
-  to: z.string().min(1).describe("移交目标成员名（sanitizeKey 归一；须在册且未 removed）"),
-  reason: z.string().optional().describe("移交原因（入 leadHistory 与审计，不参与逻辑）"),
-} as const;
-export const LeadReleaseShape = {} as const;
-export const MemberAddShape = {
-  name: z.string().min(1).describe("新成员名（须已是规范键形：字母/数字/单个连字符，≤48 字符；全角/同形/路径符/控制符等碰撞写法与保留名 lead/default/main/team-lead/user/system 拒绝）"),
-  model: z.string().optional().describe("成员模型 id；缺省用 member_model 配置，再缺省用枚举首个"),
-  reasoningLevel: z.string().optional().describe("成员推理档位；缺省用 member_reasoning 配置（默认 max）"),
-  note: z.string().optional().describe("备注（仅入审计日志，不参与逻辑）"),
-  contextChars: z.number().int().positive().optional().describe("该成员的上下文字符数声明（接收方注入预算刻度，R-18；不填=XC_CONTEXT_CHARS/200k）"),
-} as const;
-export const MemberStopShape = {
-  name: z.string().min(1).describe("要停止的成员名"),
-  reason: z.string().optional().describe("停止原因（记入 roster stopReason 与 shutdown 帧）"),
-  archive: z.boolean().optional().describe("停止前先写留档 .crosschat/archive/<name>/（缺省 true，C4）"),
-} as const;
-export const UnblockShape = {
-  taskId: z.string().min(1).describe("要解除阻塞的任务 id"),
-  unblockNote: z.string().optional().describe("解除说明（回投给认领者）"),
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -237,16 +202,28 @@ export function renderTeamInit(teamId: string, leadKey: string, alreadyLead: boo
   return `${head} lead=${leadKey}.`;
 }
 
+/**
+ * v0.9.4（A3）：通知类回执的投递结果措辞——wake 成功才可写「已发起唤醒」（且仍非送达
+ * 确认）；mailbox 降级（wake-skipped：分层闸/在途 nonce/成员状态/容量闸/spawn 失败）
+ * 只写「仅落邮箱（未唤醒）」。旧文案统一写 "delivered to X via mailbox"——"delivered"
+ * 会被读成「已送达」，A3 判据（wake-skipped 场景禁出现已送达/已消费）据此收口。
+ */
+export function renderDeliveryOutcome(delivered: "wake" | "mailbox"): string {
+  return delivered === "wake"
+    ? "已发起唤醒（wake，非送达确认）"
+    : "仅落邮箱（未唤醒，pull 兜底）";
+}
+
 export function renderIdle(from: string, to: string, delivered: "wake" | "mailbox"): string {
-  return `Idle notification from ${from} delivered to ${to} via ${delivered}.`;
+  return `Idle notification from ${from} to ${to}: ${renderDeliveryOutcome(delivered)}.`;
 }
 
 export function renderCancel(taskId: string, cancelledBy: string, receiptTo: string, delivered: "wake" | "mailbox"): string {
-  return `Task ${taskId} cancelled by ${cancelledBy}; receipt sent to ${receiptTo} (wake via ${delivered}).`;
+  return `Task ${taskId} cancelled by ${cancelledBy}; receipt sent to ${receiptTo}（${renderDeliveryOutcome(delivered)}）.`;
 }
 
 export function renderLeadTransfer(from: string, to: string, delivered: "wake" | "mailbox"): string {
-  return `Lead role transferred from ${from} to ${to}. This is a metadata role: no tasks, mailboxes or registrations moved (new lead notice via ${delivered}).`;
+  return `Lead role transferred from ${from} to ${to}. This is a metadata role: no tasks, mailboxes or registrations moved (new lead notice: ${renderDeliveryOutcome(delivered)}).`;
 }
 
 export function renderLeadRelease(released: boolean, teamId: string): string {
@@ -439,9 +416,14 @@ async function memberAdd(deps: ToolDeps, args: { name: string; model?: string; r
       });
       // sessions/<sid>.json 代写（identity.ts wakeToken 路径同形态）；v0.5.3（a6）：
       // 代写保留钩子已写的锚定令牌（v0.6 起令牌仅作钩子延续用，不再构成闸）。
+      // v0.9.4（A1）：**清掉旧 pid 证据**——重供给（auto 续用同 sid）时，记录里可能
+      // 留着上一轮已亡宿主进程的 pid；不清则「running 自述 + 旧 pid 已亡」会让看门狗
+      // 把刚供给好的成员误判 pid-dead（member-dead 误报）。新宿主进程的首个
+      // SessionStart 会写入新 pid（供给代写本身没有宿主进程可记）。
       const prebound = await readSession(stateRoot, result.sessionId);
+      const { pid: _stalePid, ...preboundRest } = prebound ?? {};
       await writeSession(stateRoot, {
-        ...(prebound ?? {}),
+        ...preboundRest,
         sessionId: result.sessionId,
         cwd: workspace,
         startedAt: prebound?.startedAt ?? readyAt,
@@ -482,11 +464,16 @@ async function memberAdd(deps: ToolDeps, args: { name: string; model?: string; r
         toAgentKey: plan.key,
         toSessionId: result.sessionId,
         workspace,
+        // v0.9.4（A5）：供给唤醒与派单唤醒同一套三级指标（wake-spawn-ok/child-alive/
+        // consumed），scene=post-provision 供漏斗面区分「投产唤醒」与「派单唤醒」。
         reason: "post-provision",
         receiptIds: backlog.map((m) => m.id),
+        // v0.9.4（A6）：票文不再预设「先 xc_read」——行动由唤醒 prompt 的结构段
+        // （身份已自动绑定 / 任务票 taskId / 正文是否内嵌）按场景分流，这里只给
+        //  backlog 事实与守则指针，避免两处指令互相矛盾。
         ticket:
           `成员供给完成：你的邮箱有 ${backlog.length} 条未读消息。` +
-          "请按成员守则开工：xc_read({scope:\"inbox\"}) 查收 → 有单则 claim/执行/report。",
+          "请按成员守则开工——按本 prompt 的行动行走：有任务票直接 xc_claim(taskId)，其余未读再 xc_read({scope:\"inbox\"}) 查收。",
         env,
       });
       delivered = sent.delivered;
@@ -500,12 +487,19 @@ async function memberAdd(deps: ToolDeps, args: { name: string; model?: string; r
     // v0.7.1（故障注-1）：本次供给接手了一个超期卡死的 provisioning 记录
     // （如 lead server 曾中途死亡）——回执如实披露，调用方知道旧尝试的结局。
     const recoveredFromTimeout = plan.swept.includes(plan.key);
+    // v0.9.4（A3）：backlog 投递结果的文案分流——wake 成功才可写「已发起唤醒」；
+    // 降级/未唤醒只写「仅落邮箱（未唤醒）」，禁出现已送达/已消费字样。
+    const backlogText = backlog.length > 0
+      ? delivered === "wake"
+        ? `; backlog ${backlog.length} message(s) → wake（已发起唤醒，非送达确认）`
+        : `; backlog ${backlog.length} message(s) → mailbox（仅落邮箱，未唤醒）`
+      : "";
     return okResult(
       `Member "${plan.key}" ready (session ${result.sessionId}, ` +
         `${result.providerId}/${result.modelId} reasoning ${result.reasoningLevel}` +
         `${result.reprovisioned ? ", reprovisioned" : ""}` +
         `${recoveredFromTimeout ? ", previous provisioning attempt had timed out (swept to failed)" : ""})` +
-        `${backlog.length > 0 ? `; backlog ${backlog.length} message(s) → ${delivered}` : ""}.`,
+        `${backlogText}.`,
       {
         name: plan.key,
         sessionId: result.sessionId,
