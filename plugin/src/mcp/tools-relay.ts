@@ -941,6 +941,10 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
         let delivered: "wake" | "mailbox" | "duplicate";
         // v0.9.1（G-12-b）：容量闸 deferral（仅 wake 路径产生；tool_request 禁唤醒路径无）。
         let wakeDeferred: WakeDeferral | undefined;
+        // v0.9.5（A4/V094-06）：wake 回执的 note 原样透传（attemptWake 的降级原因/
+        // mailboxOnlyNote 族，或 wake 态的「已发起（非送达确认）」口径）——旧实现把它
+        // 整体丢弃，调用方只见 "delivered via mailbox" 一行谎话。
+        let sentNote: string | undefined;
         if (out.delivered === "duplicate") {
           delivered = "duplicate";
         } else if (toolFrameType === "tool_request") {
@@ -961,6 +965,8 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
         } else {
           const sent = await wake(toKey, out.toSessionId, "message", [out.messageId], out.content, urgent);
           delivered = sent.delivered;
+          // v0.9.5（A4/V094-06）：note 透传（回执 payload `note` 字段 + 人可读行）。
+          sentNote = sent.note;
           // v0.9.1（G-12-b）：容量闸 deferral 进 payload（delivered 恒为 mailbox——
           // 消息已在箱里，pull 兜底；块里带原因明细与冷却窗，调用方看得见「为何没唤醒」）。
           if (sent.wakeDeferred !== undefined) wakeDeferred = sent.wakeDeferred;
@@ -1015,9 +1021,13 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
             delivered,
           });
         }
-        return okResult(renderMessage(out.messageId, me.agentKey, toKey, delivered), {
+        // v0.9.5（A4/V094-06）：人可读行与 payload 都带 note——mailbox 态的行写
+        // 「仅落邮箱（未唤醒）」+ 降级原因（无「已送达/已消费」宣称），wake 态的行写
+        // 「已发起唤醒（非送达确认）」；payload 的 `note` 字段承载 attemptWake 原文。
+        return okResult(renderMessage(out.messageId, me.agentKey, toKey, delivered, sentNote), {
           messageId: out.messageId,
           delivered,
+          ...(sentNote !== undefined && sentNote.trim() !== "" ? { note: sentNote } : {}),
           ...(urgent ? { urgent: true } : {}),
           // v0.9（G-2）：信封标注只在消息真实落箱（非 duplicate）时携带——duplicate
           // 返回的是既有消息，未必带 interrupt 元数据，不得虚报。

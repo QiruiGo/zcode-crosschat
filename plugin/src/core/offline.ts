@@ -196,17 +196,27 @@ export function offlineVerdict(
  * 只收**判据命中**的成员：名下非终态任务里至少一条 offlineVerdict 命中；`tasks`
  * 同样只列命中的那些（未命中的任务不该被建议重派——「alive-idle 任务不被误标」的
  * 验收口径在任务级成立，AC8）。名下无任何任务的成员不进清单（没有可转交物）。
+ *
+ * v0.9.5（A3/V094-14）：`opts.sessionPidFor`——**成员 → 会话记录 pid 证据**的注入面
+ * （调用方读 sessions/<sid>.json 并经 {@link deriveSessionPidEvidence} 派生后按成员
+ * 给出；本模块保持无 I/O）。不注入时与 v0.9.4 行为一致（pid 判据不参与）——那正是
+ * V094-14 的跨面矛盾根源：成员行（memberLivenessView 现场派生 pid 证据）判 dead，
+ * 本清单却因「无 pid 证据」报 null。接线后清单与展示面/判死面同判据：pid-dead 成员
+ * 的名下任务命中 process-dead（免 240min 阈值），照常列入 + 转交通知。
  */
 export function offlineMembers(
   team: TeamState,
   scan: PeerScanResult,
   now: number,
   thresholdMs: number,
-  opts: { staleMs?: number } = {},
+  opts: { staleMs?: number; sessionPidFor?: (member: TeamMember) => SessionPidEvidence | undefined } = {},
 ): OfflineMember[] {
   const out: OfflineMember[] = [];
   for (const member of team.members) {
-    const liveness = memberLiveness(member, scan, now, opts);
+    const liveness = memberLiveness(member, scan, now, {
+      staleMs: opts.staleMs,
+      sessionPid: opts.sessionPidFor?.(member),
+    });
     const hits: OfflineTaskInfo[] = [];
     let worstIdleMs = 0;
     let evidence: OfflineEvidence | null = null;

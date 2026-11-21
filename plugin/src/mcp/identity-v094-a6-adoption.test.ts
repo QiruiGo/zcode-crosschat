@@ -17,7 +17,7 @@
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
 import { identityStore, adoptHookBoundIdentity } from "./identity.js";
 import { writeSession } from "../core/registry.js";
 import type { SessionRecord } from "../core/types.js";
@@ -27,11 +27,19 @@ const dirs: string[] = [];
 let workspace: string;
 let stateRoot: string;
 
+// v0.9.5（A1/V094-02）：ppid 采纳默认关（XC_ADOPT_BY_PPID=1 才启用）——本文件锁
+// 「开启档」的四道护栏回归，beforeEach 显式开启；默认关闭与多记录不采纳的定向判据
+// 见 identity-v095-a1.test.ts。
 beforeEach(() => {
+  process.env["XC_ADOPT_BY_PPID"] = "1";
   workspace = mkdtempSync(join(tmpdir(), "xc-a6-adopt-ws-"));
   stateRoot = join(workspace, ".crosschat");
   mkdirSync(join(stateRoot, "registry", "sessions"), { recursive: true });
   dirs.push(workspace);
+});
+
+afterEach(() => {
+  delete process.env["XC_ADOPT_BY_PPID"];
 });
 
 afterAll(() => {
@@ -52,6 +60,10 @@ async function seedRecord(record: Partial<SessionRecord> & { sessionId: string }
     cwd: workspace,
     startedAt: 1,
     lastSeen: 1,
+    // v0.9.5（A1）：采纳判据补 token 项（记录必须带锚定令牌）——本文件的锚定记录
+    // 统一给种子 regToken（SessionStart 钩子铸造形态）；「无令牌不采纳」的定向判据
+    // 见 identity-v095-a1.test.ts。
+    regToken: "rt-seed-v094-adoption",
     ...record,
   } as SessionRecord);
 }

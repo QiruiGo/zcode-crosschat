@@ -35,6 +35,7 @@ import { withRegistryThenTeamLocks } from "../core/lock.js";
 import { validateMemberName } from "../core/sanitize.js";
 import {
   WAKE_INFLIGHT_MS,
+  adoptByPpidEnabledFromEnv,
   bindName,
   consumeWakeNonce,
   readNames,
@@ -122,10 +123,17 @@ export class IdentityStore {
    * 唤醒一次到位：SessionStart 钩子已把身份落盘（票据一次性消费 + 队内轴/peer 轴
    * 绑定），MCP 连接无需再调一次 xc_identify 才能开工。采纳失败/不满足护栏 →
    * 照旧 not_registered（模型回合按 wake prompt 的 wakeToken 兜底路径自证）。
+   *
+   * v0.9.5（A1/V094-02）：**采纳默认关**——`XC_ADOPT_BY_PPID=1` 才启用本路径；
+   * 默认直接 not_registered，模型回合按唤醒 prompt 的 wakeToken 兜底（2 次调用：
+   * xc_identify + xc_claim）。V094-02 实测：本会话记录因锁预算缺失而同宿主另一成员
+   * 记录成唯一命中时，ppid 采纳会错绑身份（rogue 领走他人任务）——宁可 2 次调用，
+   * 不许错绑，故默认关闭（开关解析见 core/registry.ts adoptByPpidEnabledFromEnv）。
    */
   require(connectionKey: string): BoundIdentity {
     const bound = this.#byConnection.get(connectionKey);
     if (bound) return bound;
+    if (!adoptByPpidEnabledFromEnv()) throw notRegisteredError();
     const adopted = adoptHookBoundIdentity();
     if (adopted !== undefined) {
       this.bind(connectionKey, adopted);
@@ -183,13 +191,28 @@ export const identityStore = new IdentityStore();
  * 不做签名/哈希链）；采纳面只服务「钩子刚绑好的身份让本进程的连接可见」，不扩大
  * 任何信任假设。若实测发现真实宿主里 ppid 不唯一（如所有会话共用一个 app-server），
  * 本函数自然退化为 not_registered（护栏 1 的多条命中分支），调用面回 2 次调用。
+ *
+ * v0.9.5（A1/V094-02）：**整面默认关**（`XC_ADOPT_BY_PPID=1` 才启用；env 参数注入
+ * 供测试，生产读进程环境）+ 护栏 1 追加 **token 项**——记录必须带锚定令牌
+ * `regToken`（SessionStart 钩子铸造/延续，hooks/session-start.ts）：无令牌的记录
+ * 不是钩子锚定形态（存量手写/伪造记录），不采纳。残余边界如实：token 是**在场性**
+ * 校验而非凭据出示（server 进程拿不到令牌真值可比对的对象），V094-02 的
+ * 「本会话记录缺失 + 同宿主陈旧记录成唯一命中」形态在开启档下仍有理论残余——
+ * 主防线是默认关闭（宁可 2 次调用），开启是运营者对单宿主单会话拓扑的显式背书。
  */
-export function adoptHookBoundIdentity(workspace: string = process.cwd()): BoundIdentity | undefined {
+export function adoptHookBoundIdentity(
+  workspace: string = process.cwd(),
+  env: NodeJS.ProcessEnv = process.env,
+): BoundIdentity | undefined {
   try {
+    if (!adoptByPpidEnabledFromEnv(env)) return undefined; // v0.9.5（A1）：默认关
     const stateRoot = resolveStateRoot(workspace);
     const record = readSessionByHostPidSync(stateRoot, process.ppid);
     if (record === undefined) return undefined; // 护栏 1：零条/多条命中
     if (record.cwd !== workspace) return undefined; // 护栏 1：cwd 不一致（别的会话）
+    if (record.regToken === undefined || record.regToken.trim() === '') {
+      return undefined; // 护栏 1（v0.9.5 A1 增补）：无锚定令牌 = 非钩子锚定形态
+    }
     const name = record.boundName;
     if (name === undefined || name.trim() === '') return undefined; // 护栏 1：无绑定名
     return {

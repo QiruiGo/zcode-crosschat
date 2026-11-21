@@ -443,7 +443,10 @@ describe("v0.9.3 契约：宿主归档不可见如实声明（C2，原句锁）"
   it("README 已知限制：插件对宿主侧归档态零感知（G-21）+ 不冒充活跃 + 指向 §15.6", () => {
     expect(README).toContain("插件对宿主侧归档态零感知（G-21，v0.9.3 如实声明）");
     expect(README).toContain("活性四判据合判如实落「判据来源为空（unknown）」而**不冒充活跃**");
-    expect(README).toContain("平台反馈建议（`member-archived` 事件 / 归档态投递告警）见 [docs/PROTOCOL.md](docs/PROTOCOL.md) §15.6");
+    // v0.9.5 B2：docs/LIMITATIONS.md 内两处 PROTOCOL 相对链接修复（41-v095 方案 §一 B2，
+    // href docs/PROTOCOL.md → PROTOCOL.md；链接文本与语句语义不变）——原句锁随合法文档
+    // 修复同步 href 形态，句子在场性判定不变。
+    expect(README).toContain("平台反馈建议（`member-archived` 事件 / 归档态投递告警）见 [docs/PROTOCOL.md](PROTOCOL.md) §15.6");
     expect(README).toContain("本版不自造实现");
   });
 

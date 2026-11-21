@@ -21,6 +21,16 @@
  *   （队内轴 names.json/roster + peer 轴基记录 boundName 盖章），不经模型回合；
  *   成员被唤醒后的首回合因此只需 xc_claim（wake prompt 的行动行同步改口径）。
  *
+ * v0.9.5 增量（41-v095 方案 §一 组A）：
+ * - **A1（V094-02）ppid 采纳默认关**：上面的 A6 票据消费+自动绑定随之**默认关**
+ *   （`XC_ADOPT_BY_PPID=1` 才启用，core/registry.ts adoptByPpidEnabledFromEnv）——
+ *   默认把票据留给模型回合的 wakeToken xc_identify 兜底（2 次调用），宁可多一次
+ *   调用，不许 ppid 采纳在多会话宿主上错绑身份；
+ * - **A6（V094-03）钩子消费失败回滚票据**：启用档下票据已置 used 而绑定失败
+ *   （锁忙/花名被别人持有/本会话已有别的 boundName）时，把票据恢复未用形态
+ *   （core/registry.ts restoreWakeNonce）——wake prompt 承诺的 wakeToken 兜底路径
+ *   不再因「已消费」断裂（旧实现只审计不回滚，兜底必失败）。
+ *
  * 降级规则不变：无 sessionId → 不锚定（静默 exit 0）；任何异常 → engine.jsonl 审计 → exit 0。
  *
  * Build entry: dist/hooks/session-start.mjs (scripts/build.mjs).
@@ -41,9 +51,11 @@ import {
 // v0.9.4（A6）：票据消费 + 身份绑定的 M1 原语（M4 → M1 纪律：只 import core）。
 import { createHash } from 'node:crypto';
 import {
+  adoptByPpidEnabledFromEnv,
   consumeWakeTicketForSession,
   readNames,
   readSession,
+  restoreWakeNonce,
   writeNames,
   writeSession,
 } from '../core/registry.js';
@@ -109,15 +121,49 @@ async function bindWakeTicketIdentity(input: {
   if (consumed === undefined) return { bound: false, detail: 'no-ticket' };
   const name = consumed.nonce.name ?? consumed.nonce.agentKey;
 
+  /**
+   * v0.9.5（A6/V094-03）：绑定失败的善后——**回滚票据**（恢复未用）+ 审计留痕。
+   * 票据已置 used 而绑定没落地时，wake prompt 承诺的 wakeToken 兜底路径（模型回合
+   * 用同一 token 调 xc_identify）才会可用；旧实现只审计不回滚，兜底必撞
+   * "already used"（V094-03）。回滚失败只审计不抛（钩子永不失败；最坏后果回到
+   * 旧行为——兜底撞 used，模型回合仍可走 hook 路径显式 identify）。
+   * 审计事件沿用 wake-ticket-binding-skipped 家族并补 `ticketRolledBack` 位——
+   * reason/上下文字段与旧事件逐字段一致（不新增事件名，观测面无新键）。
+   */
+  const rollbackTicket = async (
+    payload: Record<string, unknown> & { reason: string; note: string },
+  ): Promise<void> => {
+    let rolledBack = true;
+    try {
+      await restoreWakeNonce(input.stateRoot, consumed);
+    } catch (error) {
+      rolledBack = false;
+      await logEngineEvent(input.stateRoot, {
+        event: 'wake-ticket-rollback-failed',
+        reason: payload.reason,
+        name,
+        sessionId: input.sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      }).catch(() => undefined);
+    }
+    await logEngineEvent(input.stateRoot, {
+      ...payload,
+      event: 'wake-ticket-binding-skipped',
+      name,
+      sessionId: input.sessionId,
+      ticketRolledBack: rolledBack,
+      note: rolledBack
+        ? `${payload.note}（票据已回滚未用——wakeToken 兜底路径可用）`
+        : `${payload.note}（票据回滚失败——兜底 xc_identify 将撞 already used，可走 hook 路径显式 identify）`,
+    }).catch(() => undefined);
+  };
+
   // 2. 冲突预检（只读两步，随后锁内复判——预检只为提前给出审计原因）。
   const namesBefore = await readNames(input.stateRoot).catch((): NameBindings => ({}));
   const holder = namesBefore[name];
   if (holder !== undefined && holder.sessionId !== input.sessionId) {
-    await logEngineEvent(input.stateRoot, {
-      event: 'wake-ticket-binding-skipped',
+    await rollbackTicket({
       reason: 'name-bound-elsewhere',
-      name,
-      sessionId: input.sessionId,
       boundSessionId: holder.sessionId,
       note: '唤醒票据的花名已被别的 sid 持有——不抢绑，交由模型回合的 xc_identify 显式处理',
     });
@@ -125,11 +171,8 @@ async function bindWakeTicketIdentity(input: {
   }
   const recordBefore = await readSession(input.stateRoot, input.sessionId).catch(() => undefined);
   if (recordBefore?.boundName !== undefined && recordBefore.boundName !== name) {
-    await logEngineEvent(input.stateRoot, {
-      event: 'wake-ticket-binding-skipped',
+    await rollbackTicket({
       reason: 'bound-name-conflict',
-      name,
-      sessionId: input.sessionId,
       boundName: recordBefore.boundName,
       note: '本会话记录已绑定别的花名——不覆盖既有身份，交由模型回合显式处理',
     });
@@ -137,8 +180,8 @@ async function bindWakeTicketIdentity(input: {
   }
 
   // 3. 落盘（registry → team 固定锁序；钩子 2s 锁预算，锁忙即放弃——票据已消费，
-  //    模型回合可经 wakeToken 兜底路径自证（注：兜底会撞 "already used"，故锁忙时
-  //    只丢「免 identify」的优化，不丢消息——消息本就在邮箱，pull 不依赖身份绑定）。
+  //    v0.9.5（A6）起锁忙时**回滚票据**（restoreWakeNonce），保 wakeToken 兜底可用；
+  //    锁忙只丢「免 identify」的优化，不丢消息——消息本就在邮箱，pull 不依赖身份绑定。
   const locked = await withRegistryThenTeamLocks(
     input.stateRoot,
     DEFAULT_TEAM_ID,
@@ -179,16 +222,32 @@ async function bindWakeTicketIdentity(input: {
       return true;
     },
     { waitMs: 2_000 },
-  ).catch((error: unknown) => {
-    // 锁忙/IO：绑定落盘放弃（票据已一次性消费）。审计留痕——本会话首回合需自行
-    // xc_identify（hook 路径）；消息不依赖身份绑定（邮箱 pull 照常）。
-    void logEngineEvent(input.stateRoot, {
+  ).catch(async (error: unknown) => {
+    // v0.9.5（A6/V094-03）：锁忙/IO——绑定落盘放弃，票据回滚未用（保 wakeToken 兜底）。
+    // 审计留痕——本会话首回合可经 wakeToken xc_identify 自证（兜底不再必撞 used）。
+    let rolledBack = false;
+    try {
+      await restoreWakeNonce(input.stateRoot, consumed);
+      rolledBack = true;
+    } catch (rollbackError) {
+      await logEngineEvent(input.stateRoot, {
+        event: 'wake-ticket-rollback-failed',
+        reason: 'lock-busy',
+        name,
+        sessionId: input.sessionId,
+        error: rollbackError instanceof Error ? rollbackError.message : String(rollbackError),
+      }).catch(() => undefined);
+    }
+    await logEngineEvent(input.stateRoot, {
       event: 'wake-ticket-binding-skipped',
       reason: 'lock-busy',
       name,
       sessionId: input.sessionId,
+      ticketRolledBack: rolledBack,
       error: error instanceof Error ? error.message : String(error),
-      note: '票据已一次性消费但绑定落盘遇锁忙/IO——本会话首回合需自行 xc_identify（hook 路径）',
+      note: rolledBack
+        ? '绑定落盘遇锁忙/IO——票据已回滚未用，wakeToken 兜底路径可用（首回合 xc_identify 即自证）'
+        : '绑定落盘遇锁忙/IO 且票据回滚失败——首回合可走 hook 路径显式 xc_identify（兜底将撞 already used）',
     }).catch(() => undefined);
     return false;
   });
@@ -282,17 +341,23 @@ export async function runSessionStartHook(): Promise<void> {
 
   // v0.9.4（A6）：唤醒票据一次性消费 + 身份自动绑定（队内轴 + peer 轴，不经模型回合）。
   // 无票据（普通会话启动）= 零副作用；任何异常只审计不阻断（钩子永不失败）。
-  try {
-    const peerRoot = peerRootFromEnv(process.env);
-    await bindWakeTicketIdentity({
-      stateRoot: ctx.stateRoot,
-      sessionId: ctx.sessionId,
-      pid,
-      peerRoot,
-      now: Date.now(),
-    });
-  } catch (error) {
-    await auditHookFailure(ctx.stateRoot, 'session-start-wake-ticket', error);
+  // v0.9.5（A1/V094-02）：**默认关**——XC_ADOPT_BY_PPID=1 才执行本段。默认把票据
+  // 留给模型回合的 wakeToken xc_identify 兜底（2 次调用：identify + claim）；ppid
+  // 采纳在「本会话记录缺失 + 同宿主陈旧记录成唯一命中」时会错绑身份（V094-02），
+  // 宁可 2 次调用也不默认开启。绑定失败时票据回滚（A6，见 bindWakeTicketIdentity）。
+  if (adoptByPpidEnabledFromEnv(process.env)) {
+    try {
+      const peerRoot = peerRootFromEnv(process.env);
+      await bindWakeTicketIdentity({
+        stateRoot: ctx.stateRoot,
+        sessionId: ctx.sessionId,
+        pid,
+        peerRoot,
+        now: Date.now(),
+      });
+    } catch (error) {
+      await auditHookFailure(ctx.stateRoot, 'session-start-wake-ticket', error);
+    }
   }
 
   let names: string[] = [];

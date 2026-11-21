@@ -78,8 +78,11 @@ describe("render: 一行摘要", () => {
       "Task t1 completed; receipt sent to a; wake back via wake.",
     );
     expect(renderReport("t2", "in_progress", null, "mailbox")).toContain("no receipt (non-terminal)");
+    // v0.9.5（A4/V094-06）：duplicate 是去重命中不是投递——旧文案 "delivered via
+    // duplicate" 失实；mailbox/wake 两态走 renderDeliveryOutcome 分流（A4 定向测试
+    // 逐字断言见 render-v095-a4）。
     expect(renderMessage("1a2b3c4d5e6f", "a", "b", "duplicate")).toBe(
-      "Message 1a2b3c4d a → b delivered via duplicate.",
+      "Message 1a2b3c4d a → b 未重发（已存在同文未读件，duplicate；pull 兜底可读）.",
     );
     expect(renderInbox(2, 1, 0)).toBe("Inbox: 2 message(s) consumed, 1 stale discarded, 0 unread remain.");
     expect(renderClaim("t1", 1, "9f2c1a3b4d5e6f70")).toBe("Task t1 claimed (attempt 1, attemptId 9f2c1a3b).");

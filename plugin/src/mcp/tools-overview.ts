@@ -61,7 +61,10 @@ import { leadKeyOf } from "./tools-team.js";
 // v0.7（C8，M4）：离线成员挂载（DESIGN-V0.7.md §4.3）。
 import { peerRootFromEnv } from "../core/peerdir.js";
 import { scanPeers, type PeerScanResult } from "../core/peerregistry.js";
-import { offlineMemberLine, offlineMembers, offlineThresholdMsFromEnv, type OfflineMember } from "../core/offline.js";
+// v0.9.5（A3/V094-14）：offlineMembers 接 pid 证据——与成员行（memberLivenessView）/判死
+// 面（watchdog）同一派生点 deriveSessionPidEvidence + 同一存活探测 pidAlive。
+import { deriveSessionPidEvidence, offlineMemberLine, offlineMembers, offlineThresholdMsFromEnv, type OfflineMember, type SessionPidEvidence } from "../core/offline.js";
+import { pidAlive } from "../core/lock.js";
 // v0.9（G-9，PROTOCOL §12.4）：成员活性视图（三视图统一口径，单一实现）。
 import { readSession, readSessionWitness } from "../core/registry.js";
 import { memberLivenessView, sweepOwnerGuard, type SessionLivenessView, type SweepOwnerGuard } from "../core/liveness.js";
@@ -226,7 +229,23 @@ async function offlineMembersMount(deps: ToolDeps, team: TeamState, now: number,
     // 只读扫描（sweep:false）由调用方传入（team/status/liveness 三处共用一次扫描）；
     // 扫描失败（null）= 观测块不挂载（同 capacityMount 纪律：观测面永不为难任务板）。
     if (scan === null) return null;
-    const members = offlineMembers(team, scan, now, threshold.ms);
+    // v0.9.5（A3/V094-14）：按成员派生会话记录 pid 证据（读 sessions/<sid>.json 一次 +
+    // deriveSessionPidEvidence 单一派生点 + pidAlive 探测）注入 offlineMembers——与成员
+    // 行（memberLivenessView）/判死面（watchdog）同判据。旧实现不传 pid：成员行判 dead
+    // 而本清单报 null 的三面自相矛盾（V094-14）由此收口。读失败 = 无证据（判据不参与，
+    // 保守方向，不猜）。
+    const pidEvidence = new Map<string, SessionPidEvidence | undefined>();
+    for (const member of team.members) {
+      try {
+        const record = await readSession(deps.stateRoot, member.sessionId);
+        pidEvidence.set(member.key, deriveSessionPidEvidence(record, now, pidAlive));
+      } catch {
+        pidEvidence.set(member.key, undefined);
+      }
+    }
+    const members = offlineMembers(team, scan, now, threshold.ms, {
+      sessionPidFor: (member) => pidEvidence.get(member.key),
+    });
     if (members.length === 0 && !threshold.clamped && !threshold.fellBack) return null;
     return { members, lines: members.map(offlineMemberLine), clamped: threshold.clamped, fellBack: threshold.fellBack };
   } catch {

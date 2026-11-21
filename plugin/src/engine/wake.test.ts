@@ -235,6 +235,9 @@ describe("buildWakePrompt", () => {
       ...base,
       bodyText: "计算 17*23",
       includeMemberRules: true,
+      // v0.9.5（A1）：身份行/守则规则 1 按 ppid 采纳档分流——本用例锁「开启档」口径
+      //（已自动绑定/不要再调 xc_identify）；默认档（wakeToken 自证）见 wake-v095-a1。
+      adoptByPpidEnabled: true,
     });
     expect(p).toContain('[CrossChat inbox receipt: {"teamId":"default","recipient":"b","ids":["m1"]}]');
     expect(p).toContain("sessionId=sess_b");

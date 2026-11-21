@@ -1008,8 +1008,14 @@ v0.9.0（G-9）增量：payload 顶层增 `liveness:{running,idle,dead,byMember}
 **payload 回显**（队内轴；键集冻结，值为占位；契约测试按 `Object.keys` 对拍）：
 
 ```json
-{"messageId":"<messageId>","delivered":"mailbox","refs":[{"path":"<path>","sha256":"<hex>","note":"<摘要>"}]}
+{"messageId":"<messageId>","delivered":"mailbox","note":"<attemptWake 回执 note 原文>","refs":[{"path":"<path>","sha256":"<hex>","note":"<摘要>"}]}
 ```
+
+`note`（v0.9.5 A4/V094-06）：attemptWake 回执 note 的**原样透传**——mailbox 降级路径
+（wake 关闭/分层闸/在途/容量闸/spawn 失败）承载「仅落邮箱（未唤醒）：消息未送达也未
+消费」+ 降级原因；wake 态承载「已发起（非送达确认）」口径；duplicate 路径无 note
+（不落键）。人可读行（`renderMessage`）按同一 note 分流渲染，不再写
+"delivered via mailbox"（与 `mailboxOnlyNote`/`renderDeliveryOutcome` 同一口径）。
 
 resolved 引用条目的键序冻结为 `path` / `sha256` / `mime`（仅声明时）/ `note`（恒在，
 可空串）；`duplicate` 路径不回显 refs（返回的是既有件，其引用集可能与本次不同——

@@ -8,7 +8,8 @@
  * 必须完整 ci → build → prune --omit=dev，不能先 ci --omit=dev）：
  *   git worktree 导出 tag 树（产物=tag 树，不受工作区脏文件影响）
  *   → npm ci → npm run build → npm prune --omit=dev
- *   → 裁包（v0.9.4 B1/B2：移走 node_modules 与测试文件，见步骤 4）
+ *   → 裁包（v0.9.4 B1/B2：移走 node_modules 与测试文件，见步骤 4；v0.9.5 B3：包内
+ *     scripts.test 改写为如实提示语——测试文件已裁，包内 npm test 不再指向不存在的 vitest）
  *   → 自包含冒测（recon/02 §2.3 的 IMPORT_OK 口径 + tools/list 恰 10，见步骤 5）
  *   → tar czf（顶层目录 zcode-crosschat-<ver>/，天然无 .git）
  *   → SHA256（<资产>.sha256 内容 `<hex>  <文件名>`，sha256sum -c 兼容）
@@ -190,7 +191,29 @@ check(!existsSync(join(stage, "plugin", "node_modules")), "node_modules 未裁�
 check(!existsSync(join(stage, "plugin", "vitest.config.ts")), "vitest.config.ts 未裁掉");
 const remainingTests = listFiles(join(stage, "plugin", "src")).filter((f) => f.endsWith(".test.ts"));
 check(remainingTests.length === 0, `仍有 ${remainingTests.length} 个测试文件残留在 stage`);
-console.log(`pack-release: 裁包完成 —— node_modules 已移走，${testFileCount} 个测试文件 + vitest.config.ts 已移走`);
+
+// v0.9.5 方案 §一 组 B B3：包内 test 脚本诚实化。测试文件与 vitest 都已不在这个包里
+// （vitest 是 devDependency，node_modules 整个已移走），stage 的 package.json 仍写着
+// "test": "vitest run"——包内跑 npm test 只会得到 MODULE_NOT_FOUND / "No test files
+// found" 的误导报错。选择「打包时改写」（而非文档声明）：源码树的 scripts.test 必须
+// 保持原样（测试在源码树真实存在且可用），诚实化只能发生在测试真的缺席的那份拷贝上；
+// 改写后包内 npm test 打印一句如实说明并以退出码 1 结束（不给自动化假成功）。
+// 改写走原文精确替换（只动 "test" 一行的字符串值，其余字节原样保留——整文件重序列化
+// 会把 "engines" 等紧凑行重新折行，制造无关 diff）；版本一致性断言（步骤 2）在此之前
+// 已跑完，且本改写不碰版本字段。
+const SLIM_TEST_NOTICE =
+  'echo "[zcode-crosschat] prebuilt-slim has no tests: test files and vitest are stripped at pack time. ' +
+  "Tests run in the source tree only (git clone, then npm install && npm test). " +
+  '包内无测试：测试文件与 vitest 已在打包时裁掉，测试仅源码树可用。" && exit 1';
+const pkgRaw = readFileSync(join(stage, "plugin", "package.json"), "utf8");
+const testScriptRaw = '"test": "vitest run"';
+check(pkgRaw.includes(testScriptRaw), 'package.json 未找到 "test": "vitest run"（源文件形态变化？改写规则需同步更新）');
+writeFileSync(join(stage, "plugin", "package.json"), pkgRaw.replace(testScriptRaw, `"test": ${JSON.stringify(SLIM_TEST_NOTICE)}`));
+const repkg = JSON.parse(readFileSync(join(stage, "plugin", "package.json"), "utf8"));
+check(repkg.version === ver, "scripts.test 改写意外动了 version 字段");
+check(!repkg.scripts.test.includes("vitest run"), "包内 scripts.test 仍指向 vitest run（改写未生效）");
+
+console.log(`pack-release: 裁包完成 —— node_modules 已移走，${testFileCount} 个测试文件 + vitest.config.ts 已移走，包内 scripts.test 已改写为如实提示语`);
 
 // 5. 自包含冒测（recon/02 §2.3 口径：依赖图完整即 IMPORT_OK；v0.9.4 B1 追加 tools/list 恰 10）
 const probe = spawnSync(process.execPath, ["--input-type=module", "-e",

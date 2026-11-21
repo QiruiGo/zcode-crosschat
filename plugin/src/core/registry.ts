@@ -436,6 +436,14 @@ export async function readWakeNonce(stateRoot: string, token: string): Promise<W
  * Consume one nonce on the xc_register wakeToken path: marks `used` when the
  * stored nonce matches the given teamId/agentKey/sid and is still fresh.
  * @returns the consumed nonce, or undefined when missing/mismatched/used/expired.
+ *
+ * v0.9.5（A6/V094-04）：**MCP 面与钩子面判据统一**——本面此前只校验
+ * teamId/agentKey/sid（registry.ts 旧 :450），不读 `issuedToSid`；钩子面
+ * {@link consumeWakeTicketForSession} 却要求 `sid ∧ (issuedToSid ?? sid)` 双双指向
+ * 本会话——同一张票两面判据分裂（手置 issuedToSid 的 nonce 钩子拒、MCP 放行）。
+ * 现在两面同判据：`sid === match.sid ∧ (issuedToSid ?? sid) === match.sid`。
+ * issuedToSid 缺省兜底 = sid（v0.9.5 起生产三签发点恒填 issuedToSid/name，A6；
+ * 旧 nonce 缺字段仍按 sid 兜底，兼容 v0.9.3 及以前签发）。
  */
 export async function consumeWakeNonce(
   stateRoot: string,
@@ -450,6 +458,8 @@ export async function consumeWakeNonce(
   if (existing.teamId !== match.teamId || existing.agentKey !== match.agentKey || existing.sid !== match.sid) {
     return undefined;
   }
+  // v0.9.5（A6）：与钩子面同判据——issuedToSid（缺省 = sid）也必须指向本会话。
+  if ((existing.issuedToSid ?? existing.sid) !== match.sid) return undefined;
   const used: WakeNonce = { ...existing, used: true };
   await writeFileAtomic(wakeFile(stateRoot, token), JSON.stringify(used, null, 2));
   return used;
@@ -529,6 +539,39 @@ export async function consumeWakeTicketForSession(
     { waitMs: 2_000 },
   );
   return claimed;
+}
+
+/**
+ * v0.9.5（A1/V094-02）：**ppid 身份采纳开关**（唯一解析点；缺省 off）。
+ *
+ * V094-02 的形态：ppid 采纳在「本会话记录因锁预算失败而缺失 + 同宿主多会话」时会把
+ * 同宿主另一成员的记录当唯一命中，未 identify 的连接即以他人身份开工（串号）。
+ * v0.9.5 起 **默认关闭**：`XC_ADOPT_BY_PPID=1` 才启用整条「唤醒一次到位」链
+ * （SessionStart 钩子消费票据+自动绑定、MCP 连接按 ppid 采纳、唤醒 prompt 的
+ * 「已自动绑定」口径）；默认走**唤醒票据兜底**——票据留给模型回合的 wakeToken
+ * xc_identify 消费（2 次调用：identify + claim），宁可多一次调用，不许错绑身份。
+ *
+ * 解析纪律（与 offlineThresholdMsFromEnv 同族）：只认字面量 `"1"`（显式开启），
+ * 其余一切取值（未设/空串/0/true/on）都按**关闭**处理——开关方向是「多一次调用」，
+ * 误开比误关危险，取最保守解析。
+ */
+export function adoptByPpidEnabledFromEnv(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env["XC_ADOPT_BY_PPID"] === "1";
+}
+
+/**
+ * v0.9.5（A6/V094-03）：**回滚一次性票据**（SessionStart 钩子专用）——票据已置
+ * `used` 而随后的身份绑定失败（锁忙/花名被别人持有/本会话已有别的 boundName）时，
+ * 把票据恢复为未用形态，保住 wake prompt 承诺的 **wakeToken 兜底路径**可用
+ * （否则模型回合用同一 token 走 xc_identify 必撞 "already used"，兜底断裂）。
+ *
+ * 只写回「去掉 used 标记的同一 nonce」——签发字段（teamId/agentKey/sid/issuedToSid/
+ * name/voiceOwner/ts）原样保留，TTL 判据（isWakeNonceFresh 按 ts）不因回滚重置：
+ * 回滚不续命，过期票回滚后仍然过期（一次性语义不放松）。原子整文件写。
+ */
+export async function restoreWakeNonce(stateRoot: string, stored: StoredWakeNonce): Promise<void> {
+  const { used: _omit, ...nonce } = stored.nonce;
+  await writeWakeNonce(stateRoot, stored.token, nonce as WakeNonce);
 }
 
 /**

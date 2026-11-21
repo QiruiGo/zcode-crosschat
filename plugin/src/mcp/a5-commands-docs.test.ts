@@ -329,14 +329,17 @@ describe('A5 文档：无 PreCompact，故用提醒+一键（ACCEPT15-1 文档�
 // 8. 版本五处统一（AC6 静态面）
 // ---------------------------------------------------------------------------
 
-describe('A5 版本五处统一 0.9.4', () => {
-  it('package.json / plugin.json / marketplace.json / server.ts 四处 = 0.9.4', () => {
-    expect(JSON.parse(readRel('plugin/package.json')).version).toBe('0.9.4');
-    expect(JSON.parse(readRel('plugin/.zcode-plugin/plugin.json')).version).toBe('0.9.4');
-    expect(JSON.parse(readRel('marketplace.json')).plugins[0].version).toBe('0.9.4');
-    expect(readRel('plugin/src/mcp/server.ts')).toContain('const SERVER_VERSION = "0.9.4"');
+describe('A5 版本五处统一 0.9.5', () => {
+  it('package.json / plugin.json / marketplace.json / server.ts 四处 = 0.9.5', () => {
+    expect(JSON.parse(readRel('plugin/package.json')).version).toBe('0.9.5');
+    expect(JSON.parse(readRel('plugin/.zcode-plugin/plugin.json')).version).toBe('0.9.5');
+    expect(JSON.parse(readRel('marketplace.json')).plugins[0].version).toBe('0.9.5');
+    expect(readRel('plugin/src/mcp/server.ts')).toContain('const SERVER_VERSION = "0.9.5"');
   });
 
+  // v0.9.5 集成注：四处版本文件已 0.9.5（41-v095 集成道随版本冻结就地同步本断言，
+  // 即上行注解写明的「同步本断言」流程）；第五处（README 安装段）仍钉 0.9.2——同
+  // v0.9.3/v0.9.4 冻先例留给发布 lane。
   // v0.9.3 集成注：第五处（README 安装段）仍钉 0.9.2——README 未随本次版本冻结改写
   // （发布 lane 的活：就地改资产名，并同步本断言）。四处版本文件已 0.9.3，本断言与
   // README 现状相符故绿；改 README 必须同步改这里。
