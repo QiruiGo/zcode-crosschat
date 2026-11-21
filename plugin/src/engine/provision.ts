@@ -340,10 +340,15 @@ export async function provisionMember(deps: ToolDeps, spec: ProvisionSpec): Prom
     }
 
     // ---- wakeToken：sid 已知、成员注册前由引擎落盘（§6.2 wakeToken 签发细节）----
+    // v0.9.5（A6/V094-05）：欢迎票同补 issuedToSid/name（三处生产签发点的第三处，
+    // 与 attemptWake 主/重试路径同口径）——票据目标 sid 与花名落进票据本体，
+    // 「非目标 sid 拒」的两面判据（钩子面/MCP 面）才有真值可判。
     const { token } = await createWakeNonce(deps.stateRoot, {
       teamId,
       agentKey: spec.key,
       sid: sessionId,
+      issuedToSid: sessionId,
+      name: spec.key,
     });
 
     // ---- ② setModel（P1：create 结果内联枚举为主，state.updated 仅兜底）----

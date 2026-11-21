@@ -21,7 +21,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const h = vi.hoisted(() => ({
   peerRoot: "",
@@ -51,12 +51,20 @@ vi.mock("./shared.js", async (importOriginal) => {
 
 const dirs: string[] = [];
 
+// v0.9.5（A1/V094-02）：ppid 采纳默认关——钩子的票据消费+自动绑定随之默认关
+//（XC_ADOPT_BY_PPID=1 才执行）。本文件锁「开启档」的绑定回归，beforeEach 显式开启；
+// 默认关闭（票据不消费、留给模型回合兜底）的定向判据见 session-start-v095-a1.test.ts。
 beforeEach(() => {
+  process.env["XC_ADOPT_BY_PPID"] = "1";
   h.stateRoot = mkdtempSync(join(tmpdir(), "xc-a6-v094-"));
   h.peerRoot = mkdtempSync(join(tmpdir(), "xc-a6-v094-peers-"));
   h.workspace = join(tmpdir(), "xc-a6-v094-ws-");
   h.sessionId = undefined;
   dirs.push(h.stateRoot, h.peerRoot);
+});
+
+afterEach(() => {
+  delete process.env["XC_ADOPT_BY_PPID"];
 });
 
 afterAll(() => {
@@ -208,11 +216,14 @@ describe("v0.9.4 A6：唤醒票据一次性消费 + 自动绑定身份（队内�
     const token = await seedTicket({ agentKey: "b", sid: "sess_b", issuedToSid: "sess_b", name: "b" });
 
     await runHook("sess_b");
-    expect(await readNonceUsed(token)).toBe(true); // 票据照样一次性消费
+    // v0.9.5（A6/V094-03）：绑定冲突 → 票据**回滚未用**（旧实现 used=true 使兜底必撞
+    // "already used"）；审计事件带 ticketRolledBack 位。
+    expect(await readNonceUsed(token)).toBeUndefined();
     expect((await readNames())["b"]?.sessionId).toBe("sess_someone_else"); // 不抢
     const skipped = readEngineEvents().filter((e) => e["event"] === "wake-ticket-binding-skipped");
     expect(skipped).toHaveLength(1);
     expect(skipped[0]!["reason"]).toBe("name-bound-elsewhere");
+    expect(skipped[0]!["ticketRolledBack"]).toBe(true);
   });
 
   it("冲突2：本会话记录已有别的 boundName → 不覆盖既有身份", async () => {
@@ -222,12 +233,13 @@ describe("v0.9.4 A6：唤醒票据一次性消费 + 自动绑定身份（队内�
     const token = await seedTicket({ agentKey: "b", sid: "sess_b", issuedToSid: "sess_b", name: "b" });
 
     await runHook("sess_b");
-    expect(await readNonceUsed(token)).toBe(true);
+    expect(await readNonceUsed(token)).toBeUndefined(); // v0.9.5（A6）：回滚未用
     const { readSession } = await import("../core/registry.js");
     expect((await readSession(h.stateRoot, "sess_b"))?.boundName).toBe("other-name"); // 不覆盖
     const skipped = readEngineEvents().filter((e) => e["event"] === "wake-ticket-binding-skipped");
     expect(skipped).toHaveLength(1);
     expect(skipped[0]!["reason"]).toBe("bound-name-conflict");
+    expect(skipped[0]!["ticketRolledBack"]).toBe(true);
   });
 
   it("多次唤醒在途（同 sid 两张票）→ 消费 ts 最新的一张", async () => {

@@ -59,7 +59,7 @@ import {
 } from "../core/liveness.js";
 import { appendMailbox, createMessage, readMailbox } from "../core/mailbox.js";
 import { logEngineEvent } from "../core/log.js";
-import { withTeamLock } from "../core/lock.js";
+import { pidAlive, withTeamLock } from "../core/lock.js";
 import { appendTaskHistory, leadKeyOf, memberOpenTasks, readTeam, writeTeam } from "../core/teamstate.js";
 import {
   collectDependencyOutputs,
@@ -83,6 +83,7 @@ import { peerRootFromEnv } from "../core/peerdir.js";
 import { scanPeers, type PeerScanResult } from "../core/peerregistry.js";
 import { lastProgressTs } from "../core/stall.js";
 import {
+  deriveSessionPidEvidence,
   memberLiveness,
   offlineSuggestion,
   offlineThresholdMsFromEnv,
@@ -91,6 +92,7 @@ import {
   type OfflineEvidence,
   type OfflineMember,
   type OfflineTaskInfo,
+  type SessionPidEvidence,
 } from "../core/offline.js";
 // v0.7（C6/C7，DESIGN-V0.7.md §2.5/§3.3）：转办台账过期节拍 + 终态清理。
 import {
@@ -247,6 +249,23 @@ async function sweepStaleTasksLocked(
   const swept: SweptTaskInfo[] = [];
   const wakePlan: WakePlanItem[] = [];
   const seenRecipients = new Set<string>();
+  // v0.9.5（A3/V094-14）：成员 → 会话记录 pid 证据（deriveSessionPidEvidence 单一派生点
+  // + pidAlive 探测，与 liveness 展示面/watchdog 判死面同源）。C8 的 liveness 判据接线：
+  // 引擎成员从未 peer 注册（或干净摘除）时，会话记录 pid + 回合中自述 = 第二条进程死
+  // 硬证据——不接线则「成员行 dead / 清扫面 no-record」两套判据（V094-14 同族）。
+  // 逐任务缓存（一名成员多任务只读一次记录）；读失败 = 无证据（判据不参与，保守）。
+  const pidEvidenceCache = new Map<string, SessionPidEvidence | undefined>();
+  const pidEvidenceFor = async (member: TeamState["members"][number]): Promise<SessionPidEvidence | undefined> => {
+    if (pidEvidenceCache.has(member.key)) return pidEvidenceCache.get(member.key);
+    let evidence: SessionPidEvidence | undefined;
+    try {
+      evidence = deriveSessionPidEvidence(await readSession(stateRoot, member.sessionId), now, pidAlive);
+    } catch {
+      evidence = undefined;
+    }
+    pidEvidenceCache.set(member.key, evidence);
+    return evidence;
+  };
   // C8：本轮离线命中的属主（按成员聚合——一名成员多任务只通知 lead 一次）。
   const offlineHits = new Map<
     string,
@@ -282,7 +301,7 @@ async function sweepStaleTasksLocked(
           && opts.offlineThresholdMs !== undefined
           && now - (task.offlineNoticeAt ?? 0) >= opts.offlineThresholdMs
         ) {
-          const liveness = memberLiveness(member, opts.scan, now);
+          const liveness = memberLiveness(member, opts.scan, now, { sessionPid: await pidEvidenceFor(member) });
           const verdict = offlineVerdict(task, member, liveness, now, opts.offlineThresholdMs);
           if (verdict.offline && verdict.evidence !== null) {
             const entry = offlineHits.get(task.assignee) ?? {
@@ -318,7 +337,7 @@ async function sweepStaleTasksLocked(
     if (opts.scan !== undefined && opts.offlineThresholdMs !== undefined && assigneeBefore !== null) {
       const member = team.members.find((m) => m.key === assigneeBefore);
       if (member !== undefined) {
-        const liveness = memberLiveness(member, opts.scan, now);
+        const liveness = memberLiveness(member, opts.scan, now, { sessionPid: await pidEvidenceFor(member) });
         const verdict = offlineVerdict(task, member, liveness, now, opts.offlineThresholdMs);
         if (verdict.offline && verdict.evidence !== null) {
           offlineHit = {
@@ -433,8 +452,11 @@ async function ownerSweepGuard(
     witness = undefined;
   }
   // 审计：自述异常（未来值 / 自述 running 而无证言）——不阻断豁免判定（证言已是唯一输入）。
+  // v0.9.5（A3/V094-14）：会话记录读一次两用——自述异常审计（原有）+ pid 证据派生
+  //（deriveSessionPidEvidence 单一派生点，与展示面/判死面同源）。
+  let record: Awaited<ReturnType<typeof readSession>> | undefined;
   try {
-    const record = await readSession(stateRoot, member.sessionId);
+    record = await readSession(stateRoot, member.sessionId);
     const anomaly = sessionRecordLivenessAnomaly(record, now) ?? sessionRecordWitnessMismatch(record, witness, now);
     if (anomaly !== null) {
       const memoKey = `${stateRoot}:${member.sessionId}:${anomaly.field}`;
@@ -450,11 +472,16 @@ async function ownerSweepGuard(
       }
     }
   } catch {
-    /* 记录读失败：证言判定不受影响（自述本就只作展示） */
+    record = undefined; // 记录读失败：证言判定不受影响（自述本就只作展示）
   }
   // 端点活性仅展示（r3 起非豁免输入）：成员自有 server 常驻，live 不构成安全证据；
   // 但 pid-dead 仍是 C8 immediacy 的硬开关（见下）。
-  const peerLiveness: MemberLiveness = scan !== undefined ? memberLiveness(member, scan, now) : "no-record";
+  // v0.9.5（A3）：注入会话记录 pid 证据——peer 注册表无记录时（引擎成员从未 identify
+  // /干净摘除），「回合中自述 + 宿主进程亡」也能判 pid-dead，C8 immediacy 闸不再漏。
+  const pidEvidence = deriveSessionPidEvidence(record, now, pidAlive);
+  const peerLiveness: MemberLiveness = scan !== undefined
+    ? memberLiveness(member, scan, now, { sessionPid: pidEvidence })
+    : "no-record";
   const guard = sweepOwnerGuard(witness, now, thresholdMs);
   if (guard === null) return null;
   // C8 immediacy（§4.1 口径不变）：pid-dead 硬证据在场 → 活性豁免立即失效（不等证言

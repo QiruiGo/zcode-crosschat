@@ -173,6 +173,7 @@ import {
 } from "../core/config";
 import { readTeam, leadKeyOf } from "../core/teamstate";
 import {
+  adoptByPpidEnabledFromEnv,
   consumeWakeNonce,
   createWakeNonce,
   findInflightWakeNonce,
@@ -748,6 +749,13 @@ export interface WakePromptInput {
    * 直接 xc_claim」——不 xc_read 也能开工（唤醒一次到位的核心判据）。
    */
   taskId?: string;
+  /**
+   * v0.9.5（A1/V094-02）：**ppid 采纳档**（XC_ADOPT_BY_PPID=1 时 attemptWake 传 true）。
+   * true = 身份行/守则规则 1 按「钩子已自动绑定，不要再调 xc_identify」口径（v0.9.4 A6）；
+   * false/缺省（默认档）= 身份行/守则规则 1 按「wakeToken 调一次 xc_identify 自证」口径
+   * （2 次调用兜底）——ppid 采纳默认关，prompt 不再宣称未发生的自动绑定。
+   */
+  adoptByPpidEnabled?: boolean;
 }
 
 /**
@@ -804,6 +812,18 @@ export const MEMBER_RULES_V2 = composeMemberRulesV2(
  */
 export const MEMBER_RULES_V2_WAKE = composeMemberRulesV2(
   "1) 身份：本会话启动时引擎钩子已自动绑定（不要再调 xc_identify；未生效时用本 prompt 给出的 wakeToken 调一次兜底）。"
+  + "取消息：正文已内嵌时（任务票/消息正文）不要 xc_read，有任务票直接 xc_claim(taskId)；"
+  + "正文只是摘要/通知时才 xc_read({scope:\"inbox\"}) 查收。",
+);
+
+/**
+ * v0.9.5（A1/V094-02）：**默认档（ppid 采纳关）**的唤醒守则 v2——规则 1 的身份段回到
+ * v0.9.3 口径（首回合用 wakeToken 调一次 xc_identify 自证），取消息段与
+ * {@link MEMBER_RULES_V2_WAKE} 逐字一致（行动行的「一次到位」分流不依赖身份档）。
+ * ppid 采纳在多会话宿主上有错绑风险（V094-02），默认档宁可 2 次调用。
+ */
+export const MEMBER_RULES_V2_WAKE_FALLBACK = composeMemberRulesV2(
+  "1) 身份：先 xc_identify（用本 prompt 给出的 wakeToken，name/sessionId 同身份行）绑定身份。"
   + "取消息：正文已内嵌时（任务票/消息正文）不要 xc_read，有任务票直接 xc_claim(taskId)；"
   + "正文只是摘要/通知时才 xc_read({scope:\"inbox\"}) 查收。",
 );
@@ -869,14 +889,19 @@ function truncateBody(body: string, budget: number): string {
  */
 export function buildWakePrompt(input: WakePromptInput, maxChars: number = WAKE_PROMPT_MAX_CHARS): string {
   const receipt = formatReceipt(input.teamId, input.recipientKey, input.receiptIds);
-  // v0.9.4（A6）：身份行改为「钩子已自动绑定」口径——SessionStart 钩子消费唤醒票据时
-  // 就把队内轴 + peer 轴身份落盘（不经模型回合），唤醒 prompt 因此不再要求先调
-  // xc_identify；自动绑定未生效（票据已被消费/不匹配/钩子未跑）时保留 wakeToken
-  // 兜底路径（一次性/目标 sid 校验与 v0.9.3 完全一致）。
-  const identity =
-    `你是 zcode 会话 "${input.recipientKey}"，sessionId=${input.recipientSessionId}。` +
-    `身份已由引擎在会话启动时自动绑定（SessionStart 钩子消费唤醒票据，不经模型回合）——不要再调 xc_identify；` +
-    `若自动绑定未生效，用 wakeToken 填 "${input.wakeToken}" 调一次 xc_identify 兜底（name/sessionId 同上）。`;
+  // v0.9.5（A1/V094-02）：身份行按 **ppid 采纳档**分流——
+  // - 开启档（XC_ADOPT_BY_PPID=1，v0.9.4 A6 口径）：SessionStart 钩子消费唤醒票据时
+  //   已把队内轴 + peer 轴身份落盘（不经模型回合），身份行写「已自动绑定——不要再调
+  //   xc_identify」；自动绑定未生效（票据已被消费/不匹配/钩子未跑）时保留 wakeToken
+  //   兜底路径（一次性/目标 sid 校验与 v0.9.3 完全一致）；
+  // - 默认档（缺省）：ppid 采纳默认关，钩子不消费票据——身份行如实写 wakeToken
+  //   自证路径（2 次调用），不宣称未发生的自动绑定。
+  const identity = input.adoptByPpidEnabled === true
+    ? `你是 zcode 会话 "${input.recipientKey}"，sessionId=${input.recipientSessionId}。` +
+      `身份已由引擎在会话启动时自动绑定（SessionStart 钩子消费唤醒票据，不经模型回合）——不要再调 xc_identify；` +
+      `若自动绑定未生效，用 wakeToken 填 "${input.wakeToken}" 调一次 xc_identify 兜底（name/sessionId 同上）。`
+    : `你是 zcode 会话 "${input.recipientKey}"，sessionId=${input.recipientSessionId}。` +
+      `首回合先用 wakeToken 填 "${input.wakeToken}" 调一次 xc_identify（name="${input.recipientKey}"，sessionId 同上）绑定身份，再按行动行处理。`;
   // v0.9.4（A6）：行动行按「正文是否内嵌 + 是否带任务票」分流——任务票场景直接
   // xc_claim(taskId)（一次到位的核心判据）；消息正文场景不 xc_read 直接按正文处理；
   // 摘要/通知场景（post-provision 未读清单、idle/cancel/unblock…）才需要 xc_read 查收。
@@ -887,7 +912,10 @@ export function buildWakePrompt(input: WakePromptInput, maxChars: number = WAKE_
       : `调用 xc_read({scope:"inbox"}) 读取回执对应的消息。`;
   // v0.9.4（A6）：唤醒回合附加的守则用 WAKE 变体（规则 1 = 已自动绑定/正文内嵌/直接
   // claim）；欢迎回合（provision.ts）仍用 MEMBER_RULES_V2 原版（无钩子、须显式 identify）。
-  const rules = input.includeMemberRules === true ? MEMBER_RULES_V2_WAKE : undefined;
+  // v0.9.5（A1）：规则 1 同身份行分流（默认档 = MEMBER_RULES_V2_WAKE_FALLBACK）。
+  const rules = input.includeMemberRules === true
+    ? (input.adoptByPpidEnabled === true ? MEMBER_RULES_V2_WAKE : MEMBER_RULES_V2_WAKE_FALLBACK)
+    : undefined;
 
   // v0.6（C1）：urgent 唤醒 → 正文携带段首位插横幅（横幅 + 原正文合计受正文预算
   // 约束；横幅固定短行，超长时先压正文再压横幅尾部——truncateBody 作用于合计文本，
@@ -2144,13 +2172,29 @@ async function resolveReceiptTaskId(
 }
 
 /**
+ * v0.9.5（A5/V094-08）：生命周期监视的**控制句柄**——调用方（attemptWake）需要
+ * 「重试轮接管后压制原轮监视器」的能力：sessionNotFound 自动重试成功 spawn 后，
+ * 原轮投递已被判失败并被重试轮接管（同一批 receiptIds），原轮若继续跑 ③ 会把
+ * consumed 记到失败 attempt 的 nonce（V094-08 的 2/2/1 错账），②④ 会对已被重试
+ * 覆盖的投递发假告警。markSuperseded 只关 ②③④（告警/计数/limbo），保留 ①
+ * exit 尾行——原唤醒子的退出证据仍归原轮账本（审计不悬空）。
+ */
+export interface WakeLifecycleWatchHandle {
+  /** 停止监视（定时器清除；幂等）。 */
+  stop(): void;
+  /** 标记本轮投递已被重试轮接管：只保留 ① exit 尾行，②③④ 不再触发。 */
+  markSuperseded(): void;
+}
+
+/**
  * 启动 wake-child 生命周期监视（unref 定时器；引擎进程活着才有效，见边界声明）。
  * 四类信号各自只发一次（进程内flag）：exit 尾行（+ v0.9.3 A2 致死原因回读）/
  * 假成功告警（wake-slow 与 delivery-unconfirmed 合并为一条）/ 第三级指标 wake-consumed /
  * limbo 降级+告知。消费确认到齐（本批消息全部 consumedAt/readAt/discardedAt）即收工。
+ * v0.9.5（A5）：返回控制句柄（旧调用面忽略返回值仍成立——void 兼容）。
  */
-export function startWakeLifecycleWatch(cfg: WakeLifecycleWatchConfig): void {
-  if (cfg.pollMs <= 0 || cfg.windowMs <= 0) return;
+export function startWakeLifecycleWatch(cfg: WakeLifecycleWatchConfig): WakeLifecycleWatchHandle {
+  if (cfg.pollMs <= 0 || cfg.windowMs <= 0) return { stop(): void {}, markSuperseded(): void {} };
   const isAlive = cfg.pidAliveProbe ?? pidAlive;
   // v0.9.3（A3）：假成功告警的合并闸（wake-slow 与 delivery-unconfirmed 共用——
   // 两者同源同判据，一次盖章只允许一条 urgent，见 tick ②）。
@@ -2161,6 +2205,8 @@ export function startWakeLifecycleWatch(cfg: WakeLifecycleWatchConfig): void {
   let exitRecorded = false;
   let ticking = false;
   let stopped = false;
+  // v0.9.5（A5）：重试轮接管标记（true = 只保留 ① exit 尾行）。
+  let superseded = false;
 
   const stop = (): void => {
     stopped = true;
@@ -2234,7 +2280,7 @@ export function startWakeLifecycleWatch(cfg: WakeLifecycleWatchConfig): void {
       //   （stampedAt 即盖章时刻）——同一条消息不可能同时命中；
       // - vs A2：已披露 provider 限流致死（根因已知）⇒ 不再发通用假成功告警（
       //   rateLimitDisclosedNonces 查询，两个检测面共用同一集合）。
-      if (!projectionAlarmSent && now - cfg.stampedAt >= unconfirmedMs) {
+      if (!projectionAlarmSent && !superseded && now - cfg.stampedAt >= unconfirmedMs) {
         if (!(await sessionStartedSince(cfg.stateRoot, cfg.sid, cfg.stampedAt))) {
           const rateLimited = rateLimitDisclosedNonces.has(wakeNonceDigest(cfg.nonce));
           if (!rateLimited) {
@@ -2285,7 +2331,9 @@ export function startWakeLifecycleWatch(cfg: WakeLifecycleWatchConfig): void {
       //    → `wake-consumed` 汇总事件 + 收工（不空转——这正是函数头注释承诺的
       //    「消费确认到齐即收工」，此前只有 limbo 分支间接实现，本版显式化）。
       //    轮询读直读邮箱 JSONL（不走 readMailbox 读取面：不重复审计坏行/帧拒绝）。
-      if (!consumedSignaled && cfg.receiptIds !== undefined && cfg.receiptIds.length > 0) {
+      // v0.9.5（A5）：superseded = 本轮已被重试轮接管——consumed 归属重试轮监视器
+      //（cfg.nonce 是重试 nonce），原轮不再对同一批消息记第二笔 wake-consumed。
+      if (!consumedSignaled && !superseded && cfg.receiptIds !== undefined && cfg.receiptIds.length > 0) {
         try {
           const rows = await readJsonl<TeamMessage>(
             inboxFile(cfg.stateRoot, cfg.teamId, sanitizeKey(cfg.to)),
@@ -2340,7 +2388,7 @@ export function startWakeLifecycleWatch(cfg: WakeLifecycleWatchConfig): void {
       // v0.9.2（A4）判据校准三处：(a) 活性交叉校验 + 宽限（锁竞争回写未落盘不立即判）；
       // (b) prompt 内嵌全文且回合已开跑 → 记 injectedConsumed；(c) 告警按
       // (messageId, 轮次) 节流、同轮多条合并。
-      if (!limboHandled && now - cfg.stampedAt >= cfg.limboTimeoutMs) {
+      if (!limboHandled && !superseded && now - cfg.stampedAt >= cfg.limboTimeoutMs) {
         // 目标 sid 自盖章后是否有会话活动（hook 注入/lastSeen 投影）——(a)(b) 两个判据
         // 的共用输入，一次读取两用。
         const targetActive = await sessionStartedSince(cfg.stateRoot, cfg.sid, cfg.stampedAt);
@@ -2470,6 +2518,8 @@ export function startWakeLifecycleWatch(cfg: WakeLifecycleWatchConfig): void {
   timer.unref?.();
   const stopTimer = setTimeout(stop, cfg.windowMs);
   stopTimer.unref?.();
+  // v0.9.5（A5）：控制句柄（stop 幂等；markSuperseded 只关 ②③④、保留 ① exit 尾行）。
+  return { stop, markSuperseded(): void { superseded = true; } };
 }
 
 // ─────────────────────────── attemptWake（fire-and-forget 编排） ───────────────────────────
@@ -2789,9 +2839,14 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
   // 回合与桌面原会话共享 sid，xc_identify 消费本 nonce 时把 voiceOwner 转记到连接
   // 身份，uservoice 盖章面据此承认「本连接是该 sid 的唤醒续跑」（不再因 sid 被
   // elsewhere 活进程持有而拒章；对外部会话的拒绝线不放松，见 core/uservoice.ts）。
+  // v0.9.5（A6/V094-05）：签发点补 `issuedToSid`/`name`——票据目标 sid 与队内花名
+  // 落进票据本体，钩子面/MCP 面的「非目标 sid 拒」判据才有真值可判（旧实现两字段
+  // 恒缺，规格宣称不实且 V094-04 的两面判据分裂不可观测）。
   const { token } = await createWakeNonce(stateRoot, {
     teamId: req.teamId, agentKey: toKey, sid: req.toSessionId, now,
     voiceOwner: req.toSessionId,
+    issuedToSid: req.toSessionId,
+    name: toKey,
   });
   const ids = [...req.receiptIds];
   await withLockBestEffort(stateRoot, req.teamId, () =>
@@ -2800,6 +2855,9 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
   // 5. prompt + spawn（fire-and-forget）。守则附加按场景白名单（v0.2 §9.1 白名单兼容）。
   // v0.6（C1）：urgent 唤醒（xc_relay）→ 正文首位 URGENT 横幅。
   // v0.9.4（A6）：本批回执消息的 taskId（单一才给）→ prompt 行动行「直接 xc_claim」。
+  // v0.9.5（A1）：身份行/守则规则 1 按 ppid 采纳档分流（XC_ADOPT_BY_PPID=1 才写
+  // 「已自动绑定」；默认档写 wakeToken 自证路径）。
+  const adoptByPpid = adoptByPpidEnabledFromEnv(req.env);
   const receiptTaskId = await resolveReceiptTaskId(stateRoot, req.teamId, toKey, ids);
   const prompt = buildWakePrompt({
     teamId: req.teamId,
@@ -2810,6 +2868,7 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
     bodyText: req.ticket,
     includeMemberRules: includeRulesForScene(req.reason),
     scene: req.reason,
+    adoptByPpidEnabled: adoptByPpid,
     ...(receiptTaskId !== undefined ? { taskId: receiptTaskId } : {}),
     ...(req.urgent === true ? { urgent: true } : {}),
   });
@@ -2987,7 +3046,9 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
   // 计时从**盖章时刻**（now）起算：limbo 判据 = deliveredAt 已盖而 consumedAt 超时
   // 未回写（消费回写面：hook 注入 / xc_read / xc_claim，见 mailbox.ts 与 hooks/）。
   // unref 定时器：引擎进程退出即停（观测面不拖进程；总窗 = nonce TTL）。
-  startWakeLifecycleWatch({
+  // v0.9.5（A5）：捕获句柄——sessionNotFound 自动重试接管后压制原轮 ②③④（consumed
+  // 只记重试 nonce、假成功/limbo 不对已被重试覆盖的投递误发）。
+  const primaryLifecycle = startWakeLifecycleWatch({
     stateRoot,
     teamId: req.teamId,
     to: toKey,
@@ -3114,12 +3175,16 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
     const { token: retryToken } = await createWakeNonce(stateRoot, {
       teamId: req.teamId, agentKey: toKey, sid, now: retryNow,
       // v0.9.1（G-11）：重试同样记录 voiceOwner=重绑后的原会话（sid）。
+      // v0.9.5（A6/V094-05）：重试签发点同补 issuedToSid/name（与主路径同口径）。
       voiceOwner: sid,
+      issuedToSid: sid,
+      name: toKey,
     });
     const retryIds = [...ids];
     await withLockBestEffort(stateRoot, req.teamId, () =>
       claimMailboxDelivery(stateRoot, req.teamId, toKey, retryIds, retryNow));
     // v0.9.4（A6）：重试轮次同样解析 taskId（幂等：同一批消息，taskId 不变）。
+    // v0.9.5（A1）：重试 prompt 的身份行同样按 ppid 采纳档分流。
     const retryReceiptTaskId = await resolveReceiptTaskId(stateRoot, req.teamId, toKey, retryIds);
     const retryPrompt = buildWakePrompt({
       teamId: req.teamId,
@@ -3130,6 +3195,7 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
       bodyText: req.ticket,
       includeMemberRules: includeRulesForScene(req.reason),
       scene: req.reason,
+      adoptByPpidEnabled: adoptByPpid,
       ...(retryReceiptTaskId !== undefined ? { taskId: retryReceiptTaskId } : {}),
       ...(req.urgent === true ? { urgent: true } : {}),
     });
@@ -3175,6 +3241,10 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
         },
       });
       retryPid = spawned.pid;
+      // v0.9.5（A5/V094-08）：重试轮已接管本批 receiptIds 的投递——原轮监视器此后
+      // 只保留 ① exit 尾行；②③④（假成功/consumed 计数/limbo）归重试轮监视器，
+      // consumed 因此只记一笔且 nonce 属重试 attempt（修 2/2/1 错账与归属）。
+      primaryLifecycle.markSuperseded();
       // v0.9.2（A1）：重试轮次同样做启动确认（异步面：只落账，不进任何 payload——
       // 重试没有同步回执面；「重试后启动证据未见」以 lifecycle 账与 engine 事件为准）。
       // 注入 spawn 时同样没有汇报通道，按未见结算（与主路径同一注入纪律）。
@@ -3237,6 +3307,10 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
       // v0.9.3（A3）：假成功检测阈值（重试轮次同口径）。
       fakeSuccessMs: req.fakeSuccessMs ?? fakeSuccessMsFromEnv(req.env),
       windowMs: req.lifecycleWindowMs ?? WAKE_INFLIGHT_MS,
+      // v0.9.5（A5/V094-08）：重试轮传 receiptIds——第三级消费检测以 receiptIds
+      // 非空为硬门槛（tick ③），缺了它重试轮永远等不到 consumed、实际消费被原轮
+      // （已判失败的 attempt）记账——V094-08 的 2/2/1 与错归属正源于此。
+      receiptIds: retryIds,
       ...(req.pidAliveProbe !== undefined ? { pidAliveProbe: req.pidAliveProbe } : {}),
     });
   };

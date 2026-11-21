@@ -253,7 +253,9 @@ describe("CONC-2 工具层腿：≥10MiB 队内消息磁盘保真入队（传输
 
     const res = await core.xc_message({ to: "b", msg: big }, "conn-a");
     expect(res.isError).toBeUndefined();
-    expect(res.content[0]?.text).toContain("delivered via mailbox");
+    // v0.9.5（A4/V094-06）：xc_message 主消息路径文案如实——「仅落邮箱（未唤醒）」，
+    // 不再写 "delivered via mailbox"（不真实宣称送达）。
+    expect(res.content[0]?.text).toContain("仅落邮箱（未唤醒");
 
     // 磁盘真源逐字节保真（README「磁盘态任意大文件可入队」承诺）
     const raw = await readFile(inboxFile(stateRoot, "default", "b"), "utf8");

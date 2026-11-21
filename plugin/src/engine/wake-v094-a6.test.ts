@@ -52,6 +52,9 @@ afterAll(() => {
 
 function basePromptInput(overrides: Partial<Parameters<typeof buildWakePrompt>[0]> = {}) {
   return {
+    // v0.9.5（A1）：本文件锁「ppid 采纳开启档」口径（已自动绑定）；默认档（wakeToken
+    // 自证）见 wake-v095-a1 定向测试。
+    adoptByPpidEnabled: true,
     teamId: "default",
     recipientKey: "b",
     recipientSessionId: "sess_b",
