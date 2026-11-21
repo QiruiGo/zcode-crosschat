@@ -337,24 +337,16 @@ describe('A5 版本五处统一 0.9.5', () => {
     expect(readRel('plugin/src/mcp/server.ts')).toContain('const SERVER_VERSION = "0.9.5"');
   });
 
-  // v0.9.5 集成注：四处版本文件已 0.9.5（41-v095 集成道随版本冻结就地同步本断言，
-  // 即上行注解写明的「同步本断言」流程）；第五处（README 安装段）仍钉 0.9.2——同
-  // v0.9.3/v0.9.4 冻先例留给发布 lane。
-  // v0.9.3 集成注：第五处（README 安装段）仍钉 0.9.2——README 未随本次版本冻结改写
-  // （发布 lane 的活：就地改资产名，并同步本断言）。四处版本文件已 0.9.3，本断言与
-  // README 现状相符故绿；改 README 必须同步改这里。
-  // v0.9.4 B3：版本记录整段搬去 CHANGELOG.md（README 只留指针）——版本条目断言改查
-  // CHANGELOG；安装段（资产名/安装回显/命令面计数）仍钉 README。
-  // v0.9.4 集成注：四处版本文件已 0.9.4（本 describe 上头两行）；第五处（README 安装段
-  // 资产名/安装回显）仍钉 0.9.2——同 v0.9.3 冻先例留给发布 lane，同步改 README 时必须
-  // 同步改这里。CHANGELOG 版本记录断言同样留 0.9.2/0.9.1/0.9.0（v0.9.4 条目由发布 lane
-  // 随 notes 落笔后补钉）。
-  it('README 安装段指向 0.9.2；CHANGELOG 版本记录含 0.9.2/0.9.1/0.9.0 条目（第五处）', () => {
+  // v0.9.5 发布 lane 注：四处版本文件已 0.9.5；第五处（README 安装段资产名/安装回显）
+  // 已随发布 lane 就地改为 0.9.5，本断言同步改钉 0.9.5；CHANGELOG 的 v0.9.5 条目
+  // 也由发布 lane 落笔（v0.9.3/v0.9.4 条目此前由 B1 补钉）。
+  it('README 安装段指向 0.9.5；CHANGELOG 含 v0.9.5/0.9.2/0.9.1/0.9.0 条目（第五处）', () => {
     const readme = readRel('README.md');
-    expect(readme).toContain('zcode-crosschat-0.9.2-prebuilt-slim.tar.gz');
-    expect(readme).toContain('Installed plugin zcode-crosschat@dev-zcode-crosschat (0.9.2)');
+    expect(readme).toContain('zcode-crosschat-0.9.5-prebuilt-slim.tar.gz');
+    expect(readme).toContain('Installed plugin zcode-crosschat@dev-zcode-crosschat (0.9.5)');
     expect(readme).toContain('8 个斜杠命令');
     const changelog = readRel('CHANGELOG.md');
+    expect(changelog).toContain('**v0.9.5**（2026-11-21，v0.9.4 对抗轮 4 条 P2');
     expect(changelog).toContain('**v0.9.2**（2026-11-20，');
     expect(changelog).toContain('**v0.9.1**（2026-11-19，v0.8.1 首日生产实战第二批教训');
     expect(changelog).toContain('**v0.9.0**（2026-11-19，lims2.0 首日实战九缺口修复');
