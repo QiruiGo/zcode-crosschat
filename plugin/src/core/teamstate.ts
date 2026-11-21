@@ -877,29 +877,6 @@ export function allowedTransitions(task: Task): readonly TaskStatus[] {
 // consume them (their header comments document this contract).
 // ---------------------------------------------------------------------------
 
-/**
- * Create the team directory structure and the initial team record, and return
- * it. Throws when the team already exists (callers are expected to have found
- * it absent under the team lock first).
- */
-export async function createTeam(
-  stateRoot: string,
-  input: { teamId: string; name?: string; founderKey: string; now?: number },
-): Promise<TeamState> {
-  const existing = await readTeam(stateRoot, input.teamId);
-  if (existing !== undefined) {
-    throw new Error(`team "${input.teamId}" already exists`);
-  }
-  const team = newTeamState({
-    teamId: input.teamId,
-    name: input.name ?? input.teamId,
-    founderKey: input.founderKey,
-    now: input.now,
-  });
-  await writeTeam(stateRoot, team);
-  return team;
-}
-
 /** The member's single open (claimed/in_progress/blocked——v0.6 C2 起含 blocked) task, if any (dsh 同名约束). */
 export function memberOpenTask(team: TeamState, agentKey: string): Task | undefined {
   return memberOpenTasks(team.tasks, agentKey)[0];

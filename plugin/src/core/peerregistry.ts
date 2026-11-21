@@ -55,8 +55,6 @@ export const PEER_RECORD_MAX_BYTES = 262_144;
 export const PEER_KEY_MAX_BYTES = 4096;
 /** Staleness window: a peer whose lastSeen is older is considered dead. */
 export const PEER_STALE_MS = 60_000;
-/** Heartbeat cadence the registration side is expected to use (4x margin). */
-export const PEER_HEARTBEAT_MS = 15_000;
 /** formerNames FIFO cap (SPEC R-10; CC token list cap `Mjn` = 32). */
 export const PEER_FORMER_NAMES_MAX = 32;
 /** Current peer protocol version (CC `rq` = 1, @4323352). */

@@ -407,8 +407,9 @@ describe('M6 旧名移除：MIGRATION/README 同步（无「待移除」残留�
     expect(text).toContain('Tool <name> not found');
   });
 
-  it('README.md 版本记录含 v0.7.0 条目', () => {
-    const text = readFileSync(join(REPO_ROOT, 'README.md'), 'utf8');
-    expect(text).toContain('v0.7.0');
+  it('v0.7.0 旧名移除记录在用户文档面（README 工具表 + CHANGELOG 版本条目）', () => {
+    // v0.9.4 B3：版本记录搬 CHANGELOG.md；README 工具表仍声明 v0.7.0 旧名移除口径。
+    expect(readFileSync(join(REPO_ROOT, 'README.md'), 'utf8')).toContain('v0.7.0');
+    expect(readFileSync(join(REPO_ROOT, 'CHANGELOG.md'), 'utf8')).toContain('v0.7.0');
   });
 });

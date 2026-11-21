@@ -529,11 +529,12 @@ describe('v0.9.3 B2：wakeGateStatus / readActiveWakeCooldowns', () => {
 
 // ─────────────────────────── 文档登记（PROTOCOL §15.7 + README 24 + §9 env） ───────────────────────────
 
-describe('v0.9.3 组B 文档登记（PROTOCOL §15.7 + README 已知限制 24 + §9 env 表）', () => {
+describe('v0.9.3 组B 文档登记（PROTOCOL §15.7 + 已知限制 24 + §9 env 表）', () => {
   const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
   const read = (rel: string): string => readFileSync(join(repoRoot, rel), 'utf8');
   const protocol = read('docs/PROTOCOL.md');
-  const readme = read('README.md');
+  // v0.9.4 B3：已知限制整段搬去 docs/LIMITATIONS.md（README 只留指针）——条目锁随搬家。
+  const limitations = read('docs/LIMITATIONS.md');
 
   it('PROTOCOL §15.7 在册（B1 段 schema / 优先级 / 畸形披露 / 热生效四口径）', () => {
     expect(protocol).toContain('### 15.7 v0.9.3 增量：配置可观测');
@@ -550,8 +551,8 @@ describe('v0.9.3 组B 文档登记（PROTOCOL §15.7 + README 已知限制 24 + 
     expect(protocol).toContain('`XC_WAKE_OFF_ALERT_MS`（v0.9.3 B3 唤醒开关持续关闭告警阈值，缺省 1800000=30min');
   });
 
-  it('README 已知限制 24 在场（含边界声明：doctor/journal/checkpoint 仍 env 口径）', () => {
-    const item = readme.split('\n').find((l) => l.startsWith('24. **容量闸三旋钮走 config.json'));
+  it('已知限制 24 在场（含边界声明：doctor/journal/checkpoint 仍 env 口径；v0.9.4 B3 起在 docs/LIMITATIONS.md）', () => {
+    const item = limitations.split('\n').find((l) => l.startsWith('24. **容量闸三旋钮走 config.json'));
     expect(item).toBeDefined();
     expect(item!).toContain('warn_watermark');
     expect(item!).toContain('config-effective-changed');

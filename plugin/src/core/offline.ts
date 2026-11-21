@@ -22,10 +22,63 @@
  */
 import { PEER_STALE_MS, type PeerScanResult } from './peerregistry.js';
 import { lastProgressTs } from './stall.js';
-import { TERMINAL_TASK_STATUSES, memberState, type Task, type TaskStatus, type TeamMember, type TeamState } from './types.js';
+import {
+  TERMINAL_TASK_STATUSES,
+  memberState,
+  plausibleLivenessTs,
+  type Task,
+  type TaskStatus,
+  type TeamMember,
+  type TeamState,
+} from './types.js';
 
 /** 成员活性四态（DESIGN-V0.7 §4.1 表）。 */
 export type MemberLiveness = 'live' | 'pid-dead' | 'heartbeat-stale' | 'no-record';
+
+/**
+ * v0.9.4（A1）：会话记录的 **pid 证据**（成员 pid 判据的注入输入；调用方读盘 + 探测
+ * 进程存活后传入——本模块保持无 I/O 纪律）。
+ *
+ * - `pid`：sessions/<sid>.json 的 pid（SessionStart 钩子写的宿主进程 pid）；
+ * - `alive`：该 pid 当前是否活着（调用方用 core/lock.ts pidAlive 探测）；
+ * - `turnInProgress`：记录是否处于回合中（liveness === 'running' 且时刻可信）。
+ *
+ * 为什么必须 turnInProgress 才判死：成员是**回合制瞬态**——就绪态零专属进程，无头
+ * 回合结束（Stop 钩子 → idle）后宿主进程正常退出，旧 pid 已亡是**正常形态**；只有
+ * 「回合还在跑（自述 running）而进程没了」才是崩溃的硬证据。这同时保住桌面会话：
+ * 回合间隙（idle）不因旧 pid 误报，进程死由 peer 注册记录路径照常检出。
+ */
+export interface SessionPidEvidence {
+  pid: number;
+  alive: boolean;
+  turnInProgress: boolean;
+}
+
+/**
+ * v0.9.4 打回第 1 轮（V094-13）：pid 证据的**单一派生点**（纯函数；存活探测由调用方
+ * 注入，本模块仍无 I/O）。
+ *
+ * 为什么必须单一：V094-13 的形态是「看门狗按 pid 判死并落 member-dead，而
+ * xc_overview 三视图仍报 running」——两处各自拼证据时，接线漏一处就产生跨面矛盾。
+ * 现在 watchdog（判死发射面）、core/liveness.ts memberLivenessView（展示面）都调本
+ * 函数取同一份证据；record 无 pid / pid 非正整数 → undefined（无证据，判据不参与）。
+ *
+ * `turnInProgress` 的语义见 {@link SessionPidEvidence}：只有「回合中自述且时刻可信」
+ * 才让 pid-dead 参与判定——回合间隙（idle）零进程是成员正常形态。
+ */
+export function deriveSessionPidEvidence(
+  record: { pid?: number; liveness?: 'running' | 'idle'; livenessTs?: number } | undefined,
+  now: number,
+  alive: (pid: number) => boolean,
+): SessionPidEvidence | undefined {
+  const pid = record?.pid;
+  if (typeof pid !== 'number' || !Number.isSafeInteger(pid) || pid <= 0) return undefined;
+  return {
+    pid,
+    alive: alive(pid),
+    turnInProgress: record?.liveness === 'running' && plausibleLivenessTs(record.livenessTs, now),
+  };
+}
 
 /** 离线证据：进程死（硬证据，免空闲阈值）/ 空闲超时（兜底路径）。 */
 export type OfflineEvidence = 'process-dead' | 'idle-timeout';
@@ -80,12 +133,19 @@ export const DEFAULT_OFFLINE_MINUTES = 240;
  * 2. `dead` 里有同 sid 记录：任一条**不是** pid-dead（pid 仍活着，只是心跳过期；
  *    或 reason 缺失＝没有硬证据）→ `heartbeat-stale`；全部 pid-dead → `pid-dead`；
  * 3. 无任何记录（回合间隙 / 从未 peer 注册 / 优雅退出已摘记录）→ `no-record`。
+ *
+ * v0.9.4（A1）增量：第 3 类补**会话记录 pid 判据**——peer 注册表没有该 sid 的记录
+ * （引擎成员从未 xc_identify、或优雅退出已摘记录撞上进程死）时，会话记录的 pid
+ * （SessionStart 钩子写的宿主进程 pid）+ 回合中自述 = 第二条进程死硬证据：
+ * `turnInProgress ∧ ¬alive` → `pid-dead`。判据只补第 3 类空档：active 分区有记录
+ * （有进程活着且在心跳）或 dead 分区有 lastSeen-stale 记录（有进程活着只是沉默）
+ * 时都不改判——保守方向不变，peer 证据与 pid 证据冲突时活证据优先。
  */
 export function memberLiveness(
   member: TeamMember,
   scan: PeerScanResult,
   now: number,
-  opts: { staleMs?: number } = {},
+  opts: { staleMs?: number; sessionPid?: SessionPidEvidence } = {},
 ): MemberLiveness {
   const staleMs = opts.staleMs ?? PEER_STALE_MS;
   const live = scan.active.find((record) => record.sessionId === member.sessionId);
@@ -93,7 +153,14 @@ export function memberLiveness(
     return now - live.lastSeen > staleMs ? 'heartbeat-stale' : 'live';
   }
   const dead = scan.dead.filter((row) => row.record.sessionId === member.sessionId);
-  if (dead.length === 0) return 'no-record';
+  if (dead.length === 0) {
+    // v0.9.4（A1）：无 peer 记录时，会话记录 pid + running 自述 = 进程死硬证据。
+    const pidEvidence = opts.sessionPid;
+    if (pidEvidence !== undefined && pidEvidence.turnInProgress && !pidEvidence.alive) {
+      return 'pid-dead';
+    }
+    return 'no-record';
+  }
   if (dead.some((row) => row.reason !== 'pid-dead')) return 'heartbeat-stale';
   return 'pid-dead';
 }

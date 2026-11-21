@@ -15,7 +15,7 @@
  *
  * @module core/paths
  */
-import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { realpathSync } from 'node:fs';
 import { lstat, realpath } from 'node:fs/promises';
 
@@ -41,16 +41,8 @@ export function workspaceFromEnv(env: NodeJS.ProcessEnv = process.env): string {
   return typeof dir === 'string' && dir.trim() !== '' ? dir : process.cwd();
 }
 
-/** Whether `path` is already absolute (used by callers deciding to trust a cwd). */
-export function isAbsolutePath(path: string): boolean {
-  return isAbsolute(path);
-}
-
 // --- registry ---------------------------------------------------------------
 
-export function registryDir(root: string): string {
-  return join(root, 'registry');
-}
 export function sessionsDir(root: string): string {
   return join(root, 'registry', 'sessions');
 }

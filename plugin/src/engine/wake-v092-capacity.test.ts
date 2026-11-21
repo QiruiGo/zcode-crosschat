@@ -563,11 +563,12 @@ describe('v0.9.2 C5：wake-deferred 事件 gateEnv 原值（V091-18）', () => {
 
 // ─────────────────────────── 文档登记（C1/C2/C3/C5 口径必须在 PROTOCOL 在场） ───────────────────────────
 
-describe('v0.9.2 组 C 文档登记（PROTOCOL §15.2 + README 已知限制 22）', () => {
+describe('v0.9.2 组 C 文档登记（PROTOCOL §15.2 + 已知限制 22）', () => {
   const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
   const read = (rel: string): string => readFileSync(join(repoRoot, rel), 'utf8');
   const protocol = read('docs/PROTOCOL.md');
-  const readme = read('README.md');
+  // v0.9.4 B3：已知限制整段搬去 docs/LIMITATIONS.md（README 只留指针）——条目锁随搬家。
+  const limitations = read('docs/LIMITATIONS.md');
 
   it('PROTOCOL §15.2 登记键分域/上钳/沿用明示/degraded 事件/进程归类五条口径', () => {
     expect(protocol).toContain('C3 冷却键分域');
@@ -592,8 +593,8 @@ describe('v0.9.2 组 C 文档登记（PROTOCOL §15.2 + README 已知限制 22�
     expect(keys).toContain('wakeGateEnabled');
   });
 
-  it('README 已知限制 22 同步（XC_MEM_WAKE_COOLDOWN_MS 上钳与降级披露在场）', () => {
-    const item = readme.split('\n').find((l) => l.startsWith('22. **容量闸挡唤醒不拦投递'));
+  it('已知限制 22 同步（XC_MEM_WAKE_COOLDOWN_MS 上钳与降级披露在场；v0.9.4 B3 起在 docs/LIMITATIONS.md）', () => {
+    const item = limitations.split('\n').find((l) => l.startsWith('22. **容量闸挡唤醒不拦投递'));
     expect(item).toBeDefined();
     expect(item!).toContain('XC_MEM_WAKE_COOLDOWN_MS');
     expect(item!).toContain('wake-capacity-probe-failed');

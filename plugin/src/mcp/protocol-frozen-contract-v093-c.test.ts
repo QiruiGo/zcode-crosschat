@@ -37,7 +37,11 @@ import { sweepMembersOnce, type WatchdogDeps } from "../engine/watchdog.js";
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 const PROTOCOL = readFileSync(join(REPO_ROOT, "docs", "PROTOCOL.md"), "utf8");
-const README = readFileSync(join(REPO_ROOT, "README.md"), "utf8");
+// v0.9.4 B3：README 瘦身——已知限制/威胁模型搬 docs/LIMITATIONS.md、版本记录搬 CHANGELOG.md。
+// 用户文档面口径锁改查并集（原句必须仍在用户可见文档中；条目搬家不丢锁）。
+const README = ["README.md", "docs/LIMITATIONS.md", "CHANGELOG.md"]
+  .map((rel) => readFileSync(join(REPO_ROOT, rel), "utf8"))
+  .join("\n");
 
 // ---------------------------------------------------------------------------
 // 冻结块提取与键集对拍（与 protocol-frozen-contract-v090 / tools-relay-v091 同款）

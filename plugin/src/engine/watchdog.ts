@@ -56,14 +56,14 @@ import {
   type TeamState,
 } from '../core/types.js';
 import { readTeam } from '../core/teamstate.js';
-import { memberLiveness, type MemberLiveness } from '../core/offline.js';
+import { deriveSessionPidEvidence, memberLiveness, type MemberLiveness } from '../core/offline.js';
 import { scanPeers, type PeerRecord, type PeerScanResult } from '../core/peerregistry.js';
 import { peerRootFromEnv } from '../core/peerdir.js';
 import { logEngineEvent } from '../core/log.js';
 // v0.9.3 打回第 2 轮（V093-01 残留①）：重发路径补发 member-dead 事件前的「是否已有」判据，
 // 复用 M1 的 engine.jsonl 尾部窗口读单一实现（不复制一套 tail 读）。
 import { readIncidentsSince } from '../core/incidents.js';
-import { LockBusyError, withFileLock, withProcessLock, withTeamLock } from '../core/lock.js';
+import { LockBusyError, pidAlive, withFileLock, withProcessLock, withTeamLock } from '../core/lock.js';
 import {
   appendMailbox,
   createMessage,
@@ -613,12 +613,28 @@ export async function sweepMembersOnce(
     // ── 1. 无锁预计算：活性表 + 四类认领候选（都是只读投影，不碰状态文件）──
     const livenessByKey = new Map<string, MemberLiveness>();
     const deathCandidates: Array<{ key: string; sessionId: string; recentLife: boolean }> = [];
+    // v0.9.4（A1）：会话记录一次读取、两个循环复用（死亡判定的 pid 证据 + 待续跑判据）
+    // ——不新增每成员的盘读次数。
+    const sessionRecords = new Map<string, SessionRecord | undefined>();
     for (const member of team.members) {
       if (memberState(member) === 'removed') continue; // 显式终态不是「死亡」
       const sessionId = typeof member.sessionId === 'string' && member.sessionId !== '' ? member.sessionId : null;
       if (sessionId === null) continue; // 无 sid：无从判定 pid 归属
       summary.scannedMembers += 1;
-      const liveness = memberLiveness(member, scan, now);
+      let record: SessionRecord | undefined;
+      try {
+        record = await readSession(stateRoot, sessionId);
+      } catch {
+        record = undefined; // 读失败 = 无记录（保守 idle，不崩观测面）
+      }
+      sessionRecords.set(member.key, record);
+      // v0.9.4（A1）：pid 证据（记录 pid + 存活探测 + 回合中自述）——peer 注册表没有
+      // 该 sid 记录时（引擎成员从未 identify），会话记录 pid 是进程死的第二硬证据。
+      // v0.9.4 打回第 1 轮（V094-13）：派生走 core/offline.ts 的**单一派生点**——
+      // 判死发射面（本处）与展示面（core/liveness.ts memberLivenessView）从此同判据，
+      // 不再出现「看门狗发 member-dead 而 xc_overview 报 running」的跨面矛盾。
+      const pidEvidence = deriveSessionPidEvidence(record, now, pidAlive);
+      const liveness = memberLiveness(member, scan, now, { sessionPid: pidEvidence });
       livenessByKey.set(member.key, liveness);
       if (liveness === 'pid-dead') {
         deathCandidates.push({ key: member.key, sessionId, recentLife: recentLifeEvidence(scan, sessionId, now) });
@@ -631,12 +647,8 @@ export async function sweepMembersOnce(
       if (memberState(member) === 'removed') continue;
       const sessionId = typeof member.sessionId === 'string' && member.sessionId !== '' ? member.sessionId : null;
       if (sessionId === null) continue;
-      let record: SessionRecord | undefined;
-      try {
-        record = await readSession(stateRoot, sessionId);
-      } catch {
-        record = undefined; // 读失败 = 无记录（保守 idle，不崩观测面）
-      }
+      // v0.9.4（A1）：复用上方循环已读的会话记录（不重复读盘）。
+      const record = sessionRecords.get(member.key);
       const view = memberLivenessView(member, record, scan, now);
       const candidate = continuationCandidateOf(member, view, record, team.tasks, now);
       if (candidate !== undefined) {

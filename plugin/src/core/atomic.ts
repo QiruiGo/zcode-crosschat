@@ -136,6 +136,3 @@ export async function writeFileExclusive(file: string, content: string): Promise
     await rm(temporary, { force: true }).catch(() => undefined);
   }
 }
-
-/** Alias of writeFileAtomic (module-3 call name). */
-export const atomicWriteFile = writeFileAtomic;

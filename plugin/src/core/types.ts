@@ -423,6 +423,22 @@ export interface SessionRecord {
    * absent = 存量记录（升级前锚定）→ 无窗口可言，A3 零注入（不回归）。
    */
   lastTurnTs?: number;
+  /**
+   * v0.9.4（A1）：本会话**宿主进程**的 pid（SessionStart 钩子写入）——成员 pid 证据。
+   *
+   * 取值口径（写死）：钩子进程自身是短命的（hooks.json `type:process`，timeoutMs 10s，
+   * 写完 additionalContext 即退出），记它自己的 pid 会在秒级变成「进程已亡」把每个活
+   * 会话误判成 pid-dead；因此记的是**拉起本钩子的宿主会话进程**（钩子的父进程，
+   * `process.ppid`）——桌面会话的宿主进程/无头 --resume 的 CLI 进程，杀它即会话亡。
+   * absent = 存量记录 / 供给代写（member-add 的欢迎回合跑在 app-server 里、无钩子）
+   * / 锁忙未写成 → 无 pid 证据，memberLiveness 的 pid 判据不参与（不猜）。
+   *
+   * 消费面：core/offline.ts memberLiveness 的 pid 判据（与 liveness='running' 同时
+   * 成立才判 pid-dead——回合间隙零进程是成员的正常形态，Stop 钩子后的 idle 会话
+   * 不因旧 pid 已亡被误报）；看门狗（engine/watchdog.ts）据此在无 peer 注册记录的
+   * 成员（从未 xc_identify 的引擎成员）上也能检出进程死。
+   */
+  pid?: number;
 }
 
 /**
@@ -462,6 +478,20 @@ export interface WakeNonce {
    * voiceOwner === 本 sid 生效，对外部会话的拒绝线不放松。
    */
   voiceOwner?: string;
+  /**
+   * v0.9.4（A6）：**票据签发目标**（SessionStart 钩子自动绑身份用）——本 nonce 签发给
+   * 哪个 sid（= 唤醒 prompt 的接收方会话）。与 {@link WakeNonce.sid}（续跑目标会话）
+   * 同值，显式落账让「非目标 sid 拒」成为可判据：钩子只消费 issuedToSid === 本会话
+   * sid 的票据，别个 sid 的唤醒票据不被误绑。
+   */
+  issuedToSid?: string;
+  /**
+   * v0.9.4（A6）：票据签发的**队内花名**（= agentKey，唤醒 prompt 身份行同名）——
+   * 钩子消费票据后据此自动绑定队内轴身份（names.json/roster）与 peer 轴基记录，
+   * 不经模型回合（「唤醒一次到位」）。absent = 旧 nonce（v0.9.3 及以前签发）：
+   * 钩子按 agentKey 兜底取值，行为兼容。
+   */
+  name?: string;
 }
 
 /**
@@ -976,6 +1006,11 @@ export function coerceSessionRecord(value: unknown, expectedSessionId: string, n
   // v0.9.2（A3）：回合开始时刻同样走未来值校验——未来时刻在物理上不可能是产品自写的
   // 值（durable boundary 丢弃；A3 无窗口起点即零注入，保守方向）。
   const lastTurnTs = plausibleLivenessTs(value['lastTurnTs'], now) ? value['lastTurnTs'] : undefined;
+  // v0.9.4（A1）：pid 宽容增量——正整数才收（非法值整字段丢弃，不拒整条记录；
+  // 与 contextChars/regToken 同款宽容语义）。pid 是进程事实声明，不可能是未来值，
+  // 无时间校验。
+  const pidRaw = value['pid'];
+  const pid = typeof pidRaw === 'number' && Number.isSafeInteger(pidRaw) && pidRaw > 0 ? pidRaw : undefined;
   return {
     ok: true,
     record: {
@@ -989,6 +1024,7 @@ export function coerceSessionRecord(value: unknown, expectedSessionId: string, n
       ...(livenessTs === undefined ? {} : { livenessTs }),
       ...(lastEventTs === undefined ? {} : { lastEventTs }),
       ...(lastTurnTs === undefined ? {} : { lastTurnTs }),
+      ...(pid === undefined ? {} : { pid }),
     },
   };
 }
@@ -1058,12 +1094,24 @@ export function coerceWakeNonce(value: unknown): ParsedNonce | RejectedNonce {
   if (voiceOwnerRaw !== undefined && (typeof voiceOwnerRaw !== 'string' || voiceOwnerRaw.trim() === '')) {
     return { ok: false, defect: 'field "voiceOwner" is not a non-blank string' };
   }
+  // v0.9.4（A6）：issuedToSid/name 宽容增量——旧 nonce 缺省照读；在场时必须非空串
+  // （空白串按缺省处理，钩子的「非目标 sid 拒」判据不因坏值放软）。
+  const issuedToSidRaw = absent(value['issuedToSid']);
+  if (issuedToSidRaw !== undefined && (typeof issuedToSidRaw !== 'string' || issuedToSidRaw.trim() === '')) {
+    return { ok: false, defect: 'field "issuedToSid" is not a non-blank string' };
+  }
+  const nameRaw = absent(value['name']);
+  if (nameRaw !== undefined && (typeof nameRaw !== 'string' || nameRaw.trim() === '')) {
+    return { ok: false, defect: 'field "name" is not a non-blank string' };
+  }
   return {
     ok: true,
     nonce: {
       teamId, agentKey, sid, ts,
       ...(used === undefined ? {} : { used }),
       ...(voiceOwnerRaw === undefined ? {} : { voiceOwner: voiceOwnerRaw }),
+      ...(issuedToSidRaw === undefined ? {} : { issuedToSid: issuedToSidRaw }),
+      ...(nameRaw === undefined ? {} : { name: nameRaw }),
     },
   };
 }
@@ -1122,6 +1170,3 @@ export interface RejectedNonce {
 
 /** Alias of TeamMessage (module-3 call name, dsh parity). */
 export type Message = TeamMessage;
-
-/** Alias of EvidenceItem (module-3 call name). */
-export type TaskEvidence = EvidenceItem;

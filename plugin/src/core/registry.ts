@@ -18,6 +18,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, readdir } from 'node:fs/promises';
+import { readdirSync, readFileSync } from 'node:fs';
 import { writeFileAtomic } from './atomic.js';
 import { wakeDir, wakeFile, namesFile, sessionsDir, sessionFile, witnessFile, witnessDir } from './paths.js';
 import { logEngineEvent } from './log.js';
@@ -97,17 +98,23 @@ export async function writeSession(stateRoot: string, record: SessionRecord): Pr
  * 事件（core/liveness.ts 冻结命名；best-effort，写失败不影响记录本身）。
  * v0.9.2（A3）：同一点盖写 `lastTurnTs`（回合开始时刻）——UserPromptSubmit 的
  * 「回合开始事故摘要」以此为窗口起点，见函数体末与 hooks/prompt-submit.ts。
+ *
+ * v0.9.4（A1）：`options.pid`（SessionStart 钩子传入的宿主进程 pid）在同一点落盘
+ * （成员 pid 证据；core/offline.ts memberLiveness 的 pid 判据吃它）。显式传入才写，
+ * undefined = 不动既有值——UserPromptSubmit/心跳等非 SessionStart 路径不刷新 pid。
  */
 export async function refreshSessionLastSeen(
   stateRoot: string,
   sessionId: string,
-  options: { cwd?: string; now?: number; ensureRegToken?: boolean; liveness?: StoredLiveness | 'none' } = {},
+  options: { cwd?: string; now?: number; ensureRegToken?: boolean; liveness?: StoredLiveness | 'none'; pid?: number } = {},
 ): Promise<SessionRecord> {
   const now = options.now ?? Date.now();
   const existing = await readSession(stateRoot, sessionId);
   const base: SessionRecord = existing === undefined
     ? { sessionId, cwd: options.cwd ?? '', startedAt: now, lastSeen: now }
     : { ...existing, lastSeen: now, ...(options.cwd !== undefined && existing.cwd === '' ? { cwd: options.cwd } : {}) };
+  // v0.9.4（A1）：pid 证据读改写同点落盘（与 lastEventTs 同一原子写）。
+  if (options.pid !== undefined) base.pid = options.pid;
   const liveness = options.liveness ?? 'running';
   const applied = liveness === 'none'
     ? { record: { ...base, lastEventTs: now }, transition: null }
@@ -364,8 +371,15 @@ export async function unbindName(stateRoot: string, name: string, sessionId: str
  * v0.9.1（G-11）：`voiceOwner`（可选）——本次唤醒续跑的原会话（= sid）。attemptWake
  * 恒填；xc_identify 消费 nonce 时转记到连接身份，uservoice 盖章面据此放宽「sid 被
  * elsewhere 活进程持有」的拒章（共享 sid 的无头回合要能转达用户原话）。
+ *
+ * v0.9.4（A6）：`issuedToSid`/`name`（可选）——票据签发目标 sid 与队内花名。
+ * attemptWake 恒填（= sid/agentKey）：SessionStart 钩子据此做「非目标 sid 拒」的
+ * 自动绑定（一次性消费，见 {@link consumeWakeTicketForSession}）。
  */
-export function newWakeNonce(input: { teamId: string; agentKey: string; sid: string; now?: number; voiceOwner?: string }): { token: string; nonce: WakeNonce } {
+export function newWakeNonce(input: {
+  teamId: string; agentKey: string; sid: string; now?: number; voiceOwner?: string;
+  issuedToSid?: string; name?: string;
+}): { token: string; nonce: WakeNonce } {
   const token = randomUUID();
   return {
     token,
@@ -375,6 +389,8 @@ export function newWakeNonce(input: { teamId: string; agentKey: string; sid: str
       sid: input.sid,
       ts: input.now ?? Date.now(),
       ...(input.voiceOwner !== undefined ? { voiceOwner: input.voiceOwner } : {}),
+      ...(input.issuedToSid !== undefined ? { issuedToSid: input.issuedToSid } : {}),
+      ...(input.name !== undefined ? { name: input.name } : {}),
     },
   };
 }
@@ -389,10 +405,14 @@ export async function writeWakeNonce(stateRoot: string, token: string, nonce: Wa
  * Generate + persist a wake nonce in one step.
  * @returns the token (carry it into the wake prompt) and the stored nonce.
  * v0.9.1（G-11）：`voiceOwner` 透传（见 newWakeNonce）。
+ * v0.9.4（A6）：`issuedToSid`/`name` 透传（见 newWakeNonce）。
  */
 export async function createWakeNonce(
   stateRoot: string,
-  input: { teamId: string; agentKey: string; sid: string; now?: number; voiceOwner?: string },
+  input: {
+    teamId: string; agentKey: string; sid: string; now?: number; voiceOwner?: string;
+    issuedToSid?: string; name?: string;
+  },
 ): Promise<{ token: string; nonce: WakeNonce }> {
   const { token, nonce } = newWakeNonce(input);
   await writeWakeNonce(stateRoot, token, nonce);
@@ -440,6 +460,144 @@ export function isWakeNonceFresh(nonce: WakeNonce, now: number = Date.now()): bo
   return nonce.used !== true && now - nonce.ts <= WAKE_INFLIGHT_MS;
 }
 
+/**
+ * v0.9.4（A6）：SessionStart 钩子的**一次性票据消费**（唤醒一次到位的自动绑定入口）。
+ *
+ * 与 {@link consumeWakeNonce}（xc_identify 的 wakeToken 路径，调用方已知 token）不同：
+ * 钩子只拿得到自己的 sid，因此本函数**按 sid 找票**——扫 registry/wake/ 里新鲜未用、
+ * 且 `sid === sid ∧ (issuedToSid ?? sid) === sid` 的 nonce（票据只可能签发给它的
+ * 目标会话；`issuedToSid` 缺失的旧 nonce 按 sid 兜底，兼容 v0.9.3 及以前签发）。
+ * **非目标 sid 一律拒**：别个 sid 的票据不出现在候选里，钩子无法替别人消费。
+ *
+ * 一次性：命中即在 registry 锁内置 `used`（读-判-写原子段；两个进程同时跑同一 sid
+ * 的钩子时只有一方拿到 nonce，另一方得 undefined——同一张票不会被绑定两次）。
+ * 多张命中（同 sid 多轮唤醒在途）取 **ts 最新**的一张（与 findInflightWakeNonce
+ * 同口径：在途标记认最新一轮）。
+ *
+ * 威胁模型口径（PROTOCOL §10/§11.5，同机信任域）：票据消费不做签名/哈希链——同机
+ * 进程可读写 registry/wake/ 状态文件是本产品明文声明的边界（README 已知限制 12
+ * 同族）；本机制的定位是「把唤醒身份绑定从模型回合前移到钩子」，不是防同机伪造。
+ *
+ * @returns 消费掉的 nonce 与其 token；无命中返回 undefined。
+ */
+export async function consumeWakeTicketForSession(
+  stateRoot: string,
+  options: { sid: string; teamId?: string; now?: number },
+): Promise<StoredWakeNonce | undefined> {
+  const now = options.now ?? Date.now();
+  // 快路径（无锁）：registry/wake/ 不存在或没有任何 nonce 文件 → 直接返回，不为
+  // 「从来没有唤醒过的状态根」白拿一次 registry 锁（SessionStart 钩子每回合都走本
+  // 函数；锁预算 2s，能省则省）。TOCTOU 无害：attemptWake 先落 nonce 再 spawn 唤醒
+  // 子（钩子在其后跑），钩子执行时票据必已在盘上。
+  try {
+    const entries = await readdir(wakeDir(stateRoot));
+    if (!entries.some((entry) => entry.endsWith('.json'))) return undefined;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
+  }
+  let claimed: StoredWakeNonce | undefined;
+  await withRegistryLock(
+    stateRoot,
+    async () => {
+      let entries: string[];
+      try {
+        entries = await readdir(wakeDir(stateRoot));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+        throw error;
+      }
+      let found: StoredWakeNonce | undefined;
+      for (const entry of entries) {
+        if (!entry.endsWith('.json')) continue;
+        const token = entry.slice(0, -'.json'.length);
+        const nonce = await readWakeNonce(stateRoot, token);
+        if (nonce === undefined) continue;
+        if (!isWakeNonceFresh(nonce, now)) continue;
+        // 非目标 sid 拒：sid 与 issuedToSid（缺省 = sid）都必须指向本会话。
+        if (nonce.sid !== options.sid) continue;
+        if ((nonce.issuedToSid ?? nonce.sid) !== options.sid) continue;
+        if (options.teamId !== undefined && nonce.teamId !== options.teamId) continue;
+        if (found === undefined || nonce.ts > found.nonce.ts) found = { token, nonce };
+      }
+      if (found === undefined) return;
+      // 锁内原子置 used（整文件覆写；另一钩子进程此时进不来）。
+      const used: WakeNonce = { ...found.nonce, used: true };
+      await writeFileAtomic(wakeFile(stateRoot, found.token), JSON.stringify(used, null, 2));
+      claimed = { token: found.token, nonce: used };
+    },
+    { waitMs: 2_000 },
+  );
+  return claimed;
+}
+
+/**
+ * v0.9.4（A6）：按**宿主进程 pid** 找会话记录（MCP 连接自动采纳身份的读取面）。
+ *
+ * 链路：SessionStart 钩子把宿主进程 pid 写进 sessions/<sid>.json（A1），而 MCP server
+ * 与钩子同父进程（都是宿主会话拉的子进程）——server 读自己的 `process.ppid` 即可
+ * 定位「本连接所属会话」的记录，无需宿主注入 sid。多条记录同 pid（一个宿主进程跑
+ * 多个会话）→ 返回 undefined（歧义不猜，回落 not_registered 让调用方显式 identify）。
+ */
+export async function readSessionByHostPid(stateRoot: string, pid: number): Promise<SessionRecord | undefined> {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
+  let entries: string[];
+  try {
+    entries = await readdir(sessionsDir(stateRoot));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
+  }
+  let found: SessionRecord | undefined;
+  for (const entry of entries) {
+    if (!entry.endsWith('.json')) continue;
+    const record = await readSession(stateRoot, entry.slice(0, -'.json'.length));
+    if (record === undefined || record.pid !== pid) continue;
+    if (found !== undefined) return undefined; // 歧义：一个 pid 对多个会话，不猜
+    found = record;
+  }
+  return found;
+}
+
+/**
+ * v0.9.4（A6）：{@link readSessionByHostPid} 的**同步**变体——MCP 工具面的身份解析
+ * （identity.ts IdentityStore.require）是同步函数，不能改 async（调用面遍布
+ * tools-tasks/tools-relay/peer-services/guards）。同步小文件读只在「连接首次要求
+ * 身份」时发生一次（采纳后进内存缓存），与钩子的 readFileSync(0) 同族口径。
+ * 判据与异步版逐字一致：恰一条 pid 命中才返回，多条/零条 → undefined。
+ */
+export function readSessionByHostPidSync(stateRoot: string, pid: number): SessionRecord | undefined {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
+  let entries: string[];
+  try {
+    entries = readdirSync(sessionsDir(stateRoot));
+  } catch {
+    return undefined; // 无 sessions 目录/不可读：无证据（不猜）
+  }
+  let found: SessionRecord | undefined;
+  for (const entry of entries) {
+    if (!entry.endsWith('.json')) continue;
+    const sessionId = entry.slice(0, -'.json'.length);
+    let raw: string;
+    try {
+      raw = readFileSync(sessionFile(stateRoot, sessionId), 'utf8');
+    } catch {
+      continue; // 单文件读失败跳过（与 readSession 的 ENOENT 口径一致）
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      continue; // 坏行/坏文件不拦判据（durable boundary 同款宽容）
+    }
+    const coerced = coerceSessionRecord(parsed, sessionId);
+    if (!coerced.ok || coerced.record.pid !== pid) continue;
+    if (found !== undefined) return undefined; // 歧义：一个 pid 对多个会话，不猜
+    found = coerced.record;
+  }
+  return found;
+}
+
 export interface StoredWakeNonce {
   /** Token the nonce is stored under. */
   token: string;
@@ -478,27 +636,4 @@ export async function findInflightWakeNonce(
     }
   }
   return found;
-}
-
-// ---------------------------------------------------------------------------
-// Compatibility aliases for the module-3 identity flow (src/mcp/identity.ts)
-// ---------------------------------------------------------------------------
-
-/** Alias of readSession (module-3 call name). */
-export const readSessionFile = readSession;
-
-/** Alias of writeSession (module-3 call name). */
-export const writeSessionFile = writeSession;
-
-/**
- * Unconditionally mark one nonce as used, by token. The xc_register flow
- * validates freshness/match itself, then consumes; missing nonces are a no-op
- * returning false.
- */
-export async function markWakeNonceUsed(stateRoot: string, token: string, now: number = Date.now()): Promise<boolean> {
-  const existing = await readWakeNonce(stateRoot, token);
-  if (existing === undefined || existing.used === true) return false;
-  await writeWakeNonce(stateRoot, token, { ...existing, used: true, ts: existing.ts });
-  void now;
-  return true;
 }

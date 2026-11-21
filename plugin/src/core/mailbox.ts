@@ -72,7 +72,6 @@ export const FRAME_TYPES = [
   'approval_result',
   'withdrawal-notice',
 ] as const;
-export type FrameType = (typeof FRAME_TYPES)[number];
 
 const FRAME_TYPE_SET: ReadonlySet<string> = new Set<string>(FRAME_TYPES);
 

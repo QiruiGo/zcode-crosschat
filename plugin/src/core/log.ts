@@ -96,6 +96,3 @@ export async function logEngineEvent(stateRoot: string, event: EngineEvent): Pro
     }
   }
 }
-
-/** Alias of logEngineEvent (module-2/3 call name). */
-export const appendEngineLog = logEngineEvent;

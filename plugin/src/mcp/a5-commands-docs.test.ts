@@ -42,8 +42,10 @@ const EXPECTED_TOOLS = [
   'xc_relay', 'xc_overview', 'xc_team', 'xc_review', 'xc_doctor',
 ] as const;
 
-/** 本组拥有的文档/技能面（平台缺口声明与版本走查的扫描范围）。 */
-const DOC_SOURCES = ['README.md', 'docs/PROTOCOL.md', 'plugin/skills/longtask/SKILL.md', 'plugin/skills/crosschat/SKILL.md'] as const;
+/** 本组拥有的文档/技能面（平台缺口声明与版本走查的扫描范围）。
+ *  v0.9.4 B3：README 瘦身——已知限制/威胁模型搬 docs/LIMITATIONS.md、版本记录搬 CHANGELOG.md，
+ *  两个搬迁宿主一并纳入扫描范围（负例检查随之覆盖，防搬家变成宣称降级的漏洞）。 */
+const DOC_SOURCES = ['README.md', 'docs/LIMITATIONS.md', 'CHANGELOG.md', 'docs/PROTOCOL.md', 'plugin/skills/longtask/SKILL.md', 'plugin/skills/crosschat/SKILL.md'] as const;
 
 /** front-matter 解析：命令/技能 markdown 的 `--- ... ---` 头（无则抛）。 */
 function frontMatter(text: string): string {
@@ -262,17 +264,18 @@ describe('A5 crosschat skill：工具表与新小节', () => {
 // ---------------------------------------------------------------------------
 
 describe('A5 文档：无 PreCompact，故用提醒+一键（ACCEPT15-1 文档走查）', () => {
-  it('README 与 PROTOCOL 都含原句「无 PreCompact」并说明降级方案', () => {
-    expect(readRel('README.md')).toContain('无 PreCompact/PostCompact 钩子，故用「提醒 + 一键」');
+  it('用户文档面与 PROTOCOL 都含原句「无 PreCompact」并说明降级方案', () => {
+    // v0.9.4 B3：该原句随已知限制 16 搬去 docs/LIMITATIONS.md（README 只留指针）。
+    expect(readRel('docs/LIMITATIONS.md')).toContain('无 PreCompact/PostCompact 钩子，故用「提醒 + 一键」');
     expect(readRel('docs/PROTOCOL.md')).toContain('无 PreCompact，故用「提醒 + 一键」');
   });
 
-  it('README 已知限制与威胁模型各登记一条（检查点权限 + 平台缺口）', () => {
-    const readme = readRel('README.md');
-    expect(readme).toContain('不提供自动压缩检查点');
-    expect(readme).toContain('XC_CHECKPOINT_NUDGE=0');
-    expect(readme).toContain('检查点文件按项目权限管理');
-    expect(readme).toContain('插件不把它自动发给任何会话');
+  it('已知限制与威胁模型各登记一条（检查点权限 + 平台缺口；v0.9.4 B3 起在 docs/LIMITATIONS.md）', () => {
+    const limits = readRel('docs/LIMITATIONS.md');
+    expect(limits).toContain('不提供自动压缩检查点');
+    expect(limits).toContain('XC_CHECKPOINT_NUDGE=0');
+    expect(limits).toContain('检查点文件按项目权限管理');
+    expect(limits).toContain('插件不把它自动发给任何会话');
   });
 
   it('PROTOCOL §14 承载四件套（检查点格式/滚动 20/提醒五态、handoff 七要素+预算降级、timeline 事件族、status 行序）', () => {
@@ -326,24 +329,31 @@ describe('A5 文档：无 PreCompact，故用提醒+一键（ACCEPT15-1 文档�
 // 8. 版本五处统一（AC6 静态面）
 // ---------------------------------------------------------------------------
 
-describe('A5 版本五处统一 0.9.3', () => {
-  it('package.json / plugin.json / marketplace.json / server.ts 四处 = 0.9.3', () => {
-    expect(JSON.parse(readRel('plugin/package.json')).version).toBe('0.9.3');
-    expect(JSON.parse(readRel('plugin/.zcode-plugin/plugin.json')).version).toBe('0.9.3');
-    expect(JSON.parse(readRel('marketplace.json')).plugins[0].version).toBe('0.9.3');
-    expect(readRel('plugin/src/mcp/server.ts')).toContain('const SERVER_VERSION = "0.9.3"');
+describe('A5 版本五处统一 0.9.4', () => {
+  it('package.json / plugin.json / marketplace.json / server.ts 四处 = 0.9.4', () => {
+    expect(JSON.parse(readRel('plugin/package.json')).version).toBe('0.9.4');
+    expect(JSON.parse(readRel('plugin/.zcode-plugin/plugin.json')).version).toBe('0.9.4');
+    expect(JSON.parse(readRel('marketplace.json')).plugins[0].version).toBe('0.9.4');
+    expect(readRel('plugin/src/mcp/server.ts')).toContain('const SERVER_VERSION = "0.9.4"');
   });
 
-  // v0.9.3 集成注：第五处（README 安装段/版本记录）仍钉 0.9.2——README 未随本次版本
-  // 冻结改写（发布 lane 的活：就地改资产名与版本记录 bullet，并同步本断言为 0.9.3）。
-  // 四处版本文件已 0.9.3，本断言与 README 现状相符故绿；改 README 必须同步改这里。
-  it('README 安装段与版本记录指向 0.9.2（第五处）', () => {
+  // v0.9.3 集成注：第五处（README 安装段）仍钉 0.9.2——README 未随本次版本冻结改写
+  // （发布 lane 的活：就地改资产名，并同步本断言）。四处版本文件已 0.9.3，本断言与
+  // README 现状相符故绿；改 README 必须同步改这里。
+  // v0.9.4 B3：版本记录整段搬去 CHANGELOG.md（README 只留指针）——版本条目断言改查
+  // CHANGELOG；安装段（资产名/安装回显/命令面计数）仍钉 README。
+  // v0.9.4 集成注：四处版本文件已 0.9.4（本 describe 上头两行）；第五处（README 安装段
+  // 资产名/安装回显）仍钉 0.9.2——同 v0.9.3 冻先例留给发布 lane，同步改 README 时必须
+  // 同步改这里。CHANGELOG 版本记录断言同样留 0.9.2/0.9.1/0.9.0（v0.9.4 条目由发布 lane
+  // 随 notes 落笔后补钉）。
+  it('README 安装段指向 0.9.2；CHANGELOG 版本记录含 0.9.2/0.9.1/0.9.0 条目（第五处）', () => {
     const readme = readRel('README.md');
     expect(readme).toContain('zcode-crosschat-0.9.2-prebuilt-slim.tar.gz');
     expect(readme).toContain('Installed plugin zcode-crosschat@dev-zcode-crosschat (0.9.2)');
-    expect(readme).toContain('**v0.9.2**（2026-11-20，');
-    expect(readme).toContain('**v0.9.1**（2026-11-19，v0.8.1 首日生产实测第二批教训');
-    expect(readme).toContain('**v0.9.0**（2026-11-19，首日生产实测九缺口修复');
     expect(readme).toContain('8 个斜杠命令');
+    const changelog = readRel('CHANGELOG.md');
+    expect(changelog).toContain('**v0.9.2**（2026-11-20，');
+    expect(changelog).toContain('**v0.9.1**（2026-11-19，v0.8.1 首日生产实测第二批教训');
+    expect(changelog).toContain('**v0.9.0**（2026-11-19，首日生产实测九缺口修复');
   });
 });

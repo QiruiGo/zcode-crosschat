@@ -38,7 +38,7 @@
  * @module core/peermsg
  */
 import { randomUUID } from 'node:crypto';
-import { mkdir, readdir, readFile, rename, rm, stat } from 'node:fs/promises';
+import { mkdir, readdir, readFile, rename, rm } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { writeFileAtomic, stripLeadingBom } from './atomic.js';
 import { appendJsonl } from './jsonl.js';
@@ -604,14 +604,4 @@ export async function expireHeldPeerMessages(
     await rm(message.file, { force: true });
   }
   return expired;
-}
-
-/** Whether the queue file exists and is non-empty (used by the drain faces). */
-export async function peerQueueHasContent(root: string, sessionId: string): Promise<boolean> {
-  try {
-    const info = await stat(peerQueueFile(root, sessionId));
-    return info.size > 0;
-  } catch {
-    return false;
-  }
 }
