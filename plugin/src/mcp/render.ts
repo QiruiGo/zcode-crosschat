@@ -36,7 +36,27 @@ export function renderRegister(agentKey: string, sessionId: string, teamId: stri
   return `Session bound: ${agentKey} (${shortId(sessionId)}) → team "${teamId}"; roster: ${names}${warn}.`;
 }
 
-export function renderDispatch(taskId: string, to: string, delivered: string): string {
+/**
+ * xc_dispatch 的一行摘要。
+ *
+ * v0.9.7（W3/V096-01）：wake 态补**三态**参数——失败态（两轮唤醒全失败，回执时刻
+ * 已见失败证据）不再写 "via wake"（那会把失败读成成功），改写失败措辞 + 邮箱兜底
+ * 指引；未见启动证据态追加「已发起但未见启动证据（非送达确认）」。缺省（不传 wake）
+ * 输出与 v0.9.6 逐字节一致（旧调用方零行为变化）。
+ */
+export function renderDispatch(
+  taskId: string,
+  to: string,
+  delivered: string,
+  wake?: WakeReceiptState,
+): string {
+  if (delivered === "wake") {
+    const failure = wakeReceiptFailurePhrase(wake);
+    if (failure !== undefined) return `Task ${taskId} dispatched to ${to}: ${failure}.`;
+    if (wake?.startConfirmed === false) {
+      return `Task ${taskId} dispatched to ${to} via wake（已发起但未见启动证据，非送达确认）.`;
+    }
+  }
   return `Task ${taskId} dispatched to ${to} via ${delivered}.`;
 }
 
@@ -54,8 +74,28 @@ export function renderClaim(taskId: string, attempt: number, attemptId: string):
   return `Task ${taskId} claimed (attempt ${attempt}, attemptId ${shortId(attemptId)}).`;
 }
 
-export function renderReport(taskId: string, status: string, receiptTo: string | null, wakeBack: string): string {
+/**
+ * xc_report 的一行摘要。
+ *
+ * v0.9.7（W3/V096-01）：wake 态补**三态**参数——两轮唤醒全失败时不再写
+ * "wake back via wake"（V096-01 实测该形态），改写失败措辞 + 邮箱兜底指引；
+ * 未见启动证据态追加「已发起但未见启动证据」。缺省输出与 v0.9.6 逐字节一致。
+ */
+export function renderReport(
+  taskId: string,
+  status: string,
+  receiptTo: string | null,
+  wakeBack: string,
+  wake?: WakeReceiptState,
+): string {
   const to = receiptTo ? `receipt sent to ${receiptTo}` : "no receipt (non-terminal)";
+  if (wakeBack === "wake") {
+    const failure = wakeReceiptFailurePhrase(wake);
+    if (failure !== undefined) return `Task ${taskId} ${status}; ${to}; 回执${failure}.`;
+    if (wake?.startConfirmed === false) {
+      return `Task ${taskId} ${status}; ${to}; wake back via wake（已发起但未见启动证据，非送达确认）.`;
+    }
+  }
   return `Task ${taskId} ${status}; ${to}; wake back via ${wakeBack}.`;
 }
 
@@ -81,6 +121,39 @@ export function renderDeliveryOutcome(delivered: "wake" | "mailbox", startConfir
 }
 
 /**
+ * v0.9.7（V096-01/24，组 W W3）：wake 回执的**三态结构化输入**——dispatch / report /
+ * relay 三面同形，字段与 engine/wake.ts 的 {@link WakeResult} 同名字段一一对应：
+ * - `startConfirmed`：启动确认两态（false = 已发起但未见启动证据）；
+ * - `wakeTiers`：三级指标回执面快照（spawnOk/childAlive/consumed）；
+ * - `wakeFailureSeen` + `failureEvidence`：**失败第三态**——回执时刻对 wake 日志的
+ *   有界回读已见失败证据（sessionNotFound 等正向失败形态）。
+ *
+ * 三面调用方从 attemptWake 的返回值透传（v0.9.6 起 tools-team 六处回执点已接线；
+ * v0.9.7 补齐 dispatch/report/relay 三面——V096-01/24 的结构性丢键）。
+ */
+export interface WakeReceiptState {
+  startConfirmed?: boolean;
+  wakeFailureSeen?: boolean;
+  failureEvidence?: string;
+  wakeTiers?: { spawnOk: "ok"; childAlive: "ok" | "no"; consumed: "pending" };
+}
+
+/**
+ * v0.9.7（W3）：**失败措辞**（回执时刻已见失败证据时）；无失败证据 → undefined。
+ *
+ * 两轮唤醒全失败（主唤醒 + sessionNotFound 自动重绑重试）时，人可读行不得再写
+ * "dispatched via wake" / "wake back via wake"——那会把「发起了但失败了」读成成功
+ * （V096-01 实侧：两轮全失败仍写 via wake）。失败措辞优先于 via wake，并保留
+ * 「消息已在邮箱、pull 兜底、勿按已开工处理」的行动指引。
+ */
+export function wakeReceiptFailurePhrase(wake: WakeReceiptState | undefined): string | undefined {
+  if (wake?.wakeFailureSeen !== true) return undefined;
+  const evidence = wake.failureEvidence?.trim();
+  const shown = evidence !== undefined && evidence !== "" ? `：${evidence.slice(0, 160)}` : "";
+  return `唤醒失败（回执时刻 wake 日志已见失败证据${shown}）——消息已在邮箱（pull 兜底），请勿按已开工处理`;
+}
+
+/**
  * xc_relay 主消息路径（队内轴；peer 轴发送走 relayPeerSend 自己的信封渲染）的一行摘要。
  *
  * v0.9.5（A4/V094-06）：**文案如实**——旧实现三态都写 "delivered via X"：
@@ -97,6 +170,9 @@ export function renderDeliveryOutcome(delivered: "wake" | "mailbox", startConfir
  * WakeResult.startConfirmed 透传）并**渲染 note**——旧实现 wake 分支丢弃 note
  * （mailbox 分支才带），「已发起但未见启动证据」与失败侦听措辞进不了文本行。
  * 三个可选参都缺省时输出与 v0.9.5 逐字节一致（旧调用方零行为变化）。
+ *
+ * v0.9.7（W3/V096-24）：wake 分支再补**失败第三态** `wake`（WakeReceiptState）——
+ * 回执时刻已见失败证据时文本行改写失败措辞（不再写「已发起唤醒」），并保留 note 原文。
  */
 export function renderMessage(
   messageId: string,
@@ -105,6 +181,7 @@ export function renderMessage(
   delivered: string,
   note?: string,
   startConfirmed?: boolean,
+  wake?: WakeReceiptState,
 ): string {
   if (delivered === "mailbox") {
     const reason = note !== undefined && note.trim() !== "" ? `：${note}` : "";
@@ -114,6 +191,10 @@ export function renderMessage(
     return `Message ${shortId(messageId)} ${from} → ${to} 未重发（已存在同文未读件，duplicate；pull 兜底可读）.`;
   }
   const reason = note !== undefined && note.trim() !== "" ? `：${note}` : "";
+  const failure = wakeReceiptFailurePhrase(wake);
+  if (failure !== undefined) {
+    return `Message ${shortId(messageId)} ${from} → ${to} ${failure}${reason}.`;
+  }
   return `Message ${shortId(messageId)} ${from} → ${to} ${renderDeliveryOutcome("wake", startConfirmed)}${reason}.`;
 }
 

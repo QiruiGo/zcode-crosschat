@@ -20,15 +20,15 @@
 
 ### 第 1 步：下载并解包
 
-1. 打开 <https://github.com/QiruiGo/zcode-crosschat/releases>，下载资产 **`zcode-crosschat-0.9.6-prebuilt-slim.tar.gz`**（约 1.7MB；v0.9.4 起生产包已裁掉 node_modules 与测试文件）。**保留原文件名**——随包发布的 `.sha256` 校验和按原名录，改名后校验会失败。
-2. （可选）校验完整性：在文件所在目录执行 `sha256sum -c zcode-crosschat-0.9.6-prebuilt-slim.tar.gz.sha256`（PowerShell 可用 `Get-FileHash` 对照 `.sha256` 文件里的值），期望输出 `OK`。
+1. 打开 <https://github.com/QiruiGo/zcode-crosschat/releases>，下载资产 **`zcode-crosschat-0.9.7-prebuilt-slim.tar.gz`**（约 1.7MB；v0.9.4 起生产包已裁掉 node_modules 与测试文件）。**保留原文件名**——随包发布的 `.sha256` 校验和按原名录，改名后校验会失败。
+2. （可选）校验完整性：在文件所在目录执行 `sha256sum -c zcode-crosschat-0.9.7-prebuilt-slim.tar.gz.sha256`（PowerShell 可用 `Get-FileHash` 对照 `.sha256` 文件里的值），期望输出 `OK`。
 3. 解包（Windows 10+ 自带 tar，PowerShell / Git Bash 均可）：
 
    ```bash
-   tar -xzf zcode-crosschat-0.9.6-prebuilt-slim.tar.gz
+   tar -xzf zcode-crosschat-0.9.7-prebuilt-slim.tar.gz
    ```
 
-   得到目录 `zcode-crosschat-0.9.6/`（下称「解包目录」，其下应有 `marketplace.json`）。
+   得到目录 `zcode-crosschat-0.9.7/`（下称「解包目录」，其下应有 `marketplace.json`）。
 
 ### 第 2 步：安装
 
@@ -43,11 +43,11 @@ zcode 命令行**不在系统 PATH 里**（它是桌面版内置的入口），�
 ```bash
 ZC() { ELECTRON_RUN_AS_NODE=1 "<安装目录>/ZCode.exe" "<安装目录>/resources/<variant>/zcode.cjs" "$@"; }
 
-ZC plugins marketplace add "<解包目录>/zcode-crosschat-0.9.6"
+ZC plugins marketplace add "<解包目录>/zcode-crosschat-0.9.7"
 # 期望：Added marketplace dev-zcode-crosschat (1 plugins)
 
 ZC plugins install zcode-crosschat@dev-zcode-crosschat
-# 期望：Installed plugin zcode-crosschat@dev-zcode-crosschat (0.9.6) [enabled]
+# 期望：Installed plugin zcode-crosschat@dev-zcode-crosschat (0.9.7) [enabled]
 ```
 
 **PowerShell**：
@@ -55,7 +55,7 @@ ZC plugins install zcode-crosschat@dev-zcode-crosschat
 ```powershell
 function ZC { $env:ELECTRON_RUN_AS_NODE = "1"; & "<安装目录>\ZCode.exe" "<安装目录>\resources\<variant>\zcode.cjs" @args }
 
-ZC plugins marketplace add "<解包目录>/zcode-crosschat-0.9.6"
+ZC plugins marketplace add "<解包目录>/zcode-crosschat-0.9.7"
 ZC plugins install zcode-crosschat@dev-zcode-crosschat
 ```
 
@@ -132,7 +132,7 @@ ZC plugins list
 
 - `zcode_exe` / `zcode_cjs`：**通常留空即可**——插件自动探测本机 zcode 安装（自动探测仅在 Windows 上实现）；探测失败时运行 `xc_doctor`（或看报错文案），会告诉你填什么、去哪里找；
 - `member_model`：留空 = 自动选第一个可用模型——它可能是当前账号不可用的模型；若建员因模型失败，失败回执会给出可选模型与填写指引，届时再填本项即可。
-- `member_reasoning`：缺省**留空**（v0.9.6 起，留空 = 不指定档位、由模型自身声明档位表取最高）。生效口径：由插件设置（userConfig）经 manifest 注入进程——**进程级 env `XC_MEMBER_REASONING` 会被该注入覆盖，单独设进程级 env 不生效**；模型不支持所配档位时按 high → medium → 省略 有界降级（审计 `member-reasoning-fallback`，回执披露实际档位；详见 [docs/LIMITATIONS.md](docs/LIMITATIONS.md) 第 25 条）。
+- `member_reasoning`：缺省**留空**（v0.9.6 起，留空 = 不指定档位、由模型自身声明的档位表取生效档——v0.9.7 起按 app-server 真实形状解析，模型声明的 `defaultLevel` 优先、否则支持表末位）。生效口径：由插件设置（userConfig）经 manifest 注入进程——**进程级 env `XC_MEMBER_REASONING` 会被该注入覆盖，单独设进程级 env 不生效**；模型不支持所配档位时按 high → medium → 省略 有界降级（审计 `member-reasoning-fallback`，回执披露实际档位；详见 [docs/LIMITATIONS.md](docs/LIMITATIONS.md) 第 25 条）。
 
 然后在一个会话里：
 

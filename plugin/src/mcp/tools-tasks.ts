@@ -31,6 +31,7 @@ import {
   renderClaim,
   renderDispatch,
   renderReport,
+  type WakeReceiptState,
 } from "./render.js";
 import { withTeamLock, withSessionTurnLock, SessionTurnBusyError } from "../core/lock.js";
 import { attemptWake } from "../engine/wake.js";
@@ -255,6 +256,18 @@ function requireMember(team: TeamState, agentKey: string): void {
 }
 
 /**
+ * v0.9.7（W3/V096-01）：本模块 wake() 助手的返回形状——`delivered` 之外全量携带
+ * attemptWake 的**三态键**（startConfirmed/wakeTiers/wakeFailureSeen/failureEvidence，
+ * 语义见 render.ts 的 {@link WakeReceiptState}）。旧形状只有
+ * `{delivered, wakeLog, note}`，四键在 dispatch/report 回执面被结构性丢弃。
+ */
+interface WakeReceipt extends WakeReceiptState {
+  delivered: "wake" | "mailbox";
+  wakeLog?: string;
+  note?: string;
+}
+
+/**
  * v0.7.2（红队五番战 C8-B3 修复）：派单目标的**生命周期**闸。
  *
  * 红队实测（c8b3）：`xc_team member-stop` 后成员 state=removed（花名不释放、
@@ -267,6 +280,13 @@ function requireMember(team: TeamState, agentKey: string): void {
  * 修法 = 派发面显式拒绝 + 指引（不静默建单）：removed 成员的重新启用只有
  * lead 的 `xc_team member-add`（幂等重供给，§6.4）或改派活成员两条路。
  * 会籍存在性校验（requireMember）之后做——错误码区分「不在册」与「已停机」。
+ *
+ * v0.9.7（W2/R1）：**failed 成员同闸**。41-v095 real-smoke C 实测形态：member-add
+ * 失败（如 setModel 档位不被支持）后成员 state=failed ∧ sessionId=""，此时
+ * `xc_dispatch` 旧实现照样建单——任务永久 pending：failed 成员无法认领、他人得
+ * `not_assignee`、pending 不在清扫域，而唤醒侧只给 mailbox 降级（没有会话可 pull）。
+ * 修法同 removed：显式拒绝、不建单、审计留痕、回执给下一步（同名幂等重供给 / 改派）。
+ * 正常成员派单不受影响——provisioning 成员仍可收单（供给完成后投产唤醒 E-e 补投）。
  */
 async function requireDispatchTarget(stateRoot: string, team: TeamState, agentKey: string): Promise<void> {
   const member = team.members.find((m) => m.key === agentKey);
@@ -289,6 +309,36 @@ async function requireDispatchTarget(stateRoot: string, team: TeamState, agentKe
         `Re-dispatch to an active member, or ask the lead to re-enable "${agentKey}" via xc_team ` +
         `{action:"member-add"} (idempotent reprovision; the archive under .crosschat/archive/${agentKey}/ ` +
         `holds its handover context)`,
+    });
+  }
+  if (member !== undefined && memberState(member) === "failed") {
+    // v0.9.7（W2）：failed 成员显式拒绝（不建单）——原因词汇与唤醒侧
+    // `member-state:failed` 同源，运营面两面对得上；回执附 roster 上的失败原文。
+    const rosterError = typeof member.error === "string" && member.error.trim() !== ""
+      ? member.error.trim()
+      : undefined;
+    await logEngineEvent(stateRoot, {
+      event: "dispatch-refused",
+      teamId: team.teamId,
+      to: agentKey,
+      reason: "member-state:failed",
+      memberState: "failed",
+      ...(rosterError !== undefined ? { rosterError } : {}),
+    });
+    throw new ToolError({
+      error: "member-state:failed",
+      agentKey,
+      teamId: team.teamId,
+      memberState: "failed",
+      ...(rosterError !== undefined ? { rosterError } : {}),
+      message:
+        `member "${agentKey}" is in state=failed on team "${team.teamId}" (provisioning failed` +
+        `${rosterError !== undefined ? `: ${rosterError}` : ""}); dispatch refused (reason=member-state:failed) — ` +
+        "a failed member has no live session, so the task could never be claimed or pulled " +
+        "(stranded pending: others get not_assignee, the failed member cannot claim, and pending tasks are " +
+        "outside the stale-sweep domain). Fix the provisioning root cause and re-enable with " +
+        `xc_team({action:"member-add", name:"${agentKey}"}) (idempotent reprovision, §6.4), or re-dispatch ` +
+        "to an active member",
     });
   }
 }
@@ -540,8 +590,14 @@ export function createTaskCore(deps: ToolDeps): TaskCore {
             to: toKey,
             delivered: sent.delivered,
             messageId: prepared.messageId,
+            // v0.9.7（W3/V096-01）：三态键进审计（与 tools-team 六处回执点同口径）。
+            ...(sent.startConfirmed !== undefined ? { startConfirmed: sent.startConfirmed } : {}),
+            ...(sent.wakeFailureSeen === true ? { wakeFailureSeen: true } : {}),
           });
-          return okResult(renderDispatch(prepared.taskId, toKey, sent.delivered), {
+          // v0.9.7（W3/V096-01）：人可读行与 payload 都带三态——两轮唤醒全失败时行内写
+          // 失败措辞（不再 "dispatched via wake"），payload 给 startConfirmed/wakeTiers/
+          // wakeFailureSeen/failureEvidence 四键。
+          return okResult(renderDispatch(prepared.taskId, toKey, sent.delivered, sent), {
             taskId: prepared.taskId,
             status: prepared.status,
             delivered: sent.delivered,
@@ -549,6 +605,10 @@ export function createTaskCore(deps: ToolDeps): TaskCore {
             ...(prepared.teamResetWarning !== undefined ? { teamResetWarning: prepared.teamResetWarning } : {}),
             ...(sent.wakeLog ? { wakeLog: sent.wakeLog } : {}),
             ...(sent.note ? { note: sent.note } : {}),
+            ...(sent.startConfirmed !== undefined ? { startConfirmed: sent.startConfirmed } : {}),
+            ...(sent.wakeTiers !== undefined ? { wakeTiers: sent.wakeTiers } : {}),
+            ...(sent.wakeFailureSeen === true ? { wakeFailureSeen: true } : {}),
+            ...(sent.failureEvidence !== undefined ? { failureEvidence: sent.failureEvidence } : {}),
           });
         });
       });
@@ -869,6 +929,8 @@ export function createTaskCore(deps: ToolDeps): TaskCore {
 
           // 锁外唤醒派发方（§2.9-2）；blocked 保留 attempt、无回执（暂停而非终态）。
           let wakeBack: "wake" | "mailbox" = "mailbox";
+          // v0.9.7（W3/V096-01）：回执唤醒的三态键（与 dispatch 面同口径；旧实现丢掉）。
+          let wakeReceipt: WakeReceiptState | undefined;
           if (out.receipt !== null) {
             const sent = await wake(
               out.receipt.to,
@@ -878,6 +940,7 @@ export function createTaskCore(deps: ToolDeps): TaskCore {
               `收到 CrossChat 回执：task ${out.taskId} = ${out.status}`,
             );
             wakeBack = sent.delivered;
+            wakeReceipt = sent;
           }
           await logEngineEvent(stateRoot, {
             event: "report",
@@ -887,12 +950,21 @@ export function createTaskCore(deps: ToolDeps): TaskCore {
             by: me.agentKey,
             attemptId: args.attemptId,
             wakeBack,
+            // v0.9.7（W3/V096-01）：三态键进审计（dispatch 面同口径）。
+            ...(wakeReceipt?.startConfirmed !== undefined ? { startConfirmed: wakeReceipt.startConfirmed } : {}),
+            ...(wakeReceipt?.wakeFailureSeen === true ? { wakeFailureSeen: true } : {}),
           });
-          return okResult(renderReport(out.taskId, out.status, out.receipt?.to ?? null, wakeBack), {
+          // v0.9.7（W3/V096-01）：人可读行与 payload 都带三态——两轮唤醒全失败时不再写
+          // "wake back via wake"（V096-01 实测形态），改写失败措辞 + 邮箱兜底指引。
+          return okResult(renderReport(out.taskId, out.status, out.receipt?.to ?? null, wakeBack, wakeReceipt), {
             taskId: out.taskId,
             status: out.status,
             reportedAt: out.reportedAt,
             wakeBack,
+            ...(wakeReceipt?.startConfirmed !== undefined ? { startConfirmed: wakeReceipt.startConfirmed } : {}),
+            ...(wakeReceipt?.wakeTiers !== undefined ? { wakeTiers: wakeReceipt.wakeTiers } : {}),
+            ...(wakeReceipt?.wakeFailureSeen === true ? { wakeFailureSeen: true } : {}),
+            ...(wakeReceipt?.failureEvidence !== undefined ? { failureEvidence: wakeReceipt.failureEvidence } : {}),
             ...(evidence.length > 0
               ? { evidenceSha256: evidence.map((e) => ({ path: e.path, sha256: e.sha256 })) }
               : {}),
@@ -902,14 +974,21 @@ export function createTaskCore(deps: ToolDeps): TaskCore {
     },
   };
 
-  /** 推送唤醒（必须已在团队锁外；M2 决策 wake|mailbox 并 fire-and-forget，§2.5）。 */
+  /**
+   * 推送唤醒（必须已在团队锁外；M2 决策 wake|mailbox 并 fire-and-forget，§2.5）。
+   *
+   * v0.9.7（W3/V096-01）：**三态键全量透传**——旧实现只转 delivered/wakeLog/note，
+   * 把 WakeResult 的 startConfirmed/wakeTiers/wakeFailureSeen/failureEvidence 结构性
+   * 丢掉（adv-1 F-1 实测：两轮唤醒全失败的回执仍写 "dispatched via wake"，且无任何
+   * 失败面结构化键）。现在四键随结果原样转交调用方进回执 payload + 人可读行措辞。
+   */
   async function wake(
     toAgentKey: string,
     toSessionId: string | null,
     reason: string,
     receiptIds: readonly string[],
     ticket: string,
-  ): Promise<{ delivered: "wake" | "mailbox"; wakeLog?: string; note?: string }> {
+  ): Promise<WakeReceipt> {
     if (toSessionId === null) {
       return { delivered: "mailbox", note: "target has no sessionId on file" };
     }
@@ -924,7 +1003,15 @@ export function createTaskCore(deps: ToolDeps): TaskCore {
       ticket,
       env: deps.env,
     });
-    return { delivered: res.delivered, wakeLog: res.wakeLog, note: res.note };
+    return {
+      delivered: res.delivered,
+      wakeLog: res.wakeLog,
+      note: res.note,
+      ...(res.startConfirmed !== undefined ? { startConfirmed: res.startConfirmed } : {}),
+      ...(res.wakeTiers !== undefined ? { wakeTiers: res.wakeTiers } : {}),
+      ...(res.wakeFailureSeen === true ? { wakeFailureSeen: true } : {}),
+      ...(res.failureEvidence !== undefined ? { failureEvidence: res.failureEvidence } : {}),
+    };
   }
 }
 

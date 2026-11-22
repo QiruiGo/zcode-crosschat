@@ -63,7 +63,8 @@ export interface ProvisionSpec {
    *  v0.9.4（A7）：显式指定（本参数或 XC_MEMBER_MODEL）而枚举里匹配不到 → 显式报错
    *  （附可用 modelId 列表），不再静默取枚举首个。 */
   model?: string;
-  /** 推理档位覆盖；缺省用 XC_MEMBER_REASONING，再缺省取模型档位表末位或 "max"。 */
+  /** 推理档位覆盖；缺省用 XC_MEMBER_REASONING，再缺省取模型自报缺省档
+   *  （`reasoning.defaultLevel`）或档位表末位，最后 "max"（v0.9.7 W1）。 */
   reasoningLevel?: string;
   /** 供给模式（缺省 "auto"，见上）。 */
   mode?: ProvisionMode;
@@ -193,7 +194,8 @@ export function resolveReasoningFallbackTarget(
   return "";
 }
 
-/** 模型选择（§6.2 步骤②：provider 过滤 → model 精确命中否则首个；档位显式优先，末位兜底）。
+/** 模型选择（§6.2 步骤②：provider 过滤 → model 精确命中否则首个；档位显式优先，
+ * 缺省取模型自报缺省档/表末位兜底——v0.9.7 W1）。
  *
  * v0.9.4（A7）：**显式 model 匹配不到 → 显式报错**（附可用 modelId 列表），不再静默取
  * 枚举首个。旧行为（`?? pool[0]!`）把「配错了 model」呈现成「用了一个别的模型」：
@@ -227,11 +229,21 @@ export function pickModel(
   const preferModel = options.preferModel?.trim();
   const pickLevel = (hit: ModelRef): { reasoningLevel: string; reasoningFallback?: { from: string; to: string } } => {
     const levels = hit.reasoningLevels;
-    const fallbackFromTable = (): string =>
-      levels.length > 0 ? levels[levels.length - 1]! : "max";
+    // v0.9.7（W1/R2）：缺省路径的取档顺序 = **模型自报缺省档**（真实形状
+    // `reasoning.defaultLevel`）→ 档位表末位 → "max"。
+    // 旧实现只有后两档，且真实形状下档位表恒空（appserver collectModelRefs 不认
+    // `ref.*` 与 `{value,label}` 档位，42-v096 real-smoke C 根因）→ 缺省恒落 "max" →
+    // 只声明 low/medium/high 的 step-5-preview 首试 setModel 失败（R2 残留）。
+    // 现在缺省配置首试即取 defaultLevel（step-5-preview 实测 defaultLevel="high"，
+    // 与其档位表末位一致）：0 次失败重试。
+    const fallbackFromTable = (): string => {
+      const declaredDefault = hit.defaultReasoningLevel?.trim();
+      if (declaredDefault !== undefined && declaredDefault !== "") return declaredDefault;
+      return levels.length > 0 ? levels[levels.length - 1]! : "max";
+    };
     const preferReasoning = options.preferReasoning;
     if (preferReasoning === undefined || preferReasoning.trim() === "") {
-      return { reasoningLevel: fallbackFromTable() }; // 未配置 = 没有意图：模型档位表末位（最高声明档）
+      return { reasoningLevel: fallbackFromTable() }; // 未配置 = 没有意图：模型自报缺省档 → 档位表末位（最高声明档）
     }
     // v0.9.6（R2）：显式**非法档位**（不是可辨认的档位名）→ 显式报错，不静默降级。
     if (!KNOWN_REASONING_TIERS.includes(preferReasoning.trim())) {

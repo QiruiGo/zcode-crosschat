@@ -313,7 +313,7 @@ total = clamp(16000 × scale, 4000, 64000)，且 total ≥ item  # 批次基准�
 | `XC_MAX_MEMBERS` | `max_members` | `8` | 活成员上限（lead/failed/removed 不计）。触顶报 `team_at_member_cap`，payload 分报 `activeMembers`（当前活成员数）与 `activeAfterAdd`（本次写入后） |
 | `XC_MEMBER_MODEL` | `member_model` | 空 | 成员模型 id；空=引擎枚举表选第一个 |
 | `XC_MEMBER_PROVIDER` | `member_provider` | 空 | 成员模型 providerId |
-| `XC_MEMBER_REASONING` | `member_reasoning` | `max` | 成员推理档位 |
+| `XC_MEMBER_REASONING` | `member_reasoning` | 空（=不指定档位） | 成员推理档位（**v0.9.6 R2 起缺省值由 `max` 改为空**）：缺省留空 = **不指定档位**，由模型自身声明的档位表取生效档——v0.9.7 W1 起按 app-server 真实形状（`ref.{providerId,modelId}` + `reasoning.levels[].value`，兼容旧扁平形状）解析，模型声明的 `defaultLevel` 优先、否则取支持表末位（最高声明档）；模型既未自报缺省档、也未声明档位表时回落 `max`。**降级**：显式所配档位不被该模型支持 → 按 **high → medium → 省略** 有界降级（审计 `member-reasoning-fallback{from,to}`，回执如实披露实际生效档位）；显式非法档位名（不是 `minimal/low/medium/high/xhigh/max` 之一）→ **显式报错，不静默降级**。生效口径同其余 env：由 manifest 从用户设置注入，**进程级单独设该 env 会被注入值覆盖**（留空=注入空串=不指定档位）。旧缺省 `max` 在不支持 max 的模型（如只声明 low/high 的 step-5-preview）上首试 setModel 即失败，是 v0.9.6 R1（孤儿唤醒票）/R2（档位不兼容）根因——详见 docs/LIMITATIONS.md 第 25 条 |
 | `XC_MEMBER_BOOTSTRAP_TIMEOUT_MS` | `member_bootstrap_timeout_ms` | `300000` | 建员等待欢迎回合上限（ms）；超时判据随 provisioning 记录落盘（`provisionDeadlineAt`=本值+60s 宽限），lead server 中途死亡也由后续 member-add/钩子清扫为 failed——见 §5.1 |
 | `XC_INBOUND_MODE` | `inbound_mode` | `accept` | 队内自由消息入站裁决：accept/hold/refuse（协议帧不受影响） |
 | `XC_STALE_TASK_MINUTES` | `stale_task_minutes` | `30` | 僵尸任务清扫阈值（分钟；blocked 不在清扫域）。**`0`/负数/非数字一律回落缺省 30**（v0.7.1 边界-10 显式化）：既不是「立即清扫」（那会让所有在途任务瞬间回池），也不是「关闭清扫」（sweeper 照常按 30min 跑）——与 `XC_PEER_MAX_QUEUE_DEPTH` 的「0=内置值」同口径 |

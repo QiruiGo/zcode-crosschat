@@ -122,6 +122,12 @@
  * 集中在下方 import 块；M1（plugin/src/core/）是磁盘真源与协议字段的唯一定义处
  * （DESIGN §7/§8.1-3）。
  * ───────────────────────────────────────────────────────────────────────────
+ *
+ * v0.9.7 增量（reports/47-v097方案.md §一 组 W，本文件只承担 W2 半边）：
+ * - **W2 闸序**：成员状态门控（provisioning/failed/removed）上移到分层闸
+ *   （takenOver/wake-disabled）判定**之前**。缺陷形态（41-v095 real-smoke C R1 残留）：
+ *   failed 成员 sid="" 被 engineHolderIsHeadless 判成「交互式接管」→ 回执只说
+ *   wake-disabled，真正的行动项（重供给/改派）被掩盖。完整闸序见 attemptWake 步骤 1.5。
  */
 import {
   claimMailboxDelivery,
@@ -607,7 +613,15 @@ export async function revokeWakeNonceForProvisionFailure(
     }
     stored = parsed as Record<string, unknown>;
   } catch {
-    return { revoked: false, alreadyUsed: false, digest }; // 坏票不猜（readWakeNonce 面同口径）
+    // 坏票不猜（readWakeNonce 面同口径）；v0.9.7（W4）：同口径补审计——回收面也是
+    // 票据扫描点之一，坏票要在 engine.jsonl 里指向文件（否则「回收没发生」无诊断）。
+    await logEngineEvent(stateRoot, {
+      event: "wake-ticket-corrupt",
+      path: file,
+      nonce: digest,
+      note: "provision-failure 回收面读到不可解析票据：跳过该票（不回收、不阻断）",
+    });
+    return { revoked: false, alreadyUsed: false, digest };
   }
   if (stored["used"] === true) {
     return { revoked: false, alreadyUsed: true, digest }; // 已消费：无需回收
@@ -2959,6 +2973,42 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
       teamId: req.teamId, to: toKey, scene: req.reason,
     });
   }
+  // 1.5 v0.9.7（W2/R1）：**成员状态门控先于分层闸/takenOver/wake-disabled 判定**。
+  //
+  // 缺陷形态（41-v095 real-smoke C R1 残留）：供给失败的成员 state=failed ∧
+  // sessionId=""（半程死亡/超时清扫后 sid 被清空）→ resolveWakeGate 的
+  // engineHolderIsHeadless 判空 sid 为 false → 该行被当成「engine 标 ∧ 交互式持有者」
+  // （takenOver）→ decideDelivery 先返回 `wake-disabled`——回执/跳过原因只说「交互式
+  // 会话自动唤醒未开启」，真正的行动项（重供给/改派）被完全掩盖。
+  //
+  // 修法 = 闸序：成员状态门控提到分层闸判定**之前**。生命周期状态是「这个会话还能不能
+  // 被唤醒」的硬事实，比「要不要打扰属主」的开关更基础；状态不对时开关读数没有意义
+  // （对 failed/removed 成员谈 wake_enabled 只会给出错的指引）。
+  // 与 v0.9.6 R1③（先于 inflight 去重）叠加后完整闸序为：
+  //   成员状态 → 分层闸(takenOver/wake-disabled) → 在途 nonce → spawn 配置 → 容量闸。
+  // 团队不存在/成员不在册 → target undefined，本闸不命中（与 v0.1.0 行为一致，放行）；
+  // state 可选字段以 §6.5 宽容语义读取（缺省 "ready"=放行，旧数据零行为变化）。
+  const gateState = target !== undefined
+    && (memberState(target) === "provisioning" || memberState(target) === "failed" || memberState(target) === "removed")
+    ? memberState(target)
+    : undefined;
+  if (gateState !== undefined) {
+    // v0.9.6（R1③）：逐态原因 + 行动指引——failed/removed 给出明确的下一步（重供给/
+    // 改派），不再只有一句「只入箱不唤醒」（R1 验收：failed 成员的 dispatch 给出明确
+    // 原因/改派指引）。
+    const guidance = gateState === "provisioning"
+      ? "目标成员供给中（resume 会与 app-server 持有并发，V5 未验证区），只入箱不唤醒；供给完成后投产唤醒（E-e）自动补投"
+      : gateState === "failed"
+        ? "目标成员供给失败（state=failed），只入箱不唤醒——修复供给根因后用 xc_team({action:\"member-add\"}) 同名幂等重供给，或把任务改派/自领"
+        : "目标成员已移除（state=removed），不再唤醒——请把任务改派其他成员，或重新 xc_team({action:\"member-add\"}) 建员后重发";
+    const reason = `member-state:${gateState}: ${guidance}（DESIGN-V0.2 §6.3/§7.3.3）`;
+    await logEngineEvent(stateRoot, {
+      event: "wake-skipped", reason, scene: req.reason, teamId: req.teamId, to: toKey, memberState: gateState,
+    });
+    // v0.9.4（A3）：降级回执如实写「仅落邮箱（未唤醒）」——禁出现已送达/已消费。
+    return { delivered: "mailbox", note: mailboxOnlyNote(reason) };
+  }
+
   const pre = decideDelivery({ wakeGate: gate, ownerAbsent: req.ownerAbsent, inflight: false });
   if (pre.mode !== "wake") {
     // v0.9.3（B3②）：wake 关闭持续态跟踪——**仅**当挡下原因是生效值 false（G-18：
@@ -2992,26 +3042,9 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
   // 挡住供给完成后的 E-e 投产唤醒。团队不存在/成员不在册 → 与 v0.1.0 行为一致（放行）；
   // W2 的 state 可选字段以 §6.5 宽容语义读取（缺省 "ready"=放行，旧数据零行为变化）。
   // v0.9：成员记录复用步骤 0 的一次读盘（memberState 访问器=旧内联读取同语义）。
-  const gateState = target !== undefined
-    && (memberState(target) === "provisioning" || memberState(target) === "failed" || memberState(target) === "removed")
-    ? memberState(target)
-    : undefined;
-  if (gateState !== undefined) {
-    // v0.9.6（R1③）：逐态原因 + 行动指引——failed/removed 给出明确的下一步（重供给/
-    // 改派），不再只有一句「只入箱不唤醒」（R1 验收：failed 成员的 dispatch 给出明确
-    // 原因/改派指引）。
-    const guidance = gateState === "provisioning"
-      ? "目标成员供给中（resume 会与 app-server 持有并发，V5 未验证区），只入箱不唤醒；供给完成后投产唤醒（E-e）自动补投"
-      : gateState === "failed"
-        ? "目标成员供给失败（state=failed），只入箱不唤醒——修复供给根因后用 xc_team({action:\"member-add\"}) 同名幂等重供给，或把任务改派/自领"
-        : "目标成员已移除（state=removed），不再唤醒——请把任务改派其他成员，或重新 xc_team({action:\"member-add\"}) 建员后重发";
-    const reason = `member-state:${gateState}: ${guidance}（DESIGN-V0.2 §6.3/§7.3.3）`;
-    await logEngineEvent(stateRoot, {
-      event: "wake-skipped", reason, scene: req.reason, teamId: req.teamId, to: toKey, memberState: gateState,
-    });
-    // v0.9.4（A3）：降级回执如实写「仅落邮箱（未唤醒）」——禁出现已送达/已消费。
-    return { delivered: "mailbox", note: mailboxOnlyNote(reason) };
-  }
+  // v0.9.7（W2）：门控本体已上移到分层闸判定之前（步骤 1.5）——failed/removed 成员
+  // 不再被 wake-disabled/takenOver 抢先归因；「先于 inflight 去重」这半条闸序由 1.5
+  // 的位置继续保证（1.5 在 2.5 之前）。
 
   // 2.5 在途 nonce 去重（§2.5-3）。v0.9.6（R1①）：改用**活体证据**过滤版——只有
   // 「lifecycle 账有本票据的 start 证据且子进程未见退出，或票据在短宽限窗内签发」的

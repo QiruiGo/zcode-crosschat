@@ -13,7 +13,9 @@
  *   `session/requestRuntimePreferences`（15s 超时坑），可能还有
  *   `interaction/requestOfficialMcpAuthHeaders`（回 `{}` 被接受）；未知回调忽略（与实测一致）；
  * - FEASIBILITY P1：模型枚举主路径 = session/create **结果内联**的
- *   `settings.model.available[].ref`（深扫描 `{providerId, modelId}` 对象）；
+ *   `settings.model.available[].ref`（深扫描 `{providerId, modelId}` 对象；
+ *   v0.9.7 W1 起同收 `{ref:{providerId,modelId}, reasoning:{levels:[{value,label}],
+ *   defaultLevel}}` 真实形状，见 {@link collectModelRefs}）；
  *   `state.updated` 事件流不可依赖、仅作兜底；
  * - FEASIBILITY P4：`session/send` accept 后 ≤3s 会话即落库，硬杀 app-server 不丢——
  *   因此 keeper 可随工具调用消亡（本文件 kill() 即 E4 的 child.kill() 同款）。
@@ -38,6 +40,12 @@ export interface ModelRef {
   modelId: string;
   /** 模型声明的推理档位（node.reasoning.levels，可空）。 */
   reasoningLevels: readonly string[];
+  /**
+   * v0.9.7（W1/R2）：模型自报的**缺省推理档位**（真实形状 `reasoning.defaultLevel`；
+   * 旧扁平形状/未声明 → undefined）。pickModel 的缺省路径（未配置 member_reasoning）
+   * 优先取它，回落档位表末位、再回落 "max"——见 provision.ts pickLevel。
+   */
+  defaultReasoningLevel?: string;
 }
 
 /** 自定义回调应答器：返回值作为 `{id, result}` 回写。 */
@@ -61,7 +69,57 @@ interface PendingRequest {
   timer: NodeJS.Timeout;
 }
 
-/** 深度收集带 providerId+modelId 的对象（demo/bootstrap-sessions.mjs:74-87 同款，不假设层级）。 */
+function asRecord(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+/**
+ * 读模型声明的推理档位表（`reasoning.levels`）。
+ *
+ * v0.9.7（W1/R2）：**两种条目形状都收**——真实形状是 `{value,label}` 对象数组
+ * （42-v096 real-smoke C 的 `appserver-models-probe.json` 实测），旧扁平形状/测试
+ * 替身是字符串数组。旧实现只收字符串 → 真实形状下档位表恒空 → pickModel 缺省落
+ * "max" → 不支持 max 的模型（如只声明 low/medium/high 的 step-5-preview）首试
+ * setModel 即失败（R2 残留根因）。
+ */
+function readReasoningLevels(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  const levels: string[] = [];
+  for (const entry of raw) {
+    if (typeof entry === "string") {
+      if (entry.trim() !== "") levels.push(entry.trim());
+      continue;
+    }
+    if (entry !== null && typeof entry === "object") {
+      const value = (entry as Record<string, unknown>)["value"];
+      if (typeof value === "string" && value.trim() !== "") levels.push(value.trim());
+    }
+  }
+  return levels;
+}
+
+/**
+ * 深度收集带 providerId+modelId 的对象（demo/bootstrap-sessions.mjs:74-87 同款，不假设层级）。
+ *
+ * v0.9.7（W1/R2）：**真实形状**解析。app-server `settings.model.available[]` 的实测
+ * 形状（42-v096 real-smoke C 抓取，`evidence/42-v096/real-smoke/appserver-models-probe.json`）：
+ * ```json
+ * { "ref": { "providerId": "new-provider", "modelId": "step-5-preview" },
+ *   "reasoning": { "levels": [ {"value":"low","label":"low"}, … ], "defaultLevel": "high" } }
+ * ```
+ * 即 providerId/modelId 在 `ref` 里、档位是 `{value,label}` 对象、另有 `defaultLevel`。
+ * 旧实现只认**顶层** providerId/modelId 且只收字符串档位：真实形状下递归命中 `ref` 后
+ * `reasoning` 不在同一节点 → 档位表恒空。现在两种形状同口径：
+ * - 定位：`ref.{providerId,modelId}` 优先，回落顶层 `providerId/modelId`（旧扁平形状）；
+ * - 档位：`reasoning.levels[]` 每项可为字符串或 `{value,label}`（{@link readReasoningLevels}）；
+ * - 缺省档：`reasoning.defaultLevel` 进 {@link ModelRef.defaultReasoningLevel}。
+ *
+ * 去重合并（同一 model 二次出现时补全首次缺失的档位信息）：主路径是 create 结果内联
+ * 枚举（带完整 reasoning 段），`state.updated` 兜底流可能只带 `{providerId,modelId}`——
+ * 旧实现「首次命中即锁死」会把后到者的档位表丢掉，故重复项只做**补空**不改已得值。
+ */
 function collectModelRefs(node: unknown, out: ModelRef[]): void {
   if (Array.isArray(node)) {
     for (const entry of node) collectModelRefs(entry, out);
@@ -69,11 +127,34 @@ function collectModelRefs(node: unknown, out: ModelRef[]): void {
   }
   if (node !== null && typeof node === "object") {
     const record = node as Record<string, unknown>;
-    if (typeof record["providerId"] === "string" && typeof record["modelId"] === "string") {
-      const levelsRaw = (record["reasoning"] as Record<string, unknown> | undefined)?.["levels"];
-      const levels = Array.isArray(levelsRaw) ? levelsRaw.filter((l): l is string => typeof l === "string") : [];
-      if (!out.some((m) => m.providerId === record["providerId"] && m.modelId === record["modelId"])) {
-        out.push({ providerId: record["providerId"], modelId: record["modelId"], reasoningLevels: levels });
+    const ref = asRecord(record["ref"]);
+    const flatProvider = typeof record["providerId"] === "string" ? record["providerId"] : undefined;
+    const flatModel = typeof record["modelId"] === "string" ? record["modelId"] : undefined;
+    const providerId = typeof ref["providerId"] === "string" ? ref["providerId"] : flatProvider;
+    const modelId = typeof ref["modelId"] === "string" ? ref["modelId"] : flatModel;
+    if (providerId !== undefined && modelId !== undefined) {
+      const reasoning = asRecord(record["reasoning"]);
+      const levels = readReasoningLevels(reasoning["levels"]);
+      const rawDefault = reasoning["defaultLevel"];
+      const defaultLevel = typeof rawDefault === "string" && rawDefault.trim() !== ""
+        ? rawDefault.trim()
+        : undefined;
+      const existing = out.find((m) => m.providerId === providerId && m.modelId === modelId);
+      if (existing === undefined) {
+        out.push({
+          providerId,
+          modelId,
+          reasoningLevels: levels,
+          ...(defaultLevel !== undefined ? { defaultReasoningLevel: defaultLevel } : {}),
+        });
+        return;
+      }
+      // 重复项只补空（见上）：不覆盖已得的档位表/缺省档。
+      if (existing.reasoningLevels.length === 0 && levels.length > 0) {
+        existing.reasoningLevels = levels;
+      }
+      if (existing.defaultReasoningLevel === undefined && defaultLevel !== undefined) {
+        existing.defaultReasoningLevel = defaultLevel;
       }
       return;
     }

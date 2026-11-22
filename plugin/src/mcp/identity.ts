@@ -725,6 +725,18 @@ export async function xcRegister(
     //「受保护 sid」并强制验锚定令牌——堵住「任意花名 + 队内成员真 sid」的 peer
     // 冒充。基记录缺失时按注册事实补建（cwd=进程工作区；regToken 与 workspace 侧
     // 锚定记录同值）；盖章失败只审计不回滚注册（保护是尽力面，注册本身已验证）。
+    //
+    // v0.9.7（I1/V096-15 修复）：盖章从「字段白名单整记录重建」改为**合并写**。
+    // 旧实参只列 sessionId/cwd/source/startedAt/lastSeen/permissionMode/regToken/
+    // boundName——SessionStart 钩子 v0.9.4（A1）起写进基记录的宿主 **pid 投影**
+    //（hooks/session-start.ts，与 workspace 侧 sessions/<sid>.json 同值同口径）不在
+    // 其中，identify 一成功即把机器全局面的 pid 证据抹掉：跨工作区对读失真 + 开启档
+    // 采纳护栏 5 的宿主佐证面（readPeerBaseSidsByHostPidSync 按 pid 归因）在 identify
+    // 后的窗口期缺席 → 本会话连接被拒回落 2 次调用（45-v096 验收 V096-15，P2）。
+    // 修法（47-v097 方案 I1）：以旧记录为底稿（本块上方已 readPeerBaseRecord 读过，
+    // 同一把 registry→team 组合锁内），本次盖章字段以最新为准覆盖，pid 及其他既有
+    // 字段（含白名单外的未来/外部字段）原样保留；writePeerBaseRecord 本身即
+    // tmp+rename 原子写（core/atomic.ts）。
     if (options.peerRoot !== undefined) {
       try {
         const base = await readPeerBaseRecord(options.peerRoot, sessionId);
@@ -733,14 +745,14 @@ export async function xcRegister(
         // 它没见过的令牌会把合法的 peer 注册锁死。
         const stampToken = sess?.regToken ?? base?.regToken;
         await writePeerBaseRecord(options.peerRoot, {
+          ...(base ?? {}), // 合并写：pid 与一切既有字段保留（旧记录缺省时为空底稿）
           sessionId,
           cwd: base?.cwd ?? process.cwd(),
           source: base?.source ?? null,
           startedAt: base?.startedAt ?? now,
           lastSeen: base?.lastSeen ?? now,
-          ...(base?.permissionMode !== undefined ? { permissionMode: base.permissionMode } : {}),
           ...(stampToken !== undefined ? { regToken: stampToken } : {}),
-          boundName: agentKey,
+          boundName: agentKey, // 冲突字段以最新为准（陈旧绑定标记被本次注册名覆盖）
         });
         if (base === undefined) {
           await logEngineEvent(stateRoot, {

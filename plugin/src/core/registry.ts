@@ -421,7 +421,21 @@ export async function createWakeNonce(
   return { token, nonce };
 }
 
-/** Read one wake nonce by token; undefined when absent. */
+/**
+ * Read one wake nonce by token; undefined when absent.
+ *
+ * v0.9.7（W4/V096-02）：**坏票守卫**——`JSON.parse` 失败（票据文件被写坏/截断/手改）
+ * 不再向上抛 SyntaxError，改为**跳过该票** + 审计 `wake-ticket-corrupt{path}`（指向
+ * 坏文件本身，运维可直读定位）后返回 undefined。
+ *
+ * 缺陷形态（adv-1 F-2 实测）：registry/wake/ 里一个不可解析的 JSON 文件令
+ * {@link consumeWakeTicketForSession} / {@link findLiveInflightWakeNonce} /
+ * {@link revokeWakeNonceForProvisionFailure} 三个扫描点全部抛错 → 所有 dispatch 与
+ * relay 整单报 opaque internal（无自愈、无诊断、不知是哪个文件坏）。本守卫把
+ * 「一张坏票」降级成「一张被跳过的票」：其余票据照常参与判定，审计指向坏文件。
+ * 与 {@link coerceWakeNonce} 的宽容读取同族（形状不合法早已按 undefined 跳过），
+ * 差别只在 JSON 语法层——此前它走的是 throw 分支。
+ */
 export async function readWakeNonce(stateRoot: string, token: string): Promise<WakeNonce | undefined> {
   let raw: string;
   try {
@@ -430,7 +444,19 @@ export async function readWakeNonce(stateRoot: string, token: string): Promise<W
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
     throw error;
   }
-  const parsed = coerceWakeNonce(JSON.parse(raw));
+  let parsedJson: unknown;
+  try {
+    parsedJson = JSON.parse(raw);
+  } catch (error) {
+    // 坏票：跳过 + 审计指向文件（不阻断其他票据；logEngineEvent 自身吞写失败）。
+    await logEngineEvent(stateRoot, {
+      event: 'wake-ticket-corrupt',
+      path: wakeFile(stateRoot, token),
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return undefined;
+  }
+  const parsed = coerceWakeNonce(parsedJson);
   return parsed.ok ? parsed.nonce : undefined;
 }
 

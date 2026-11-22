@@ -31,6 +31,9 @@ import { randomUUID } from "node:crypto";
 import { lstat } from "node:fs/promises";
 import { auditDegradationWarning, logEngineEvent } from "../core/log.js";
 import { readTeam } from "../core/teamstate.js";
+// v0.9.7（V096-17 修复）：panel 成员行未读计数的取数与裁决（同 core/snapshot.ts
+// countUnread、mcp/tools-overview.ts countUnreadFor 的口径：未读 ∧ 未丢弃 ∧ 现行）。
+import { isCurrentMail, readMailbox } from "../core/mailbox.js";
 import {
   localPidDomain,
   peerInboxFile,
@@ -236,7 +239,12 @@ export interface PeerRenameResult {
 export interface PeerAgentsPanel {
   self?: PeerRow;
   peers: PeerRow[];
-  /** v0.5（R-7）：成员行增 isLead（现算字段 `m.key===leadKeyOf(team)`，不入盘不入快照）。 */
+  /**
+   * v0.5（R-7）：成员行增 isLead（现算字段 `m.key===leadKeyOf(team)`，不入盘不入快照）。
+   * v0.9.7（V096-17 修复）：`unread` 为该成员邮箱的真实未读数（未读 ∧ 未丢弃 ∧
+   * isCurrentMail；与 snapshot.json / xc_overview status·team 板面同源同口径）——
+   * v0.5~v0.9.6 它是硬编码 0，panel 成了同刻唯一报「无未读」的面。
+   */
   members: { key: string; role: string; state: string; unread: number; isLead: boolean }[];
   /**
    * v0.9.2（C4）：任务计数改**七态全量**（`TASK_STATUSES` 逐一为键），与 `xc_overview`
@@ -1210,13 +1218,31 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
       const selfRows = await rowsOf("self");
       const peers = await rowsOf("session");
       const team = await readTeam(deps.stateRoot, "default");
+      // v0.9.7（V096-17 修复）：成员行 unread 接**真实**计数——此前恒为硬编码 0
+      // （peer-services.ts:1219 旧桩），panel 是同刻唯一报 0 的面（snapshot.json /
+      // statusView / 板面都有真值）⇒ 机器可读计数失真，消费方得到虚假「无未读」。
+      // 口径与其余面逐条同源：未读 ∧ 未丢弃 ∧ isCurrentMail（core/snapshot.ts
+      // countUnread、mcp/tools-overview.ts countUnreadFor、engine/wake.ts
+      // pendingMessageCount 同一判据）。读路径**无锁纯读**（§2.7-5 rename 原子写
+      // 保证读者看到完整文件）；不就地丢弃陈旧件、不清扫——那是消费面
+      // （readCurrentMailboxLocked）的语义，观测面不动盘。
+      const unreadByKey = new Map<string, number>();
+      if (team !== undefined) {
+        for (const member of team.members) {
+          const msgs = await readMailbox(deps.stateRoot, team.teamId, member.key);
+          unreadByKey.set(
+            member.key,
+            msgs.filter((m) => !m.readAt && !m.discardedAt && isCurrentMail(team, m)).length,
+          );
+        }
+      }
       // v0.5（R-7）：成员行增 isLead 现算字段（leadKeyOf 含 founder 兜底语义，
       // member-tools.ts 同款；不入盘不入快照，修复 v0.4 的无标注缺口）。
       const members = (team?.members ?? []).map((member) => ({
         key: member.key,
         role: member.role,
         state: member.state ?? "ready",
-        unread: 0,
+        unread: unreadByKey.get(member.key) ?? 0,
         isLead: team !== undefined && member.key === leadKeyOf(team),
       }));
       // v0.9.2（C4）：七态全量计数（一个不漏；键集恒为 TASK_STATUSES，缺的记 0）。

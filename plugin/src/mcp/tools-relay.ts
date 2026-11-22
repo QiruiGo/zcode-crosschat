@@ -104,12 +104,25 @@ import {
   ToolError,
   type ToolResult,
 } from "./protocol.js";
-import { renderMessage } from "./render.js";
+import { renderMessage, type WakeReceiptState } from "./render.js";
 import { attemptWake, findDuplicateMail, type MailIdentity, type WakeDeferral } from "../engine/wake.js";
 import type { ToolDeps } from "./core.js";
 
 /** v1 单队固定 default（与 tools.ts 同规）。 */
 const TEAM_ID = DEFAULT_TEAM_ID;
+
+/**
+ * v0.9.7（W3/V096-24）：relay 面 wake() 助手的返回形状——`delivered` 之外全量携带
+ * attemptWake 的**三态键**（startConfirmed/wakeTiers/wakeFailureSeen/failureEvidence，
+ * 语义见 render.ts 的 {@link WakeReceiptState}）+ v0.9.1 的容量闸 deferral 块。
+ * 旧形状缺四键，45b-v096 验收补正据此立 V096-24（relay 面只有 note 文本披露）。
+ */
+interface WakeReceipt extends WakeReceiptState {
+  delivered: "wake" | "mailbox";
+  wakeLog?: string;
+  note?: string;
+  wakeDeferred?: WakeDeferral;
+}
 
 // ---------------------------------------------------------------------------
 // 入参 schema（§1.2-T6 RelayShape）
@@ -450,6 +463,10 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
    * v0.9.1（G-12-b）：容量闸 deferral 块随结果透出——attemptWake 在 spawn 前读
    * capacity verdict，RED 时不 spawn 并带 wake-deferred{reason:"capacity-red"} +
    * 冷却窗；这里原样转交调用方进 payload（不丢信息）。
+   * v0.9.7（W3/V096-24）：**三态键全量透传**——旧实现只回传
+   * delivered/wakeLog/note/wakeDeferred，把 WakeResult 的 startConfirmed/wakeTiers/
+   * wakeFailureSeen/failureEvidence 结构性丢掉（45b 补正：relay 面四键全文件零命中，
+   * 只有 note 文本披露）。现在四键随结果原样转交调用方进回执 payload + 人可读行。
    */
   async function wake(
     toAgentKey: string,
@@ -458,7 +475,7 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
     receiptIds: readonly string[],
     ticket: string,
     urgent: boolean,
-  ): Promise<{ delivered: "wake" | "mailbox"; wakeLog?: string; note?: string; wakeDeferred?: WakeDeferral }> {
+  ): Promise<WakeReceipt> {
     if (toSessionId === null) {
       return { delivered: "mailbox", note: "target has no sessionId on file" };
     }
@@ -479,6 +496,10 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
       wakeLog: res.wakeLog,
       note: res.note,
       ...(res.wakeDeferred !== undefined ? { wakeDeferred: res.wakeDeferred } : {}),
+      ...(res.startConfirmed !== undefined ? { startConfirmed: res.startConfirmed } : {}),
+      ...(res.wakeTiers !== undefined ? { wakeTiers: res.wakeTiers } : {}),
+      ...(res.wakeFailureSeen === true ? { wakeFailureSeen: true } : {}),
+      ...(res.failureEvidence !== undefined ? { failureEvidence: res.failureEvidence } : {}),
     };
   }
 
@@ -584,15 +605,23 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
             return { withdrawn: uniqueIds, noticeId: notice.id, noticeContent: notice.content, toSessionId: recipient.sessionId };
           });
           const sent = await wake(toKey, outcome.toSessionId, "withdrawal", [outcome.noticeId], outcome.noticeContent, false);
+          // v0.9.7（W3/V096-24）：撤回通知帧的唤醒回执同样带三态键（与 message 路径同口径）。
           return okResult(
             `Withdrew ${outcome.withdrawn.length} unread message(s) to "${toKey}" (deleted from their inbox); `
-            + "a withdrawal-notice frame was appended so the receiver knows.",
+            + "a withdrawal-notice frame was appended so the receiver knows"
+            + (sent.wakeFailureSeen === true
+              ? `; ⚠ 通知帧唤醒失败（回执时刻 wake 日志已见失败证据${sent.failureEvidence !== undefined ? `：${sent.failureEvidence.slice(0, 160)}` : ""}）——通知已在邮箱，pull 兜底`
+              : ""),
             {
               withdrawn: outcome.withdrawn,
               withdrawnCount: outcome.withdrawn.length,
               noticeMessageId: outcome.noticeId,
               to: toKey,
               delivered: sent.delivered,
+              ...(sent.startConfirmed !== undefined ? { startConfirmed: sent.startConfirmed } : {}),
+              ...(sent.wakeTiers !== undefined ? { wakeTiers: sent.wakeTiers } : {}),
+              ...(sent.wakeFailureSeen === true ? { wakeFailureSeen: true } : {}),
+              ...(sent.failureEvidence !== undefined ? { failureEvidence: sent.failureEvidence } : {}),
             },
           );
         }
@@ -945,6 +974,8 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
         // mailboxOnlyNote 族，或 wake 态的「已发起（非送达确认）」口径）——旧实现把它
         // 整体丢弃，调用方只见 "delivered via mailbox" 一行谎话。
         let sentNote: string | undefined;
+        // v0.9.7（W3/V096-24）：wake 回执的三态快照（45b 补正立项的 relay 残面）。
+        let wakeReceipt: WakeReceiptState | undefined;
         if (out.delivered === "duplicate") {
           delivered = "duplicate";
         } else if (toolFrameType === "tool_request") {
@@ -970,6 +1001,9 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
           // v0.9.1（G-12-b）：容量闸 deferral 进 payload（delivered 恒为 mailbox——
           // 消息已在箱里，pull 兜底；块里带原因明细与冷却窗，调用方看得见「为何没唤醒」）。
           if (sent.wakeDeferred !== undefined) wakeDeferred = sent.wakeDeferred;
+          // v0.9.7（W3/V096-24）：三态键透传（renderMessage 传 startConfirmed 与失败措辞；
+          // payload 四键全带）。
+          wakeReceipt = sent;
         }
         await logEngineEvent(stateRoot, {
           event: "message",
@@ -1024,11 +1058,27 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
         // v0.9.5（A4/V094-06）：人可读行与 payload 都带 note——mailbox 态的行写
         // 「仅落邮箱（未唤醒）」+ 降级原因（无「已送达/已消费」宣称），wake 态的行写
         // 「已发起唤醒（非送达确认）」；payload 的 `note` 字段承载 attemptWake 原文。
-        return okResult(renderMessage(out.messageId, me.agentKey, toKey, delivered, sentNote), {
-          messageId: out.messageId,
-          delivered,
-          ...(sentNote !== undefined && sentNote.trim() !== "" ? { note: sentNote } : {}),
-          ...(urgent ? { urgent: true } : {}),
+        // v0.9.7（W3/V096-24）：wake 态行再传 startConfirmed（未见启动证据两态）与
+        // 失败第三态措辞（两轮唤醒全失败 → 不再写「已发起唤醒」）；payload 补四键。
+        return okResult(
+          renderMessage(
+            out.messageId,
+            me.agentKey,
+            toKey,
+            delivered,
+            sentNote,
+            wakeReceipt?.startConfirmed,
+            wakeReceipt,
+          ),
+          {
+            messageId: out.messageId,
+            delivered,
+            ...(sentNote !== undefined && sentNote.trim() !== "" ? { note: sentNote } : {}),
+            ...(wakeReceipt?.startConfirmed !== undefined ? { startConfirmed: wakeReceipt.startConfirmed } : {}),
+            ...(wakeReceipt?.wakeTiers !== undefined ? { wakeTiers: wakeReceipt.wakeTiers } : {}),
+            ...(wakeReceipt?.wakeFailureSeen === true ? { wakeFailureSeen: true } : {}),
+            ...(wakeReceipt?.failureEvidence !== undefined ? { failureEvidence: wakeReceipt.failureEvidence } : {}),
+            ...(urgent ? { urgent: true } : {}),
           // v0.9（G-2）：信封标注只在消息真实落箱（非 duplicate）时携带——duplicate
           // 返回的是既有消息，未必带 interrupt 元数据，不得虚报。
           ...(interruptRequested ? { interrupt: interruptBlock(out.delivered !== "duplicate") } : {}),
