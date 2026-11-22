@@ -17,7 +17,8 @@
  *   v0.9.7 W1 起同收 `{ref:{providerId,modelId}, reasoning:{levels:[{value,label}],
  *   defaultLevel}}` 真实形状，见 {@link collectModelRefs}）；
  *   `state.updated` 事件流不可依赖、仅作兜底（v0.9.8 D1 起合并按来源定序：
- *   create 结果权威优先，兜底流只补空不覆盖，见 {@link ModelRefSource}）；
+ *   create 结果权威优先，兜底流只补空不覆盖；v0.9.9 V098-13 起池序同样按来源
+ *   分层——create 条目恒在前、兜底只补缺，见 {@link ModelRefSource}）；
  * - FEASIBILITY P4：`session/send` accept 后 ≤3s 会话即落库，硬杀 app-server 不丢——
  *   因此 keeper 可随工具调用消亡（本文件 kill() 即 E4 的 child.kill() 同款）。
  *
@@ -113,6 +114,14 @@ function readReasoningLevels(raw: unknown): string[] {
  * 自己那份（可能错/旧的）档位表锁死，后到的 create 权威档位表反而只被「补空」
  * 对待 → 首试按错档发 setModel（v0.9.8 方案 D1 的缺陷形态）。现在合并以来源定序：
  * create 后到即覆盖兜底流已锁定的档位信息（非空值才覆盖），兜底流后到仍只补空。
+ *
+ * v0.9.9（V098-13）：权威级同时决定**池序**——`#models` 恒定满足「所有 create 来源
+ * 条目在前（按晋升 create 的次序）、纯兜底流条目在后（按首见次序）」的分层不变式，
+ * 与两流到达顺序无关。旧实现池序 = 到达序：兜底流先到时它枚举的模型占住池首，
+ * 后到的 create 新模型只能追加到池尾 → 无显式 model 时 `pool[0]`（provision 步骤②
+ * 的缺省 pick）取到兜底模型而非 create 池首，供给结果随乱序漂移。现在 create 新条目
+ * 插入 create 层尾部（兜底层之前）、兜底流锁定的条目被 create 晋升时移到 create 层
+ * 尾部——两流乱序到达 → 池序与缺省 pick 稳定（验收锚点）。
  */
 export type ModelRefSource = "create" | "state.updated";
 
@@ -129,6 +138,24 @@ interface ModelCollectContext {
 
 function modelSourceKey(providerId: string, modelId: string): string {
   return `${providerId}\u0000${modelId}`;
+}
+
+/**
+ * v0.9.9（V098-13）：**create 层尾部下标**——`out` 中最后一个锁定来源为 create 的
+ * 条目之后的位置（无 create 条目 = 0）。池序分层不变式的锚点：create 新条目插到
+ * 这里、被 create 晋升的兜底条目也移到此处，纯兜底条目因此恒留在其后。
+ *
+ * 无账本（`sources` 缺省，不关心权威级的直调方）时返回 `out.length` = 维持旧追加
+ * 语义（ModelCollectContext.sources 的「缺省 = 旧行为」契约）。
+ */
+function createTierEnd(out: ModelRef[], sources: Map<string, ModelRefSource> | undefined): number {
+  if (sources === undefined) return out.length;
+  let end = 0;
+  for (let i = 0; i < out.length; i += 1) {
+    const entry = out[i]!;
+    if (sources.get(modelSourceKey(entry.providerId, entry.modelId)) === "create") end = i + 1;
+  }
+  return end;
 }
 
 /**
@@ -150,7 +177,11 @@ function modelSourceKey(providerId: string, modelId: string): string {
  * 合并（v0.9.8 D1/V097-01 起按**来源权威级**定序，见 {@link ModelRefSource}）：
  * - create（权威源）后到 → 用 create 的非空档位信息**覆盖**兜底流已锁定的值，
  *   并把该条目来源改判 create；create 自身缺席的字段仍由兜底流补空（不抹除）；
- * - state.updated（兜底）后到，或同源重复 → 只补空不改已得值（v0.9.7 原语义）。
+ * - state.updated（兜底）后到，或同源重复 → 只补空不改已得值（v0.9.7 原语义）；
+ * - v0.9.9（V098-13）**池序分层**：`out` 恒定满足「create 条目在前、纯兜底条目在
+ *   后」的分层不变式（与两流到达顺序无关）——create 新条目插 create 层尾（兜底层
+ *   之前）、兜底条目被 create 晋升时移到 create 层尾；无显式 model 时 provision
+ *   步骤②的缺省 pick（`pool[0]`）因此稳定取 create 池首。
  */
 function collectModelRefs(node: unknown, out: ModelRef[], context: ModelCollectContext = {}): void {
   if (Array.isArray(node)) {
@@ -174,12 +205,19 @@ function collectModelRefs(node: unknown, out: ModelRef[], context: ModelCollectC
         : undefined;
       const existing = out.find((m) => m.providerId === providerId && m.modelId === modelId);
       if (existing === undefined) {
-        out.push({
+        const entry: ModelRef = {
           providerId,
           modelId,
           reasoningLevels: levels,
           ...(defaultLevel !== undefined ? { defaultReasoningLevel: defaultLevel } : {}),
-        });
+        };
+        // v0.9.9（V098-13）：create 新条目插到 create 层尾部（兜底层之前），兜底
+        // 新条目仍追加池尾——池序按来源分层，不再随两流到达顺序漂移。
+        if (source === "create" && context.sources !== undefined) {
+          out.splice(createTierEnd(out, context.sources), 0, entry);
+        } else {
+          out.push(entry);
+        }
         context.sources?.set(modelSourceKey(providerId, modelId), source);
         return;
       }
@@ -189,6 +227,15 @@ function collectModelRefs(node: unknown, out: ModelRef[], context: ModelCollectC
         if (levels.length > 0) existing.reasoningLevels = levels;
         if (defaultLevel !== undefined) existing.defaultReasoningLevel = defaultLevel;
         context.sources?.set(modelSourceKey(providerId, modelId), "create");
+        // v0.9.9（V098-13）：该条目由兜底晋升为 create → 移到 create 层尾部：
+        // 让位给先前的 create 条目、仍先于所有纯兜底条目（池序分层不变式）。
+        if (context.sources !== undefined) {
+          const from = out.indexOf(existing);
+          if (from >= 0) {
+            out.splice(from, 1);
+            out.splice(createTierEnd(out, context.sources), 0, existing);
+          }
+        }
         return;
       }
       // 兜底流后到（或同源重复）：只补空（见上），不覆盖已得的档位表/缺省档。
@@ -218,7 +265,8 @@ export class AppServerKeeper {
   /**
    * v0.9.8（D1/V097-01）：每条已枚举模型的**来源账本**（权威级判据；与 #models 同序
    * 键）。不并入 ModelRef 本体——getModels() 的对外形状逐字节不变（v0.9.7 W1 锚点
-   * 测试按精确形状断言），权威排序只影响合并行为。
+   * 测试按精确形状断言），权威排序只影响合并行为。v0.9.9（V098-13）起兼作池序分层
+   * 判据：#models 中 create 条目恒在前、纯兜底条目恒在后（见 {@link createTierEnd}）。
    */
   #modelSources = new Map<string, ModelRefSource>();
   #buffer = "";
@@ -348,12 +396,21 @@ export class AppServerKeeper {
    * v0.9.8（D1/V097-01）：本入口的吸收标记为**权威源**（create 结果）——同一模型
    * 已被 state.updated 兜底流先行锁定（哪怕带了一份陈旧/不一致的档位表）时，此处
    * 以 create 的非空档位信息覆盖之；合并语义见 {@link collectModelRefs}。
+   *
+   * v0.9.9（V098-13）：本入口吸收的**新**模型进入 create 层（池序先于一切兜底
+   * 条目）；先到的兜底条目若在本结果里出现，随之晋升并移到 create 层尾部——
+   * 无显式 model 的缺省 pick 稳定取 create 池首，不受两流到达顺序影响。
    */
   absorbModels(value: unknown): void {
     collectModelRefs(value, this.#models, { source: "create", sources: this.#modelSources });
   }
 
-  /** 当前已枚举到的模型表快照（create 结果 + state.updated 兜底，按序去重）。 */
+  /**
+   * 当前已枚举到的模型表快照（create 结果 + state.updated 兜底，按序去重）。
+   * v0.9.9（V098-13）：次序为**来源分层**——create 来源条目在前（按晋升 create 的
+   * 次序）、纯 state.updated 兜底条目在后（按首见次序），与两流到达顺序无关；
+   * 无显式 model 时调用方（provision 步骤②）取池首 = create 池首。
+   */
   getModels(): ModelRef[] {
     return [...this.#models];
   }

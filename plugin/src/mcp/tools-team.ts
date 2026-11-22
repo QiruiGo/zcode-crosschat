@@ -22,6 +22,13 @@
  * 交接检查点到 `.crosschat/checkpoints/<me>/<ISO>.md`（core/checkpoint.ts；每 agent
  * 保留最近 20 份）。平台无 PreCompact 钩子，这是一键落盘的补偿入口；**无 lead 闸**
  * （每人只写自己的目录），读路径无锁，不碰 team.json/邮箱/锁/任务状态机。
+ *
+ * v0.9.9 增量（V098-06）：`member-stop` 除收回**已认领**在途单（既有 §7.3.3 语义）
+ * 外，把该成员名下**未认领单**（pending ∧ assignee 空 ∧ to 命中）一并回池——旧实现
+ * 只覆盖在途单，派了没人领的单在停机后永久搁浅（他人 claim 得 not_assignee、停机
+ * 成员无法认领、pending 不在 stale 清扫域、创建者零回执）。回池与在途收回同一团队
+ * 锁临界段落盘（崩在中间即永久搁浅），创建者回执 + `member-unclaimed-repooled`
+ * 审计与供给失败面（engine/provision.ts）、看门狗判死面（engine/watchdog.ts）同源。
  */
 
 import { randomUUID } from "node:crypto";
@@ -34,7 +41,7 @@ import { logEngineEvent } from "../core/log.js";
 import { appendMailbox, createMessage, readMailbox, urgentFirst } from "../core/mailbox.js";
 import { bindName, readSession, writeSession } from "../core/registry.js";
 import { sanitizeKey, validateMemberName } from "../core/sanitize.js";
-import { getTask, leadKeyOf, memberOpenTasks, newTeamState, readTeam, sortTasksForBoard, transitionTask, unblockTask, writeTeam, provisionStaleAfterMs, sweepStaleProvisioningLocked } from "../core/teamstate.js";
+import { getTask, leadKeyOf, memberOpenTasks, newTeamState, readTeam, repoolUnclaimedTasksLocked, sortTasksForBoard, transitionTask, unblockTask, writeTeam, provisionStaleAfterMs, sweepStaleProvisioningLocked } from "../core/teamstate.js";
 import { taskJournalPath, writeArchive } from "../core/archive.js";
 // v0.8.0（A1，DESIGN-V0.8.md §3）：checkpoint 服务端落盘 + 容量水位推导（与 handoff/status 共用同一助手）。
 // v0.9.8（组 O D7/V097-21）：未读裁决统一到 core/checkpoint.ts 单一真源
@@ -617,10 +624,18 @@ interface MemberStopOutcome {
   key: string;
   stopReason: string | undefined;
   revoked: { taskId: string; title: string; previousStatus: string }[];
+  /**
+   * v0.9.9（V098-06）：连带回池的**未认领单**（pending ∧ assignee 空 ∧ to 命中该成员
+   * 的派单）——与开放任务收回（revoked）是两族：前者从未被认领（attempt=0），后者是
+   * 在途被收回。absent/空数组 = 无未认领单（旧行为逐字节保持）。
+   */
+  repooledUnclaimed: { taskId: string; title: string }[];
   shutdownMessageId: string;
   toSessionId: string;
   archive?: { dir: string; journalPath: string; metaPath: string; skippedJournals?: string[]; warnings?: string[] };
   archiveError?: string;
+  /** v0.9.9（V098-06）：未认领单回池的尽力清理失败详情（停止本身照常完成；如实披露，不谎称已回池）。 */
+  repoolError?: string;
 }
 
 /** C4（§3.4）：停止前留档——任务清单 + 未读索引 + 各任务 journal 聚合（best-effort）。
@@ -839,22 +854,76 @@ async function memberStop(deps: ToolDeps, args: { name: string; reason?: string;
       ...(args.reason === undefined ? {} : { stopReason: args.reason }),
       lastSeen: now,
     };
+
+    // ---- v0.9.9（V098-06）：该成员名下**未认领单**连带回池（与上方开放任务收回同一
+    //      临界段、同一次 writeTeam 落盘）----
+    // 缺陷形态（51-v098 验收 adv-3 i=0）：旧实现只收回**已认领**在途单
+    // （memberOpenTasks → revokeAttempt），派了没人领的单（pending ∧ assignee 空 ∧
+    // to 命中）永久搁浅——他人 claim 得 not_assignee（to 硬闸）、停机成员无法认领、
+    // pending 不在 stale 清扫域（SWEEPABLE 只含 claimed/in_progress）、创建者零回执。
+    // 修法 = 回池判据改用 to（teamstate.memberUnclaimedTasks），释放/回执/审计与
+    // 供给失败面（provision.ts catch）和判死面（watchdog）同源——
+    // repoolUnclaimedTasksLocked 的锁内半边（自持写盘 + createdBy task-receipt）。
+    // 为什么必须在锁内：与「开放任务收回 + removed」拆成两次落盘的话，进程崩在中间
+    // 即留下 removed 成员名下的 to 预留单永久搁浅（看门狗跳过 removed 成员、清扫域
+    // 不含 pending、他人 not_assignee——四处皆不救）。
+    // best-effort：回池失败不阻断停止本身（成员已 removed、开放任务已回池的「不丢」
+    // 底线已守），但如实披露（payload repoolError + 审计 member-stop-repool-failed）。
+    let repooledUnclaimed: { taskId: string; title: string }[] = [];
+    let repoolError: string | undefined;
+    try {
+      const released = await repoolUnclaimedTasksLocked(stateRoot, team, key, {
+        reason: "member-stopped",
+        ...(args.reason === undefined ? {} : { detail: args.reason }),
+        by: me.agentKey,
+        now,
+      });
+      repooledUnclaimed = released.map((entry) => ({ taskId: entry.taskId, title: entry.title }));
+    } catch (error) {
+      repoolError = error instanceof Error ? error.message : String(error);
+      await logEngineEvent(stateRoot, {
+        event: "member-stop-repool-failed",
+        teamId: me.teamId,
+        name: key,
+        by: me.agentKey,
+        error: repoolError,
+      });
+    }
+
     await writeTeam(stateRoot, team);
     return {
       key,
       stopReason: args.reason,
       revoked,
+      repooledUnclaimed,
       shutdownMessageId: shutdown.id,
       toSessionId: member.sessionId,
       ...(archiveOutcome !== undefined ? { archive: archiveOutcome } : {}),
       ...(archiveError !== undefined ? { archiveError } : {}),
+      ...(repoolError !== undefined ? { repoolError } : {}),
     };
   });
 
   await logEngineEvent(stateRoot, {
     event: "member-stopped", teamId: me.teamId, name: out.key, by: me.agentKey,
     stopReason: out.stopReason ?? null, revokedTasks: out.revoked.map((r) => r.taskId),
+    // v0.9.9（V098-06）：未认领单回池事实入停机审计（与 member-unclaimed-repooled
+    // 同族；空数组 = 无未认领单，旧审计形状不变）。
+    repooledUnclaimedTasks: out.repooledUnclaimed.map((r) => r.taskId),
   });
+  // v0.9.9（V098-06）：未认领单回池的观测面事件（与供给失败/判死两面同键同值：
+  // member-unclaimed-repooled{name,taskIds,reason}）。锁外落（teamstate 的锁内半边
+  // 只做状态+回执，不写 engine.jsonl）；无回池 = 零事件。
+  if (out.repooledUnclaimed.length > 0) {
+    await logEngineEvent(stateRoot, {
+      event: "member-unclaimed-repooled",
+      teamId: me.teamId,
+      name: out.key,
+      taskIds: out.repooledUnclaimed.map((r) => r.taskId),
+      reason: "member-stopped",
+      by: me.agentKey,
+    });
+  }
 
   // ---- 锁外：尽力唤醒成员收尾（§6.1「尽力唤醒（成员按守则 7 收尾）」）----
   let delivered: "wake" | "mailbox" | "skipped" = "skipped";
@@ -890,6 +959,10 @@ async function memberStop(deps: ToolDeps, args: { name: string; reason?: string;
     `Member "${out.key}" removed (state removed` +
       `${out.stopReason === undefined ? "" : `, reason: ${out.stopReason}`}); ` +
       `requeued tasks: ${out.revoked.map((r) => r.taskId).join(", ") || "none"}; ` +
+      // v0.9.9（V098-06）：未认领单回池事实进回执（不变式 5：回池不得虚报——空 =
+      // 无未认领单，与修复前逐字节一致）。
+      `unclaimed tasks returned to the pending pool: ${out.repooledUnclaimed.map((r) => r.taskId).join(", ") || "none"}` +
+      `${out.repoolError !== undefined ? ` (REPOOL FAILED: ${out.repoolError})` : ""}; ` +
       `shutdown notice → ${delivered === "skipped" ? "skipped（未尝试唤醒）" : renderDeliveryOutcome(delivered, wakeStartConfirmed)}` +
       `${out.archive !== undefined ? `; archive → ${out.archive.dir}` : ""}` +
       `${out.archive?.skippedJournals !== undefined && out.archive.skippedJournals.length > 0
@@ -901,6 +974,7 @@ async function memberStop(deps: ToolDeps, args: { name: string; reason?: string;
       state: "removed",
       ...(out.stopReason === undefined ? {} : { stopReason: out.stopReason }),
       revokedTasks: out.revoked,
+      repooledUnclaimed: out.repooledUnclaimed,
       shutdownMessageId: out.shutdownMessageId,
       shutdownWake: delivered,
       ...(wakeStartConfirmed !== undefined ? { startConfirmed: wakeStartConfirmed } : {}),
@@ -909,6 +983,7 @@ async function memberStop(deps: ToolDeps, args: { name: string; reason?: string;
       ...(failureEvidence !== undefined ? { failureEvidence } : {}),
       ...(out.archive !== undefined ? { archive: out.archive } : {}),
       ...(out.archiveError !== undefined ? { archiveError: out.archiveError } : {}),
+      ...(out.repoolError !== undefined ? { repoolError: out.repoolError } : {}),
       ...(wakeNote === undefined ? {} : { note: wakeNote }),
     },
   );
@@ -1904,7 +1979,7 @@ export function registerTeamTools(
   const description =
     "Command family in one tool (actions: init/transfer/release/member-add/member-stop/idle/cancel/unblock/checkpoint). " +
     "action=init becomes lead (takeover:true ONLY on explicit user instruction); transfer/release move/drop the metadata lead role; " +
-    "member-add provisions an engine member (lead only); member-stop removes a member, requeues its open tasks with receipts and (default archive:true) writes .crosschat/archive/<name>/ first (C4); " +
+    "member-add provisions an engine member (lead only); member-stop removes a member, requeues its open tasks and returns its unclaimed dispatches (pending tasks reserved via `to`) to the shared pending pool — both with creator receipts — and (default archive:true) writes .crosschat/archive/<name>/ first (C4); " +
     "idle reports idleness to the lead; cancel cancels a task (lead or creator); unblock releases a blocked task back to its preBlocked status (lead/creator/claimant) with an unblock-notice to the claimant; " +
     "checkpoint writes a 7-section handoff checkpoint to .crosschat/checkpoints/<you>/<ISO>.md server-side (keeps the newest 20 per member; note goes into section 7); " +
     "there is no PreCompact hook on this platform, so use it before accepting compression or handing over.";

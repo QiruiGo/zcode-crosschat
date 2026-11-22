@@ -93,7 +93,19 @@ async function seedTeam(taskStatus: "in_progress" | "completed" = "in_progress")
   await writeTeam(root, team);
 }
 
-/** 成员会话记录：liveness=idle 且 idleSinceTs 之前进入 idle。 */
+/**
+ * 成员会话记录：liveness=idle 且 idleSinceTs 之前进入 idle。
+ *
+ * v0.9.9（V098-08，集成员第 1 轮修红）：补 `lastEventTs: idleSinceTs`——该字段是**心跳通道**
+ * （core/liveness.ts:70「凡是触到 registry 的引擎事件都是心跳」）。core/types.ts:1065-1071 的
+ * 30min 陈旧上限只套「无心跳通道」的记录：本 harness 原本只写 livenessTs=1h 前且无 lastEventTs，
+ * 读盘即被丢成 undefined ⇒ continuationCandidateOf（engine/watchdog.ts:466）拿不到 idle 起点
+ * ⇒ 看门狗面 5 例全红。补上心跳通道后，记录形态与真实「空闲 1h 的活成员」一致（livenessTs 记
+ * 进入 idle 的时刻，lastEventTs 记最后一次引擎事件），陈旧上限按设计把新鲜度裁决权交还心跳的
+ * 既有消费面，本文件要测的「idle ≥ 阈值 ⇒ 待续跑」判据回到可测状态。
+ * 对判死面无扰动：WATCHDOG_FRESH_DEATH_MS=10min（engine/watchdog.ts:154），1h 前的
+ * lastEventTs/lastSeen 在 recentLifeEvidence 里与「字段缺席」同为 false。
+ */
 async function seedIdleSession(sessionId: string, idleSinceTs: number): Promise<void> {
   await writeSession(root, {
     sessionId,
@@ -102,6 +114,7 @@ async function seedIdleSession(sessionId: string, idleSinceTs: number): Promise<
     lastSeen: idleSinceTs,
     liveness: "idle",
     livenessTs: idleSinceTs,
+    lastEventTs: idleSinceTs,
   });
 }
 

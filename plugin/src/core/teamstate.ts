@@ -600,19 +600,74 @@ export function releaseUnclaimedTask(
 }
 
 /**
- * v0.9.8（D2/V097-07）：把一名**供给失败/停机**成员名下的未认领单回池 + 通知创建者
- * （锁内读-改-写；repairTeamState 同款的「状态自愈」入口，调用方 = 供给失败面
- * engine/provision.ts 的 catch 与 member-stop 面）。
+ * v0.9.9（V098-06/V098-07）：回池的**锁内半边**（调用方已持团队锁；member-stop 的
+ * 停机面与供给失败/看门狗判死面共用同一份释放+回执实现）。
  *
- * 一步到位（团队锁内）：
+ * 一步到位（调用方的临界段内）：
  * 1. {@link memberUnclaimedTasks} 取该成员未认领单（pending ∧ assignee 空 ∧ to 命中）；
  * 2. {@link releaseUnclaimedTask} 逐张删 to 回共享待领池 + writeTeam；
- * 3. 逐张给 **createdBy** 投一条 task-receipt（status=failed，error 说明成员供给
- *    失败/停机、任务已回池——与 member-stop 的回执帧同形同族）；
- * 4. engine.jsonl 落 `member-unclaimed-repooled{name,taskIds,reason}`（观测面）。
+ * 3. 逐张给 **createdBy** 投一条 task-receipt（status=failed，error 说明成员不可用、
+ *    任务已回池——与 member-stop 对已认领单的回执帧同形同族）；
+ * 4. 返回释放清单；**审计由调用方落**（`member-unclaimed-repooled`）——锁内不写
+ *    engine.jsonl，与全模块纪律一致（供给失败/判死面在锁外随
+ *    {@link repoolUnclaimedTasksForFailedMember}，停机面随 member-stopped 之后）。
  *
- * 幂等安全：无未认领单 = 零写零审计，返回空数组。任何 IO 失败只记审计不抛——
- * 失败路径的清理不能掩盖原始供给错误（provision.ts catch 的调用纪律）。
+ * 为什么停机面必须走锁内半边而不是锁外包装（V098-06）：member-stop 的临界段里还有
+ * 「已认领单收回（revokeAttempt）+ 成员置 removed」要一起落盘——未认领单若等锁外
+ * 二次回池，进程崩在两者之间即留下「removed 成员名下的一张 to 预留单」永久搁浅
+ * （removed 成员不被看门狗扫、pending 不在 stale 清扫域、他人 claim 得 not_assignee）。
+ *
+ * 幂等安全：无未认领单 = 零写零邮件，返回空数组。
+ */
+export async function repoolUnclaimedTasksLocked(
+  stateRoot: string,
+  team: TeamState,
+  key: string,
+  input: { reason: string; detail?: string; by?: string; now?: number },
+): Promise<{ taskId: string; title: string; createdBy: string }[]> {
+  const released: { taskId: string; title: string; createdBy: string }[] = [];
+  const now = input.now ?? Date.now();
+  for (const task of memberUnclaimedTasks(team.tasks, key)) {
+    if (!releaseUnclaimedTask(task, { by: input.by ?? 'engine', now, event: 'released-member-unavailable' })) continue;
+    released.push({ taskId: task.id, title: task.title, createdBy: task.createdBy });
+  }
+  if (released.length === 0) return released;
+  await writeTeam(stateRoot, team);
+  const detail = input.detail !== undefined && input.detail.trim() !== '' ? `: ${input.detail.trim().slice(0, 300)}` : '';
+  for (const entry of released) {
+    await appendMailbox(stateRoot, team.teamId, entry.createdBy, createMessage(
+      key,
+      entry.createdBy,
+      JSON.stringify({
+        type: 'task-receipt',
+        teamId: team.teamId,
+        taskId: entry.taskId,
+        status: 'failed',
+        error: `revoked: member "${key}" became unavailable (${input.reason})${detail}; task returned to the pending pool`,
+        title: entry.title,
+      }),
+      {
+        taskId: entry.taskId,
+        sourceTaskId: entry.taskId,
+        sourceTaskStatus: 'pending',
+        deliveryClaimedAt: now,
+      },
+    ));
+  }
+  return released;
+}
+
+/**
+ * v0.9.8（D2/V097-07）：把一名**供给失败/停机**成员名下的未认领单回池 + 通知创建者
+ * （锁外包装：自持团队锁读-改-写；repairTeamState 同款的「状态自愈」入口）。
+ *
+ * v0.9.9（V098-06/V098-07）接线面：供给失败面 engine/provision.ts 的 catch、看门狗
+ * 判死面 engine/watchdog.ts 的死亡路径（V098-07）。member-stop 面（V098-06）不走本
+ * 包装而走锁内半边 {@link repoolUnclaimedTasksLocked}——停止的临界段里未认领单回池
+ * 必须与「开放任务收回 + 成员置 removed」同一次落盘（崩在中间 = 永久搁浅，见该函数
+ * 声明）；审计 `member-unclaimed-repooled` 由停机面在锁外补落（同键同值）。
+ *
+ * 幂等安全：无未认领单 = 零写零审计，返回空数组。
  */
 export async function repoolUnclaimedTasksForFailedMember(
   stateRoot: string,
@@ -620,38 +675,10 @@ export async function repoolUnclaimedTasksForFailedMember(
   key: string,
   input: { reason: string; detail?: string; by?: string },
 ): Promise<{ taskId: string; title: string; createdBy: string }[]> {
-  const released: { taskId: string; title: string; createdBy: string }[] = [];
-  const now = Date.now();
-  await withTeamLock(stateRoot, teamId, async () => {
+  const released = await withTeamLock(stateRoot, teamId, async () => {
     const team = await readTeam(stateRoot, teamId);
-    if (team === undefined) return;
-    for (const task of memberUnclaimedTasks(team.tasks, key)) {
-      if (!releaseUnclaimedTask(task, { by: input.by ?? 'engine', now, event: 'released-member-unavailable' })) continue;
-      released.push({ taskId: task.id, title: task.title, createdBy: task.createdBy });
-    }
-    if (released.length === 0) return;
-    await writeTeam(stateRoot, team);
-    const detail = input.detail !== undefined && input.detail.trim() !== '' ? `: ${input.detail.trim().slice(0, 300)}` : '';
-    for (const entry of released) {
-      await appendMailbox(stateRoot, teamId, entry.createdBy, createMessage(
-        key,
-        entry.createdBy,
-        JSON.stringify({
-          type: 'task-receipt',
-          teamId,
-          taskId: entry.taskId,
-          status: 'failed',
-          error: `revoked: member "${key}" became unavailable (${input.reason})${detail}; task returned to the pending pool`,
-          title: entry.title,
-        }),
-        {
-          taskId: entry.taskId,
-          sourceTaskId: entry.taskId,
-          sourceTaskStatus: 'pending',
-          deliveryClaimedAt: now,
-        },
-      ));
-    }
+    if (team === undefined) return [];
+    return repoolUnclaimedTasksLocked(stateRoot, team, key, input);
   });
   if (released.length > 0) {
     await logEngineEvent(stateRoot, {

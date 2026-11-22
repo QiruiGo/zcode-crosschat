@@ -30,14 +30,14 @@
  * @module core/mailbox
  */
 import { randomUUID } from 'node:crypto';
-import { readFile, readdir } from 'node:fs/promises';
+import { open, readFile, readdir } from 'node:fs/promises';
 import { appendJsonl, readJsonl, rewriteJsonl, type MalformedLine } from './jsonl.js';
 import { writeFileAtomic, stripLeadingBom } from './atomic.js';
 import { sanitizeKey } from './sanitize.js';
 import { isRecord, isTeamMessage, normalizeMessage, TERMINAL_TASK_STATUSES, type TeamMessage, type TeamState } from './types.js';
 import { logEngineEvent } from './log.js';
 import { withFileLock, withProcessLock } from './lock.js';
-import { inboxDir, inboxFile, teamLockNames } from './paths.js';
+import { engineLogFile, inboxDir, inboxFile, teamLockNames } from './paths.js';
 import { readTeam } from './teamstate.js';
 
 // ---------------------------------------------------------------------------
@@ -184,12 +184,14 @@ export function urgentFirst<T extends { ts: number; urgent?: boolean }>(items: r
  *
  * 口径（写死）：
  * - `interrupt === true`（v0.9 G-2 软中断元数据，xc_relay interrupt:true 写入）；
- * - `steer === true`（v0.9.8 组 S 的硬插队元数据，xc_relay steer:true 写入）。
+ * - `steer === true`（v0.9.8 组 S 的硬插队元数据；**v0.9.9 起由写入侧落盘**——
+ *   mcp/tools-relay.ts 的 V098-02 修法把 `steer:true` 补进邮箱行（与 refs 同款在
+ *   TeamMessage 形状之外补键，字段白名单 core/types.ts 属组 H 文件域），读面靠
+ *   {@link withSteerTolerance} 把它从磁盘行补回——「组 S 落盘即生效」的跨组契约）。
  *
- * steer 键的**容错读**：组 S 把 `steer` 落进 TeamMessage 白名单（core/types.ts）之前，
- * 本函数按结构形状认布尔真值——组 S 一落盘即生效，不因字段冻结次序漏判；反过来
- * 即便 steer 消息同时盖了 `interrupt:true`（组 S 的自然形态：中止+续跑也是纠偏），
- * 两个键命中同一个判定，不会双计。
+ * steer 消息恒同时盖 `interrupt:true`（写入侧 steer⇒interrupt，S1）——两个键命中
+ * 同一个判定，不会双计；steer 键是显式自描述（区分「steer 纠偏」与「普通软中断」），
+ * 优先级语义两者等价。
  *
  * 内容永不做判据（V090-13 纪律）：正文里写 "interrupt=true" 不升级优先级——
  * 只有消息元数据驱动。
@@ -375,24 +377,32 @@ export interface MailboxRead {
 }
 
 /**
- * v0.9.8（J1，跨组契约）：**steer 元数据的读面宽容拷贝**。
+ * v0.9.8（J1，跨组契约）→ v0.9.9（V098-02 落地后复检）：**steer 元数据的读面宽容拷贝**。
  *
- * 背景：`steer` 布尔元数据由组 S（xc_relay steer:true）写入邮箱行，而字段白名单的
- * 唯一权威在 core/types.ts 的 normalizeMessage（非本组文件域）。若不在这里补一层
- * 宽容，`steer:true` 的消息一经过「读邮箱」就被静默剥掉——J1 的预留预算、J2 的
- * 横幅、J3 的边界提示、J4 的状态全部看不见 steer，等于「steer 消息不参与积压优先级」。
+ * 背景：`steer` 布尔元数据由写入侧（xc_relay steer:true，mcp/tools-relay.ts）落进
+ * 邮箱行，而字段白名单的唯一权威在 core/types.ts 的 normalizeMessage（非本组文件域）。
+ * 若不在这里补一层宽容，`steer:true` 的消息一经过「读邮箱」就被静默剥掉——J1 的预留
+ * 预算、J2 的横幅、J3 的边界提示、J4 的状态全部看不见 steer，等于「steer 消息不参与
+ * 积压优先级」。
+ *
+ * v0.9.9 复核（V098-09）：v0.9.8 时本函数是**死代码**——写入侧从未落 steer 键
+ * （adv-1 F3/G3：J1/J2/J3 全走 interrupt 分支）。本版组 W 的 V098-02 修法已让写入侧
+ * 把 `steer:true` 补进邮箱行（tools-relay.ts：「组 S 落盘即生效的跨组契约」），
+ * 故按方案给的二选一分支走**「让写入侧落 steer 键使其可达」**：本函数随之可达，
+ * 不再是死代码；删除它反而会让刚落盘的 steer 键被 normalizeMessage 静默剥离
+ * （types.ts 白名单未含该键——组 H 文件域），steer 的「显式自描述」变只写不读。
  *
  * 纪律（与 urgent/interrupt 的宽容拷贝同口径）：
  * - 只认**布尔真值**，非法值（字符串/数字/null）一律不认（不做静默裁剪）；
  * - 只在本读面补这一个键，其余字段仍以 normalizeMessage 的归一结果为准；
- * - 组 S 一旦把 `steer` 写进 types.ts 的白名单（`if (typeof value.steer === 'boolean') out.steer = value.steer;`），
+ * - 组 H 一旦把 `steer` 写进 types.ts 的白名单（`if (typeof value.steer === 'boolean') out.steer = value.steer;`），
  *   本函数即成为无害的重复劳动（同值覆盖），可随之删除——跨组收敛点在此明示。
  */
 function withSteerTolerance(normalized: TeamMessage, raw: unknown): TeamMessage {
   if (!isRecord(raw)) return normalized;
   // 只认布尔真值：字符串/数字/null/缺失一律不认（不做静默裁剪，urgent/interrupt 同口径）。
   if (raw['steer'] !== true) return normalized;
-  // `steer` 尚未进 core/types.ts 的 TeamMessage（组 S 的字段域），故此处向下转型：
+  // `steer` 尚未进 core/types.ts 的 TeamMessage（组 S/H 的字段域），故此处向下转型：
   // 运行时多带一个布尔键，类型面仍以 TeamMessage 为准（消费侧一律走
   // {@link isInterruptOrSteer} 的宽容形状读它，不靠类型系统）。
   return { ...normalized, steer: true } as TeamMessage;
@@ -421,6 +431,8 @@ async function readMailboxDetailed(
   };
   // v0.9.8（J1）：steer 宽容拷贝（见 {@link withSteerTolerance} 的跨组契约注记）——
   // 逐行从原始值补回布尔 steer，使「读邮箱」之后的每个面都能看见硬插队元数据。
+  // v0.9.9（V098-09 复核）：写入侧已落 steer 键（组 W 的 V098-02 修法），本拷贝
+  // 随之可达——不是死代码。
   const rawLines = await readJsonl<TeamMessage>(file, isTeamMessage, collectingSink);
   const messages = rawLines.map((value) => withSteerTolerance(normalizeMessage(value), value));
   // v0.9.3（P0）：缺省坏行汇报 = 一次读取一条汇总审计 + 文件×60s 窗节流；调用方
@@ -935,12 +947,15 @@ export function mailboxPrompt(teamId: string, recipient: string, messages: reado
  * | `read` | `readAt`（对方调了读取面 `xc_read({scope:"inbox"})`） |
  * | `consumed` | 保留态：现行 `acknowledgeMailbox` 把 readAt/consumedAt **同时**盖章，故读取面消费恒报 `read`；`consumed` 只在 readAt 缺席而确认到齐时单独出现（与 `injected` 同条件，按读面优先归并） |
  * | `held` | 躺在收方隔离区 `inbox/<key>.held.jsonl`（入站策略 hold，未经 xc_review 放行） |
- * | `refused` | 该 id 解析为一条 `delivery-refused` 回执帧（入站策略 refuse 的凭据） |
+ * | `refused` | **引擎凭据确认**的 `delivery-refused` 回执帧（入站策略 refuse 的凭据；判据见 {@link refusalReceiptEvidence}——v0.9.9 V098-03 起只认引擎回执，正文不可伪造） |
  * | `discarded` | `discardedAt`（陈旧 / 审批门拒 / 已作废） |
  * | `unknown` | 本队任何邮箱（主箱 + 隔离区）都找不到该 id——**不是 8 态之一**：拒绝对未知 id 猜态 |
  *
  * 纪律：判据只读邮箱行上的印章与隔离区位置，**不读消息正文**（J4 权限模型要求
- * 「不开放读别人邮箱内容」——返回行只有状态与 stamps，没有 content）。
+ * 「不开放读别人邮箱内容」——返回行只有状态与 stamps，没有 content）。`refused` 是
+ * 唯一例外口径：帧形状（`isDeliveryRefusedReceipt`）只是**必要不充分**条件，真正
+ * 判据是引擎自己的凭据（{@link refusalReceiptEvidence} 对账 engine.jsonl 的
+ * `inbound-refused` 事件）——正文可被任意成员复刻，只解析正文等于伪造权威状态面。
  */
 export type MessageStatus =
   | "queued"
@@ -953,21 +968,111 @@ export type MessageStatus =
   | "discarded"
   | "unknown";
 
-/** 一条 `delivery-refused` 回执帧（guards.ts refuse 分支写给发送方的那条）。 */
+/**
+ * 帧形状判据：一行是否是 `delivery-refused` 回执帧（guards.ts / tools-relay.ts
+ * 的入站策略 refuse 分支写给发送方的那条）。
+ *
+ * **必要不充分条件**（v0.9.9 V098-03）：形状可被任意成员经 xc_relay 复刻——
+ * 回执帧与「正文恰好是同一段 JSON 的普通消息」在邮箱行上字节级不可区分
+ * （from/to/content/印章全部可仿造）。故本函数**单独不**判定 `refused` 态；
+ * 真正判据是 {@link refusalReceiptEvidence} 的引擎凭据对账。
+ */
 export function isDeliveryRefusedReceipt(message: TeamMessage): boolean {
   const cls = classifyFrame(message.content);
   return cls.kind === "frame" && cls.frameType === "delivery-refused";
 }
 
 /**
- * J4 状态阶梯（纯函数；`held` = 该行是在隔离区读到的）。
+ * v0.9.9（V098-03）：`refused` 态的**引擎凭据**判据——按 messageId 对账
+ * engine.jsonl 里的 `inbound-refused` 审计事件。
+ *
+ * 为什么必须对账审计日志：refuse 分支（mcp/guards.ts 的入站策略执行面与
+ * mcp/tools-relay.ts 的队内轴核心）在写回执的同一请求里落一条
+ * `{event:"inbound-refused", teamId, from, to, messageId, policySource}`——
+ * 成员发消息（哪怕正文是同一段 JSON）产生不了这条事件。v0.9.8 的判据只解析
+ * 正文（adv-2 F1，P2）：任一成员即可让自己发出的消息恒报 `refused`，权威状态面
+ * （lead 据它判断投递结果）可说谎；carve-out（「回执收方本人可查」）也被扩大成
+ * 「任何消息的收方本人可查」。
+ *
+ * 口径（写死）：
+ * - 只认 `event==="inbound-refused"` ∧ `teamId` 相符 ∧ `messageId` 相符的行；
+ * - 只读 engine.jsonl 的**尾部窗口**（{@link REFUSAL_EVIDENCE_TAIL_BYTES}，可经
+ *   `tailBytes` 覆盖供测试）——与 core/incidents.ts 的读取纪律同源（观测面有界，
+ *   不整文件读入）；
+ * - 文件缺失/不可读/解析失败/窗口内无匹配 ⇒ `false`（保守侧：宁可少报 refused，
+ *   不伪造权威状态；引擎凭据缺失时该行按印章态报 queued/delivered/…）；
+ * - 同机可写 engine.jsonl 是既定边界（PROTOCOL §10/§11.5：不做签名/哈希链）——
+ *   本判据把「伪造 refused」从「发一条消息」提到「改审计日志」，与其余引擎凭据同族。
+ *
+ * 尾部窗口的已知限制（如实声明）：回执事件早于窗口起点时 genuine 回执也报不到
+ * refused——状态查询通常紧随 `inbound_refused` 错误（其 payload 带 receiptMessageId），
+ * 超长历史的回执请以 engine.jsonl 的 `inbound-refused` 事件为权威。
+ */
+export const REFUSAL_EVIDENCE_TAIL_BYTES = 2 * 1024 * 1024;
+
+export async function refusalReceiptEvidence(
+  stateRoot: string,
+  teamId: string,
+  messageId: string,
+  tailBytes: number = REFUSAL_EVIDENCE_TAIL_BYTES,
+): Promise<boolean> {
+  let handle;
+  try {
+    handle = await open(engineLogFile(stateRoot), 'r');
+  } catch {
+    return false; // 缺文件/不可开：无凭据可对账（不猜）
+  }
+  try {
+    const size = (await handle.stat()).size;
+    if (size === 0) return false;
+    const start = Math.max(0, size - tailBytes);
+    const length = size - start;
+    const buffer = Buffer.alloc(length);
+    await handle.read(buffer, 0, length, start);
+    let text = buffer.toString('utf8');
+    if (start > 0) {
+      // 窗口首行大概率是半行：丢到第一个换行为止（incidents.ts 同纪律——
+      // 宁可少算窗口边界上的一条，也不把半行当凭据）。
+      const newline = text.indexOf('\n');
+      text = newline >= 0 ? text.slice(newline + 1) : '';
+    }
+    for (const line of text.split('\n')) {
+      // 廉价预滤：messageId 是 uuid，命不中就不必 JSON.parse。
+      if (line.trim() === '' || !line.includes(messageId)) continue;
+      let value: unknown;
+      try {
+        value = JSON.parse(line);
+      } catch {
+        continue; // 坏行不是凭据（engine.jsonl 的坏行由 incidents/读取面各自披露）
+      }
+      if (!isRecord(value)) continue;
+      if (value['event'] !== 'inbound-refused') continue;
+      if (value['teamId'] !== teamId || value['messageId'] !== messageId) continue;
+      return true;
+    }
+    return false;
+  } catch {
+    return false; // 读取意外：观测面尽力而为（保守 = 不判 refused）
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
+/**
+ * J4 状态阶梯（纯函数；`held` = 该行是在隔离区读到的；
+ * `refusalEvidence` = {@link refusalReceiptEvidence} 的引擎凭据对账结果）。
  *
  * 优先级（写死，取第一个命中的）：held → refused → discarded → read → injected
  * → delivered → queued。
+ *
+ * v0.9.9（V098-03）：`refused` 要求**引擎凭据**（第三参显式为 true）——帧形状
+ * 只是必要不充分条件（正文可伪造，见 {@link isDeliveryRefusedReceipt}）。纯函数
+ * 调用方（单测/无审计日志的场景）不传第三参 = 无凭据 ⇒ 不判 refused，该行按
+ * 印章态归并；工具面（mcp/tools-read.ts 的 J4 查询）负责先对账再传凭据。
  */
-export function messageStatusOf(message: TeamMessage, held: boolean): MessageStatus {
+export function messageStatusOf(message: TeamMessage, held: boolean, refusalEvidence = false): MessageStatus {
   if (held) return "held";
-  if (isDeliveryRefusedReceipt(message)) return "refused";
+  if (refusalEvidence && isDeliveryRefusedReceipt(message)) return "refused";
   if (message.discardedAt !== undefined) return "discarded";
   if (message.readAt !== undefined) return "read";
   if (message.consumedAt !== undefined) return "injected";

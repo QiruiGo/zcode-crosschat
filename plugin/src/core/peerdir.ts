@@ -341,8 +341,12 @@ export async function readPeerBaseRecordRaw(
  *   该键——未知档类语义不变）；
  * - `regToken`/`boundName`/`pid`：本回合有值即刷新，缺省保留旧值（与 v0.9.7 I1
  *   identify 合并写同口径——两面的合并规则一致才不会互相抵消）；
- * - `sessionId`/`cwd`/`source`/`lastSeen`：以本回合事实为准（source 缺省落 null，
- *   与旧钩子行为一致）；
+ * - `source`：v0.9.9（V098-14）起与上组同口径——本回合**带了**来源（非空串）才刷新，
+ *   **缺省（undefined/null）保留旧值**。旧实现无条件 `source: patch.source`：钩子主
+ *   写面的载荷常常不带 source（`stdin.str('source') ?? null`），一个不带来源的钩子
+ *   回合就把 identify 等其他写面盖的 source 抹成 null（adv-3 case8 Part A，P3）。
+ *   钩子回合不掌握来源事实，抹掉即失真；新旧都没有才落 null（未知来源语义不变）；
+ * - `sessionId`/`cwd`/`lastSeen`：以本回合事实为准；
  * - 其余键（白名单外）：原样保留。
  *
  * 原子性由调用方的锁保证（v0.9.8 D5：钩子侧读-改-写进 registry 锁）；本函数自身
@@ -356,7 +360,8 @@ export async function upsertPeerBaseRecord(
   patch: {
     cwd: string;
     permissionMode?: 'bypass' | 'prompting';
-    source: string | null;
+    /** 本回合载荷的来源；undefined/null = 本回合没给 → 保留旧值（V098-14）。 */
+    source?: string | null;
     /** startedAt 缺省取值与 lastSeen 的当前时刻。 */
     now: number;
     regToken?: string;
@@ -371,12 +376,17 @@ export async function upsertPeerBaseRecord(
       : existing !== undefined && existing[key] !== undefined
         ? { [key]: existing[key] }
         : {};
+  const existingSource = existing !== undefined && typeof existing['source'] === 'string'
+    ? existing['source']
+    : null;
   const merged: Record<string, unknown> = {
     ...(existing ?? {}), // 白名单外字段原样保留（D6 第 3 条）
     sessionId,
     cwd: patch.cwd,
     ...keep('permissionMode', patch.permissionMode),
-    source: patch.source,
+    // v0.9.9（V098-14）：source 保留——本回合没带来源（undefined/null）时不抹既有值；
+    // 带了（非空串）才以本回合事实刷新。空串按「没给」处理（载荷空值不是来源事实）。
+    source: typeof patch.source === 'string' && patch.source !== '' ? patch.source : existingSource,
     // startedAt 只认首次（D6 第 1 条）：旧记录有数字即保留。
     startedAt: typeof existing?.['startedAt'] === 'number' ? existing['startedAt'] : patch.now,
     lastSeen: patch.now,

@@ -433,6 +433,147 @@ type RelayExtras = Partial<
   Pick<TeamMessage, "taskId" | "attemptId" | "sourceTaskId" | "sourceAttemptId" | "sourceTaskStatus" | "deliveryClaimedAt" | "origin" | "originSessionId" | "urgent">
 >;
 
+/**
+ * v0.9.9（V098-02）：**steer 权限闸的内部边界结论**——编排层（`xcRelay`，guards 之前）
+ * 判定通过后随 `xc_relay` 入参下传；内层据此跳过重复判定并取用已消费的盖章结论。
+ *
+ * 为什么需要它：adv-4 缺陷 B 的根因是 `withGuards` 的入站策略层（hold/refuse）包装在
+ * 内核权限闸**外层**，策略文件一开 hold，内核的 steer 权限闸（旧位置）整个不可达——
+ * 成员→成员 steer 变成 `delivered:"held"`、无拒绝无审计。修法 = 权限闸前移到 guards
+ * 之前（编排层）。但用户原话印章是**一次性消费**的：编排层判定用掉后，内层若重跑
+ * `uservoiceMatchAndConsume` 必判未命中 → origin=user 丢、viaUser 丢、uservoice-hit
+ * 审计丢。故编排层把结论显式下传，内层不重跑（直调内核的旧路径不受影响：该字段
+ * 缺省 = 内层自判，行为与 v0.9.8 逐字节一致）。
+ *
+ * 纪律：本字段**不进 RelayShape/zod**（不是 MCP 工具面参数），只存在于编排层→内核的
+ * 内部调用；外部调用方无法伪造（编排层是唯一生产入口，且它自己就是闸）。
+ */
+export interface SteerAuthorizedFlag {
+  /** 用户原话盖章命中（origin=user 路径放行）；lead 直判为 false（其消息仍可被内层盖章）。 */
+  viaUser: boolean;
+  /** 编排层已消费的盖章结论（非 lead 路径在场；内层直接取用，不重跑）。 */
+  stamp?: StampOutcome;
+}
+
+/** 盖章求值结果（命中/未命中 + 原因；与 core/uservoice 的 UservoiceMatch 同族）。 */
+export type StampOutcome = UservoiceMatch | { hit: false; reason: string };
+
+/**
+ * v0.9.9（V098-02）：**steer 权限闸**（S4：仅 lead 或 origin=user 用户原话）——
+ * 编排层与内核层共用的判定出口（审计 + 结构化拒绝；通过则静默返回）。
+ *
+ * 拒绝时一个字节都不落箱（连 hold 隔离区都不进——「成员互发一律拒绝」的纪律形态），
+ * 审计 `steer-rejected` 与 accept 策略下同形（adv-4 B：hold 不再吞掉拒绝）。
+ */
+export async function assertSteerAuthorized(
+  stateRoot: string,
+  me: BoundIdentity,
+  toKey: string,
+  leadKey: string | null,
+  isLead: boolean,
+  isUser: boolean,
+): Promise<void> {
+  if (isLead || isUser) return;
+  await logEngineEvent(stateRoot, {
+    event: "steer-rejected",
+    teamId: me.teamId,
+    from: me.agentKey,
+    to: toKey,
+    reason: "steer is lead/user only; member-to-member steer is refused (soft interrupt stays allowed)",
+  });
+  throw new ToolError(
+    {
+      error: "steer_not_authorized",
+      to: toKey,
+      from: me.agentKey,
+      leadKey,
+      message: `steer_not_authorized: "${me.agentKey}" is neither the team lead nor a user-stamped session `
+        + "(origin=user) — steer (terminate→resume) is restricted to the lead or the user; "
+        + "members may still send a soft interrupt (interrupt:true) or an urgent message",
+    },
+    "steer is lead/user only; members may use interrupt:true (soft interrupt) instead",
+  );
+}
+
+/**
+ * v0.9.9（V098-02）：用户原话盖章求值（steer 权限闸与 origin 标记共用；记忆化由调用方
+ * 闭包负责）。与 v0.9.8 内层 computeStamp 闭包同口径：C6/C7 机器帧免盖章；会话归属
+ * 核验失败落 `uservoice-stamp-refused` 审计并返回未命中（拒绝线不放松）。
+ */
+export async function computeUservoiceStamp(
+  deps: Pick<ToolDeps, "stateRoot" | "env">,
+  me: BoundIdentity,
+  content: string,
+  now: number,
+  machineFrame: boolean,
+): Promise<StampOutcome> {
+  if (machineFrame) return { hit: false, reason: "machine-frame-exempt (C6/C7)" };
+  // v0.9.1（G-11）：me.voiceOwner = 本连接经唤醒 nonce 证明继承的原会话——盖章核验
+  // 据此承认共享 sid 的无头续跑；无证明时恒缺失，拒绝线不放松。
+  const authority = await verifyUservoiceStampAuthority(
+    peerRootFromEnv(deps.env), deps.stateRoot, me.sessionId,
+    { voiceOwner: me.voiceOwner },
+  );
+  if (!authority.ok) {
+    await logEngineEvent(deps.stateRoot, {
+      event: "uservoice-stamp-refused",
+      sessionId: me.sessionId,
+      reason: authority.reason,
+    });
+    return { hit: false, reason: authority.reason };
+  }
+  return await uservoiceMatchAndConsume(peerRootFromEnv(deps.env), me.sessionId, content, now, deps.env);
+}
+
+/**
+ * v0.9.9（V098-02）：**steer 权限闸前移**——在 `xcRelay` 编排层（guards 之前）判定。
+ *
+ * 判定与旧内核闸同口径（lead 直判 / 非 lead 才提前算 origin=user 依据），两处差别：
+ * ① 位置：入站策略（hold/refuse）之前——策略文件不再能短路权限闸与审计链；
+ * ② 印章：非 lead 路径在此**消费**用户原话印章，结论随 {@link SteerAuthorizedFlag}
+ *    下传内层（origin/viaUser/uservoice-hit 三面取同一结论，不重复消费）。
+ *
+ * lead 路径不预消耗印章（与旧实现一致）：lead 的消息仍由内层主路径照常盖章。
+ * 撤回模式/缺 msg 的调用不触发本闸（入参合法性错误优先，由内层显式拒绝）。
+ */
+export async function authorizeSteerForTeamAxis(
+  deps: Pick<ToolDeps, "stateRoot" | "env">,
+  me: BoundIdentity,
+  args: RelayArgs,
+  now: number,
+): Promise<SteerAuthorizedFlag> {
+  const team = await readTeam(deps.stateRoot, me.teamId);
+  const leadKey = team !== undefined ? leadKeyOf(team) : null;
+  const isLead = leadKey !== null && leadKey !== "" && me.agentKey === leadKey;
+  const toKey = sanitizeKey(args.to);
+  if (isLead) {
+    await assertSteerAuthorized(deps.stateRoot, me, toKey, leadKey, true, false);
+    return { viaUser: false };
+  }
+  const stamp = await computeUservoiceStamp(deps, me, args.msg ?? "", now, parseToolFrameType(args.msg ?? "") !== undefined);
+  await assertSteerAuthorized(deps.stateRoot, me, toKey, leadKey, false, stamp.hit === true);
+  return { viaUser: true, stamp };
+}
+
+/**
+ * v0.9.9（V098-02）：**hold 挡下 steer 的如实回执块**（守卫层 `guards.ts` 与内核层
+ * 共用同一形状，防两处漂移）。消息在隔离区：既没唤醒也没终止——回执明说
+ * 「steer 未执行」，不写普通 interrupt 块让调用方误以为已投递，更不假装抢占。
+ * 放行（xc_review accept）后消息随保留的 steer/interrupt/urgent 元数据进主邮箱，
+ * J1 置顶/预留预算仍按 steer 语义生效。
+ */
+export function steerHeldReceipt(policySource: string): { interrupt: SteerOutcome; preempted: false } {
+  return {
+    interrupt: {
+      requested: true,
+      result: "deferred-next-turn",
+      reason: `入站策略 hold（source=${policySource}）——消息在隔离区，steer 未执行（无唤醒、无终止）；xc_review({action:"accept"}) 放行后随下次投递生效`,
+    },
+    // v0.9.9（E3）：顶层别名同步给（hold 形态恒未抢占）。
+    preempted: false,
+  };
+}
+
 /** 与 tools.ts runCore 同口径的错误映射 + 审计降级披露（单测直驱用）。 */
 async function runRelayCore(stateRoot: string, fn: () => Promise<ToolResult>): Promise<ToolResult> {
   let result: ToolResult;
@@ -725,14 +866,17 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
           }
         }
 
-        // v0.9.8（S4）：**steer 权限闸前置**——在入站策略（hold/refuse 会落盘）之前：
-        // 拒绝时一个字节都不落箱，连隔离区都不进（「成员→成员一律拒绝」的纪律形态）。
+        // v0.9.8（S4）+ v0.9.9（V098-02）：**steer 权限闸**。v0.9.8 把闸从入站策略
+        // 之后提到之前（仍在内核内）；adv-4 缺陷 B 实测：`withGuards` 的入站策略层
+        // （hold/refuse）包装在内核**外层**，策略文件一开 hold 就把本闸整个短路——
+        // 成员→成员 steer 变成 delivered:"held"、无拒绝无审计、暂存副本丢元数据。
+        // v0.9.9 修法 = 权限闸**前移到 guards 之前**（`xcRelay` 编排层的
+        // {@link authorizeSteerForTeamAxis}），结论经内部边界字段 `steerAuthorized`
+        // 下传：本层只在「直调内核」（测试/过渡态，该字段缺省）时自判——旧行为逐字节
+        // 保留，作为编排层之外的第二道闸。
         // lead 直判（无需盖章）；非 lead 才提前算 origin=user 依据。为不改变非 steer
         // 路径的盖章顺序（held/refuse 不消耗用户原话印章的既有语义），盖章抽成
-        // **记忆化闭包**：非 steer 路径仍在原位置首次求值（顺序逐字节不变）；steer 路径
-        // 在此提前求值一次——显式取舍：被拒/被暂存的 steer 消息也会消耗那条用户原话
-        // 印章（steer 是高权限请求，调用方应为授权判定付出这一次性成本）。
-        type StampOutcome = UservoiceMatch | { hit: false; reason: string };
+        // **记忆化闭包**：非 steer 路径仍在原位置首次求值（顺序逐字节不变）。
         let cachedStamp: StampOutcome | undefined;
         const computeStamp = async (): Promise<StampOutcome> => {
           if (cachedStamp !== undefined) return cachedStamp;
@@ -759,32 +903,15 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
               })();
           return cachedStamp;
         };
-        if (steerRequested) {
+        // v0.9.9（V098-02）：编排层（guards 之前）的权限闸结论。在场 = 已放行且
+        // （非 lead 路径）印章已在其处消费——本层不重跑闸、不重跑盖章。
+        const steerAuthorized = (args as RelayArgs & { steerAuthorized?: SteerAuthorizedFlag }).steerAuthorized;
+        if (steerRequested && steerAuthorized === undefined) {
           const steerTeam = await readTeam(stateRoot, me.teamId);
           const steerLeadKey = steerTeam !== undefined ? leadKeyOf(steerTeam) : null;
           const isLead = steerLeadKey !== null && steerLeadKey !== "" && me.agentKey === steerLeadKey;
           const isUser = isLead || (await computeStamp()).hit === true;
-          if (!isLead && !isUser) {
-            await logEngineEvent(stateRoot, {
-              event: "steer-rejected",
-              teamId: me.teamId,
-              from: me.agentKey,
-              to: toKey,
-              reason: "steer is lead/user only; member-to-member steer is refused (soft interrupt stays allowed)",
-            });
-            throw new ToolError(
-              {
-                error: "steer_not_authorized",
-                to: toKey,
-                from: me.agentKey,
-                leadKey: steerLeadKey,
-                message: `steer_not_authorized: "${me.agentKey}" is neither the team lead nor a user-stamped session `
-                  + "(origin=user) — steer (terminate→resume) is restricted to the lead or the user; "
-                  + "members may still send a soft interrupt (interrupt:true) or an urgent message",
-              },
-              "steer is lead/user only; members may use interrupt:true (soft interrupt) instead",
-            );
-          }
+          await assertSteerAuthorized(stateRoot, me, toKey, steerLeadKey, isLead, isUser);
         }
 
         // 入站策略（§7.4-I4）：chat 路径前置裁决（与 guards.ts guardedMessage 同口径；
@@ -827,14 +954,11 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
               // held 件不带 envelope 标注——信封未进可读邮箱（接受审阅后随元数据渲染）。
               // v0.9.8（S5）：steer 请求被 hold 挡下 → 回执明说「steer 未执行」（消息在
               // 隔离区，既没唤醒也没终止）；不写普通 interrupt 块让调用方误以为已投递。
+              // v0.9.9（V098-02/E3）：与 guards.ts 守卫层共用 {@link steerHeldReceipt}
+              // （同一形状 + E3 顶层别名 preempted:false——组装链下本分支不可达，但
+              // 直调内核/未来改闸序时两处不得漂移）。
               ...(steerRequested
-                ? {
-                    interrupt: {
-                      requested: true as const,
-                      result: "deferred-next-turn" as const,
-                      reason: `入站策略 hold（source=${policy.source}）——消息在隔离区，steer 未执行（无唤醒、无终止）；xc_review({action:"accept"}) 放行后随下次投递生效`,
-                    },
-                  }
+                ? steerHeldReceipt(policy.source)
                 : interruptRequested ? { interrupt: interruptBlock(false) } : {}),
               ...(refs !== undefined ? { refs } : {}),
             },
@@ -873,7 +997,11 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
         // （engine.jsonl uservoice-hit 实测）；机器帧不应有用户亲述语义。
         // v0.9.8（S4）：改调记忆化闭包 computeStamp——steer 权限闸（上方，入站策略之前）
         // 可能已提前求值；非 steer 路径在此首次求值，顺序与旧实现逐字节等价。
-        const stamp = await computeStamp();
+        // v0.9.9（V098-02）：steer 权限闸前移到编排层后，**非 lead 的 steer 路径**其印章
+        // 已在编排层消费——此处直接取用其结论（`steerAuthorized.stamp`），不重跑
+        // （一次性印章重跑必判未命中，origin=user/uservoice-hit/viaUser 三面会丢）。
+        // lead 的 steer 路径该字段不带 stamp → 照旧自算（lead 的消息仍可被盖章）。
+        const stamp = steerAuthorized?.stamp ?? (await computeStamp());
 
         const out = await withTeamLock(stateRoot, me.teamId, async () => {
           const team = await readTeam(stateRoot, me.teamId);
@@ -991,6 +1119,12 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
             }),
             ...(refs !== undefined ? { refs } : {}),
           };
+          // v0.9.9（V098-02）：steer 元数据随消息落盘（`steer:true`）——读取面
+          // core/mailbox.ts 的 withSteerTolerance/J1/J2/J3 认它（组 S 落盘即生效的
+          // 跨组契约）；字段白名单在 core/types.ts（非本文件域），故与 refs 同款在
+          // TeamMessage 之外补键。steer 恒蕴含 interrupt:true（S1），此键是显式自描述
+          // （不双计：isInterruptOrSteer 两键同一判定）。
+          if (steerRequested) (msg as TeamMessage & { steer?: boolean }).steer = true;
           await appendMailbox(stateRoot, me.teamId, toKey, msg);
 
           // v0.7（C6，§2.5）：tool_result 回投终填台账（ok→executed / error→error /
@@ -1195,6 +1329,20 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
           ...(steerBlock !== undefined
             ? { interrupt: steerBlock }
             : interruptRequested ? { interrupt: interruptBlock(out.delivered !== "duplicate") } : {}),
+          // v0.9.9（E3）：抢占字段的**顶层别名**（preempted/stopped/turn）——v0.9.8 起
+          // 抢占结果只住在 `interrupt.*` 下，调用方按顶层解析取不到（44-v098 real-smoke
+          // E §7.4 实测记录）。旧字段原位不动（向后兼容）；别名只在 steer 请求时出现，
+          // 普通 interrupt/非 interrupt 路径形状逐字节不变。
+          // - `preempted`：布尔——抢占真的发生了（result==="preempted"）；false = 降级/
+          //   不支持/未执行（原因仍见 interrupt.reason，不隐瞒）；
+          // - `stopped`/`turn`：与 interrupt.stopped/turn 同值的实况块（缺席即未发生）。
+          ...(steerBlock !== undefined
+            ? {
+                preempted: steerBlock.result === "preempted",
+                ...(steerBlock.stopped !== undefined ? { stopped: steerBlock.stopped } : {}),
+                ...(steerBlock.turn !== undefined ? { turn: steerBlock.turn } : {}),
+              }
+            : {}),
           ...(delivered === "duplicate" ? { duplicate: true } : {}),
           // v0.9.1（G-10）：refs 回显（duplicate 返回既有件——其引用集可能与本次不同，
           // 故只在真实落箱时回显，避免虚报「这条带了新引用」）。
@@ -1613,6 +1761,13 @@ async function runRelayOrchestration(stateRoot: string, fn: () => Promise<ToolRe
 /**
  * xc_relay 编排：身份 → removed 硬拒 → C1 归一（interrupt 蕴含 urgent）→ 双轴路由。
  *
+ * v0.9.9（V098-02）：**steer 权限闸在队内轴调用之前执行**（{@link authorizeSteerForTeamAxis}）
+ * ——队内轴核心的发送方法是组装链内的被守卫包装核心，入站策略 hold/refuse 会在内核
+ * 权限闸之前短路（adv-4 缺陷 B：策略文件一开 hold，成员→成员 steer 变 held、无拒绝无
+ * 审计）。编排层在守卫**之前**判定：拒绝则零落箱（连隔离区都不进），放行则结论经内部
+ * 边界字段 `steerAuthorized` 下传（印章一次性，内层不重跑）。peer 轴不触发本闸
+ * （steer 对 peer 轴一律显式拒收，错误口径 steer_peer_axis_unsupported 优先）。
+ *
  * @param teamRelay 队内轴核心（M1 组装链内的内部方法——守卫/排空已包装）。
  * @param faceB true = 队内路径已含面 B 排空（组装链内核心）；false = 编排层为队内
  *   路径补一次 appendPeerEnvelopes。**peer 路径恒排空**——xc_relay 不是 core 方法、
@@ -1633,9 +1788,28 @@ export async function xcRelay(
     const urgent = args.urgent === true || interruptRequested;
     const { target, axis } = splitAxisSuffix(args.to);
 
+    // v0.9.9（V098-02）：steer 权限闸（队内轴专用，惰性 + 记忆化——两个队内调用点
+    // 共用一次判定；peer 路径不触发，保持 steer_peer_axis_unsupported 的优先口径）。
+    // 撤回模式/缺 msg 的调用不触发（入参合法性错误优先，由内层显式拒绝）。
+    const steerRequested = args.steer === true;
+    let steerAuthorized: SteerAuthorizedFlag | undefined;
+    const ensureSteerAuthorized = async (): Promise<void> => {
+      if (!steerRequested || args.msg === undefined) return;
+      if (steerAuthorized === undefined) {
+        steerAuthorized = await authorizeSteerForTeamAxis(deps, me, { ...args, to: target }, Date.now());
+      }
+    };
+    /** 队内轴入参 = 原样透传 + 内部边界字段（steerAuthorized 缺省 = 内层自判，旧行为）。 */
+    const teamAxisArgs = (): RelayArgs => {
+      const inner: RelayArgs & { steerAuthorized?: SteerAuthorizedFlag } = { ...args, to: target };
+      if (steerAuthorized !== undefined) inner.steerAuthorized = steerAuthorized;
+      return inner;
+    };
+
     // 显式后缀 → 跳过解析直接路由（§1.2-T6）。
     if (axis === "team") {
-      const result = await teamRelay.xc_message({ ...args, to: target }, connectionKey);
+      await ensureSteerAuthorized();
+      const result = await teamRelay.xc_message(teamAxisArgs(), connectionKey);
       return faceB ? result : await appendPeerEnvelopes(result, deps);
     }
     if (axis === "peer") {
@@ -1672,7 +1846,8 @@ export async function xcRelay(
       );
     }
     if (teamHit !== undefined) {
-      const result = await teamRelay.xc_message({ ...args, to: target }, connectionKey);
+      await ensureSteerAuthorized();
+      const result = await teamRelay.xc_message(teamAxisArgs(), connectionKey);
       return faceB ? result : await appendPeerEnvelopes(result, deps);
     }
     if (peerHit) {

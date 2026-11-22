@@ -194,7 +194,10 @@ async function logLivenessTransition(
   transition: LivenessTransition | null,
 ): Promise<void> {
   if (transition === null) return;
-  const name = record.boundName ?? null;
+  // v0.9.9（V098-01）：审计名兜底链 = boundName（member-add 供给代写的无头持有者标）
+  // → wakeTicketBound（票据消费记账标记，v0.9.9 起票据路径改写它）→ null。票据路径
+  // 不再写 boundName 后，唤醒绑定会话的活性迁移审计仍可命名——安全修复不丢观测面。
+  const name = record.boundName ?? record.wakeTicketBound?.name ?? null;
   await logEngineEvent(stateRoot, {
     event: transition.to === 'running' ? SESSION_RUNNING_EVENT : SESSION_IDLE_EVENT,
     sessionId,
@@ -633,11 +636,24 @@ export interface HostResumeProbe {
 }
 
 /**
- * 读一个进程的完整命令行（PowerShell Get-CimInstance；wmic 在新 Win11 已移除——实测
- * 本机 26300 不可用，单拍实测 ~0.74s）。失败/超时 → undefined（fail-closed）。
+ * 读一个进程的完整命令行。两条可达通道（「可及则做，不可及如实声明」——V098-08）：
+ * 1. **Linux `/proc/<pid>/cmdline`**（NUL 分隔的 argv；存在即读，零子进程开销）；
+ * 2. **Windows PowerShell Get-CimInstance**（wmic 在新 Win11 已移除——实测本机
+ *    26300 不可用，单拍实测 ~0.74s）。
+ * 两条都不可达（非 Linux 无 /proc ∧ CIM 失败/超时/权限）→ undefined（fail-closed：
+ * 调用方按「未核验」处理，不许当成已核验）。
  */
-function readProcessCommandLineViaCim(pid: number): string | undefined {
+function readProcessCommandLine(pid: number): string | undefined {
   if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
+  // 通道 1：Linux /proc（本机实测之外的移植面；Windows 上该路径不存在，零成本跳过）。
+  try {
+    const procRaw = readFileSync(`/proc/${pid}/cmdline`, 'utf8');
+    const joined = procRaw.split('\u0000').filter((part) => part !== '').join(' ').trim();
+    if (joined !== '') return joined;
+  } catch {
+    /* 非 Linux 或不可读：落通道 2 */
+  }
+  // 通道 2：Windows CIM。
   try {
     const result = spawnSync(
       'powershell.exe',
@@ -670,7 +686,7 @@ function readProcessCommandLineViaCim(pid: number): string | undefined {
  * 宿主下唯一本插件 server 子进程才可归属到本会话；桌面多会话宿主（非 --resume）
  * 一律不写锚（该拓扑归属不可判定 → 采纳面拒绝，回落 wakeToken 票据兜底）。
  *
- * options.readCommandLine 供测试注入（生产走 CIM）。
+ * options.readCommandLine 供测试注入（生产走 {@link readProcessCommandLine}）。
  */
 export function probeHostResumeSidSync(
   hostPid: number,
@@ -678,12 +694,43 @@ export function probeHostResumeSidSync(
 ): HostResumeProbe {
   // pid 自身非法即无从探测（fail-closed）——注入读取器也先过本闸（防御纵深）。
   if (!Number.isSafeInteger(hostPid) || hostPid <= 0) return { available: false };
-  const commandLine = (options.readCommandLine ?? readProcessCommandLineViaCim)(hostPid);
+  const commandLine = (options.readCommandLine ?? readProcessCommandLine)(hostPid);
   if (commandLine === undefined) return { available: false };
   const normalized = commandLine.replaceAll('\\', '/');
   const match = /--resume\s+(\S+)/.exec(normalized);
   if (match === null || match[1] === undefined) return { available: true };
   return { available: true, resumeSid: match[1].replace(/^"|"$/g, '') };
+}
+
+/**
+ * v0.9.9（V098-08）：pid 的**身份**判据——进程命令行是否自证「本会话的唤醒子」
+ * （`--resume <sid>`，引擎 spawnDirect 的拉起形态）。
+ *
+ * 修什么：pid 只验存活不验身份（`process.kill(pid,0)`）——OS pid 复用后，一个与会话
+ * 毫无关系的旁观进程会被当成「成员的活回合宿主」（adv-1 G2/F2：陈旧记录 + pid 复用
+ * → steer 强杀旁观进程）。本函数补身份轴：活 ∧ 命令行正是本会话的唤醒子，才认。
+ *
+ * 三态返回（可及则做，不可及如实声明）：
+ * - `confirmed`：cmdline 可读且 `--resume` 的 sid 正是 `sessionId`；
+ * - `refuted`：cmdline 可读，但 resume sid 是别的值或没有该 token（桌面 app-server、
+ *   交互 CLI、别的会话的唤醒子）——**不是**本会话的唤醒子；
+ * - `unknown`：cmdline 不可读（枚举失败/超时/权限/pid 非法）——调用方必须按「未核验」
+ *   如实披露（回落既有判据并说明），不得当成 confirmed 也不得当成 refuted。
+ *
+ * 消费面（engine/wake.ts classifySteerTarget 的唤醒子佐证注入，属组 W 文件域）：
+ * 与 wakeTicketBound 记账标记、pid 存活、livenessTs 陈旧上限（types.ts
+ * LIVENESS_TS_STALE_MS）共同构成「活回合 ∧ 可终止」的多重判据；本函数是其中的
+ * 身份轴原语，注入面由 steer 分类调用方接线（测试经 options.readCommandLine 注入）。
+ */
+export function probePidResumeClaim(
+  pid: number,
+  sessionId: string,
+  options: { readCommandLine?: (pid: number) => string | undefined } = {},
+): 'confirmed' | 'refuted' | 'unknown' {
+  if (typeof sessionId !== 'string' || sessionId.trim() === '') return 'refuted';
+  const probe = probeHostResumeSidSync(pid, options);
+  if (!probe.available) return 'unknown';
+  return probe.resumeSid === sessionId ? 'confirmed' : 'refuted';
 }
 
 /**

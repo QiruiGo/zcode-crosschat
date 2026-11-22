@@ -200,6 +200,11 @@ export function resolveReasoningFallbackTarget(
 /** 模型选择（§6.2 步骤②：provider 过滤 → model 精确命中否则首个；档位显式优先，
  * 缺省取模型自报缺省档/表末位兜底——v0.9.7 W1）。
  *
+ * v0.9.9（V098-13）：缺省路径的「首个」= **create 池首**——keeper 的模型池序按来源
+ * 分层（appserver.ts {@link AppServerKeeper.getModels}：create 来源条目恒在前、纯
+ * state.updated 兜底条目在后），不再取决于兜底流与 create 流的到达顺序；两流乱序
+ * 到达 → 本函数的缺省 pick 与供给结果稳定。
+ *
  * v0.9.8（D1/V097-01）：缺省路径的档位名与模型**声明表**交叉校验——自报缺省档不在
  * 声明表里 → 回退表末位 + `reasoningFallback{from,to}`（调用方落
  * `member-reasoning-fallback` 审计），不把错档发给 setModel 首试。

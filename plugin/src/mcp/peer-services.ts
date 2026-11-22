@@ -284,17 +284,41 @@ export interface PeerAgentsPanel {
  * v0.9.8（组 O R2）：sessionId → **活跃** peer 花名 的解析（纯函数，panel 与 team
  * 板面成员行共用同一实现——「两面一致」不接受两份会漂移的解析）。
  *
- * 口径：只取 `scan.active` 里 `record.name` 非空的记录，按扫描序**首个**命中
- * （与 uservoice 盖章核验/callerDeclaredContextChars 的 find 同口径）。同一 sid
- * 多条活跃记录（桌面会话 + 无头 --resume 续跑共享 sid 的真实形态）时取首个——
- * 花名寻址以注册表扫描序为准，此处只做「成员 → 可寻址名」的呈现，不裁决归属。
+ * 口径：只取 `scan.active` 里 `record.name` 非空的记录；同一 sid 多条活跃记录时
+ * （桌面会话 + 无头 --resume 续跑共享 sid 的真实形态）按名一致才呈现。
  * 死记录不进表（进程已亡，不可寻址——诚实缺失优于给一个发不到的名字）。
+ *
+ * v0.9.9（V098-12）：**歧义拒绝**取代「扫描序首个命中」。旧实现按 readdir 扫描序
+ * 取首个同名 sid 记录——同机往 peer 注册表植一条「同 sid、异名、活 pid」的冒充记录
+ * （文件名 pid 小于真实记录即字典序先到）即可劫持「可直接复制」的显示地址：team
+ * 板面与 panel 两面同时显示冒充名，而该名在寻址面根本不可达（key 文件不可读）
+ * （adv-3 i=4，P3；同机伪造边界族的可发现面形态）。
+ *
+ * 新口径（与扫描序无关的确定性聚合）：
+ * - 同一 sid 的活跃记录**花名全一致** → 呈现该名（含合法的「桌面 + 无头续跑同 sid
+ *   同名」形态，行为不变）；
+ * - 同一 sid 出现**多个不同花名** → 歧义：**不呈现**（该 sid 不出现在返回表里）。
+ *   冒充记录再也不能改变显示地址——它只能把地址从「可复制」降级为「缺失」，
+ *   而缺失是诚实的（无法判定哪条记录才是该 sid 的真身）；
+ * - 花名冲突不做「权威排序」裁决：pid/startedAt/文件名都可被植记录者挑选，
+ *   任何排序规则都能被针对——拒绝呈现是唯一不依赖「猜哪条真」的口径。
+ *
+ * 返回表大小只减不增（歧义 sid 缺席），调用方面对 `peerName === undefined` 的既有
+ * 语义（「仅队内 key 可达」）不变。
  */
 export function peerNameBySessionId(scan: PeerScanResult | null | undefined): Map<string, string> {
-  const out = new Map<string, string>();
+  const namesBySid = new Map<string, Set<string>>();
   for (const record of scan?.active ?? []) {
     if (record.name === undefined || record.name === '') continue;
-    if (!out.has(record.sessionId)) out.set(record.sessionId, record.name);
+    const names = namesBySid.get(record.sessionId) ?? new Set<string>();
+    names.add(record.name);
+    namesBySid.set(record.sessionId, names);
+  }
+  const out = new Map<string, string>();
+  for (const [sid, names] of namesBySid) {
+    if (names.size !== 1) continue; // 歧义（≥2 个不同花名）：拒绝呈现（V098-12）
+    const [only] = names;
+    if (only !== undefined) out.set(sid, only);
   }
   return out;
 }

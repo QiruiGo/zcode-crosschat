@@ -439,6 +439,29 @@ export interface SessionRecord {
    * 成员（从未 xc_identify 的引擎成员）上也能检出进程死。
    */
   pid?: number;
+  /**
+   * v0.9.9（V098-01）：**唤醒票据消费标记**（SessionStart 钩子票据路径专用记账；
+   * 与 {@link SessionRecord.boundName} 刻意分路）。
+   *
+   * 背景：`boundName` 自 v0.9.1 r4（V090-04）起是「引擎供给的无头持有者」判据
+   * （core/config.ts engineHolderIsHeadless / engine/wake.ts classifySteerTarget），
+   * 其可信度押在「唯一写入路径 = member-add 供给代写，交互会话无法自签」上。v0.9.8
+   * 的 V098-01 直接路径（takeover + identify 自签）已挡，但钩子的**唤醒票据消费
+   * 路径**（hooks/session-start.ts bindWakeTicketIdentity，门控 XC_ADOPT_BY_PPID=1）
+   * 仍在写会话记录 boundName——交互会话 takeover 引擎花名后收到引擎签发给行 sid 的
+   * 票据，钩子一消费即把 boundName 自签进交互会话自己的记录，steer 随即把交互宿主
+   * 当无头会话强杀并谎称 preempted（adv-1 G1，P2）。
+   *
+   * 修法（本字段）：该路径**不再写 boundName**（恢复 V090-04 不变式），改写本标记
+   * 承接记账需求——哪张票、绑的哪个花名、何时被本会话消费：
+   * - 写入点唯一：bindWakeTicketIdentity（票据消费成功后；仅开启档，缺省档票据留给
+   *   模型回合 wakeToken 兜底，行为逐字节不变）；
+   * - **不构成**无头持有者证据：票据可经 takeover 后的行 sid 自签到达（攻击面与
+   *   boundName 相同），故任何持有者判据都不得把它当充分条件；
+   * - 消费面：core/registry.ts logLivenessTransition 的审计名兜底（boundName 缺省
+   *   时取本标记的 name，保持唤醒绑定会话的活性迁移审计不丢名）。
+   */
+  wakeTicketBound?: { name: string; ts: number };
 }
 
 /**
@@ -968,14 +991,39 @@ function coerceLeadHistory(value: unknown): LeadHistoryEntry[] | undefined {
 export const LIVENESS_TS_FUTURE_SKEW_MS = 5 * 60_000;
 
 /**
+ * v0.9.9（V098-08）：活性自述时刻的**陈旧上限**（ms）——`livenessTs`（回合开始时刻）
+ * 老于该窗的 `running` 自述不再作为「有活回合」的依据。
+ *
+ * 缺陷形态（adv-1 G2/F2，P3）：`plausibleLivenessTs` 只拒未来值，陈旧记录（2h 前的
+ * running 自述）+ OS pid 复用即可让 steer 判「有活唤醒回合」→ preempted → 强杀一个
+ * 与插件毫无关系的旁观进程，回执还不披露记录陈旧。取项目既定 stale 口径 30min
+ * （core/snapshot.ts DEFAULT_STALE_TASK_MINUTES / core/liveness.ts
+ * LIVENESS_EVIDENCE_FRESH_MS 同宽）：一个声称 running 的会话若 30min 没有任何状态
+ * 迁移/心跳佐证，其自述不可信—— steer 判活、pid-dead 硬证据、三视图 state 一并按
+ * 「无可信时刻」处理（纠偏仍随本次投递送达，不丢消息；宁可不判活，也不错杀）。
+ *
+ * 只作用于 `livenessTs`（回合开始时刻）：`lastEventTs`/`lastTurnTs` 不套用本窗
+ * （心跳代理与事故窗口各有消费面的新鲜窗，见 coerceSessionRecord 逐字段口径）。
+ */
+export const LIVENESS_TS_STALE_MS = 30 * 60_000;
+
+/**
  * v0.9.1（V090-01）：活性时间戳的物理可信校验（纯函数）。
  * 有限正数且不晚于 `now + LIVENESS_TS_FUTURE_SKEW_MS` 才可信；未来值在
  * coerceSessionRecord（durable boundary）与 core/liveness.ts 纯函数（防御纵深，
  * 兜内联构造的记录）两处消费——伪造 `lastEventTs=+1年` 不能再制造
  * `now - last <= thresholdMs` 恒真的永久心跳豁免。
+ *
+ * v0.9.9（V098-08）：可选第三参 `maxAgeMs` = **陈旧上限**（同时要求
+ * `value >= now - maxAgeMs`）。缺省不套用（既有调用点语义逐字节不变——它们校验的
+ * 是心跳/窗口类时刻，套 30min 窗会把每个安静会话的心跳全判成「不可信」）；
+ * 上限的**执行点**是 coerceSessionRecord 对 `livenessTs` 的 durable boundary 校验
+ * （见该处），使一切经 readSession 读盘的消费面（steer 判活 / pid-dead / 三视图）
+ * 自动获得同一口径，无需每个消费面各自接线。
  */
-export function plausibleLivenessTs(value: unknown, now: number): value is number {
-  return isFiniteNumber(value) && value > 0 && value <= now + LIVENESS_TS_FUTURE_SKEW_MS;
+export function plausibleLivenessTs(value: unknown, now: number, maxAgeMs?: number): value is number {
+  if (!isFiniteNumber(value) || value <= 0 || value > now + LIVENESS_TS_FUTURE_SKEW_MS) return false;
+  return maxAgeMs === undefined || value >= now - maxAgeMs;
 }
 
 export function coerceSessionRecord(value: unknown, expectedSessionId: string, now: number = Date.now()): ParsedSession | RejectedSession {
@@ -996,13 +1044,31 @@ export function coerceSessionRecord(value: unknown, expectedSessionId: string, n
   const regToken = optionalString(value['regToken']);
   // v0.9（G-9）：活性三字段宽容增量（§11.1 纪律）——旧记录缺省照读；在场时取值
   // 非法（liveness 枚举外 / 时间戳非有限数）整字段丢弃，绝不整文件拒绝。
-  // v0.9.1（V090-01）：livenessTs/lastEventTs 加**未来值校验**（plausibleLivenessTs）
-  // ——未来时刻在物理上不可能是产品自写的值，durable boundary 直接丢弃（absent =
-  // 无心跳/无状态时刻，下游按保守口径处理：running 失去可信时刻 → 不豁免清扫）。
+  // v0.9.1（V090-01）：livenessTs/lastEventTs/lastTurnTs 加**未来值校验**
+  // （plausibleLivenessTs）——未来时刻在物理上不可能是产品自写的值，durable
+  // boundary 直接丢弃（absent = 无心跳/无状态时刻，下游按保守口径处理：running
+  // 失去可信时刻 → 不豁免清扫）。
+  // v0.9.9（V098-08）：livenessTs 加**陈旧上限**（LIVENESS_TS_STALE_MS）——但只对
+  // **没有心跳通道**的记录套用。判据分层：
+  // - 记录带 lastEventTs（v0.9 G-5 心跳，每次引擎事件刷新）⇒ 活性佐证是心跳而不是
+  //   回合开始时刻，新鲜度由心跳的消费面裁决（看门狗 recentLifeEvidence 10min 窗 /
+  //   memberLivenessView fresh() 30min 窗 / sweepOwnerGuard 引擎证言）——**回合开始
+  //   很久但心跳新鲜的长回合必须保持可信**（V094-13/V095-07 锚点：长回合进程猝死仍
+  //   要能判 pid-dead，不能被回合开始时刻一票否决）；
+  // - 记录没有心跳通道（v0.9.0 前的存量记录 / 最小记录 / 伪造记录）⇒ livenessTs 是
+  //   唯一活性佐证：老于上限即「该 running 自述已多久没有任何佐证」——G2 形态（陈旧
+  //   记录 + OS pid 复用 → steer 把旁观进程当活回合宿主强杀）正是这一类，丢弃时刻
+  //   （liveness 字段保留，下游异常面据「running ∧ 无可信时刻」如实记账）。
   const livenessRaw = optionalString(value['liveness']);
   const liveness = livenessRaw === 'running' || livenessRaw === 'idle' ? livenessRaw : undefined;
-  const livenessTs = plausibleLivenessTs(value['livenessTs'], now) ? value['livenessTs'] : undefined;
-  const lastEventTs = plausibleLivenessTs(value['lastEventTs'], now) ? value['lastEventTs'] : undefined;
+  const lastEventTs = plausibleLivenessTs(value['lastEventTs'], now) ? value['lastEventTs'] as number : undefined;
+  const livenessTs = plausibleLivenessTs(
+    value['livenessTs'],
+    now,
+    lastEventTs === undefined ? LIVENESS_TS_STALE_MS : undefined,
+  )
+    ? value['livenessTs'] as number
+    : undefined;
   // v0.9.2（A3）：回合开始时刻同样走未来值校验——未来时刻在物理上不可能是产品自写的
   // 值（durable boundary 丢弃；A3 无窗口起点即零注入，保守方向）。
   const lastTurnTs = plausibleLivenessTs(value['lastTurnTs'], now) ? value['lastTurnTs'] : undefined;
@@ -1011,6 +1077,15 @@ export function coerceSessionRecord(value: unknown, expectedSessionId: string, n
   // 无时间校验。
   const pidRaw = value['pid'];
   const pid = typeof pidRaw === 'number' && Number.isSafeInteger(pidRaw) && pidRaw > 0 ? pidRaw : undefined;
+  // v0.9.9（V098-01）：wakeTicketBound 宽容增量——对象 ∧ name 非空串 ∧ ts 有限数
+  // 才整字段收；形状不符（含 name 空串/ts 非数/非对象）整字段丢弃，不拒整条记录
+  // （§11.1 纪律；旧记录无该字段照常缺省）。
+  const wakeTicketBoundRaw = value['wakeTicketBound'];
+  const wakeTicketBound = isRecord(wakeTicketBoundRaw)
+    && isNonBlankString(wakeTicketBoundRaw['name'])
+    && isFiniteNumber(wakeTicketBoundRaw['ts'])
+    ? { name: wakeTicketBoundRaw['name'], ts: wakeTicketBoundRaw['ts'] }
+    : undefined;
   return {
     ok: true,
     record: {
@@ -1025,6 +1100,7 @@ export function coerceSessionRecord(value: unknown, expectedSessionId: string, n
       ...(lastEventTs === undefined ? {} : { lastEventTs }),
       ...(lastTurnTs === undefined ? {} : { lastTurnTs }),
       ...(pid === undefined ? {} : { pid }),
+      ...(wakeTicketBound === undefined ? {} : { wakeTicketBound }),
     },
   };
 }

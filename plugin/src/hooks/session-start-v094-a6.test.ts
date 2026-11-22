@@ -174,9 +174,17 @@ describe("v0.9.4 A6：唤醒票据一次性消费 + 自动绑定身份（队内�
     const { readTeam } = await import("../core/teamstate.js");
     const row = (await readTeam(h.stateRoot, "default"))!.members.find((m) => m.key === "b");
     expect(row?.sessionId).toBe("sess_b");
-    // 会话记录 boundName 落账（缺才写）
+    // v0.9.9（V098-01）：会话记录**不再写 boundName**——该字段是「引擎供给的无头持有者」
+    // 判据，唯一写入路径必须是 member-add 供给代写；票据路径自签 boundName 即 adv-1 G1
+    // （交互宿主被 steer 当无头会话强杀 + 谎称 preempted）。记账改走专用标记
+    // wakeTicketBound（花名 + 消费时刻），持有者判据不认它。
     const { readSession } = await import("../core/registry.js");
-    expect((await readSession(h.stateRoot, "sess_b"))?.boundName).toBe("b");
+    const recordAfter = await readSession(h.stateRoot, "sess_b");
+    expect(recordAfter?.boundName).toBeUndefined();
+    expect(recordAfter?.wakeTicketBound).toMatchObject({ name: "b" });
+    expect(typeof recordAfter?.wakeTicketBound?.ts).toBe("number");
+    // pid 投影照写（A1 成员 pid 证据，与持有者判据无关）
+    expect(recordAfter?.pid).toBe(process.ppid);
     // ③ peer 轴：基记录 boundName + pid 盖章
     const { readPeerBaseRecord } = await import("../core/peerdir.js");
     const base = await readPeerBaseRecord(h.peerRoot, "sess_b");

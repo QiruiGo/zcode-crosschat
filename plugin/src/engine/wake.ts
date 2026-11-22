@@ -2504,27 +2504,93 @@ export interface SteerDirective {
   sleep?: (ms: number) => Promise<void>;
 }
 
-/** steer 终止手段的注入形状（测试用；生产恒走平台真实实现）。 */
-export type SteerKillFn = (pid: number, force: boolean) => { ok: boolean; error?: string };
+/**
+ * steer 终止手段的注入形状（测试用；生产恒走平台真实实现）。
+ *
+ * v0.9.9（E1）：返回值补**进程树披露**（`tree`）——`taskkill /T` 覆盖的不只是宿主 pid，
+ * 还有它当时已拉起的工具子进程；枚举不可用（CIM 查询失败/非 Windows）时退化为
+ * `[pid]`（至少如实披露根）。测试注入面可只回 `{ok}`（tree 缺省 = 不披露）。
+ */
+export type SteerKillFn = (pid: number, force: boolean) => { ok: boolean; error?: string; tree?: number[] };
+
+/** 进程树枚举（CIM 快照）的超时上限（ms）—— steer 终止路径是同步编排，枚举必须有界。 */
+export const STEER_TREE_ENUM_TIMEOUT_MS = 5_000;
 
 /**
- * 平台真实终止手段（S2）：
- * - Windows：`taskkill /PID <pid>`（无 /F ≈ WM_CLOSE 语义）→ 超时/被拒才 `taskkill /PID <pid> /F`；
- * - 非 Windows：SIGTERM → SIGKILL。
+ * v0.9.9（E1）：Windows 进程树枚举（根 pid + 递归子孙，根在前）——`taskkill /T` 的
+ * 披露面数据源。一次有界 PowerShell CIM 快照（`Get-CimInstance Win32_Process` 的
+ * pid/ppid 两列，纯数字、不依赖 locale 解析），本地建父子图后 DFS。
+ *
+ * 边界（如实声明）：
+ * - 快照是**枚举时刻**的形态：枚举之后才拉起的工具子进程不在披露里（但 `taskkill /T`
+ *   在 kill 时刻现场枚举，实际覆盖以它为准——披露是 best-effort，不是覆盖承诺）；
+ * - CIM 不可用（powershell 缺失/超时/退出非 0）→ 返回 `[pid]`（只披露根，不猜）；
+ * - 只读快照，无副作用。
+ */
+export function windowsProcessTree(pid: number): number[] {
+  const root = [pid];
+  if (process.platform !== "win32" || !Number.isSafeInteger(pid) || pid <= 0) return root;
+  const result = spawnSync(
+    "powershell",
+    ["-NoProfile", "-Command", "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId) $($_.ParentProcessId)\" }"],
+    { windowsHide: true, timeout: STEER_TREE_ENUM_TIMEOUT_MS, encoding: "utf8" },
+  );
+  if (result.status !== 0 || typeof result.stdout !== "string") return root;
+  const children = new Map<number, number[]>();
+  for (const line of result.stdout.split(/\r?\n/)) {
+    const m = /^\s*(\d+)\s+(\d+)\s*$/.exec(line);
+    if (m === null) continue;
+    const child = Number(m[1]);
+    const parent = Number(m[2]);
+    const bucket = children.get(parent);
+    if (bucket === undefined) children.set(parent, [child]);
+    else bucket.push(child);
+  }
+  const out: number[] = [];
+  const seen = new Set<number>([pid]);
+  const frontier: number[] = [pid];
+  while (frontier.length > 0) {
+    const current = frontier.shift()!;
+    out.push(current);
+    for (const kid of children.get(current) ?? []) {
+      if (!seen.has(kid)) {
+        seen.add(kid);
+        frontier.push(kid);
+      }
+    }
+  }
+  return out.length > 0 ? out : root;
+}
+
+/**
+ * 平台真实终止手段（S2 + v0.9.9 E1 进程树修订）：
+ * - Windows：`taskkill /PID <pid> /T`（无 /F ≈ WM_CLOSE 语义，**带子进程树**）→
+ *   超时/被拒才 `taskkill /PID <pid> /T /F`；kill 前先枚举进程树随结果披露（E1）；
+ * - 非 Windows：SIGTERM → SIGKILL，并 best-effort 同发进程组（唤醒子经 helper
+ *   `detached:true` 拉起 = 进程组组长，组内即它的工具子进程树）；
  * 同步返回（spawnSync）——steer 是同步编排路径，且强杀确认必须有界（不挂起工具调用）。
  */
-export function platformSteerKill(pid: number, force: boolean): { ok: boolean; error?: string } {
+export function platformSteerKill(pid: number, force: boolean): { ok: boolean; error?: string; tree?: number[] } {
   if (process.platform === "win32") {
-    const args = ["/PID", String(pid)];
+    // E1：先枚举再终止——被终止的进程树要能披露（pids/数量）；枚举失败退化为 [pid]。
+    const tree = windowsProcessTree(pid);
+    const args = ["/PID", String(pid), "/T"];
     if (force) args.push("/F");
     const result = spawnSync("taskkill", args, { windowsHide: true });
-    if (result.status === 0) return { ok: true };
+    if (result.status === 0) return { ok: true, tree };
     const detail = (result.stderr?.toString() ?? result.stdout?.toString() ?? "").trim();
-    return { ok: false, error: `taskkill exit ${result.status ?? "signal"}: ${detail.slice(0, 200)}` };
+    return { ok: false, error: `taskkill exit ${result.status ?? "signal"}: ${detail.slice(0, 200)}`, tree };
   }
   try {
     process.kill(pid, force ? "SIGKILL" : "SIGTERM");
-    return { ok: true };
+    // E1：进程组 best-effort（唤醒子是 detached 组长；组即它的工具子进程树）。
+    // 失败（ESRCH：非组长/组已散）忽略——主信号已交付即算 ok，组信号是增量覆盖。
+    try {
+      process.kill(-pid, force ? "SIGKILL" : "SIGTERM");
+    } catch {
+      /* 非组长或组已不存在：无树可杀，主路径语义不变 */
+    }
+    return { ok: true, tree: [pid] };
   } catch (err) {
     return { ok: false, error: `signal ${force ? "SIGKILL" : "SIGTERM"} failed: ${err instanceof Error ? err.message : String(err)}` };
   }
@@ -2556,17 +2622,32 @@ export interface SteerStopResult {
   gracefulRefusal?: string;
   /** 终止失败的原因（stopped=false 时在场）。 */
   error?: string;
+  /**
+   * v0.9.9（E1）：本次终止**实际覆盖的进程树**（根 pid 在前；根 + 终止手段枚举到的
+   * 工具子进程）。注入 kill 不回 tree 时缺省（不虚构披露）。回执/审计据此披露
+   * 「被终止的进程树（pids/数量）」——E1 修的就是「只杀宿主、工具子进程存活」。
+   */
+  tree?: number[];
+  /**
+   * v0.9.9（E1）：根确认死亡后，树内**仍存活**的 pid（best-effort 复核；空 = 无残留）。
+   * 缺省 = 本次未做复核（注入 kill 未给树 / 终止失败提前返回）。
+   */
+  treeSurvivors?: number[];
 }
 
 /**
- * steer 终止编排（S2）：**先优雅**（taskkill /PID 无 /F ≈ WM_CLOSE）→ 宽限窗内等自行退出
- * → 超时（或优雅信号被 OS 拒绝）才走**带 /F 的 taskkill 强杀** → 有界确认死亡。
+ * steer 终止编排（S2 + v0.9.9 E1 进程树修订）：**先优雅**（`taskkill /PID <pid> /T`
+ * 无 /F ≈ WM_CLOSE，**带子进程树**）→ 宽限窗内等自行退出 → 超时（或优雅信号被 OS
+ * 拒绝）才走**`taskkill /PID <pid> /T /F` 强杀整棵树** → 有界确认死亡 → 树内存活复核。
  *
  * 两条实现注记（都有实测依据，44-v098 feasibility）：
  * ① 优雅被拒（taskkill 无 /F 对无头进程报错）→ **不等满窗**直接升级强杀：没有信号在途，
  *    等待不会带来退出； waitedMs 如实记实际耗时（审计面可见这条捷径）；
- * ② 强杀遗留孤儿子进程（被杀进程自己的子进程父死后仍存活）是已知副作用——回执/信封
- *    首行的「未落盘进度可能丢失」即覆盖此形态，不在本函数承诺清理（插件不持有进程树）。
+ * ② v0.9.9（E1）起强杀**带进程树**（/T）：v0.9.8 只杀宿主 pid，旧回合已拉起的工具子进程
+ *    （150s powershell 实测）父死后继续存活、旧副作用可能继续（44-v098 real-smoke E §3.2
+ *    的 pids.log 逐次采样即此形态）。修法不是「撤销已发生副作用」（做不到），而是
+ *    **不再留下继续跑的子进程**：/T 覆盖宿主 + 其工具子进程，回执/审计披露被终止的
+ *    进程树（pids/数量）与强杀确认后的树内残存（无残留 = 空）。
  */
 export async function stopTurnForSteer(
   pid: number,
@@ -2590,53 +2671,87 @@ export async function stopTurnForSteer(
     return { pid, graceful: false, waitedMs: 0, stopped: false, error: `refusing to steer-kill pid ${pid} (invalid or self)` };
   }
   const startedAt = now();
-  // ① 优雅终止（WM_CLOSE 语义）。
+  // 进程树披露合并器：优雅/强杀两次 kill 各自枚举的快照取并集（根恒在首）。
+  // 注入 kill 不回 tree（既有测试形态）→ 合并结果恒缺省，不虚构披露键。
+  let mergedTree: number[] | undefined;
+  const absorbTree = (killResult: { tree?: number[] }): void => {
+    if (killResult.tree === undefined) return;
+    if (mergedTree === undefined) mergedTree = [...killResult.tree];
+    else for (const p of killResult.tree) if (!mergedTree.includes(p)) mergedTree.push(p);
+  };
+  // 根确认死亡后的树内存活复核（best-effort：只对已枚举到的 pid 用进程内探询，有界）。
+  const survivorsOf = (): number[] | undefined =>
+    mergedTree === undefined ? undefined : mergedTree.filter((p) => alive(p));
+  const withTree = (result: SteerStopResult): SteerStopResult => ({
+    ...result,
+    ...(mergedTree !== undefined ? { tree: [...mergedTree] } : {}),
+    ...(result.stopped && mergedTree !== undefined ? { treeSurvivors: survivorsOf() ?? [] } : {}),
+  });
+  // ① 优雅终止（WM_CLOSE 语义，/T 带树）。
   const graceful = kill(pid, false);
+  absorbTree(graceful);
   // 优雅信号被 OS 拒绝的原文（Windows 无头进程常态）——两条返回路径都要带（审计要能
   // 解释「为何 graceful=false 而 waitedMs 远小于宽限窗」）。
   const gracefulRefusal = graceful.ok ? undefined : graceful.error;
   if (graceful.ok) {
     while (now() - startedAt < graceMs) {
-      if (!alive(pid)) return { pid, graceful: true, waitedMs: now() - startedAt, stopped: true };
+      if (!alive(pid)) return withTree({ pid, graceful: true, waitedMs: now() - startedAt, stopped: true });
       await sleep(STEER_STOP_POLL_MS);
     }
-    if (!alive(pid)) return { pid, graceful: true, waitedMs: now() - startedAt, stopped: true };
+    if (!alive(pid)) return withTree({ pid, graceful: true, waitedMs: now() - startedAt, stopped: true });
   }
-  // ② 超时或优雅被拒 → /F 强杀。
+  // ② 超时或优雅被拒 → /F 强杀（/T 带树）。
   const forced = kill(pid, true);
+  absorbTree(forced);
   if (!forced.ok) {
     const stillAlive = alive(pid);
-    return {
+    return withTree({
       pid,
       graceful: false,
       waitedMs: now() - startedAt,
       stopped: !stillAlive,
       ...(gracefulRefusal !== undefined ? { gracefulRefusal } : {}),
       ...(stillAlive ? { error: forced.error ?? "force kill failed; process still alive" } : {}),
-    };
+    });
   }
   const forceDeadline = now() + STEER_FORCE_CONFIRM_MS;
   while (now() < forceDeadline) {
     if (!alive(pid)) {
-      return {
+      return withTree({
         pid,
         graceful: false,
         waitedMs: now() - startedAt,
         stopped: true,
         ...(gracefulRefusal !== undefined ? { gracefulRefusal } : {}),
-      };
+      });
     }
     await sleep(STEER_STOP_POLL_MS);
   }
   const stillAlive = alive(pid);
-  return {
+  return withTree({
     pid,
     graceful: false,
     waitedMs: now() - startedAt,
     stopped: !stillAlive,
     ...(gracefulRefusal !== undefined ? { gracefulRefusal } : {}),
     ...(stillAlive ? { error: "process still alive after /F" } : {}),
-  };
+  });
+}
+
+/**
+ * v0.9.9（E1）：终止实况的**进程树措辞**（回执 reason 行内联；无树披露 → 空串）。
+ *
+ * - 树全部终止：`，进程树 N 个（pid/pid）全部终止`——E1 验收「宿主与其工具子进程均死亡」；
+ * - 树内有残存：`，进程树 N 个（…），其中 M 个仍存活（…，强杀后未亡——请人工核查）`
+ *   （如实披露「无残留」不成立，不假装整树死绝）；
+ * - 注入 kill 未给树（测试形态）→ 空串（不虚构披露）。
+ */
+export function steerTreeClause(stopped: { tree?: number[]; treeSurvivors?: number[] } | undefined): string {
+  if (stopped?.tree === undefined) return "";
+  const treePart = `进程树 ${stopped.tree.length} 个（${stopped.tree.join("/")}）`;
+  const survivors = stopped.treeSurvivors ?? [];
+  if (survivors.length === 0) return `，${treePart}全部终止`;
+  return `，${treePart}，其中 ${survivors.length} 个仍存活（${survivors.join("/")}，强杀后未亡——请人工核查）`;
 }
 
 /** steer 三态结果词（S5 冻结）：抢占成功 / 降级下一回合 / 不支持（交互式）。 */
@@ -2725,13 +2840,27 @@ export function classifySteerTarget(input: {
   };
 }
 
-/** steer 回执块（S5 冻结形状；工具面原样进 payload `interrupt` 键）。 */
+/**
+ * steer 回执块（S5 冻结形状；工具面原样进 payload `interrupt` 键）。
+ *
+ * v0.9.9（E1）：`stopped` 块补**进程树披露**（`tree` = 被终止的进程树 pids，根在前；
+ * `treeSurvivors` = 强杀确认后树内仍存活的 pid，空 = 无残留）。两键都缺省 = 终止手段
+ * 未给出树（测试注入形态），不虚构。
+ */
 export interface SteerOutcome {
   requested: true;
   result: SteerResultWord;
   reason: string;
   /** 终止实况（仅抢占成功时在场；失败回退不带——不把「试图终止」写成「已终止」）。 */
-  stopped?: { pid: number; graceful: boolean; waitedMs: number };
+  stopped?: {
+    pid: number;
+    graceful: boolean;
+    waitedMs: number;
+    /** v0.9.9（E1）：被终止的进程树（根 pid 在前；宿主 + 其工具子进程）。 */
+    tree?: number[];
+    /** v0.9.9（E1）：树内残存（强杀确认后仍存活的 pid；空数组 = 无残留）。 */
+    treeSurvivors?: number[];
+  };
   /** 新回合实况（仅新回合真实发起时在场）。 */
   turn?: { nonce: string; startConfirmed: boolean };
 }
@@ -3422,8 +3551,15 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
   // 与重唤醒都带（buildWakePrompt 恒附加，budget 内）。读失败 → 空名单（不附行，
   // 不因观测面读盘失败阻断唤醒）。
   const wakeRoster = await readWakeRoster(stateRoot, req.teamId, toKey);
-  /** v0.9.8（S2）：终止实况（抢占成功后才置位；回执/审计的 stopped 块只认它）。 */
-  let steerStopped: { pid: number; graceful: boolean; waitedMs: number } | undefined;
+  /** v0.9.8（S2）：终止实况（抢占成功后才置位；回执/审计的 stopped 块只认它）。
+   *  v0.9.9（E1）：带进程树披露（tree/treeSurvivors——被终止的宿主 + 工具子进程）。 */
+  let steerStopped: {
+    pid: number;
+    graceful: boolean;
+    waitedMs: number;
+    tree?: number[];
+    treeSurvivors?: number[];
+  } | undefined;
   /**
    * v0.9.8（S5）：steer 回执装配器——给一个既有返回结果挂 steer 三态块。
    *
@@ -3440,7 +3576,13 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
       skipReason?: string;
       result?: SteerResultWord;
       reason?: string;
-      stopped?: { pid: number; graceful: boolean; waitedMs: number };
+      stopped?: {
+        pid: number;
+        graceful: boolean;
+        waitedMs: number;
+        tree?: number[];
+        treeSurvivors?: number[];
+      };
       turn?: { nonce: string; startConfirmed: boolean };
     } = {},
   ): Promise<T> => {
@@ -3701,7 +3843,14 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
         { skipReason: reason },
       );
     }
-    steerStopped = { pid: stop.pid, graceful: stop.graceful, waitedMs: stop.waitedMs };
+    steerStopped = {
+      pid: stop.pid,
+      graceful: stop.graceful,
+      waitedMs: stop.waitedMs,
+      // v0.9.9（E1）：进程树披露（注入 kill 未回 tree 时缺省，不虚构键）。
+      ...(stop.tree !== undefined ? { tree: stop.tree } : {}),
+      ...(stop.treeSurvivors !== undefined ? { treeSurvivors: stop.treeSurvivors } : {}),
+    };
     await logEngineEvent(stateRoot, {
       event: "steer-stopped",
       pid: stop.pid,
@@ -3715,6 +3864,10 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
       // Windows 无头进程常态：优雅信号被 OS 拒绝（「只能强行终止（带 /F）」）→ 原文进审计，
       // 解释为何 graceful=false 而 waitedMs 远小于宽限窗（44-v098 feasibility 实测形态）。
       ...(stop.gracefulRefusal !== undefined ? { gracefulRefusal: stop.gracefulRefusal } : {}),
+      // v0.9.9（E1）：被终止的进程树（pids + 数量）与强杀确认后的树内残存——「只杀宿主、
+      // 工具子进程存活」的缺陷形态自此在审计面可逐 pid 对账。
+      ...(stop.tree !== undefined ? { treePids: stop.tree, treeCount: stop.tree.length } : {}),
+      ...(stop.treeSurvivors !== undefined ? { treeSurvivors: stop.treeSurvivors } : {}),
     });
     // 旧回合的票据随之作废——它的回合已被终止。不消费则 15min 在途标记会挡住下一轮
     // 唤醒/重试（findLiveInflightWakeNonce 只认「有 start 证据且无 exit 尾行」的票据；
@@ -3916,7 +4069,7 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
       {
         result: "deferred-next-turn",
         reason: steerStopped !== undefined
-          ? `已终止旧回合（pid ${steerStopped.pid}，${steerStopped.graceful ? "graceful" : "forced"}，等待 ${steerStopped.waitedMs}ms），但新回合 spawn 失败（${spawnFailReason}）——纠偏留在邮箱（pull 兜底）；旧回合未落盘进度可能丢失`
+          ? `已终止旧回合（pid ${steerStopped.pid}，${steerStopped.graceful ? "graceful" : "forced"}，等待 ${steerStopped.waitedMs}ms${steerTreeClause(steerStopped)}），但新回合 spawn 失败（${spawnFailReason}）——纠偏留在邮箱（pull 兜底）；旧回合未落盘进度可能丢失`
           : `本次未发起唤醒：${spawnFailReason}（消息留邮箱，pull 兜底，租约到期可重试）`,
         ...(steerStopped !== undefined ? { stopped: steerStopped } : {}),
       },
@@ -4030,6 +4183,9 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
       stoppedPid: steerStopped.pid,
       stoppedGraceful: steerStopped.graceful,
       waitedMs: steerStopped.waitedMs,
+      // v0.9.9（E1）：被终止的进程树随抢占成功事件一并落账（与 steer-stopped 同值，可对拍）。
+      ...(steerStopped.tree !== undefined ? { treePids: steerStopped.tree, treeCount: steerStopped.tree.length } : {}),
+      ...(steerStopped.treeSurvivors !== undefined ? { treeSurvivors: steerStopped.treeSurvivors } : {}),
     });
   }
 
@@ -4425,7 +4581,7 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
   if (steerStopped !== undefined) {
     return attachSteer(success, {
       result: "preempted",
-      reason: `已终止旧回合（pid ${steerStopped.pid}，${steerStopped.graceful ? "graceful" : "forced"}，等待 ${steerStopped.waitedMs}ms）并以 steer 信封续跑新回合——纠偏是新回合首条指令；旧回合未落盘进度可能丢失`,
+      reason: `已终止旧回合（pid ${steerStopped.pid}，${steerStopped.graceful ? "graceful" : "forced"}，等待 ${steerStopped.waitedMs}ms${steerTreeClause(steerStopped)}）并以 steer 信封续跑新回合——纠偏是新回合首条指令；旧回合未落盘进度可能丢失`,
       stopped: steerStopped,
       // turn.nonce 落**不可反查摘要**（与 steer-turn-started 审计同值，可对拍）——真值
       // 只存在于唤醒 prompt 与 registry/wake/ 真源（V091-01 纪律：工具回执不给可消耗令牌）。

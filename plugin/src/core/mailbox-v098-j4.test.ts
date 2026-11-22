@@ -1,11 +1,17 @@
 /**
  * v0.9.8（组 M·J4）定向单测：一行消息状态的**纯函数层**——
  * interrupt/steer 谓词、置顶排序、状态阶梯、邮箱键枚举。
+ * v0.9.9（V098-03 更新）：refused 判据改引擎凭据对账（形状不再足够）。
+ * v0.9.9（V098-09 复核）：steer 键由写入侧落盘（组 W 的 V098-02 修法），读面宽容
+ * 拷贝可达——谓词两键同一判定（steer 恒蕴含 interrupt，不双计）。
  *
  * 口径写死（与 core/mailbox.ts 的 MessageStatus 注释、docs/V098-J4-MESSAGE-STATUS.md 同源）：
  * held → refused → discarded → read → injected → delivered → queued（→ unknown = 找不到）。
  *
- * 权限与跨邮箱定位在 mcp/tools-read-v098-j4.test.ts 驱动（要真邮箱文件）。
+ * 权限与跨邮箱定位在 mcp/tools-read-v098-j4.test.ts 驱动（要真邮箱文件）；
+ * refused 的引擎凭据对账（engine.jsonl）在 mailbox-v099-v09803.test.ts 驱动；
+ * steer 键经**真实写入路径**（xc_relay steer:true）落盘后的读回在
+ * mcp/tools-relay-v099-v09809.test.ts 驱动。
  */
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -24,8 +30,9 @@ import {
 import type { TeamMessage } from "./types.js";
 
 /**
- * v0.9.8（J1 跨组契约）：steer 元数据由组 S 写进邮箱行，字段白名单（types.ts）属其
- * 文件域——故测试侧同样用宽容形状构造（运行时的键由 core/mailbox.ts 的读面补回）。
+ * v0.9.8（J1 跨组契约）：steer 元数据由写入侧落进邮箱行（v0.9.9 起 tools-relay.ts 的
+ * V098-02 修法），字段白名单（types.ts）属组 H 文件域——故测试侧同样用宽容形状构造
+ * （运行时的键由 core/mailbox.ts 的读面补回）。
  */
 type MsgInit = Partial<TeamMessage> & { steer?: boolean };
 
@@ -53,6 +60,7 @@ describe("v0.9.8 J4：interrupt/steer 谓词（三面共用的唯一实现）", 
     expect(isInterruptOrSteer(message({ interrupt: true, steer: true }))).toBe(true);
     expect(isInterruptOrSteer(message())).toBe(false);
     expect(isInterruptOrSteer(message({ urgent: true }))).toBe(false);
+    // steer 恒蕴含 interrupt（写入侧 S1）⇒ 两键同集，只计一条。
     expect(countUnreadInterrupts([message({ interrupt: true }), message({ id: "m-2", steer: true }), message({ id: "m-3" })]))
       .toBe(2);
   });
@@ -118,16 +126,26 @@ describe("v0.9.8 J4：状态阶梯（写死口径）", () => {
     expect(messageStatusOf(message({ deliveredAt: 1_500 }), true)).toBe("held");
   });
 
-  it("refused：delivery-refused 回执帧（优先级高于其他印章）", () => {
+  it("refused：delivery-refused 回执帧 + 引擎凭据（优先级高于其他印章）", () => {
     const receipt = message({
       id: "r-1", from: "bob", to: "alice",
       content: JSON.stringify({ type: "delivery-refused", teamId: "default", to: "bob", reason: "inbound policy refuse" }),
       deliveryClaimedAt: 1_500,
     });
     expect(isDeliveryRefusedReceipt(receipt)).toBe(true);
-    expect(messageStatusOf(receipt, false)).toBe("refused");
+    // v0.9.9（V098-03）：形状只是必要不充分条件——无引擎凭据时不判 refused（按印章态归并）。
+    expect(messageStatusOf(receipt, false)).toBe("queued");
+    expect(messageStatusOf(receipt, false, true)).toBe("refused");
     expect(isDeliveryRefusedReceipt(message({ content: "普通聊天" }))).toBe(false);
     expect(isDeliveryRefusedReceipt(message({ content: JSON.stringify({ type: "chat" }) }))).toBe(false);
+  });
+
+  it("held 仍压过 refused：隔离区里的回执形状件恒为 held", () => {
+    const receipt = message({
+      id: "r-2", from: "bob", to: "alice",
+      content: JSON.stringify({ type: "delivery-refused", teamId: "default", to: "bob", reason: "inbound policy refuse" }),
+    });
+    expect(messageStatusOf(receipt, true, true)).toBe("held");
   });
 
   it("discarded：discardedAt 优先于 read/injected（作废是终局）", () => {

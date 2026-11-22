@@ -204,6 +204,7 @@ describe("v0.9.8 J2：回合首行插队/纠偏横幅", () => {
   });
 
   it("steer 元数据同样触发横幅（与 interrupt 同一个谓词）", async () => {
+    // v0.9.9 复核（V098-09）：写入侧已落 steer 键（组 W 的 V098-02 修法），谓词两键同一判定。
     withUnread([msg("s-1", "lead", { steer: true })]);
     const context = await injectedContext();
     expect(context.startsWith("⛔ 插队/纠偏待处理（1 条）")).toBe(true);

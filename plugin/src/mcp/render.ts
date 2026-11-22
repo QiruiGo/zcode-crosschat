@@ -162,13 +162,36 @@ export function wakeReceiptFailurePhrase(wake: WakeReceiptState | undefined): st
  * - `result:"unsupported"`：交互式会话（插件无权终止，只有用户 Esc）。
  *
  * 人可读行由 {@link steerReceiptPhrase} 产出——三态措辞分流，失败/降级不写「抢占成功」。
+ *
+ * v0.9.9（E1）：`stopped` 块补进程树披露（`tree` = 被终止的宿主 + 工具子进程 pids；
+ * `treeSurvivors` = 强杀确认后树内仍存活的 pid，空 = 无残留）——措辞见
+ * {@link steerReceiptPhrase}。
  */
 export interface SteerReceiptState {
   requested: true;
   result: "preempted" | "deferred-next-turn" | "unsupported";
   reason: string;
-  stopped?: { pid: number; graceful: boolean; waitedMs: number };
+  stopped?: {
+    pid: number;
+    graceful: boolean;
+    waitedMs: number;
+    tree?: number[];
+    treeSurvivors?: number[];
+  };
   turn?: { nonce: string; startConfirmed: boolean };
+}
+
+/**
+ * v0.9.9（E1）：进程树披露短语（被终止的树 + 残存；无 tree → 空串）。
+ * 纯函数，与 engine/wake.ts 的 steerTreeClause 同口径（人可读行用分号连接）。
+ */
+export function steerTreePhrase(steer: SteerReceiptState | undefined): string | undefined {
+  const tree = steer?.stopped?.tree;
+  if (tree === undefined) return undefined;
+  const treePart = `进程树 ${tree.length} 个（${tree.join("/")}）`;
+  const survivors = steer?.stopped?.treeSurvivors ?? [];
+  if (survivors.length === 0) return `${treePart}全部终止`;
+  return `${treePart}，其中 ${survivors.length} 个仍存活（${survivors.join("/")}，强杀后未亡——请人工核查）`;
 }
 
 /**
@@ -178,6 +201,10 @@ export interface SteerReceiptState {
  *   「未落盘进度可能丢失」披露（强杀副作用，方案 §五 边界）；
  * - deferred-next-turn：⛔ steer 降级 + 原因（idle/闸挡/失败）——不写「已抢占」；
  * - unsupported：⛔ 不支持抢占 + 原因（交互式会话只有用户 Esc）+ 软中断兜底指引。
+ *
+ * v0.9.9（E1）：preempted 短语补**进程树披露**（taskkill /T：宿主 + 其工具子进程，
+ * 及强杀确认后的树内残存）——「只杀宿主、工具子进程继续跑」的缺陷形态（44-v098
+ * real-smoke E §3.2 实测）自此在回执人可读行可见。
  */
 export function steerReceiptPhrase(steer: SteerReceiptState | undefined): string | undefined {
   if (steer === undefined || steer.requested !== true) return undefined;
@@ -185,12 +212,14 @@ export function steerReceiptPhrase(steer: SteerReceiptState | undefined): string
     const stopped = steer.stopped !== undefined
       ? `（终止 pid ${steer.stopped.pid}，${steer.stopped.graceful ? "graceful" : "forced"}，等待 ${steer.stopped.waitedMs}ms）`
       : "";
+    const tree = steerTreePhrase(steer);
+    const treePart = tree !== undefined ? `，${tree}` : "";
     const turn = steer.turn !== undefined
       ? steer.turn.startConfirmed
         ? "；新回合已启动（start-confirmed）"
         : "；新回合已发起但未见启动证据（非送达确认）"
       : "";
-    return `⛔ steer 抢占成功${stopped}：旧回合已终止，纠偏是新回合首条指令${turn}；旧回合未落盘进度可能丢失`;
+    return `⛔ steer 抢占成功${stopped}${treePart}：旧回合已终止，纠偏是新回合首条指令${turn}；旧回合未落盘进度可能丢失`;
   }
   if (steer.result === "unsupported") {
     return `⛔ steer 不支持抢占：${steer.reason}`;

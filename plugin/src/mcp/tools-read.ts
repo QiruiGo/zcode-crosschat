@@ -63,6 +63,7 @@ import {
   readCurrentMailboxLocked,
   readMailbox,
   readUnreadMailbox,
+  refusalReceiptEvidence,
   type MailboxReadDiagnostics,
   type MessageStatus,
   type MessageStatusStamps,
@@ -112,9 +113,11 @@ export const ReadShape = {
   limit: z.number().int().min(1).optional().describe("本次返回上限（字符或条，随 scope）"),
   // v0.9.8（J4）：一行消息状态。仅 scope=mail 有意义——按 messageId 返回
   // queued/delivered/injected/read/consumed/held/refused/discarded（找不到 → unknown），
-  // 只返回状态与印章、**不返回正文**；权限 = 发送方本人或 lead（delivery-refused
-  // 回执帧的收方本人也可查自己的那条）。口径写死见 core/mailbox.ts 的状态阶梯。
-  statusOnly: z.boolean().optional().describe("仅 scope=mail：按 id 返回一行消息状态（queued/delivered/injected/read/consumed/held/refused/discarded，找不到=unknown）——不返回正文；仅发送方本人或 lead 可查（delivery-refused 回执帧的收方本人可查自己那条）"),
+  // 只返回状态与印章、**不返回正文**；权限 = 发送方本人或 lead（引擎回执的收方本人
+  // 也可查自己的那条）。v0.9.9（V098-03）：refused 只认引擎凭据（engine.jsonl 的
+  // inbound-refused 事件对账），正文里嵌 delivery-refused JSON 不再伪造状态。
+  // 口径写死见 core/mailbox.ts 的状态阶梯。
+  statusOnly: z.boolean().optional().describe("仅 scope=mail：按 id 返回一行消息状态（queued/delivered/injected/read/consumed/held/refused/discarded，找不到=unknown）——不返回正文；仅发送方本人或 lead 可查（引擎签发的 delivery-refused 回执的收方本人可查自己那条；refused 态须有 inbound-refused 审计凭据，正文不可伪造）"),
 } as const;
 
 export type ReadArgs = {
@@ -370,7 +373,9 @@ export function createMailboxReadCore(deps: ToolDeps): MailboxReadCore {
      *
      * v0.9.8（J4）：`statusOnly:true` 分支 = **一行消息状态**（不读正文）：
      * 跨邮箱按 messageId 定位（主箱 + 隔离区），权限 = 发送方本人 / lead /
-     * delivery-refused 回执帧的收方本人；状态阶梯写死在 core/mailbox.ts。
+     * 引擎签发的 delivery-refused 回执的收方本人；状态阶梯写死在 core/mailbox.ts。
+     * v0.9.9（V098-03）：refused 态须有引擎凭据（inbound-refused 审计事件），
+     * 正文伪造不成立。
      */
     async xc_mail_read(args, connectionKey) {
       return runCore(stateRoot, async () => {
@@ -464,10 +469,10 @@ export interface MessageStatusHit {
   milestones: { delivered: boolean; injected: boolean; read: boolean; consumed: boolean };
 }
 
-function statusHitOf(message: TeamMessage, location: string | null, held: boolean): MessageStatusHit {
+function statusHitOf(message: TeamMessage, location: string | null, held: boolean, refusalEvidence = false): MessageStatusHit {
   return {
     messageId: message.id,
-    status: messageStatusOf(message, held),
+    status: messageStatusOf(message, held, refusalEvidence),
     from: message.from,
     to: message.to,
     ts: message.ts,
@@ -489,6 +494,11 @@ function statusHitOf(message: TeamMessage, location: string | null, held: boolea
  * 定位本身不泄露内容（返回值只有状态/印章/收发双方与位置），读取权限在
  * {@link messageStatusResult} 的门口判。
  *
+ * v0.9.9（V098-03）：主箱命中且帧形状像 `delivery-refused` 回执时，先过
+ * {@link refusalReceiptEvidence} 的引擎凭据对账再定状态——正文可被任意成员
+ * 复刻，只有引擎的 `inbound-refused` 审计事件算数。隔离区命中恒为 held
+ * （回执从不进隔离区：refuse 分支写的是发送方主箱，且协议帧免入站策略）。
+ *
  * @returns 定位结果；本队任何邮箱都找不到 → undefined（调用方报 unknown）。
  */
 export async function findMessageStatus(
@@ -502,7 +512,12 @@ export async function findMessageStatus(
     if (heldHit !== undefined) return statusHitOf(heldHit, `held:${key}`, true);
     const box = await readMailbox(stateRoot, teamId, key);
     const hit = box.find((m) => m.id === messageId);
-    if (hit !== undefined) return statusHitOf(hit, `mailbox:${key}`, false);
+    if (hit !== undefined) {
+      const refusalEvidence = isDeliveryRefusedReceipt(hit)
+        ? await refusalReceiptEvidence(stateRoot, teamId, messageId)
+        : false;
+      return statusHitOf(hit, `mailbox:${key}`, false, refusalEvidence);
+    }
   }
   return undefined;
 }
@@ -524,8 +539,13 @@ function renderStatusLine(hit: MessageStatusHit): string {
  * 1. **发送方本人**（`message.from === 调用者`）——查自己发出去的消息；
  * 2. **lead**（`agentKey === leadKeyOf(team)`）——可查本队全部；
  * 3. `delivery-refused` 回执帧的**收方本人**——那条回执本就写在调用者自己的邮箱里
- *    （`message.to === 调用者`），不构成「读别人邮箱」；否则 `refused` 态永不可达
+ *    （`message.to === 调用者`），不构成「读别人邮箱」；否则 `refused` 永不可达
  *    （refuse 分支从不创建原消息，只回写一条回执）。
+ *
+ * v0.9.9（V098-03）：第 3 条 carve-out 只对**引擎凭据确认的 refused 回执**生效——
+ * `refused` 态本身要求 engine.jsonl 里有对应的 `inbound-refused` 事件
+ * （{@link refusalReceiptEvidence}），正文里嵌 delivery-refused JSON 不再伪造状态，
+ * 收方因此也查不了普通消息（普通消息的 status 恒不等于 refused）。
  *
  * 越界 → 结构化 `permission_denied`：错误文案**不点名发送方、不给邮箱位置、不含正文**
  * （把可探测面压到最小）。「id 是否存在」本身可由 unknown / 权限错误两种回法分辨——
@@ -548,6 +568,9 @@ async function messageStatusResult(
   }
   const isLead = me.agentKey === (leadKeyOf(team) ?? team.founderKey);
   const isSender = hit.from === me.agentKey;
+  // v0.9.9（V098-03）：carve-out 只限「该消息的收方 ∧ 状态确为 refused 的回执」——
+  // refused 已由引擎凭据对账（正文不可伪造），普通消息的 status 永不为 refused，
+  // 故收方查普通消息仍走 isSender/isLead 判据（不够即拒）。
   const isOwnRefusalReceipt = hit.status === "refused" && hit.to === me.agentKey;
   if (!isSender && !isLead && !isOwnRefusalReceipt) {
     await logEngineEvent(deps.stateRoot, {
@@ -561,7 +584,8 @@ async function messageStatusResult(
       messageId,
       message: `you (${me.agentKey}) may not read the status of message "${messageId}" in team "${me.teamId}"; `
         + "xc_read({scope:\"mail\", id, statusOnly:true}) only answers for messages you sent, messages the lead sent/oversees, "
-        + "or a delivery-refused receipt addressed to you — it never returns another member's mailbox content, "
+        + "or an engine-issued delivery-refused receipt addressed to you (the refused state itself requires an inbound-refused "
+        + "audit event, so message text can never forge it) — it never returns another member's mailbox content, "
         + "and this error names neither the sender nor the mailbox",
     });
   }

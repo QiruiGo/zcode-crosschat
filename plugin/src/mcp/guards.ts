@@ -33,6 +33,11 @@ import { readTeam } from "../core/teamstate.js";
 import { memberState } from "../core/types.js";
 import { appendHeldMessage, readInboundPolicy } from "../core/policy.js";
 import { parseToolFrameType } from "../core/toolrelay.js";
+// v0.9.9（V098-02）：hold 挡下 steer 的如实回执块（与内核 hold 分支同源，防两处漂移）
+// + steer 权限闸（直调组装链核心时的第二道防线）。tools-relay.ts 对本模块只有
+// type-only 反向依赖（ToolDeps），无运行时环。
+import { authorizeSteerForTeamAxis, steerHeldReceipt, type SteerAuthorizedFlag } from "./tools-relay.js";
+import type { RelayArgs } from "./tools-relay.js";
 import type { ToolCore, ToolDeps } from "./core.js";
 import type { TeamMessage } from "../core/types.js";
 
@@ -105,7 +110,14 @@ export function withGuards(core: ToolCore, deps: ToolDeps): ToolCore {
   /** chat 入站策略执行（§7.4-I4）：仅 chat 到这里；source 字段不成对/自发消息等
    * 异常参数原样透传给内层校验（保持 v0.1.0 错误口径不变）。
    * v0.6：队内轴发送入参为 RelayArgs（`msg` 必填；forwardOf 已砍）——hold 隔离副本
-   * 的 forwardOf 指针占位一并移除（转发机制在主路径即被显式拒绝，不可达）。 */
+   * 的 forwardOf 指针占位一并移除（转发机制在主路径即被显式拒绝，不可达）。
+   * v0.9.9（V098-02）：hold 分支补 **steer 归一 + 元数据保留 + 如实回执**——
+   * xc_relay 的 steer:true 经编排层权限闸（guards 之前）放行后到达本层，本层必须
+   * ① 按 C1/S1 同款归一（steer 蕴含 interrupt 蕴含 urgent——裸 args 里这三个键都
+   * 缺省，旧实现直接丢元数据）；② 暂存副本保留 steer:true（放行后 J1 置顶/预留预算
+   * 按 steer 语义生效）；③ 回执经 {@link steerHeldReceipt} 明说「steer 未执行」。
+   * 成员→成员 steer 在生产路径到不了本层（编排层权限闸已拒 + 审计，隔离区都不进）；
+   * 直调组装链核心的 steer 由本层第二道闸兜底（见下方 steerAuthorized）。 */
   const guardedMessage: ToolCore["xc_message"] = (args, connectionKey) =>
     gated(args, connectionKey, async (a, ck) => {
       const me = identityStore.require(ck);
@@ -124,20 +136,51 @@ export function withGuards(core: ToolCore, deps: ToolDeps): ToolCore {
       // 为 string（发送路径）。
       if (a.withdrawMessageIds !== undefined || a.msg === undefined) return core.xc_message(a, ck);
       if (parseToolFrameType(a.msg) !== undefined) return core.xc_message(a, ck);
+      // v0.9.9（V098-02）：C1/S1 归一（steer 蕴含 interrupt 蕴含 urgent）——与内核
+      // 的发送路径同口径；编排层传来的裸 args 不带这三个键的蕴含关系。
+      const steerRequested = a.steer === true;
+      const interruptRequested = a.interrupt === true || steerRequested;
+      const urgent = a.urgent === true || interruptRequested;
+      // v0.9.9（V098-02）：**本层（guards）的 steer 权限闸**——第二道防线。生产路径
+      // （xc_relay 编排层）已在 guards 之前判定并下传 `steerAuthorized`，本闸跳过
+      // （印章一次性，不重复消费）；**直调组装链核心**（无编排层）的 steer 调用在此
+      // 兜底——否则 hold/refuse 分支仍会在内核闸之前短路（adv-4 缺陷 B 的完整修复面）。
+      let steerAuthorized = (a as RelayArgs & { steerAuthorized?: SteerAuthorizedFlag }).steerAuthorized;
+      if (steerRequested && steerAuthorized === undefined) {
+        steerAuthorized = await authorizeSteerForTeamAxis({ stateRoot, env }, me, a, Date.now());
+      }
+      const inner: RelayArgs & { steerAuthorized?: SteerAuthorizedFlag } =
+        steerAuthorized !== undefined ? { ...a, steerAuthorized } : { ...a };
       const policy = await readInboundPolicy(stateRoot, me.teamId, env);
-      if (policy.mode === "accept") return core.xc_message(a, ck);
+      if (policy.mode === "accept") return core.xc_message(inner, ck);
 
       if (policy.mode === "hold") {
         // hold 隔离副本保留 urgent 标记（C1：接受审阅后插队不丢）。
         // v0.9（G-2）：软中断元数据同样保留（接受审阅后信封横幅随读取面渲染不丢）。
+        // v0.9.9（V098-02）：steer 元数据同样保留（J1/J2/J3 的读面宽容拷贝认它；
+        // 字段白名单在 core/types.ts 非本文件域，故与 tools-relay.ts 主路径同款补键）。
         const msg = createMessage(me.agentKey, toKey, a.msg, chatExtrasOf(a));
-        if (a.urgent === true) msg.urgent = true;
-        if (a.interrupt === true) msg.interrupt = true;
+        if (urgent) msg.urgent = true;
+        if (interruptRequested) msg.interrupt = true;
+        if (steerRequested) (msg as TeamMessage & { steer?: boolean }).steer = true;
         await appendHeld(stateRoot, me.teamId, toKey, msg);
         return okResult(
           `Message held by inbound policy (mode=hold, source=${policy.source}): quarantined in ` +
             `${toKey}.held.jsonl; hooks/wakes never see it until xc_review accepts it.`,
-          { messageId: msg.id, from: me.agentKey, to: toKey, delivered: "held", policy: "hold" },
+          {
+            messageId: msg.id,
+            from: me.agentKey,
+            to: toKey,
+            delivered: "held",
+            policy: "hold",
+            ...(urgent ? { urgent: true } : {}),
+            // held 件不带 envelope 标注——信封未进可读邮箱（接受审阅后随元数据渲染）。
+            // v0.9.9（V098-02）：steer 请求 → 明说「steer 未执行」（与内核 hold 分支
+            // 同一形状 + E3 顶层别名，防两处漂移）。非 steer 路径仍不带 interrupt 块
+            // （信封未进可读邮箱，接受后随元数据渲染——v0.9.8 口径不改）；urgent 披露键
+            // 与内核 hold 分支对齐（暂存件带 urgent → 放行即插队，调用方应看得见）。
+            ...(steerRequested ? steerHeldReceipt(policy.source) : {}),
+          },
         );
       }
       // refuse：不入目标邮箱；给发送者邮箱写 delivery-refused 回执（白名单协议帧，
@@ -179,12 +222,15 @@ export function withGuards(core: ToolCore, deps: ToolDeps): ToolCore {
   };
 }
 
-/** hold 分支的落盘动作独立成函数（appendHeldMessage + 审计）。 */
+/** hold 分支的落盘动作独立成函数（appendHeldMessage + 审计）。
+ *  v0.9.9（V098-02）：审计补 urgent/interruptRequested/steerRequested 三标记——与内核
+ *  hold 分支（tools-relay.ts inbound-held 事件）同口径，组装链下守卫层才是真实暂存面，
+ *  审计面必须能把 steer 请求与普通消息区分开（adv-4 B：hold 下审计不可分辨）。 */
 async function appendHeld(
   stateRoot: string,
   teamId: string,
   toKey: string,
-  msg: TeamMessage,
+  msg: TeamMessage & { steer?: boolean },
 ): Promise<void> {
   await appendHeldMessage(stateRoot, teamId, toKey, msg);
   await logEngineEvent(stateRoot, {
@@ -193,5 +239,8 @@ async function appendHeld(
     from: msg.from,
     to: toKey,
     messageId: msg.id,
+    ...(msg.urgent === true ? { urgent: true } : {}),
+    ...(msg.interrupt === true ? { interruptRequested: true } : {}),
+    ...(msg.steer === true ? { steerRequested: true } : {}),
   });
 }

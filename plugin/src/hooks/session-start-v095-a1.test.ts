@@ -147,7 +147,11 @@ describe("v0.9.5 A1：钩子的票据消费随 ppid 采纳档默认关", () => {
     expect(await readNonceUsed(token)).toBe(true);
     const { readNames, readSession } = await import("../core/registry.js");
     expect((await readNames(h.stateRoot))["b"]?.sessionId).toBe("sess_b");
-    expect((await readSession(h.stateRoot, "sess_b"))?.boundName).toBe("b");
+    // v0.9.9（V098-01）：票据路径不再写会话记录 boundName（无头持有者判据字段，唯一
+    // 合法写入路径 = member-add 供给代写）；记账标记 wakeTicketBound 承接（花名+时刻）。
+    const recordAfter = await readSession(h.stateRoot, "sess_b");
+    expect(recordAfter?.boundName).toBeUndefined();
+    expect(recordAfter?.wakeTicketBound).toMatchObject({ name: "b" });
     expect(readEngineEvents().filter((e) => e["event"] === "wake-ticket-bound")).toHaveLength(1);
   });
 });

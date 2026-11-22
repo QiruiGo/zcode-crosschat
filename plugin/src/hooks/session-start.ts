@@ -318,11 +318,15 @@ export interface WakeTicketBindingOutcome {
  *    只留审计——模型回合随后会拿到明确错误而非静默错绑）；
  * 3. 落盘（registry → team 固定锁序）：names.json 缺绑才绑（同 sid 幂等刷新）、
  *    roster 行 sid 刷新（仅 ready 态的在册行；不新建行——钩子不虚构成员）、
- *    会话记录 boundName（缺才写，不覆盖别人的身份）；
+ *    会话记录 wakeTicketBound 记账标记 + pid 投影（**不写 boundName**——V098-01，
+ *    见下方注释；既有 boundName（member-add 供给代写）原样保留）；
  * 4. peer 轴盖章：机器全局基记录 boundName + pid（xc_identify 的同款盖章面）。
  *
  * 边界（如实声明）：票据消费属同机信任域（PROTOCOL §10/§11.5：同机进程可读写状态
  * 文件，不做签名/哈希链）；本机制把身份绑定从模型回合前移到钩子，不防同机伪造。
+ * v0.9.9（V098-01）：正因同机信任域包含「引擎给行 sid 签发票据」这一产品路径，
+ * 票据消费**不得**触碰 boundName（无头持有者判据字段）——否则 takeover + 一次唤醒
+ * 期派单即可自签该字段（adv-1 G1）。记账改走 wakeTicketBound 专用标记。
  */
 async function bindWakeTicketIdentity(input: {
   stateRoot: string;
@@ -435,12 +439,23 @@ async function bindWakeTicketIdentity(input: {
       }
       const record = await readSession(input.stateRoot, input.sessionId).catch(() => undefined);
       if (record !== undefined) {
+        // v0.9.9（V098-01）：票据路径**不再写会话记录 boundName**。该字段自 v0.9.1 r4
+        // （V090-04）起是「引擎供给的无头持有者」判据（core/config.ts
+        // engineHolderIsHeadless / engine/wake.ts classifySteerTarget），其不变式是
+        // 「唯一写入路径 = member-add 供给代写」；而票据路径门控 XC_ADOPT_BY_PPID=1，
+        // 交互会话 takeover 引擎花名后收到引擎签发给**行当前 sid** 的票据，钩子一消费
+        // 即把 boundName 自签进交互会话自己的记录——steer 随即把交互宿主当无头会话
+        // 强杀并谎称 preempted（adv-1 G1，P2；v0.9.8 只堵了 identify 自签路径）。
+        // 改写真专用记账标记 wakeTicketBound（哪张票、哪个花名、何时消费）：它**不
+        // 构成**持有者证据（票据可被同一路径自签到达，provenance 弱于供给代写），
+        // 任何判活/判无头面都不得把它当充分条件。pid 投影照写（A1 成员 pid 证据，
+        // 与持有者判据无关）。
         const next = {
           ...record,
-          ...(record.boundName === undefined ? { boundName: name } : {}),
           ...(input.pid !== undefined ? { pid: input.pid } : {}),
+          wakeTicketBound: { name, ts: input.now },
         };
-        if (next.boundName !== record.boundName || next.pid !== record.pid) {
+        if (next.pid !== record.pid || next.wakeTicketBound.name !== record.wakeTicketBound?.name) {
           await writeSession(input.stateRoot, next);
         }
       }
@@ -484,6 +499,11 @@ async function bindWakeTicketIdentity(input: {
   // v0.9.8（D6）：盖章面也改走 upsertPeerBaseRecord 的「读旧→合并→写」——与主路径
   // 同一合并口径（startedAt 只认首次、白名单外字段保留、pid 缺省不丢），不再另用
   // 一份字段白名单重建（两张写面各写一份白名单，正是 D6 的失真源）。
+  // v0.9.9（V098-14）：source 不再无条件覆盖——本票据路径不掌握来源事实，传
+  // `base?.source ?? null`（null=缺省）由 upsertPeerBaseRecord 保留旧值，不抹既有。
+  // 注意：基记录的 boundName 是 peer 轴**观测标记**（peer-services.ts 注册面软校验），
+  // 与队内轴的无头持有者判据字段（sessions/<sid>.json 的 boundName）分路，不受
+  // V098-01 影响。
   try {
     const base = await readPeerBaseRecord(input.peerRoot, input.sessionId);
     await upsertPeerBaseRecord(input.peerRoot, input.sessionId, {
@@ -546,6 +566,8 @@ export async function writeSessionPeerBaseRecord(input: {
     await upsertPeerBaseRecord(input.peerRoot, input.sessionId, {
       cwd: input.workspace,
       ...(input.permissionMode !== undefined ? { permissionMode: input.permissionMode } : {}),
+      // v0.9.9（V098-14）：source 缺省（null = 本回合载荷没给来源）时**保留旧值**——
+      // 钩子回合不掌握来源事实，不得把 identify 等其他写面盖的 source 抹成 null。
       source: input.source,
       now: input.now,
       ...(input.regToken !== undefined ? { regToken: input.regToken } : {}),

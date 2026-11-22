@@ -56,7 +56,7 @@ import {
   type TeamMessage,
   type TeamState,
 } from '../core/types.js';
-import { readTeam } from '../core/teamstate.js';
+import { memberUnclaimedTasks, readTeam, repoolUnclaimedTasksForFailedMember } from '../core/teamstate.js';
 import { deriveSessionPidEvidence, memberLiveness, type MemberLiveness } from '../core/offline.js';
 import { scanPeers, type PeerRecord, type PeerScanResult } from '../core/peerregistry.js';
 import { peerRootFromEnv } from '../core/peerdir.js';
@@ -299,6 +299,14 @@ export interface WatchdogSweepSummary {
   leaseExpired: string[];
   /** v0.9.3（A4）：本轮**实际通知**的待续跑成员（一条 episode 一次；状态变化才重置）。 */
   needsContinuation: Array<{ key: string; taskId: string; idleForMin: number }>;
+  /**
+   * v0.9.9（V098-07）：本轮由**判死路径**回池的未认领单（成员键 → 任务 id 清单）——
+   * pid-dead 成员名下 pending ∧ assignee 空 ∧ to 命中的派单，判死即回共享待领池
+   * （创建者已收到 task-receipt、审计 `member-unclaimed-repooled`）。修复前这些单
+   * 不在任何回池域（stale 清扫只含 claimed/in_progress）而永久搁浅。空 = 本轮无此类
+   * 回池（无 pid-dead 成员 / 无未认领单 / 回池失败——失败落 `watchdog-repool-failed`）。
+   */
+  unclaimedRepooled: Array<{ key: string; taskIds: string[] }>;
   /** 本轮新发现的在途 nonce 孤儿（不可反查摘要）。 */
   orphanNonces: string[];
   /** 本轮尝试过的唤醒（含降级）。 */
@@ -541,6 +549,11 @@ function recentLifeEvidence(
  * 重供给建议附「(成员,会话) 独立记账」说明——v0.9.5 台账按键记账时，按文案走 member-add
  * 重供给恰是下一次死亡被静音的原因（V095-06 的「自荐误导」），复合键记账后该路径不再静音，
  * 文案如实注明。
+ *
+ * v0.9.9（V098-07）：`repooledUnclaimed` = 判死路径已将该成员未认领单回池的任务 id
+ * （V098-07 修法）。非空时尾段如实写「未认领派单已回池至共享待领池（创建者已收到回执）」，
+ * 在途单保持「冻结待回池 + requeueAtMs」口径——未认领单本就不在 stale 清扫域、板面无
+ * requeueAtMs，旧文案对它们是过度承诺；空时尾段逐字节保持 v0.9.6 口径（在途单冻结）。
  */
 function renderMemberDeadText(
   key: string,
@@ -549,6 +562,7 @@ function renderMemberDeadText(
   firstSight: boolean,
   catchUp = false,
   freshEvidence = true,
+  repooledUnclaimed?: string[],
 ): string {
   const head = firstSight
     ? (catchUp
@@ -560,17 +574,33 @@ function renderMemberDeadText(
     : isLead
       ? `lead "${key}" 进程已亡（pid-dead）`
       : `成员 "${key}" 进程已亡（pid-dead，sid ${sessionId}）`;
+  // v0.9.9（V098-07）：未认领单的真实措辞（已回池 ↔ 创建者回执）；在途单的「冻结待
+  // 回池 + requeueAtMs」口径只在有未认领单时把「名下任务」收窄为「在途任务」——
+  // 两者并列时不出现「已回池」与「冻结」互相矛盾。
+  const unclaimedNote = repooledUnclaimed !== undefined && repooledUnclaimed.length > 0
+    ? `名下未认领派单已回池至共享待领池（${repooledUnclaimed.join(", ")}；创建者已收到回执）；`
+    : '';
+  const frozenClause = unclaimedNote === ''
+    ? '名下任务已冻结待回池（预计回池时刻见 xc_overview 板面各任务 requeueAtMs）'
+    : '在途任务已冻结待回池（预计回池时刻见 xc_overview 板面各任务 requeueAtMs）';
   const tail = isLead
     ? '——其会话与 MCP server 已不存在，队内推送面随之中断；在册队友已收到本通知，请接手指令：'
-      + '名下任务已冻结待回池（预计回池时刻见 xc_overview 板面各任务 requeueAtMs），回池后用 xc_dispatch 重派，'
+      + unclaimedNote
+      + `${frozenClause}，回池后用 xc_dispatch 重派，`
       + '或用 xc_team({action:"member-add"}) 幂等重供给（重供给按 (成员,会话) 独立记账，新会话的死亡照常告警）。'
-    : '——其会话/无头回合已不存在；名下任务已冻结待回池（预计回池时刻见 xc_overview 板面各任务 requeueAtMs），'
+    : '——其会话/无头回合已不存在；'
+      + unclaimedNote
+      + `${frozenClause}，`
       + '回池后用 xc_dispatch 重派，或用 xc_team({action:"member-add"}) 幂等重供给'
       + '（重供给按 (成员,会话) 独立记账，新会话的死亡照常告警）。';
   return head + tail;
 }
 
-/** v0.9.3 打回第 1 轮（V093-04）：死亡告警**重发**文案（认领了但通知从未落地的兜底）。 */
+/** v0.9.3 打回第 1 轮（V093-04）：死亡告警**重发**文案（认领了但通知从未落地的兜底）。
+ *  v0.9.9（V098-07）：「名下任务已冻结待回池」收窄为「在途任务」——未认领派单由判死
+ *  路径即时回池（V098-07），不在 stale 清扫域、板面无 requeueAtMs，旧措辞对它们是过度
+ *  承诺；重发发生在死亡认领的下一轮，彼时未认领单早已回池（或留有
+ *  watchdog-repool-failed 审计），文案不再对其状态作断言。 */
 function renderRenotifyText(keys: readonly string[], leadKey: string, leadCurrentlyDead: boolean): string {
   const head = leadCurrentlyDead
     ? `[zcode-crosschat 看门狗] ⚠ lead "${leadKey}" 进程已亡（pid-dead）——其会话与 MCP server 已不存在，队内推送面随之中断；`
@@ -578,7 +608,7 @@ function renderRenotifyText(keys: readonly string[], leadKey: string, leadCurren
   return head
     + `以下成员的死亡告警此前只完成了台账认领、通知未落地（认领与通知非原子，或引擎进程崩在两者之间），现重发：${keys.join(', ')}。`
     + '消息不丢：以上事项均以邮箱为兜底（pull 可读、降级后可重投）。请用 xc_overview 看在册成员活性与未读，'
-    + '其名下任务已冻结待回池（预计回池时刻见板面 requeueAtMs），回池后用 xc_dispatch 重派，'
+    + '其在途任务已冻结待回池（预计回池时刻见板面 requeueAtMs），回池后用 xc_dispatch 重派，'
     + '或用 xc_team({action:"member-add"}) 幂等重供给（重供给按 (成员,会话) 独立记账）。';
 }
 
@@ -640,20 +670,26 @@ async function notifyAndWake(
   }
 }
 
-/** 本轮事故的合并文案（按 incident 顺序编号；无事故返回 undefined）。 */
+/** 本轮事故的合并文案（按 incident 顺序编号；无事故返回 undefined）。
+ *  v0.9.9（V098-07）：`opts.unclaimedRepooled` 非空（本轮判死路径回池了未认领单）时，
+ *  尾段的任务措辞如实分流——未认领派单「已回池至共享待领池（创建者已收到回执）」、
+ *  在途单「已冻结待回池（requeueAtMs）」；空时逐字节保持 v0.9.6 口径。 */
 function renderRoundIncidents(
   incidents: readonly RoundIncident[],
-  opts: { leadKey: string; leadCurrentlyDead: boolean },
+  opts: { leadKey: string; leadCurrentlyDead: boolean; unclaimedRepooled?: readonly { key: string; taskIds: string[] }[] },
 ): string | undefined {
   if (incidents.length === 0) return undefined;
   const head = opts.leadCurrentlyDead
     ? `[zcode-crosschat 看门狗] ⚠ lead "${opts.leadKey}" 进程已亡（pid-dead）——其会话与 MCP server 已不存在，队内推送面随之中断；本轮共检出 ${incidents.length} 项协作事故：`
     : `[zcode-crosschat 看门狗] ⚠ 本轮共检出 ${incidents.length} 项协作事故：`;
   const lines = incidents.map((incident, index) => `${index + 1}) ${incident.text}`);
+  const taskClause = opts.unclaimedRepooled !== undefined && opts.unclaimedRepooled.length > 0
+    ? '死亡成员未认领派单已回池至共享待领池（创建者已收到回执）、在途任务已冻结待回池（预计回池时刻见板面 requeueAtMs）'
+    : '死亡成员名下任务已冻结待回池（预计回池时刻见板面 requeueAtMs）';
   return (
     `${head}\n${lines.join('\n')}\n`
     + '消息不丢：以上事项均以邮箱为兜底（pull 可读、降级后可重投）。'
-    + '请用 xc_overview 看在册成员活性与未读；死亡成员名下任务已冻结待回池（预计回池时刻见板面 requeueAtMs），'
+    + `请用 xc_overview 看在册成员活性与未读；${taskClause}，`
     + '回池后用 xc_dispatch 重派，或用 xc_team({action:"member-add"}) 幂等重供给（重供给按 (成员,会话) 独立记账）。'
     + '本告警来自 MCP server 内的看门狗定时器（XC_WATCHDOG_MS 缺省 60s，0=关；每会话一把扫描，'
     + '跨进程认领保证同一次事故只有一个通告者）；看门狗全部随进程死亡时，由 UserPromptSubmit 的回合开始事故摘要兜底。'
@@ -774,6 +810,7 @@ export async function sweepMembersOnce(
     limboAlerted: [],
     leaseExpired: [],
     needsContinuation: [],
+    unclaimedRepooled: [],
     orphanNonces: [],
     wakes: [],
   };
@@ -947,6 +984,49 @@ export async function sweepMembersOnce(
       });
     }
 
+    // ── 1.5 v0.9.9（V098-07）：pid-dead 成员的**未认领单**回池（团队锁内）──
+    // 缺陷形态（51-v098 验收 adv-3 i=1）：判死路径只告警不回池——派给死者的未认领单
+    // （pending ∧ assignee 空 ∧ to 命中）不在 stale 清扫域（SWEEPABLE 只含
+    // claimed/in_progress）、他人 claim 得 not_assignee、死者无法认领 ⇒ 永久搁浅，
+    // 创建者零回执；且死亡告警「名下任务已冻结待回池（板面 requeueAtMs）」对未认领单
+    // 属过度承诺（板面 requeueAtMs 只覆盖 assignee 命中单，pending 单永远等不到清扫）。
+    // 修法 = 死亡路径调用回池原语（core/teamstate.ts
+    // repoolUnclaimedTasksForFailedMember：删 to 回共享待领池 + 创建者 task-receipt +
+    // 审计 member-unclaimed-repooled），与供给失败面（provision.ts catch）同款。
+    // 位置在状态锁认领**之前**：锁序恒为「先团队锁（回池/limbo 降级）→ 再状态锁
+    // （认领）」（见 WATCHDOG_STATE_LOCK_NAME 注释），不成环；且回池结果可进本轮告警
+    // 文案（未认领单如实写「已回池」而非「冻结待回池」）。
+    // 判据 = liveness pid-dead（进程死硬证据，与告警同源）∧ 名下有未认领单（phase 1
+    // 快照预筛，省掉无谓的锁竞争）；每轮对命中成员回池一次——幂等（to 清后不再命中），
+    // 停机后**新派给死者**的单下一轮自愈（dispatch 面只拒 removed/failed，不拒
+    // pid-dead-but-roster-ready）。removed 成员的未认领单不在此域：停机面（member-stop，
+    // V098-06）已在同一临界段回池。
+    const unclaimedRepooledByKey = new Map<string, string[]>();
+    for (const member of team.members) {
+      if (livenessByKey.get(member.key) !== 'pid-dead') continue;
+      if (memberUnclaimedTasks(team.tasks, member.key).length === 0) continue;
+      try {
+        const released = await repoolUnclaimedTasksForFailedMember(stateRoot, teamId, member.key, {
+          reason: 'member-dead',
+          detail: 'watchdog: member process is dead (pid-dead); unclaimed dispatch returned to the shared pending pool',
+        });
+        if (released.length === 0) continue; // 锁内重判后已无可回池（并发已处理）——零审计零披露
+        const taskIds = released.map((entry) => entry.taskId);
+        unclaimedRepooledByKey.set(member.key, taskIds);
+        summary.unclaimedRepooled.push({ key: member.key, taskIds });
+      } catch (error) {
+        // 回池是判死路径的尽力清理：失败不掩盖死亡告警本身（成员照常告警；判据不销，
+        // 下一轮自愈）。落审计让「未认领单没回池」在观测面可见；**不回写告警文案**
+        // （不把没回池的单说成已回池——不变式 5）。
+        await logEngineEvent(stateRoot, {
+          event: 'watchdog-repool-failed',
+          teamId,
+          member: member.key,
+          error: error instanceof Error ? error.message : String(error),
+        }).catch(() => undefined);
+      }
+    }
+
     const incidents: RoundIncident[] = [];
 
     // ── 2. 状态锁内认领（V092-01：读状态→判迁移→写状态必须原子，否则重叠扫描各发一套）──
@@ -1023,6 +1103,9 @@ export async function sweepMembersOnce(
               firstSight,
               summary.resume !== undefined,
               hit.recentLife,
+              // v0.9.9（V098-07）：本轮已回池的未认领单（若有）——文案对它们写「已回池」
+              // 而不是「冻结待回池」（后者对 pending 单是过度承诺）。
+              unclaimedRepooledByKey.get(hit.key),
             ),
           });
         }
@@ -1286,7 +1369,13 @@ export async function sweepMembersOnce(
     // ── 5. 锁外通知 + 唤醒（attemptWake 必须持无团队锁，§2.7-4）──
     if (incidents.length > 0) {
       const recipients = planRecipients({ team, leadKey, livenessByKey, leadCurrentlyDead: summary.leadCurrentlyDead });
-      const text = renderRoundIncidents(incidents, { leadKey, leadCurrentlyDead: summary.leadCurrentlyDead });
+      const text = renderRoundIncidents(incidents, {
+        leadKey,
+        leadCurrentlyDead: summary.leadCurrentlyDead,
+        // v0.9.9（V098-07）：本轮判死路径回池的未认领单——合并文案据此用「已回池」真实
+        // 措辞（空 = 无未认领单，文案逐字节保持 v0.9.6 口径）。
+        unclaimedRepooled: summary.unclaimedRepooled,
+      });
       if (text !== undefined) {
         if (recipients.length === 0) {
           // 无人可通知（lead 死且无其他活成员 / 全员不可寻址）→ 只落审计，不抛、不回退。
