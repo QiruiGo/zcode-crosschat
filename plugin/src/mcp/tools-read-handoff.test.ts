@@ -177,7 +177,7 @@ describe("xc_read scope=handoff：路由与前置闸", () => {
 
 // ---------------------------------------------------------------------------
 describe("xc_read scope=handoff：self 视角七要素", () => {
-  it("payload 八键（七要素 + filter）；文本七章；identity/isLead 如实", async () => {
+  it("payload 九键（七要素 + filter + roster）；文本七章；identity/isLead 如实", async () => {
     await seedTeam([
       task({ id: "t-a1", status: "in_progress", assignee: "alice", attempt: 2 }),
       task({ id: "t-b2", status: "blocked", assignee: "alice", blockedReason: "等审批文件", lastProgressTs: T0 - 200 * MIN }),
@@ -193,10 +193,19 @@ describe("xc_read scope=handoff：self 视角七要素", () => {
     const res = await handoff({}, "conn-alice");
     expect(res.isError).toBeUndefined();
     const payload = payloadOf(res) as Record<string, unknown>;
-    // 七要素 + filter（无 truncated/warnings/unreadWithheld——未超限、无异常）
+    // 七要素 + filter + roster（v0.9.8 组 O R2 起多一个 roster 键：可寻址队友名单；
+    // 无 truncated/warnings/unreadWithheld——未超限、无异常。roster 在「self 剔除后为空」
+    // 或 peer 扫描失败时缺席，故本键是条件键——见下方单成员队用例）
     expect(Object.keys(payload).sort()).toEqual(
-      ["capacity", "checkpoint", "filter", "identity", "pool", "suggestions", "tasks", "unread"].sort(),
+      ["capacity", "checkpoint", "filter", "identity", "pool", "roster", "suggestions", "tasks", "unread"].sort(),
     );
+    // R2：名单 = 花名册除自己（alice）外的成员；peerName absent = 仅队内可达（本用例无活跃 peer 记录）
+    expect(payload["roster"]).toEqual([
+      { key: "lead", isLead: true },
+      { key: "bob", isLead: false },
+    ]);
+    // R2：文本第 1 章给寻址行 + 直连行（与 xc_overview 成员行同一解析源，两面一致）
+    // ——断言放在本用例末尾，复用下面已声明的 text（不重复声明）。
     // 1. 身份
     expect(payload["identity"]).toMatchObject({
       agentKey: "alice", teamId: "default", leadKey: "lead", role: "worker", memberState: "ready", isLead: false,
@@ -225,6 +234,10 @@ describe("xc_read scope=handoff：self 视角七要素", () => {
     expect(text).toContain("## 2. 我的任务");
     expect(text).toContain("阻塞原因：等审批文件");
     expect(text).toContain("- t-c3 | high | 补单测 | 依赖 -");
+    // R2（v0.9.8 组 O）：第 1 章的「可寻址队友」+「直连」两行（与 xc_overview 成员行
+    // 同一解析源 peerNameBySessionId，两面一致；peerName absent = 仅队内可达）。
+    expect(text).toContain("- 可寻址队友: lead(lead)（队内 lead / 仅队内）、bob（队内 bob / 仅队内）");
+    expect(text).toContain('- 直连: 队内 xc_relay({to:"<队内 key>"})；跨会话 xc_relay({to:"<peer 名>"})');
   });
 
   it("checkpoint 缺失 → null + 文本占位（不假装有）", async () => {
@@ -244,6 +257,21 @@ describe("xc_read scope=handoff：self 视角七要素", () => {
     const payload = payloadOf(res) as Record<string, unknown>;
     expect(payload["capacity"]).toMatchObject({ level: "RED" });
     expect((payload["suggestions"] as string[]).join("\n")).toContain("compress-advice: 容量预警");
+  });
+
+  it("R2：self 剔除后名单为空 → roster 键缺席、文本无寻址行（条件键，不塞空数组）", async () => {
+    // 花名册只有 lead + alice 自己：除自己外还有 lead——要「空」得让视角成员就是唯一成员。
+    const solo = newTeamState({ teamId: "default", name: "default", founderKey: "alice", founder: member("alice"), now: T0 });
+    solo.leadKey = "alice";
+    solo.tasks = [];
+    await writeTeam(stateRoot, solo);
+    bind("alice", "conn-alice");
+
+    const res = await handoff({}, "conn-alice");
+    expect(res.isError).toBeUndefined();
+    const payload = payloadOf(res) as Record<string, unknown>;
+    expect(Object.keys(payload).sort()).not.toContain("roster");
+    expect(textOf(res)).not.toContain("可寻址队友");
   });
 });
 

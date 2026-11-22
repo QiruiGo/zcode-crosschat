@@ -45,6 +45,7 @@ import {
   type HandoffCapacity,
   type HandoffCheckpoint,
   type HandoffPoolItem,
+  type HandoffRosterEntry, // v0.9.8（组 O R2）：handoff 包「可寻址队友」章
   type HandoffTask,
 } from "../core/handoff.js";
 import {
@@ -52,13 +53,23 @@ import {
   classifyFrame,
   discardMailboxMessages,
   isCurrentMail,
+  isDeliveryRefusedReceipt,
+  isInterruptOrSteer,
+  interruptFirst,
+  listMailboxKeys,
   markMailboxConsumed,
+  messageStatusOf,
+  messageStatusStamps,
   readCurrentMailboxLocked,
   readMailbox,
   readUnreadMailbox,
-  urgentFirst,
   type MailboxReadDiagnostics,
+  type MessageStatus,
+  type MessageStatusStamps,
 } from "../core/mailbox.js";
+// J4 的隔离区读取：held 队列的属主是 core/policy.ts（W5），本模块只读不写
+// （不 import 其写面，避免把入站策略的写入能力带进状态查询）。
+import { readHeldMessages } from "../core/policy.js";
 import { gateToolRequestRender, type ToolGateContext, type ToolGateRenderResult } from "../core/toolgate.js";
 import { parseToolFrameType } from "../core/toolrelay.js";
 import type { TeamMessage, TeamState } from "../core/types.js";
@@ -82,7 +93,7 @@ import { sha256Of } from "../core/msgstore.js";
 import { peerRootFromEnv } from "../core/peerdir.js";
 import { logPeerEvent, scanPeers } from "../core/peerregistry.js";
 import { archiveJournalPath, taskJournalPath } from "../core/archive.js";
-import { getPeerServices } from "./peer-services.js";
+import { getPeerServices, peerNameBySessionId } from "./peer-services.js";
 import { assertToolIdWithinLimit, truncateIdEcho } from "./tools-tasks.js";
 import { checkLinkContainment } from "../core/paths.js";
 import type { ToolDeps } from "./core.js";
@@ -99,6 +110,11 @@ export const ReadShape = {
   field: z.enum(["result", "error", "prompt", "acceptance"]).optional().describe("仅 scope=task：要分页读的字段"),
   offset: z.number().int().min(0).optional().describe("起始偏移/条"),
   limit: z.number().int().min(1).optional().describe("本次返回上限（字符或条，随 scope）"),
+  // v0.9.8（J4）：一行消息状态。仅 scope=mail 有意义——按 messageId 返回
+  // queued/delivered/injected/read/consumed/held/refused/discarded（找不到 → unknown），
+  // 只返回状态与印章、**不返回正文**；权限 = 发送方本人或 lead（delivery-refused
+  // 回执帧的收方本人也可查自己的那条）。口径写死见 core/mailbox.ts 的状态阶梯。
+  statusOnly: z.boolean().optional().describe("仅 scope=mail：按 id 返回一行消息状态（queued/delivered/injected/read/consumed/held/refused/discarded，找不到=unknown）——不返回正文；仅发送方本人或 lead 可查（delivery-refused 回执帧的收方本人可查自己那条）"),
 } as const;
 
 export type ReadArgs = {
@@ -107,11 +123,12 @@ export type ReadArgs = {
   field?: "result" | "error" | "prompt" | "acceptance";
   offset?: number;
   limit?: number;
+  statusOnly?: boolean;
 };
 
 export interface MailboxReadCore {
   xc_check_inbox(args: Record<string, never>, connectionKey: string): Promise<ToolResult>;
-  xc_mail_read(args: { messageId: string; offset?: number; limit?: number }, connectionKey: string): Promise<ToolResult>;
+  xc_mail_read(args: { messageId: string; offset?: number; limit?: number; statusOnly?: boolean }, connectionKey: string): Promise<ToolResult>;
   xc_task_read(args: { taskId: string; field: "result" | "error" | "prompt" | "acceptance"; offset?: number; limit?: number }, connectionKey: string): Promise<ToolResult>;
 }
 
@@ -200,12 +217,15 @@ export function createMailboxReadCore(deps: ToolDeps): MailboxReadCore {
         // 收件箱消费走 team 锁：锁内用 readCurrentMailboxLocked（陈旧消息就地
         // discarded 落盘并剔除），正当消息此刻即消费（acknowledgeMailbox，§2.8）。
         // v0.6（C1 读取序）：呈现序 urgent-first（物序不动——JSONL 追加真源纪律）。
+        // v0.9.8（J1）：interrupt/steer 纠错消息在 urgent 之上再置顶一档
+        // （interruptFirst：纠错 → urgent → 普通；无纠错消息时与 urgentFirst 同序），
+        // 且批次窗口**先给纠错面单独开窗**——纠偏不被普通消息挤出口径。
         const diagnostics: MailboxReadDiagnostics = { malformed: [], discarded: 0 };
         const budget = receiverInjectBudget(contextCharsFromEnv(deps.env), deps.env);
         const consumed = await withTeamLock(stateRoot, me.teamId, async () => {
           const team = (await readTeam(stateRoot, me.teamId)) ?? teamBefore;
           const current = await readCurrentMailboxLocked(stateRoot, team, me.agentKey, undefined, diagnostics);
-          const unread = urgentFirst(current.filter((m) => m.readAt === undefined));
+          const unread = interruptFirst(current.filter((m) => m.readAt === undefined));
           // v0.7（C6，DESIGN-V0.7 §2.7）：审批门（inbox 路）——tool_request 帧按台账
           // state 裁决：拒 → 遮蔽占位 + 标记 discarded（不进注入面；首拒已由门回投
           // 请求方并通知 lead）；放 → 「APPROVAL VERIFIED」头 + 全文。门只对
@@ -217,9 +237,20 @@ export function createMailboxReadCore(deps: ToolDeps): MailboxReadCore {
               gated.set(m.id, await gateToolRequestRender(m, gateCtx));
             }
           }
-          const entries = unread.map((m) => inboxEntry(m, budget.item, gated.get(m.id)));
-          const windowCount = batchWindowCount(entries.map((e) => e.cost), budget.total);
-          const windowed = unread.slice(0, windowCount);
+          const entryById = new Map(unread.map((m) => [m.id, inboxEntry(m, budget.item, gated.get(m.id))] as const));
+          const costOf = (m: (typeof unread)[number]): number => entryById.get(m.id)!.cost;
+          // J1：批次窗口 = 纠错面（用满 budget.total 内它自己的开销）+ 普通面（剩余预算）。
+          // 无纠错消息时两段合并与 v0.9.7 的「单窗口前缀」逐字节等价（priorityWindow=0）。
+          const priorityUnread = unread.filter((m) => isInterruptOrSteer(m));
+          const normalUnread = unread.filter((m) => !isInterruptOrSteer(m));
+          const priorityWindow = batchWindowCount(priorityUnread.map(costOf), budget.total);
+          const prioritySpent = priorityUnread.slice(0, priorityWindow).reduce((sum, m) => sum + costOf(m), 0);
+          const normalWindow = batchWindowCount(
+            normalUnread.map(costOf),
+            Math.max(0, budget.total - prioritySpent),
+          );
+          const windowed = [...priorityUnread.slice(0, priorityWindow), ...normalUnread.slice(0, normalWindow)];
+          const entries = windowed.map((m) => entryById.get(m.id)!);
           await acknowledgeMailbox(
             stateRoot,
             me.teamId,
@@ -249,8 +280,11 @@ export function createMailboxReadCore(deps: ToolDeps): MailboxReadCore {
           }
           return {
             messages: windowed,
-            entries: entries.slice(0, windowCount),
+            entries,
             totalUnread: unread.length,
+            // J1：本批里纠错（interrupt/steer）条的条数——审计面据此区分
+            // 「普通积压被截断」与「纠偏已优先占预算」两种形态。
+            interruptWindowed: priorityUnread.slice(0, priorityWindow).length,
             gatedRefused: [...gated.values()].filter((g) => g.gate === "refuse").length,
             gatedPassed: [...gated.values()].filter((g) => g.gate === "pass").length,
           };
@@ -292,6 +326,8 @@ export function createMailboxReadCore(deps: ToolDeps): MailboxReadCore {
             truncatedCount,
             totalChars: envelopeText.length,
             ...(batchTruncated ? { batchTotalUnread: consumed.totalUnread, batchReturned: consumed.messages.length } : {}),
+            // v0.9.8（J1）：纠错条数（0 = 本轮没有 interrupt/steer，键缺席——审计形状不变）
+            ...(consumed.interruptWindowed > 0 ? { interruptWindowed: consumed.interruptWindowed } : {}),
           });
         }
         const result = okResult(
@@ -331,10 +367,17 @@ export function createMailboxReadCore(deps: ToolDeps): MailboxReadCore {
      * {@link gateToolRequestRender}（与 inbox 路同一个门）：未放行只出遮蔽占位，
      * 放行出「APPROVAL VERIFIED」头 + 全文。门可能带首拒侧效应（回投请求方）——
      * 门是唯一的门，读哪条路都过它。
+     *
+     * v0.9.8（J4）：`statusOnly:true` 分支 = **一行消息状态**（不读正文）：
+     * 跨邮箱按 messageId 定位（主箱 + 隔离区），权限 = 发送方本人 / lead /
+     * delivery-refused 回执帧的收方本人；状态阶梯写死在 core/mailbox.ts。
      */
     async xc_mail_read(args, connectionKey) {
       return runCore(stateRoot, async () => {
         const me = identityStore.require(connectionKey);
+        if (args.statusOnly === true) {
+          return await messageStatusResult(deps, me, args.messageId);
+        }
         const message = (await readMailbox(stateRoot, me.teamId, me.agentKey)).find((m) => m.id === args.messageId);
         if (message === undefined) {
           throw invalidParamsError(`unknown messageId "${args.messageId}"; xc_read({scope:"mail"}) only reads your own mailbox history`);
@@ -405,6 +448,136 @@ export function createMailboxReadCore(deps: ToolDeps): MailboxReadCore {
 }
 
 // ---------------------------------------------------------------------------
+// v0.9.8（J4）：一行消息状态（scope:"mail" + statusOnly:true）
+// ---------------------------------------------------------------------------
+
+/** J4 查询的定位结果（**不含 content**——权限模型「不开放读别人邮箱内容」）。 */
+export interface MessageStatusHit {
+  messageId: string;
+  status: MessageStatus;
+  from: string;
+  to: string;
+  ts: number;
+  /** `mailbox:<key>` / `held:<key>`；unknown 时 null。 */
+  location: string | null;
+  stamps: MessageStatusStamps;
+  milestones: { delivered: boolean; injected: boolean; read: boolean; consumed: boolean };
+}
+
+function statusHitOf(message: TeamMessage, location: string | null, held: boolean): MessageStatusHit {
+  return {
+    messageId: message.id,
+    status: messageStatusOf(message, held),
+    from: message.from,
+    to: message.to,
+    ts: message.ts,
+    location,
+    stamps: messageStatusStamps(message),
+    milestones: {
+      delivered: message.deliveredAt !== undefined,
+      injected: message.consumedAt !== undefined && message.readAt === undefined,
+      read: message.readAt !== undefined,
+      consumed: message.consumedAt !== undefined,
+    },
+  };
+}
+
+/**
+ * 按 messageId 在本队**全部邮箱**（主箱 + hold 隔离区）里定位一条消息。
+ *
+ * 为什么必须跨邮箱找：发送方要查「我发给 bob 的那条」——那条躺在 **bob 的**邮箱里。
+ * 定位本身不泄露内容（返回值只有状态/印章/收发双方与位置），读取权限在
+ * {@link messageStatusResult} 的门口判。
+ *
+ * @returns 定位结果；本队任何邮箱都找不到 → undefined（调用方报 unknown）。
+ */
+export async function findMessageStatus(
+  stateRoot: string,
+  teamId: string,
+  messageId: string,
+): Promise<MessageStatusHit | undefined> {
+  for (const key of await listMailboxKeys(stateRoot, teamId)) {
+    const held = await readHeldMessages(stateRoot, teamId, key);
+    const heldHit = held.find((m) => m.id === messageId);
+    if (heldHit !== undefined) return statusHitOf(heldHit, `held:${key}`, true);
+    const box = await readMailbox(stateRoot, teamId, key);
+    const hit = box.find((m) => m.id === messageId);
+    if (hit !== undefined) return statusHitOf(hit, `mailbox:${key}`, false);
+  }
+  return undefined;
+}
+
+/** J4 的一行渲染（状态 + 收发双方 + 印章真值；无正文）。 */
+function renderStatusLine(hit: MessageStatusHit): string {
+  const stampText = Object.entries(hit.stamps)
+    .map(([key, value]) => `${key}=${new Date(value).toISOString()}`)
+    .join(", ");
+  const where = hit.location === null ? "" : `，位置 ${hit.location}`;
+  return `消息 ${hit.messageId} 状态：${hit.status}（from ${hit.from} → to ${hit.to}，ts ${new Date(hit.ts).toISOString()}`
+    + `${where}${stampText === "" ? "" : `，${stampText}`}）`;
+}
+
+/**
+ * J4 读取面：权限判定 + 一行状态。
+ *
+ * 权限（写死，与方案 §二 J4 一致）：
+ * 1. **发送方本人**（`message.from === 调用者`）——查自己发出去的消息；
+ * 2. **lead**（`agentKey === leadKeyOf(team)`）——可查本队全部；
+ * 3. `delivery-refused` 回执帧的**收方本人**——那条回执本就写在调用者自己的邮箱里
+ *    （`message.to === 调用者`），不构成「读别人邮箱」；否则 `refused` 态永不可达
+ *    （refuse 分支从不创建原消息，只回写一条回执）。
+ *
+ * 越界 → 结构化 `permission_denied`：错误文案**不点名发送方、不给邮箱位置、不含正文**
+ * （把可探测面压到最小）。「id 是否存在」本身可由 unknown / 权限错误两种回法分辨——
+ * 这是「按 id 查状态」的固有性质（unknown 必须能给发送方自己用），如实声明、不假装隐藏。
+ */
+async function messageStatusResult(
+  deps: ToolDeps,
+  me: { agentKey: string; teamId: string },
+  messageId: string,
+): Promise<ToolResult> {
+  const team = await readTeam(deps.stateRoot, me.teamId);
+  if (team === undefined) throw new ToolError({ error: "no_team", message: "no team on disk yet" });
+  const hit = await findMessageStatus(deps.stateRoot, me.teamId, messageId);
+  if (hit === undefined) {
+    // 拒绝对未知 id 猜态：unknown 不是 8 态之一，是「本队邮箱里没有这条」的如实回答。
+    return okResult(
+      `消息 ${messageId} 状态：unknown（本队任何邮箱——主箱与 hold 隔离区——都没有这条 id；它不是 8 个状态之一，不猜）`,
+      { messageId, status: "unknown" as MessageStatus, location: null },
+    );
+  }
+  const isLead = me.agentKey === (leadKeyOf(team) ?? team.founderKey);
+  const isSender = hit.from === me.agentKey;
+  const isOwnRefusalReceipt = hit.status === "refused" && hit.to === me.agentKey;
+  if (!isSender && !isLead && !isOwnRefusalReceipt) {
+    await logEngineEvent(deps.stateRoot, {
+      event: "message-status-denied",
+      teamId: me.teamId,
+      agentKey: me.agentKey,
+      messageId,
+    });
+    throw new ToolError({
+      error: "permission_denied",
+      messageId,
+      message: `you (${me.agentKey}) may not read the status of message "${messageId}" in team "${me.teamId}"; `
+        + "xc_read({scope:\"mail\", id, statusOnly:true}) only answers for messages you sent, messages the lead sent/oversees, "
+        + "or a delivery-refused receipt addressed to you — it never returns another member's mailbox content, "
+        + "and this error names neither the sender nor the mailbox",
+    });
+  }
+  return okResult(renderStatusLine(hit), {
+    messageId: hit.messageId,
+    status: hit.status,
+    from: hit.from,
+    to: hit.to,
+    ts: hit.ts,
+    location: hit.location,
+    stamps: hit.stamps,
+    milestones: hit.milestones,
+  });
+}
+
+// ---------------------------------------------------------------------------
 // xc_read 工具层（scope 路由；peer 两轴经 PeerServices；journal 为 C4 新面）
 // ---------------------------------------------------------------------------
 
@@ -449,7 +622,13 @@ export async function handleRead(deps: ToolDeps, args: ReadArgs, connectionKey: 
       if (args.id === undefined || args.id === "") {
         throw new ToolError({ error: "invalid_params", message: "scope=mail requires \"id\" (message id)" });
       }
-      return core.xc_mail_read({ messageId: args.id, ...(args.offset !== undefined ? { offset: args.offset } : {}), ...(args.limit !== undefined ? { limit: args.limit } : {}) }, connectionKey);
+      return core.xc_mail_read({
+        messageId: args.id,
+        ...(args.offset !== undefined ? { offset: args.offset } : {}),
+        ...(args.limit !== undefined ? { limit: args.limit } : {}),
+        // v0.9.8（J4）：statusOnly 只对 mail scope 有意义（其他 scope 的 id 不是 messageId）
+        ...(args.statusOnly !== undefined ? { statusOnly: args.statusOnly } : {}),
+      }, connectionKey);
     case "task":
       if (args.id === undefined || args.id === "") {
         throw new ToolError({ error: "invalid_params", message: "scope=task requires \"id\" (task id)" });
@@ -879,6 +1058,23 @@ async function readHandoffScope(deps: ToolDeps, args: ReadArgs, connectionKey: s
     checkpoint = await latestCheckpointSafe(deps.stateRoot, me.agentKey, now, warnings);
   }
 
+  // v0.9.8（组 O R2）：可寻址队友名单（队内 key 恒在 + peer 名）——与 xc_overview
+  // 成员行（team 板面 + panel agents()）同一解析源 peerNameBySessionId，两面一致。
+  // 只读扫描（sweep:false，观测纪律）；扫描失败 → 不注入名单（包照常出，不出寻址行）。
+  let roster: HandoffRosterEntry[] | undefined;
+  try {
+    const peerNames = peerNameBySessionId(
+      await scanPeers(peerRootFromEnv(deps.env), Date.now(), { sweep: false }),
+    );
+    roster = team.members.map((m) => ({
+      key: m.key,
+      ...(peerNames.get(m.sessionId) !== undefined ? { peerName: peerNames.get(m.sessionId)! } : {}),
+      isLead: m.key === leadKeyOf(team),
+    }));
+  } catch {
+    roster = undefined; // 观测失败不为难接手包
+  }
+
   // 7. 建议下一步的数据面：视角内任务按 C5 停滞阈值算旗标 + 我的在途任务（单在途规则提示）
   const stalled = stalledTasks(selected, now, stallThresholdMs(deps.env, staleThresholdMsFromEnv(deps.env)).ms);
   const myOpenTaskId = filter.kind === "member"
@@ -932,6 +1128,7 @@ async function readHandoffScope(deps: ToolDeps, args: ReadArgs, connectionKey: s
     checkpoint,
     stalled,
     myOpenTaskId,
+    ...(roster !== undefined ? { roster } : {}),
     ...(continuityHint !== undefined ? { continuityHint } : {}),
     ...(warnings.length > 0 ? { warnings } : {}),
   });

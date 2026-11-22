@@ -25,15 +25,21 @@
  * 发送侧权限防线（R-17 / CC @34233402）：`xc_relay` 的工具描述内嵌反 launder
  * 警示；接收侧尾注里也有一份（D7 的对偶面，由 W5 的信封渲染器负责）。
  *
+ * v0.9.8（组 O）增量：R2 成员行补可寻址名（peerNameBySessionId 单一解析，panel 与
+ * team 板面共用）；D7 成员行 unread 判据收敛到 core/checkpoint.ts unreadCountFor。
+ *
  * @module mcp/peer-services
  */
 import { randomUUID } from "node:crypto";
 import { lstat } from "node:fs/promises";
 import { auditDegradationWarning, logEngineEvent } from "../core/log.js";
 import { readTeam } from "../core/teamstate.js";
-// v0.9.7（V096-17 修复）：panel 成员行未读计数的取数与裁决（同 core/snapshot.ts
-// countUnread、mcp/tools-overview.ts countUnreadFor 的口径：未读 ∧ 未丢弃 ∧ 现行）。
-import { isCurrentMail, readMailbox } from "../core/mailbox.js";
+// v0.9.8（组 O D7/V097-21）：panel 成员行未读计数统一到 core/checkpoint.ts 的
+// 单一真源 unreadCountFor（未读 ∧ 未丢弃 ∧ isCurrentMail）——与 snapshot/status/
+// team 板面/checkpoint/改名守卫同一判据（v0.9.7 起本文件自带一份内联过滤，
+// 现收敛掉）。
+import { readMailbox } from "../core/mailbox.js";
+import { unreadCountFor } from "../core/checkpoint.js";
 import {
   localPidDomain,
   peerInboxFile,
@@ -242,10 +248,15 @@ export interface PeerAgentsPanel {
   /**
    * v0.5（R-7）：成员行增 isLead（现算字段 `m.key===leadKeyOf(team)`，不入盘不入快照）。
    * v0.9.7（V096-17 修复）：`unread` 为该成员邮箱的真实未读数（未读 ∧ 未丢弃 ∧
-   * isCurrentMail；与 snapshot.json / xc_overview status·team 板面同源同口径）——
+   * isCurrentMail；与 snapshot.json / xc_overview status·team 板面同源同口径；
+   * v0.9.8 D7 起判据收敛到 core/checkpoint.ts unreadCountFor 单一真源）——
    * v0.5~v0.9.6 它是硬编码 0，panel 成了同刻唯一报「无未读」的面。
+   * v0.9.8（组 O R2）：成员行增 `peerName`（可寻址名）——该成员 sessionId 对应的
+   * 活跃 peer 花名（跨会话 `xc_relay({to:"<peerName>"})` 可直接复制）；
+   * **absent = 当前无活跃 peer 记录**（仅队内 key 可达——引擎供给成员的回合间隙
+   * 即此形态）。队内 key 恒在 `key` 列，故寻址信息两面（队内/跨会话）都在行上。
    */
-  members: { key: string; role: string; state: string; unread: number; isLead: boolean }[];
+  members: { key: string; role: string; state: string; unread: number; isLead: boolean; peerName?: string }[];
   /**
    * v0.9.2（C4）：任务计数改**七态全量**（`TASK_STATUSES` 逐一为键），与 `xc_overview`
    * view:"status" 的 `taskCounts`、team 板面同口径——三桶时代（pending/in_progress/done）
@@ -267,6 +278,25 @@ export interface PeerAgentsPanel {
      */
     sessionLevelQuery?: { policy: string; holdCause?: string };
   };
+}
+
+/**
+ * v0.9.8（组 O R2）：sessionId → **活跃** peer 花名 的解析（纯函数，panel 与 team
+ * 板面成员行共用同一实现——「两面一致」不接受两份会漂移的解析）。
+ *
+ * 口径：只取 `scan.active` 里 `record.name` 非空的记录，按扫描序**首个**命中
+ * （与 uservoice 盖章核验/callerDeclaredContextChars 的 find 同口径）。同一 sid
+ * 多条活跃记录（桌面会话 + 无头 --resume 续跑共享 sid 的真实形态）时取首个——
+ * 花名寻址以注册表扫描序为准，此处只做「成员 → 可寻址名」的呈现，不裁决归属。
+ * 死记录不进表（进程已亡，不可寻址——诚实缺失优于给一个发不到的名字）。
+ */
+export function peerNameBySessionId(scan: PeerScanResult | null | undefined): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const record of scan?.active ?? []) {
+    if (record.name === undefined || record.name === '') continue;
+    if (!out.has(record.sessionId)) out.set(record.sessionId, record.name);
+  }
+  return out;
 }
 
 /** peer 服务面（工具层与实现层之间的唯一接缝；测试注入假实现）。 */
@@ -1218,24 +1248,26 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
       const selfRows = await rowsOf("self");
       const peers = await rowsOf("session");
       const team = await readTeam(deps.stateRoot, "default");
-      // v0.9.7（V096-17 修复）：成员行 unread 接**真实**计数——此前恒为硬编码 0
-      // （peer-services.ts:1219 旧桩），panel 是同刻唯一报 0 的面（snapshot.json /
-      // statusView / 板面都有真值）⇒ 机器可读计数失真，消费方得到虚假「无未读」。
-      // 口径与其余面逐条同源：未读 ∧ 未丢弃 ∧ isCurrentMail（core/snapshot.ts
-      // countUnread、mcp/tools-overview.ts countUnreadFor、engine/wake.ts
-      // pendingMessageCount 同一判据）。读路径**无锁纯读**（§2.7-5 rename 原子写
-      // 保证读者看到完整文件）；不就地丢弃陈旧件、不清扫——那是消费面
-      // （readCurrentMailboxLocked）的语义，观测面不动盘。
+      // v0.9.8（组 O D7/V097-21）：成员行 unread 接**真实**计数（v0.9.7 V096-17 修复）
+      // 并统一到 core/checkpoint.ts 的单一真源 unreadCountFor——此前本文件自带一份
+      // 内联过滤（msgs.filter(!readAt && !discardedAt && isCurrentMail)），与 snapshot/
+      // status·team 板面/checkpoint/改名守卫是同判据的**第五份复制**；D7 要求同一邮箱
+      // 各面未读数一致，复制必然漂移，故收敛成一个函数。读路径**无锁纯读**
+      // （§2.7-5 rename 原子写保证读者看到完整文件）；不就地丢弃陈旧件、不清扫——
+      // 那是消费面（readCurrentMailboxLocked）的语义，观测面不动盘。
       const unreadByKey = new Map<string, number>();
       if (team !== undefined) {
         for (const member of team.members) {
           const msgs = await readMailbox(deps.stateRoot, team.teamId, member.key);
-          unreadByKey.set(
-            member.key,
-            msgs.filter((m) => !m.readAt && !m.discardedAt && isCurrentMail(team, m)).length,
-          );
+          unreadByKey.set(member.key, unreadCountFor(team, msgs));
         }
       }
+      // v0.9.8（组 O R2）：成员行补**可寻址名**——队内 key 恒在（`key` 列），此处补
+      // 跨会话 peer 花名（sessionId → 活跃 peer 记录 name）。absent = 该成员当前没有
+      // 活跃 peer 记录（仅队内可达，如引擎供给成员的回合间隙）。取数与 team 板面
+      // （tools-overview.ts）同一函数 peerNameBySessionId，两面一致、可直接复制。
+      const peerScan = await scanPeers(root(), Date.now(), { sweep: false }).catch(() => null);
+      const peerNames = peerNameBySessionId(peerScan);
       // v0.5（R-7）：成员行增 isLead 现算字段（leadKeyOf 含 founder 兜底语义，
       // member-tools.ts 同款；不入盘不入快照，修复 v0.4 的无标注缺口）。
       const members = (team?.members ?? []).map((member) => ({
@@ -1244,6 +1276,7 @@ export function createDefaultPeerServices(deps: ToolDeps): PeerServices {
         state: member.state ?? "ready",
         unread: unreadByKey.get(member.key) ?? 0,
         isLead: team !== undefined && member.key === leadKeyOf(team),
+        ...(peerNames.get(member.sessionId) !== undefined ? { peerName: peerNames.get(member.sessionId)! } : {}),
       }));
       // v0.9.2（C4）：七态全量计数（一个不漏；键集恒为 TASK_STATUSES，缺的记 0）。
       const tasks = Object.fromEntries(TASK_STATUSES.map((s) => [s, 0])) as Record<TaskStatus, number>;

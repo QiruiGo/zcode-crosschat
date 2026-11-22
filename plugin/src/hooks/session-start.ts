@@ -58,6 +58,7 @@ import {
   auditHookFailure,
   boundNamesForSession,
   emitAdditionalContext,
+  HOOK_LOCK_WAIT_MS,
   logHookEvent,
   peerRootFromEnv,
   readHookPermissionMode,
@@ -65,7 +66,6 @@ import {
   readStdinPayload,
   refreshSessionRegistration,
   resolveHookContext,
-  writePeerBaseRecord,
 } from './shared.js';
 // v0.9.4（A6）：票据消费 + 身份绑定的 M1 原语（M4 → M1 纪律：只 import core）。
 import { createHash } from 'node:crypto';
@@ -84,8 +84,9 @@ import {
   writeSession,
 } from '../core/registry.js';
 import { readTeam, writeTeam } from '../core/teamstate.js';
-import { withRegistryThenTeamLocks } from '../core/lock.js';
+import { LockBusyError, withRegistryLock, withRegistryThenTeamLocks } from '../core/lock.js';
 import { DEFAULT_TEAM_ID, memberState, type NameBindings } from '../core/types.js';
+import { upsertPeerBaseRecord } from '../core/peerdir.js';
 import { logEngineEvent } from '../core/log.js';
 
 /**
@@ -480,18 +481,17 @@ async function bindWakeTicketIdentity(input: {
   }
 
   // 4. peer 轴基记录盖章（队内绑定标记 + A1 的 pid 投影；与 xc_identify 的盖章同面）。
+  // v0.9.8（D6）：盖章面也改走 upsertPeerBaseRecord 的「读旧→合并→写」——与主路径
+  // 同一合并口径（startedAt 只认首次、白名单外字段保留、pid 缺省不丢），不再另用
+  // 一份字段白名单重建（两张写面各写一份白名单，正是 D6 的失真源）。
   try {
     const base = await readPeerBaseRecord(input.peerRoot, input.sessionId);
-    await writePeerBaseRecord(input.peerRoot, {
-      sessionId: input.sessionId,
+    await upsertPeerBaseRecord(input.peerRoot, input.sessionId, {
       cwd: base?.cwd ?? process.cwd(),
       source: base?.source ?? null,
-      startedAt: base?.startedAt ?? input.now,
-      lastSeen: input.now,
-      ...(base?.permissionMode !== undefined ? { permissionMode: base.permissionMode } : {}),
-      ...(base?.regToken !== undefined ? { regToken: base.regToken } : {}),
+      now: input.now,
       ...(input.pid !== undefined ? { pid: input.pid } : {}),
-      boundName: name,
+      boundName: name, // 冲突字段以最新为准（陈旧绑定标记被本次注册名覆盖）
     });
   } catch (error) {
     await auditHookFailure(input.stateRoot, 'session-start-wake-ticket-peer-base', error);
@@ -506,6 +506,65 @@ async function bindWakeTicketIdentity(input: {
     note: 'SessionStart 钩子一次性消费唤醒票据并自动绑定身份（队内轴 + peer 轴），不经模型回合',
   });
   return { bound: true, name, detail: 'bound' };
+}
+
+/**
+ * v0.9.8（D6/V097-16 + D5/V097-15）：SessionStart 的**机器全局基记录**写入口——
+ * 「读旧→合并→写」且**读-改-写进 registry 锁**。
+ *
+ * D6（白名单整记录重建失真）：旧实现每次 SessionStart 用字段白名单**整记录重建**
+ * （sessionId/cwd/permissionMode/source/startedAt/lastSeen/regToken/boundName/pid）：
+ * - `startedAt` 每次重置为当前时刻——会话起始时刻被抹掉；
+ * - 本回合载荷没有 permission_mode 时键被丢掉，先前记录的档类真源抹成未知；
+ * - 白名单外字段（其他写入面/未来扩展留下的）整记录重建即消失。
+ * 现在经 core/peerdir.ts 的 {@link upsertPeerBaseRecord} 合并：startedAt 只认首次、
+ * permissionMode 缺省保留旧值、白名单外字段原样带回（逐字段口径见该函数注释）。
+ *
+ * D5（与 identify 合并写互相覆盖）：xc_identify 的基记录盖章（mcp/identity.ts）在
+ * `withRegistryThenTeamLocks` 内做「读旧→合并→写」，而本钩子旧实现**不设锁**整记录
+ * 重写——两边互不知情时，identify 盖的 boundName/pid 或钩子写的 permissionMode/
+ * startedAt 可被对方整记录覆盖（并发盖章压测下丢字段）。现在钩子侧读-改-写进
+ * **同一把 registry 锁**（workspace 状态根的 registry 锁，identify 组合锁的第一把），
+ * 锁忙重试一次（钩子 2s 预算 ×2）后放弃并审计——钩子永不因它失败；丢失一次回写
+ * 无害（下回合 SessionStart 再补，与 refreshSessionRegistration 的降级口径一致）。
+ */
+export async function writeSessionPeerBaseRecord(input: {
+  stateRoot: string;
+  peerRoot: string;
+  sessionId: string;
+  workspace: string;
+  /** 本回合载荷的权限档（undefined = 载荷没给；合并时保留旧值）。 */
+  permissionMode: 'bypass' | 'prompting' | undefined;
+  source: string | null;
+  /** 本回合 workspace 侧铸造/延续的锚定令牌（undefined = 保留旧值）。 */
+  regToken: string | undefined;
+  /** A1 的宿主进程 pid 证据（undefined = 保留旧值）。 */
+  pid: number | undefined;
+  now: number;
+}): Promise<void> {
+  const write = async (): Promise<void> => {
+    await upsertPeerBaseRecord(input.peerRoot, input.sessionId, {
+      cwd: input.workspace,
+      ...(input.permissionMode !== undefined ? { permissionMode: input.permissionMode } : {}),
+      source: input.source,
+      now: input.now,
+      ...(input.regToken !== undefined ? { regToken: input.regToken } : {}),
+      ...(input.pid !== undefined ? { pid: input.pid } : {}),
+    });
+  };
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      await withRegistryLock(input.stateRoot, write, { waitMs: HOOK_LOCK_WAIT_MS });
+      return;
+    } catch (error) {
+      // 锁忙：重试一次（总预算 2×HOOK_LOCK_WAIT_MS）；其余 IO 错误或第二次仍忙 →
+      // 审计后放弃（钩子永不失败；下回合 SessionStart 会再合并一次）。
+      if (attempt >= 2 || !(error instanceof LockBusyError)) {
+        await auditHookFailure(input.stateRoot, 'session-start-peer-base', error);
+        return;
+      }
+    }
+  }
 }
 
 /**
@@ -539,25 +598,27 @@ export async function runSessionStartHook(): Promise<void> {
 
   // v0.3：机器全局 peer 基记录（跨会话域的档类真源 + 兜底身份来源）。
   // v0.5.3（a6/a8）：同步锚定令牌（与 workspace 侧 sessions/<sid>.json 同值），
-  // 并保留既有 boundName（xc_identify 盖的队内绑定标记）——基记录每次
-  // SessionStart 全量重写，不保留就会把绑定标记抹掉。
+  // 并保留既有 boundName（xc_identify 盖的队内绑定标记）。
   // v0.9.4（A1）：同步 pid 证据（与 workspace 侧同值同口径）。
+  // v0.9.8（D5/D6）：改为「读旧→合并→写」且读-改-写进 registry 锁——不再字段
+  // 白名单整记录重建（丢 permissionMode/白名单外字段、重置 startedAt），也不再与
+  // identify 的合并写无锁互踩（writeSessionPeerBaseRecord 的纪律见其注释）。
   try {
     const peerRoot = peerRootFromEnv(process.env);
-    const existing = await readPeerBaseRecord(peerRoot, ctx.sessionId);
     // 令牌取值：本回合 workspace 侧铸造/延续的 regToken 优先；锁忙没拿到时回退
-    // 基记录既有值（跨记录两处必须同值）。
+    // 基记录既有值（跨记录两处必须同值）——读取在锁内合并时完成，此处只取提示值。
+    const existing = await readPeerBaseRecord(peerRoot, ctx.sessionId);
     const baseToken = regToken ?? existing?.regToken;
-    await writePeerBaseRecord(peerRoot, {
+    await writeSessionPeerBaseRecord({
+      stateRoot: ctx.stateRoot,
+      peerRoot,
       sessionId: ctx.sessionId,
-      cwd: ctx.workspace,
+      workspace: ctx.workspace,
       permissionMode: readHookPermissionMode(stdin),
       source: stdin?.str('source', 'source') ?? null,
-      startedAt: Date.now(),
-      lastSeen: Date.now(),
-      ...(baseToken !== undefined ? { regToken: baseToken } : {}),
-      ...(existing?.boundName !== undefined ? { boundName: existing.boundName } : {}),
-      ...(pid !== undefined ? { pid } : {}),
+      regToken: baseToken,
+      pid,
+      now: Date.now(),
     });
   } catch (error) {
     await auditHookFailure(ctx.stateRoot, 'session-start-peer-base', error);

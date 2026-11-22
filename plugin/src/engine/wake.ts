@@ -142,8 +142,10 @@ import {
   createMessage,
   sweepLimboDeliveriesLocked,
 } from "../core/mailbox";
-import { readFileSync, rm, appendFileSync, mkdirSync } from "node:fs";
+import { readFileSync, rm, appendFileSync, mkdirSync, existsSync } from "node:fs";
 import { createHash } from "node:crypto";
+// v0.9.8（S2）：steer 终止手段（Windows taskkill / 非 Windows 信号）——同步 spawn。
+import { spawnSync } from "node:child_process";
 // v0.9.1（G-12-b）：容量闸冷却记录用 promise 版 mkdir/rm（与 core/atomic.ts 同族口径）。
 // v0.9.3（A2）：三级计数读 engine.jsonl 尾部窗口（open + stat，与 core/timeline.ts 同口径）。
 // v0.9.3 打回第 1 轮（V093-02/03）：投递尝试证据扫描（registry/wake 目录 + logs 目录清单）。
@@ -189,9 +191,21 @@ import {
   WAKE_INFLIGHT_MS,
 } from "../core/registry";
 import { sanitizeKey } from "../core/sanitize";
-import { memberState, memberIdentity, isTeamMessage, type TeamMember, type TeamMessage, type TeamState, type WakeNonce } from "../core/types";
+import {
+  memberState,
+  memberIdentity,
+  isTeamMessage,
+  plausibleLivenessTs,
+  type SessionRecord,
+  type TeamMember,
+  type TeamMessage,
+  type TeamState,
+  type WakeNonce,
+} from "../core/types";
 import { spawnResume, type WakeSpawnConfig } from "./resume-cli";
 import { explicitSpawnConfigError, resolveZcodeSpawnConfig, type ResolvedSpawnConfig } from "./zcode-locate";
+// v0.9.8（S3）：steer 信封的 journal 指针（任务日志唯一定义点，core/archive.ts）。
+import { taskJournalPath } from "../core/archive.js";
 // v0.9.2（A4-c）：limbo 告警节流台账（与 engine/watchdog.ts 的看门狗清扫共用真源）。
 import {
   limboAlertAlreadySent,
@@ -256,6 +270,40 @@ export function findWakeFailureEvidence(logText: string): string | undefined {
     }
   }
   return undefined;
+}
+
+/**
+ * v0.9.8（V097-09/D3）：读一次 wake 日志的失败证据（读不到/不存在 → undefined）。
+ * 与 {@link findWakeFailureEvidence} 同判据；抽出来供回执的**有界二次回读**复用。
+ */
+function readWakeFailureEvidenceOrUndefined(logFile: string): string | undefined {
+  try {
+    return findWakeFailureEvidence(readFileSync(logFile, "utf8"));
+  } catch {
+    return undefined; // 日志尚未落盘/不可读：按「未知」处理，不虚构失败
+  }
+}
+
+/**
+ * v0.9.8（V097-09/D3）：回执补读**轮次**缺省值（2 轮）与 env `XC_WAKE_RECEIPT_RECHECK_ROUNDS`
+ * 解析（0 = 关闭补读回退旧行为；上限 20 轮防误配把工具调用挂死；非法值回落缺省不静默——
+ * 调用方传错时行为与缺省一致，且补读总量仍有界）。
+ */
+export const WAKE_RECEIPT_RECHECK_ROUNDS_DEFAULT = 2;
+export const WAKE_RECEIPT_RECHECK_ROUNDS_MAX = 20;
+export function wakeReceiptRecheckRoundsFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env["XC_WAKE_RECEIPT_RECHECK_ROUNDS"];
+  if (raw === undefined || raw.trim() === "") return WAKE_RECEIPT_RECHECK_ROUNDS_DEFAULT;
+  const n = Number(raw);
+  return Number.isSafeInteger(n) && n >= 0 && n <= WAKE_RECEIPT_RECHECK_ROUNDS_MAX
+    ? n
+    : WAKE_RECEIPT_RECHECK_ROUNDS_DEFAULT;
+}
+
+/** v0.9.8（V097-09/D3）：回执补读**步长**缺省值（300ms）与 env `XC_WAKE_RECEIPT_RECHECK_MS` 解析。 */
+export const WAKE_RECEIPT_RECHECK_MS_DEFAULT = 300;
+export function wakeReceiptRecheckMsFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+  return positiveIntFromEnv(env, "XC_WAKE_RECEIPT_RECHECK_MS", WAKE_RECEIPT_RECHECK_MS_DEFAULT);
 }
 
 /**
@@ -943,6 +991,13 @@ export interface WakePromptInput {
    * （2 次调用兜底）——ppid 采纳默认关，prompt 不再宣称未发生的自动绑定。
    */
   adoptByPpidEnabled?: boolean;
+  /**
+   * v0.9.8（R1）：**队友名单**（除收件人外的队内成员键）——identity 段后附加一行
+   * 「队友：m1, m2（可 xc_relay({to:"m1"}) 直连，不必经过 lead）」，让新成员首回合
+   * 就知道队友名字与直连接口（方案 49-v098 §二 组 R R1；首次/重唤醒都带）。
+   * 缺省/空数组 → 不附该行（既有 prompt 逐字节不变）。
+   */
+  roster?: readonly string[];
 }
 
 /**
@@ -1032,6 +1087,9 @@ export const WAKE_SCENES = [
   "post-provision",
   "shutdown",
   "stale-sweep",
+  // v0.9.8（S1）：steer（终止→续跑）场景标签——engine.jsonl scene 字段可枚举审计；
+  // 与 message 一样内嵌正文（纠偏原文必须到模型手上，见 wakePromptEmbedsMessageBody）。
+  "steer",
 ] as const;
 
 /**
@@ -1103,6 +1161,11 @@ export function buildWakePrompt(input: WakePromptInput, maxChars: number = WAKE_
   const rules = input.includeMemberRules === true
     ? (input.adoptByPpidEnabled === true ? MEMBER_RULES_V2_WAKE : MEMBER_RULES_V2_WAKE_FALLBACK)
     : undefined;
+  // v0.9.8（R1）：队友行（identity 段后）——名单为空/缺省时不附（既有 prompt 不变）。
+  // 示例用名单首位（具体名字比占位符更可操作）；单队友时自指也成立。
+  const rosterLine = input.roster !== undefined && input.roster.length > 0
+    ? `队友：${input.roster.join(", ")}（可 xc_relay({to:"${input.roster[0]}"}) 直连，不必经过 lead）`
+    : undefined;
 
   // v0.6（C1）：urgent 唤醒 → 正文携带段首位插横幅（横幅 + 原正文合计受正文预算
   // 约束；横幅固定短行，超长时先压正文再压横幅尾部——truncateBody 作用于合计文本，
@@ -1111,15 +1174,20 @@ export function buildWakePrompt(input: WakePromptInput, maxChars: number = WAKE_
     ? `${URGENT_WAKE_BANNER}\n${input.bodyText}`
     : input.bodyText;
 
-  // 分隔符开销：parts 以 "\n\n" 连接。
-  const sepCount = (rules === undefined ? 3 : 4) * 2;
+  // 分隔符开销：parts 以 "\n\n" 连接（v0.9.8 R1：队友行计入分隔符与预算）。
+  const sepCount = ((rules === undefined ? 3 : 4) + (rosterLine === undefined ? 0 : 1)) * 2;
   const bodyBudget = Math.max(
     0,
-    maxChars - receipt.length - identity.length - action.length - (rules?.length ?? 0) - sepCount,
+    maxChars - receipt.length - identity.length - action.length - (rosterLine?.length ?? 0) - (rules?.length ?? 0) - sepCount,
   );
-  const parts = rules === undefined
-    ? [receipt, identity, action, truncateBody(body, bodyBudget)]
-    : [receipt, identity, action, truncateBody(body, bodyBudget), rules];
+  const parts = [
+    receipt,
+    identity,
+    ...(rosterLine !== undefined ? [rosterLine] : []),
+    action,
+    truncateBody(body, bodyBudget),
+    ...(rules !== undefined ? [rules] : []),
+  ];
   let prompt = parts.join("\n\n");
   if (prompt.length > maxChars) {
     // 兜底硬切（结构性部分自身超限时才会走到这里）。
@@ -2326,9 +2394,346 @@ export interface WakeLifecycleWatchConfig {
  * 不因它没另调 xc_read 而误判 limbo。其余场景（dispatch/post-provision/unblock/idle/
  * cancel/report/shutdown/stale-sweep/task-offline…）的 ticket 是指令/摘要/任务票，
  * 不构成消息全文，判据保持原样（必须 xc_read / hook 注入回写才算消费）。
+ *
+ * v0.9.8（S1/S3）：`steer` 入列——纠偏信封（正文 + 指针）整体作为新回合首条指令，
+ * 成员回合开跑即「已消费」（纠偏已被处理/至少已被看见），不因未另调 xc_read 误判 limbo。
  */
 export function wakePromptEmbedsMessageBody(scene: string): boolean {
-  return scene === "message" || scene === "withdrawal";
+  return scene === "message" || scene === "withdrawal" || scene === "steer";
+}
+
+// ─────────────────── steer：终止→续跑（v0.9.8 组 S，方案 49-v098 §二） ───────────────────
+
+/**
+ * v0.9.8（S1-S5）：**steer（硬插队）**——`xc_relay({steer:true})` 对引擎供给成员的
+ * 「终止当前唤醒回合 → 立刻 --resume 新回合，纠偏作新回合首条指令」。
+ *
+ * 平台边界（方案 §五 / docs/DESIGN.md §5 对照表）：宿主没有回合中注入原语，steer 不是
+ * 「注入思考」而是「中止 + 续跑」；交互式会话插件无权终止（只有用户 Esc）——这两条是
+ * 本模块所有降级路径的出发点：
+ * - 引擎供给成员（team.json identity="engine"）∧ 有活唤醒回合（会话记录 liveness=running
+ *   ∧ pid 存活）→ **抢占**：终止旧回合（S2）→ spawnResume 新回合（S3）；
+ * - 引擎供给成员但空闲 → 降级**普通唤醒**（不终止任何东西，纠偏随投递送达）；
+ * - 交互式会话 / 不在册目标 → 降级**软中断**（消息带 interrupt 元数据 + urgent 排序），
+ *   回执 result="unsupported"（「只有用户 Esc」如实告知，不假装抢占）。
+ *
+ * 权限（S4）不在本层：仅 lead 或用户（origin=user）可 steer 由工具面
+ * （mcp/tools-relay.ts）判定；本层只负责执行、终止、续跑与**诚实回执**（S5）——
+ * 终止/续跑失败一律回退软中断（消息留邮箱，pull 兜底），绝不假装成功。
+ *
+ * 实测依据（44-v098 feasibility）：kill（graceful 被 OS 拒 → /F 成功）→ 立刻 --resume
+ * 续跑 exit 0、纠偏被处理、无会话损坏；gracefulWorked=false（Windows 无头进程对
+ * WM_CLOSE 语义的 taskkill 直接报错「只能强行终止」），因此 S2 的实现把「优雅被拒」
+ * 视为立即升级 /F 的信号（没有信号在途，等满宽限窗不会带来退出）。
+ */
+
+/** steer 场景标签（进 WAKE_SCENES 与 engine.jsonl scene 字段）。 */
+export const STEER_SCENE = "steer";
+
+/** steer 正文字符上限（S3/C2：≤2KB 正文 + 指针；历史大段内容不重放）。 */
+export const STEER_ENVELOPE_MAX_BODY_CHARS = 2048;
+
+/**
+ * steer 信封首行——**抢占成功**（上一回合已被终止）措辞（S3 冻结语义）：
+ * 明写「未落盘进度可能丢失」与 checkpoint 建议——强杀的副作用可能已发生
+ * （方案 §五 边界：单个正在执行的工具调用被强杀后副作用可能已发生）。
+ */
+export const STEER_ENVELOPE_HEADER_ABORTED =
+  "⛔ 上一回合已被 lead/用户中止（steer）：先处理本指令；未落盘进度可能丢失，必要时先 checkpoint。";
+
+/**
+ * steer 信封首行——**降级路径**（未发生任何中止）措辞。与 {@link STEER_ENVELOPE_HEADER_ABORTED}
+ * 分开是回执诚实的要求：空闲/交互式降级时谎称「上一回合已中止」会误导成员去 checkpoint
+ * 一个根本没在跑的任务。
+ */
+export const STEER_ENVELOPE_HEADER_IDLE =
+  "⛔ 纠偏指令（steer，来自 lead/用户；未发生回合中止）：请优先处理本条。";
+
+/** steer 信封组装入参（S3）。 */
+export interface SteerEnvelopeInput {
+  /** 纠偏正文（消息原文）。 */
+  body: string;
+  /** 发起者花名（lead 或 user）——进归因行与审计。 */
+  by: string;
+  /** 用户原话介入（origin=user 盖章命中）——归因行区分「用户亲述」与「lead 转达」。 */
+  viaUser?: boolean;
+  /** true = 抢占成功（旧回合已终止，首行用 ABORTED 措辞）；false = 降级路径（IDLE 措辞）。 */
+  aborted: boolean;
+  /** 任务 id 指针（可选；attemptWake 从回执消息解析的单一 taskId）。 */
+  taskId?: string;
+  /** journal 指针（可选；与 taskId 成对给出）。 */
+  journalPath?: string;
+  /** 正文字符上限（缺省 {@link STEER_ENVELOPE_MAX_BODY_CHARS}；测试注入小值）。 */
+  maxBodyChars?: number;
+}
+
+/**
+ * 组装 steer 信封（S3，纯函数）：首行（中止/未中止分流）+ 归因行 + 正文（≤2KB 截断）
+ * + 指针行（taskId / journal 路径）。
+ *
+ * 信封整体随后作为 {@link buildWakePrompt} 的 bodyText——prompt 侧还有 4000 字符
+ * 总预算与截断兜底；本函数只负责 C2 判据「正文 ≤2KB + 指针」。
+ */
+export function buildSteerEnvelope(input: SteerEnvelopeInput): string {
+  const maxBody = input.maxBodyChars ?? STEER_ENVELOPE_MAX_BODY_CHARS;
+  const by = input.by.trim() === "" ? "lead" : input.by.trim();
+  const attribution = input.viaUser === true
+    ? `来自用户（origin=user，经 ${by} 的会话转达）`
+    : `来自 ${by}`;
+  const lines: string[] = [
+    input.aborted ? STEER_ENVELOPE_HEADER_ABORTED : STEER_ENVELOPE_HEADER_IDLE,
+    attribution,
+    truncateBody(input.body, maxBody),
+  ];
+  const pointers: string[] = [];
+  if (input.taskId !== undefined && input.taskId.trim() !== "") pointers.push(`taskId=${input.taskId.trim()}`);
+  if (input.journalPath !== undefined && input.journalPath.trim() !== "") pointers.push(`journal=${input.journalPath.trim()}`);
+  if (pointers.length > 0) lines.push(`指针：${pointers.join("；")}（进度以磁盘真源为准）`);
+  return lines.join("\n");
+}
+
+/** steer 指令（WakeRequest.steer；工具面判定权限后交给本层执行）。 */
+export interface SteerDirective {
+  /** 发起者花名（lead 或 user）——进审计与信封归因行。 */
+  by: string;
+  /** 用户原话介入（origin=user 盖章命中；S4 放行依据之一，进审计）。 */
+  viaUser?: boolean;
+  /** 测试注入：终止手段（缺省 {@link platformSteerKill}）。 */
+  kill?: SteerKillFn;
+  /** 测试注入：终止等待 sleep（缺省 setTimeout）。 */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/** steer 终止手段的注入形状（测试用；生产恒走平台真实实现）。 */
+export type SteerKillFn = (pid: number, force: boolean) => { ok: boolean; error?: string };
+
+/**
+ * 平台真实终止手段（S2）：
+ * - Windows：`taskkill /PID <pid>`（无 /F ≈ WM_CLOSE 语义）→ 超时/被拒才 `taskkill /PID <pid> /F`；
+ * - 非 Windows：SIGTERM → SIGKILL。
+ * 同步返回（spawnSync）——steer 是同步编排路径，且强杀确认必须有界（不挂起工具调用）。
+ */
+export function platformSteerKill(pid: number, force: boolean): { ok: boolean; error?: string } {
+  if (process.platform === "win32") {
+    const args = ["/PID", String(pid)];
+    if (force) args.push("/F");
+    const result = spawnSync("taskkill", args, { windowsHide: true });
+    if (result.status === 0) return { ok: true };
+    const detail = (result.stderr?.toString() ?? result.stdout?.toString() ?? "").trim();
+    return { ok: false, error: `taskkill exit ${result.status ?? "signal"}: ${detail.slice(0, 200)}` };
+  }
+  try {
+    process.kill(pid, force ? "SIGKILL" : "SIGTERM");
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: `signal ${force ? "SIGKILL" : "SIGTERM"} failed: ${err instanceof Error ? err.message : String(err)}` };
+  }
+}
+
+/** steer 优雅终止宽限窗缺省（ms）——env `XC_STEER_GRACE_MS` 可配（S2；0 新增必填配置）。 */
+export const STEER_GRACE_MS_DEFAULT = 8_000;
+
+/** steer 优雅终止宽限窗（ms）：env `XC_STEER_GRACE_MS`（正整数；非法/缺省 → 8000）。 */
+export function steerGraceMsFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+  return positiveIntFromEnv(env, "XC_STEER_GRACE_MS", STEER_GRACE_MS_DEFAULT);
+}
+
+/** /F 强杀后确认死亡的有界等待（ms）——强杀不是瞬时的，回执前确认（不无限等）。 */
+export const STEER_FORCE_CONFIRM_MS = 2_000;
+
+/** 终止等待轮询步长（ms）。 */
+export const STEER_STOP_POLL_MS = 100;
+
+/** steer 终止结果（S2 审计与 S5 回执的数据源）。 */
+export interface SteerStopResult {
+  pid: number;
+  /** true = 优雅信号被接受且进程在宽限窗内自行退出；false = 优雅被拒/超时 → 走了 /F。 */
+  graceful: boolean;
+  waitedMs: number;
+  /** false = 优雅 + 强杀两种手段后进程仍存活（steer 必须回退软中断，不假装成功）。 */
+  stopped: boolean;
+  /** 优雅信号被 OS 拒绝的原文（Windows 无头进程常态：「只能强行终止（带 /F）」）。 */
+  gracefulRefusal?: string;
+  /** 终止失败的原因（stopped=false 时在场）。 */
+  error?: string;
+}
+
+/**
+ * steer 终止编排（S2）：**先优雅**（taskkill /PID 无 /F ≈ WM_CLOSE）→ 宽限窗内等自行退出
+ * → 超时（或优雅信号被 OS 拒绝）才走**带 /F 的 taskkill 强杀** → 有界确认死亡。
+ *
+ * 两条实现注记（都有实测依据，44-v098 feasibility）：
+ * ① 优雅被拒（taskkill 无 /F 对无头进程报错）→ **不等满窗**直接升级强杀：没有信号在途，
+ *    等待不会带来退出； waitedMs 如实记实际耗时（审计面可见这条捷径）；
+ * ② 强杀遗留孤儿子进程（被杀进程自己的子进程父死后仍存活）是已知副作用——回执/信封
+ *    首行的「未落盘进度可能丢失」即覆盖此形态，不在本函数承诺清理（插件不持有进程树）。
+ */
+export async function stopTurnForSteer(
+  pid: number,
+  graceMs: number,
+  options: {
+    kill?: SteerKillFn;
+    alive?: (pid: number) => boolean;
+    sleep?: (ms: number) => Promise<void>;
+    now?: () => number;
+  } = {},
+): Promise<SteerStopResult> {
+  const kill = options.kill ?? platformSteerKill;
+  const alive = options.alive ?? ((p: number) => pidAlive(p));
+  const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    timer.unref?.();
+  }));
+  const now = options.now ?? Date.now;
+  // 自杀/非法 pid 防御：会话记录 pid 异常等于本进程时绝不终止（那会杀掉引擎自己）。
+  if (!Number.isSafeInteger(pid) || pid <= 0 || pid === process.pid) {
+    return { pid, graceful: false, waitedMs: 0, stopped: false, error: `refusing to steer-kill pid ${pid} (invalid or self)` };
+  }
+  const startedAt = now();
+  // ① 优雅终止（WM_CLOSE 语义）。
+  const graceful = kill(pid, false);
+  // 优雅信号被 OS 拒绝的原文（Windows 无头进程常态）——两条返回路径都要带（审计要能
+  // 解释「为何 graceful=false 而 waitedMs 远小于宽限窗」）。
+  const gracefulRefusal = graceful.ok ? undefined : graceful.error;
+  if (graceful.ok) {
+    while (now() - startedAt < graceMs) {
+      if (!alive(pid)) return { pid, graceful: true, waitedMs: now() - startedAt, stopped: true };
+      await sleep(STEER_STOP_POLL_MS);
+    }
+    if (!alive(pid)) return { pid, graceful: true, waitedMs: now() - startedAt, stopped: true };
+  }
+  // ② 超时或优雅被拒 → /F 强杀。
+  const forced = kill(pid, true);
+  if (!forced.ok) {
+    const stillAlive = alive(pid);
+    return {
+      pid,
+      graceful: false,
+      waitedMs: now() - startedAt,
+      stopped: !stillAlive,
+      ...(gracefulRefusal !== undefined ? { gracefulRefusal } : {}),
+      ...(stillAlive ? { error: forced.error ?? "force kill failed; process still alive" } : {}),
+    };
+  }
+  const forceDeadline = now() + STEER_FORCE_CONFIRM_MS;
+  while (now() < forceDeadline) {
+    if (!alive(pid)) {
+      return {
+        pid,
+        graceful: false,
+        waitedMs: now() - startedAt,
+        stopped: true,
+        ...(gracefulRefusal !== undefined ? { gracefulRefusal } : {}),
+      };
+    }
+    await sleep(STEER_STOP_POLL_MS);
+  }
+  const stillAlive = alive(pid);
+  return {
+    pid,
+    graceful: false,
+    waitedMs: now() - startedAt,
+    stopped: !stillAlive,
+    ...(gracefulRefusal !== undefined ? { gracefulRefusal } : {}),
+    ...(stillAlive ? { error: "process still alive after /F" } : {}),
+  };
+}
+
+/** steer 三态结果词（S5 冻结）：抢占成功 / 降级下一回合 / 不支持（交互式）。 */
+export type SteerResultWord = "preempted" | "deferred-next-turn" | "unsupported";
+
+/** steer 目标分类（S1 的判定面；纯函数——成员记录/会话记录/pid 探测由调用方读取注入）。 */
+export interface SteerClassification {
+  result: SteerResultWord;
+  reason: string;
+  /** result="preempted" 时的目标 pid（调用方据此终止）。 */
+  pid?: number;
+}
+
+/**
+ * steer 目标分类（S1，纯函数）：
+ * - 不在册 → unsupported（无法确认引擎供给身份，不终止）；
+ * - 交互式/存量成员（identity≠engine）→ unsupported（插件无权终止交互式会话）；
+ * - **无头持有者校验**（v0.9.8 V098-01）：identity:"engine" 只是花名册行的**粘滞标**
+ *   （「谁建了这行」），不证明「当前持有者还是引擎供给的无头会话」——交互会话经
+ *   xc_identify({takeover:true}) 接管已死引擎成员花名后，joinTeam 重复注册只换
+ *   sessionId、保留 identity 粘滞标。判据与唤醒闸同源（core/config.ts
+ *   {@link engineHolderIsHeadless}：行当前 sid 的会话记录带**本名 boundName** ⟺
+ *   无头持有者；boundName 唯一写入路径 = member-add 供给代写，交互会话无法自签，
+ *   见 identity.ts V090-04 修复）。**活回合 ∧ 非无头持有者 → unsupported**
+ *   （对交互宿主进程强杀 = 越权，且回执会谎称 preempted，与 S1 冻结语义矛盾）；
+ * - 引擎供给成员（无头持有者）∧ liveness=running（时刻可信）∧ pid 存活 → preempted{pid}；
+ * - 无活回合（idle/无记录/pid 已亡/pid 异常=本进程）→ deferred-next-turn（无可终止
+ *   对象，纠偏随本次投递送达——与持有者是否无头无关：没有活回合就没有抢占）。
+ */
+export function classifySteerTarget(input: {
+  member: TeamMember | undefined;
+  record: SessionRecord | undefined;
+  now: number;
+  alive?: (pid: number) => boolean;
+}): SteerClassification {
+  const alive = input.alive ?? ((p: number) => pidAlive(p));
+  if (input.member === undefined) {
+    return {
+      result: "unsupported",
+      reason: "目标不在队内花名册（无法确认引擎供给身份），steer 不执行终止——纠偏按软中断投递（邮箱 urgent + INTERRUPT 信封）",
+    };
+  }
+  if (memberIdentity(input.member) !== "engine") {
+    return {
+      result: "unsupported",
+      reason: "交互式会话无法被插件终止（steer 仅对引擎供给成员生效；中断交互式回合只有用户 Esc）——steer 降级为软中断语义"
+        + "（消息带 interrupt 元数据 + urgent 排序，投递结果见 delivered），请人工 Esc 或等待其下回合 inbox-check 查收",
+    };
+  }
+  const record = input.record;
+  const running = record !== undefined
+    && record.liveness === "running"
+    && plausibleLivenessTs(record.livenessTs, input.now);
+  const pid = running && typeof record!.pid === "number" && Number.isSafeInteger(record!.pid) && record!.pid > 0
+    ? record!.pid
+    : undefined;
+  if (pid !== undefined && pid === process.pid) {
+    return {
+      result: "deferred-next-turn",
+      reason: `会话记录 pid=${pid} 与本进程相同（异常状态），不执行终止——纠偏随本次投递送达，收方下回合生效`,
+    };
+  }
+  if (pid !== undefined && alive(pid)) {
+    // v0.9.8（V098-01）：有活回合 ≠ 可抢占。粘滞 identity 标 + 交互式接管 =
+    // 「engine 标行 ∧ 交互持有者」（唤醒闸的 takenOver 同族形态）——强杀交互宿主
+    // 进程越权，回执必须落 unsupported（软中断降级），不落 preempted。
+    const headless = record !== undefined && record.boundName === input.member.key;
+    if (!headless) {
+      return {
+        result: "unsupported",
+        reason: `花名册行带 identity:"engine" 粘滞标，但当前 sid（${input.member.sessionId}）的会话记录不是无头持有者`
+          + "（boundName 不匹配——交互式接管形态，V090-05 同族）：交互式会话无法被插件终止，"
+          + "steer 不执行终止——降级为软中断语义（消息带 interrupt 元数据 + urgent 排序，投递结果见 delivered），"
+          + "请人工 Esc 或等待其下回合 inbox-check 查收",
+      };
+    }
+    return {
+      result: "preempted",
+      reason: `引擎供给成员（无头持有者：boundName=${record!.boundName}）且有活唤醒回合（pid ${pid}，liveness=running）——执行终止→续跑`,
+      pid,
+    };
+  }
+  return {
+    result: "deferred-next-turn",
+    reason: "引擎供给成员但当前无活唤醒回合（liveness≠running / pid 缺失或已亡）——未执行终止，纠偏随本次投递送达，收方下回合生效",
+  };
+}
+
+/** steer 回执块（S5 冻结形状；工具面原样进 payload `interrupt` 键）。 */
+export interface SteerOutcome {
+  requested: true;
+  result: SteerResultWord;
+  reason: string;
+  /** 终止实况（仅抢占成功时在场；失败回退不带——不把「试图终止」写成「已终止」）。 */
+  stopped?: { pid: number; graceful: boolean; waitedMs: number };
+  /** 新回合实况（仅新回合真实发起时在场）。 */
+  turn?: { nonce: string; startConfirmed: boolean };
 }
 
 /**
@@ -2849,6 +3254,17 @@ export interface WakeRequest {
    * startWakeLifecycleWatch ②）。测试注入小值。
    */
   fakeSuccessMs?: number;
+  /**
+   * v0.9.8（S1）：**steer 指令**（xc_relay({steer:true})）——终止→续跑。
+   *
+   * 语义分层（S1）：仅引擎供给成员且存在活唤醒回合时真正抢占（终止旧回合 → 新回合
+   * 首条指令=纠偏信封）；空闲目标降级普通唤醒；交互式会话降级软中断（回执
+   * result="unsupported"）。权限（S4：仅 lead/user）由工具面判定后本层才执行；
+   * 终止/续跑失败一律回退软中断并如实回执（S5），不假装成功。
+   *
+   * 缺省（不传）= 既有唤醒路径逐字节不变（steer 默认关闭，方案 §四 不变式 3）。
+   */
+  steer?: SteerDirective;
 }
 
 export interface WakeResult {
@@ -2887,6 +3303,13 @@ export interface WakeResult {
    * 由 engine 事件 `wake-consumed` 与邮箱真源说话——回执不假装知道未来。
    */
   wakeTiers?: { spawnOk: "ok"; childAlive: "ok" | "no"; consumed: "pending" };
+  /**
+   * v0.9.8（S5）：steer 回执（仅 steer 请求在场）——三态结果词 + 终止实况（stopped）
+   * + 新回合实况（turn）。工具面原样进 payload `interrupt` 键（PROTOCOL §7 的 steer 形态）。
+   * 失败回退（终止失败/spawn 失败）时 result 如实降为 "deferred-next-turn"，
+   * stopped/turn 只记真实发生的事——不把「试图」写成「已」。
+   */
+  steer?: SteerOutcome;
 }
 
 /** 短暂重取 team 锁做邮箱补盖章（dsh tools.js:2150 形态）；失败不阻断主流程。 */
@@ -2910,6 +3333,20 @@ async function readWakeTargetMember(stateRoot: string, teamId: string, agentKey:
     return team.members.find((m) => m.key === agentKey);
   } catch {
     return undefined; // team.json 损坏等：门控尽力而为，唤醒路径不受阻
+  }
+}
+
+/**
+ * v0.9.8（R1）：读唤醒 prompt 的**队友名单**——除收件人外的队内成员键（排序稳定）。
+ * 团队不存在/读盘失败 → 空数组（buildWakePrompt 不附队友行；观测面读盘失败不阻断唤醒）。
+ */
+async function readWakeRoster(stateRoot: string, teamId: string, excludeKey: string): Promise<string[]> {
+  try {
+    const team = await readTeam(stateRoot, teamId);
+    if (team === undefined) return [];
+    return team.members.map((m) => m.key).filter((key) => key !== excludeKey).sort();
+  } catch {
+    return [];
   }
 }
 
@@ -2965,6 +3402,83 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
   //    注：旧版「不碰磁盘先判」的优化随分层取消——file 层与成员身份都在盘上，
   //    这是 G-6「配置跟工作区走」决策的固有代价（小文件、投递频率级读取）。
   const target = await readWakeTargetMember(stateRoot, req.teamId, toKey);
+  // v0.9.8（S1）：steer 目标分类（**早分类**——attemptWake 的每条返回路径都要能带
+  // 如实的 steer 回执，S5）。会话记录一次读盘（liveness/pid 真源在
+  // registry/sessions/<sid>.json，v0.9.4 A1 由 SessionStart 钩子写入宿主进程 pid）；
+  // 读失败按「无活回合」处理（不猜进程状态）。抢占是否真正发生由下方终止结果
+  // （steerStopped）说话——分类只说「可不可以抢占」。
+  let steerClass: SteerClassification | undefined;
+  if (req.steer !== undefined) {
+    let record: SessionRecord | undefined;
+    try {
+      record = await readSession(stateRoot, req.toSessionId);
+    } catch {
+      record = undefined; // 记录损坏/读失败：按无活回合处理（保守：不终止）
+    }
+    steerClass = classifySteerTarget({ member: target, record, now, alive: req.pidAliveProbe });
+  }
+  // v0.9.8（R1）：队友名单（除自己外的队内成员键，排序求稳定）——唤醒 prompt 的
+  // identity 段后带「队友：…可 xc_relay({to:"…"}) 直连，不必经过 lead」行；首次唤醒
+  // 与重唤醒都带（buildWakePrompt 恒附加，budget 内）。读失败 → 空名单（不附行，
+  // 不因观测面读盘失败阻断唤醒）。
+  const wakeRoster = await readWakeRoster(stateRoot, req.teamId, toKey);
+  /** v0.9.8（S2）：终止实况（抢占成功后才置位；回执/审计的 stopped 块只认它）。 */
+  let steerStopped: { pid: number; graceful: boolean; waitedMs: number } | undefined;
+  /**
+   * v0.9.8（S5）：steer 回执装配器——给一个既有返回结果挂 steer 三态块。
+   *
+   * 诚实三判据（不假装成功）：
+   * ① 无 steer 请求 → 原样返回（既有路径零行为变化，方案 §四 不变式 3）；
+   * ② 分类是 "preempted" 但终止没发生（闸挡下/终止失败/spawn 失败）→ 降为
+   *    "deferred-next-turn"：没有终止就没有抢占，回执不许停留在分类态；
+   * ③ stopped/turn 块只记真实发生的事（调用方显式传入才带）。
+   */
+  const attachSteer = async <T extends WakeResult>(
+    res: T,
+    opts: {
+      /** 本次未发起唤醒的原因（闸挡下/spawn 失败）——触发 preempted→deferred 降级。 */
+      skipReason?: string;
+      result?: SteerResultWord;
+      reason?: string;
+      stopped?: { pid: number; graceful: boolean; waitedMs: number };
+      turn?: { nonce: string; startConfirmed: boolean };
+    } = {},
+  ): Promise<T> => {
+    if (steerClass === undefined || req.steer === undefined) return res;
+    const result: SteerResultWord = opts.result
+      ?? (steerClass.result === "preempted" && steerStopped === undefined ? "deferred-next-turn" : steerClass.result);
+    const reason = opts.reason
+      ?? (opts.skipReason !== undefined
+        ? (steerClass.result === "preempted" && steerStopped === undefined
+          ? `目标有活唤醒回合但本次未执行终止（${opts.skipReason}）——纠偏留在邮箱（pull 兜底），收方下回合生效`
+          : `${steerClass.reason}；本次未发起唤醒：${opts.skipReason}`)
+        : steerClass.reason);
+    // 非「抢占且新回合已发起」的 steer 结局一律落 steer-degraded 审计（抢占成功的审计是
+    // steer-turn-started，两者互斥不叠加）。await：调用方（工具回执）紧随其后读审计面，
+    // 不 awaited 的日志写会把「回执已出、审计未落」的竞态留给观测面（V097-09 同族纪律）。
+    if (result !== "preempted" || opts.turn === undefined) {
+      await logEngineEvent(stateRoot, {
+        event: "steer-degraded",
+        result,
+        reason,
+        scene: req.reason,
+        teamId: req.teamId,
+        to: toKey,
+        by: req.steer.by,
+        ...(req.steer.viaUser === true ? { viaUser: true } : {}),
+      });
+    }
+    return {
+      ...res,
+      steer: {
+        requested: true,
+        result,
+        reason,
+        ...(opts.stopped !== undefined ? { stopped: opts.stopped } : {}),
+        ...(opts.turn !== undefined ? { turn: opts.turn } : {}),
+      },
+    } as T;
+  };
   const gate = resolveWakeGate(stateRoot, req.env, target);
   if (gate.warning !== undefined) {
     // 畸形 config.json：回落次层（WARNING 披露对齐 env 卫生口径；不阻断本次判定）。
@@ -3006,7 +3520,7 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
       event: "wake-skipped", reason, scene: req.reason, teamId: req.teamId, to: toKey, memberState: gateState,
     });
     // v0.9.4（A3）：降级回执如实写「仅落邮箱（未唤醒）」——禁出现已送达/已消费。
-    return { delivered: "mailbox", note: mailboxOnlyNote(reason) };
+    return attachSteer({ delivered: "mailbox", note: mailboxOnlyNote(reason) }, { skipReason: reason });
   }
 
   const pre = decideDelivery({ wakeGate: gate, ownerAbsent: req.ownerAbsent, inflight: false });
@@ -3026,7 +3540,7 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
       ...(gate.warning !== undefined ? { configWarning: gate.warning } : {}),
     });
     // v0.9.4（A3）：降级回执如实写「仅落邮箱（未唤醒）」——禁出现已送达/已消费。
-    return { delivered: "mailbox", note: mailboxOnlyNote(pre.reason) };
+    return attachSteer({ delivered: "mailbox", note: mailboxOnlyNote(pre.reason) }, { skipReason: pre.reason });
   }
   // v0.9.3（B3②）：生效值恢复 true——清掉关闭持续态（下一次持续关闭重新起算）。
   // 位置在预判通过处：此刻 gate.enabled 恒 true（engine-member 免开关同算恢复）。
@@ -3050,8 +3564,11 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
   // 「lifecycle 账有本票据的 start 证据且子进程未见退出，或票据在短宽限窗内签发」的
   // 新鲜票据才算在途；供给失败留票等孤儿票（无 spawn 证据）不再压制派单。正常在途票
   // （spawn 了、子进程活着）照旧去重——R1 修复不牺牲现有去重语义（方案 §二-5）。
+  // v0.9.8（S1）：**steer 不受在途去重阻挡**——「有活唤醒回合」正是 steer 的抢占对象：
+  // 该在途票据所属的回合将被终止，票据随之作废（终止成功后消费，见 S2 终止块）。
+  // 非 steer 路径行为逐字节不变。
   const inflight = await findLiveInflightWakeNonce(stateRoot, toKey, { teamId: req.teamId, now });
-  if (inflight !== undefined) {
+  if (inflight !== undefined && req.steer === undefined) {
     const d = decideDelivery({ wakeGate: gate, ownerAbsent: req.ownerAbsent, inflight: true });
     await logEngineEvent(stateRoot, {
       event: "wake-skipped", reason: d.reason, scene: req.reason, teamId: req.teamId, to: toKey,
@@ -3060,7 +3577,7 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
       inflightNonce: wakeNonceDigest(inflight.token),
     });
     // v0.9.4（A3）：降级回执如实写「仅落邮箱（未唤醒）」——禁出现已送达/已消费。
-    return { delivered: "mailbox", note: mailboxOnlyNote(d.reason) };
+    return attachSteer({ delivered: "mailbox", note: mailboxOnlyNote(d.reason) }, { skipReason: d.reason });
   }
 
   // 3.7 v0.5.3（A5 修复）：显式 spawn 配置无效（XC_ZCODE_EXE/XC_ZCODE_CJS 配置了但路径
@@ -3075,7 +3592,7 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
         event: "wake-skipped", reason, scene: req.reason, teamId: req.teamId, to: toKey,
       });
       // v0.9.4（A3）：降级回执如实写「仅落邮箱（未唤醒）」——禁出现已送达/已消费。
-      return { delivered: "mailbox", note: mailboxOnlyNote(reason) };
+      return attachSteer({ delivered: "mailbox", note: mailboxOnlyNote(reason) }, { skipReason: reason });
     }
   }
 
@@ -3115,13 +3632,16 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
       gateEnv: wakeCapacityGateEnvRaw(req.env),
       urgent: req.urgent === true,
     });
-    return {
-      delivered: "mailbox",
-      // v0.9.4（A3）：降级回执如实写「仅落邮箱（未唤醒）」——禁出现已送达/已消费。
-      note: mailboxOnlyNote(reason)
-        + `（容量闸 v0.9.1 G-12-b；冷却 ${Math.round(capacityDeferral.cooldownMs / 1000)}s，env XC_MEM_WAKE_COOLDOWN_MS 可调，XC_MEM_WAKE_GATE=off 可关闸）`,
-      wakeDeferred: capacityDeferral,
-    };
+    return attachSteer(
+      {
+        delivered: "mailbox",
+        // v0.9.4（A3）：降级回执如实写「仅落邮箱（未唤醒）」——禁出现已送达/已消费。
+        note: mailboxOnlyNote(reason)
+          + `（容量闸 v0.9.1 G-12-b；冷却 ${Math.round(capacityDeferral.cooldownMs / 1000)}s，env XC_MEM_WAKE_COOLDOWN_MS 可调，XC_MEM_WAKE_GATE=off 可关闸）`,
+        wakeDeferred: capacityDeferral,
+      },
+      { skipReason: reason },
+    );
   }
 
   // 4. 写一次性 nonce（兼在途标记）+ 盖投递租约（尽力而为）。
@@ -3142,25 +3662,107 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
   await withLockBestEffort(stateRoot, req.teamId, () =>
     claimMailboxDelivery(stateRoot, req.teamId, toKey, ids, now));
 
+  // 4.5 v0.9.8（S2）：**steer 终止**——位置在全部闸门 + nonce/租约之后、spawn 之前：
+  // 只有「这一轮真的要发起新回合」时才终止旧回合。闸挡下就终止会让成员既丢进度
+  // （强杀副作用）又收不到纠偏（无新回合）——那是纯粹的伤害，故终止必须最后发生。
+  // 终止失败（两种手段后 pid 仍存活）→ 不起新回合（同 sid 并发 --resume 是未验证区），
+  // 释放租约 + 消费 nonce，回退软中断（S5：失败不假装成功）。
+  if (req.steer !== undefined && steerClass !== undefined && steerClass.result === "preempted" && steerClass.pid !== undefined) {
+    const steer = req.steer;
+    const stop = await stopTurnForSteer(steerClass.pid, steerGraceMsFromEnv(req.env), {
+      ...(steer.kill !== undefined ? { kill: steer.kill } : {}),
+      ...(steer.sleep !== undefined ? { sleep: steer.sleep } : {}),
+      ...(req.pidAliveProbe !== undefined ? { alive: req.pidAliveProbe } : {}),
+    });
+    if (!stop.stopped) {
+      const reason = `steer 终止失败（pid ${stop.pid} 仍在存活：${stop.error ?? "unknown"}）——未发起新回合（避免同会话并发 --resume），纠偏留在邮箱（pull 兜底）`;
+      await logEngineEvent(stateRoot, {
+        event: "steer-stop-failed",
+        pid: stop.pid,
+        waitedMs: stop.waitedMs,
+        error: stop.error ?? "still alive",
+        gracefulRefusal: stop.gracefulRefusal ?? null,
+        scene: req.reason,
+        teamId: req.teamId,
+        to: toKey,
+        by: steer.by,
+        ...(steer.viaUser === true ? { viaUser: true } : {}),
+      });
+      // 不起新回合 = 没有真正的唤醒在途：释放租约 + 消费 nonce（与 spawn 同步失败同纪律）。
+      await withLockBestEffort(stateRoot, req.teamId, () =>
+        releaseMailboxDelivery(stateRoot, req.teamId, toKey, [...ids]));
+      try {
+        await consumeWakeNonce(stateRoot, token, { teamId: req.teamId, agentKey: toKey, sid: req.toSessionId }, now);
+      } catch {
+        /* 尽力而为 */
+      }
+      return attachSteer(
+        { delivered: "mailbox", note: mailboxOnlyNote(reason), wakeLog: wakeLogFile(stateRoot, toKey, now), receiptIds: ids },
+        { skipReason: reason },
+      );
+    }
+    steerStopped = { pid: stop.pid, graceful: stop.graceful, waitedMs: stop.waitedMs };
+    await logEngineEvent(stateRoot, {
+      event: "steer-stopped",
+      pid: stop.pid,
+      graceful: stop.graceful,
+      waitedMs: stop.waitedMs,
+      scene: req.reason,
+      teamId: req.teamId,
+      to: toKey,
+      by: steer.by,
+      ...(steer.viaUser === true ? { viaUser: true } : {}),
+      // Windows 无头进程常态：优雅信号被 OS 拒绝（「只能强行终止（带 /F）」）→ 原文进审计，
+      // 解释为何 graceful=false 而 waitedMs 远小于宽限窗（44-v098 feasibility 实测形态）。
+      ...(stop.gracefulRefusal !== undefined ? { gracefulRefusal: stop.gracefulRefusal } : {}),
+    });
+    // 旧回合的票据随之作废——它的回合已被终止。不消费则 15min 在途标记会挡住下一轮
+    // 唤醒/重试（findLiveInflightWakeNonce 只认「有 start 证据且无 exit 尾行」的票据；
+    // 强杀可能导致 exit 尾行缺失，见 wakeTicketHasLiveEvidence 的边界声明）。
+    if (inflight !== undefined) {
+      try {
+        await consumeWakeNonce(stateRoot, inflight.token, { teamId: req.teamId, agentKey: toKey, sid: inflight.nonce.sid }, now);
+      } catch {
+        /* 尽力而为 */
+      }
+    }
+  }
+
   // 5. prompt + spawn（fire-and-forget）。守则附加按场景白名单（v0.2 §9.1 白名单兼容）。
   // v0.6（C1）：urgent 唤醒（xc_relay）→ 正文首位 URGENT 横幅。
   // v0.9.4（A6）：本批回执消息的 taskId（单一才给）→ prompt 行动行「直接 xc_claim」。
   // v0.9.5（A1）：身份行/守则规则 1 按 ppid 采纳档分流（XC_ADOPT_BY_PPID=1 才写
   // 「已自动绑定」；默认档写 wakeToken 自证路径）。
+  // v0.9.8（S1）：steer 请求 → 正文 = steer 信封（首行中止/未中止措辞 + 归因 + ≤2KB
+  // 正文 + taskId/journal 指针；C2 短指令）；R1 → 队友名单行进 identity 段后。
   const adoptByPpid = adoptByPpidEnabledFromEnv(req.env);
   const receiptTaskId = await resolveReceiptTaskId(stateRoot, req.teamId, toKey, ids);
+  const steerEnvelope = req.steer !== undefined
+    ? buildSteerEnvelope({
+        body: req.ticket,
+        by: req.steer.by,
+        ...(req.steer.viaUser !== undefined ? { viaUser: req.steer.viaUser } : {}),
+        // 抢占成功（旧回合已终止）→ 中止措辞；降级路径 → 未发生中止措辞（不谎称）。
+        aborted: steerStopped !== undefined,
+        ...(receiptTaskId !== undefined
+          ? { taskId: receiptTaskId, journalPath: taskJournalPath(stateRoot, receiptTaskId) }
+          : {}),
+      })
+    : undefined;
   const prompt = buildWakePrompt({
     teamId: req.teamId,
     recipientKey: toKey,
     recipientSessionId: req.toSessionId,
     wakeToken: token,
     receiptIds: ids,
-    bodyText: req.ticket,
+    bodyText: steerEnvelope ?? req.ticket,
     includeMemberRules: includeRulesForScene(req.reason),
     scene: req.reason,
     adoptByPpidEnabled: adoptByPpid,
     ...(receiptTaskId !== undefined ? { taskId: receiptTaskId } : {}),
     ...(req.urgent === true ? { urgent: true } : {}),
+    // v0.9.8（R1）：队友名单（除自己外的队内成员键）——首次/重唤醒都带。
+    ...(wakeRoster.length > 0 ? { roster: wakeRoster } : {}),
   });
   const logFile = wakeLogFile(stateRoot, toKey, now);
   // v0.9.1（G-12v3）：wake-child 生命周期日志文件（start 头行/exit 尾行/limbo 行）。
@@ -3294,17 +3896,31 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
     pid = spawned.pid;
   } catch (err) {
     await releaseOnFailure("spawn", err);
-    return {
-      delivered: "mailbox",
-      // v0.9.1 r3（V090-08）：降级路径的 note 同样携带畸形 config.json 的 WARNING
-      // （与 wake 态 note、wake-skipped 原因行同一披露口径）。
-      // v0.9.4（A3）：同样带「仅落邮箱（未唤醒）」——spawn 失败也是没唤醒成功，
-      // 回执不得被读成已送达/已消费。
-      note: mailboxOnlyNote(`spawn-failed: ${err instanceof Error ? err.message : String(err)}（消息留邮箱，pull 兜底，租约到期可重试）`)
-        + (gate.warning !== undefined ? `；${gate.warning}` : ""),
-      wakeLog: logFile,
-      receiptIds: ids,
-    };
+    // v0.9.8（S5）：steer 的 spawn 失败——若旧回合已被终止（steerStopped 在场），
+    // 回执必须同时说清「终止已发生」与「新回合未起来」：result 显式降为
+    // deferred-next-turn（没有新回合就不是抢占成功），stopped 块记终止实况，
+    // turn 块缺席（没有新回合，不虚构）。
+    const spawnFailReason = `spawn-failed: ${err instanceof Error ? err.message : String(err)}`;
+    return attachSteer(
+      {
+        delivered: "mailbox",
+        // v0.9.1 r3（V090-08）：降级路径的 note 同样携带畸形 config.json 的 WARNING
+        // （与 wake 态 note、wake-skipped 原因行同一披露口径）。
+        // v0.9.4（A3）：同样带「仅落邮箱（未唤醒）」——spawn 失败也是没唤醒成功，
+        // 回执不得被读成已送达/已消费。
+        note: mailboxOnlyNote(`${spawnFailReason}（消息留邮箱，pull 兜底，租约到期可重试）`)
+          + (gate.warning !== undefined ? `；${gate.warning}` : ""),
+        wakeLog: logFile,
+        receiptIds: ids,
+      },
+      {
+        result: "deferred-next-turn",
+        reason: steerStopped !== undefined
+          ? `已终止旧回合（pid ${steerStopped.pid}，${steerStopped.graceful ? "graceful" : "forced"}，等待 ${steerStopped.waitedMs}ms），但新回合 spawn 失败（${spawnFailReason}）——纠偏留在邮箱（pull 兜底）；旧回合未落盘进度可能丢失`
+          : `本次未发起唤醒：${spawnFailReason}（消息留邮箱，pull 兜底，租约到期可重试）`,
+        ...(steerStopped !== undefined ? { stopped: steerStopped } : {}),
+      },
+    );
   }
 
   // 6. 成功：markDelivered（已启动投递传输；消费与否由 readAt 说话，§2.1）+ 审计。
@@ -3397,17 +4013,53 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
   // 退出仍记 null：不猜）。
   startConfirmedRef.value = startOutcome.confirmed;
 
+  // v0.9.8（S3）：steer 新回合审计——`steer-turn-started{nonce,startConfirmed}`。
+  // nonce 只落**不可反查摘要**（V091-01 纪律：真值仅存于 registry/wake/ 真源与唤醒
+  // prompt，共享日志不给人可消费的令牌）；startConfirmed 如实带启动确认两态。
+  if (req.steer !== undefined && steerStopped !== undefined) {
+    await logEngineEvent(stateRoot, {
+      event: "steer-turn-started",
+      nonce: wakeNonceDigest(token),
+      startConfirmed: startOutcome.confirmed,
+      pid,
+      scene: req.reason,
+      teamId: req.teamId,
+      to: toKey,
+      by: req.steer.by,
+      ...(req.steer.viaUser === true ? { viaUser: true } : {}),
+      stoppedPid: steerStopped.pid,
+      stoppedGraceful: steerStopped.graceful,
+      waitedMs: steerStopped.waitedMs,
+    });
+  }
+
   // v0.9.6（V095-14/adv3-F1）：回执时刻的**失败第三态**——启动确认结算后对 wake 日志
   // 做一次有界回读：快失败证据（sessionNotFound 等）此刻已在盘上时，回执如实披露
   // 「已发起但已见失败证据」（payload wakeFailureSeen/failureEvidence + note），不再让
   // 「已发起唤醒」成为调用方拿到的最后一句、失败只活在 1s 后的 engine 事件里。只读
   // 不清账：租约释放/nonce 消费/wake-failed 事件仍归失败侦听（startFailureWatch），
   // 两者对同一份日志同判据，互不重复记账。日志尚未出现/读失败 → 不表态（不误报）。
-  let receiptFailureEvidence: string | undefined;
-  try {
-    receiptFailureEvidence = findWakeFailureEvidence(readFileSync(logFile, "utf8"));
-  } catch {
-    receiptFailureEvidence = undefined; // 日志尚未落盘：按「未知」处理，不虚构失败
+  //
+  // v0.9.8（V097-09/D3）：单次回读升级为**有界二次回读**。缺陷形态（47-v097 §一 D3）：
+  // 唤醒失败证据晚于回执落盘 → 回执读作成功（单次回读竞态：证据在 readFileSync 之后
+  // 几百毫秒才落盘）。修法：回执定稿前对 wake 日志做有界补读——
+  // `XC_WAKE_RECEIPT_RECHECK_MS`（缺省 300ms）× `XC_WAKE_RECEIPT_RECHECK_ROUNDS`
+  // （缺省 2 轮，0 = 关闭回退旧行为）。两个 env 都是可选观测旋钮（0 新增必填配置）。
+  // 三面一致：补读命中时，payload（wakeFailureSeen/failureEvidence）、note（失败措辞）
+  // 与紧随其后的 engine.jsonl wake-failed（失败侦听下一拍，同判据同证据）三方一致；
+  // 补读未命中 → 与旧行为逐字节一致（不虚构失败）。
+  // 日志文件不存在（注入 spawn 的测试形态 / 子进程尚未建文件）→ 无可读对象，不补读。
+  let receiptFailureEvidence = readWakeFailureEvidenceOrUndefined(logFile);
+  if (receiptFailureEvidence === undefined && existsSync(logFile)) {
+    const rounds = wakeReceiptRecheckRoundsFromEnv(req.env);
+    const delayMs = wakeReceiptRecheckMsFromEnv(req.env);
+    for (let round = 0; round < rounds && receiptFailureEvidence === undefined; round++) {
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, delayMs);
+        timer.unref?.();
+      });
+      receiptFailureEvidence = readWakeFailureEvidenceOrUndefined(logFile);
+    }
   }
 
   // v0.9（G-8）：sessionNotFound 的单次自动重试（方案 §一 G-8「投递遇 sessionNotFound →
@@ -3489,19 +4141,32 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
       claimMailboxDelivery(stateRoot, req.teamId, toKey, retryIds, retryNow));
     // v0.9.4（A6）：重试轮次同样解析 taskId（幂等：同一批消息，taskId 不变）。
     // v0.9.5（A1）：重试 prompt 的身份行同样按 ppid 采纳档分流。
+    // v0.9.8（S1/R1）：steer 重试轮同样带 steer 信封（aborted 沿用首轮终止实况）与队友名单。
     const retryReceiptTaskId = await resolveReceiptTaskId(stateRoot, req.teamId, toKey, retryIds);
+    const retrySteerEnvelope = req.steer !== undefined
+      ? buildSteerEnvelope({
+          body: req.ticket,
+          by: req.steer.by,
+          ...(req.steer.viaUser !== undefined ? { viaUser: req.steer.viaUser } : {}),
+          aborted: steerStopped !== undefined,
+          ...(retryReceiptTaskId !== undefined
+            ? { taskId: retryReceiptTaskId, journalPath: taskJournalPath(stateRoot, retryReceiptTaskId) }
+            : {}),
+        })
+      : undefined;
     const retryPrompt = buildWakePrompt({
       teamId: req.teamId,
       recipientKey: toKey,
       recipientSessionId: sid,
       wakeToken: retryToken,
       receiptIds: retryIds,
-      bodyText: req.ticket,
+      bodyText: retrySteerEnvelope ?? req.ticket,
       includeMemberRules: includeRulesForScene(req.reason),
       scene: req.reason,
       adoptByPpidEnabled: adoptByPpid,
       ...(retryReceiptTaskId !== undefined ? { taskId: retryReceiptTaskId } : {}),
       ...(req.urgent === true ? { urgent: true } : {}),
+      ...(wakeRoster.length > 0 ? { roster: wakeRoster } : {}),
     });
     const retryLogFile = wakeLogFile(stateRoot, toKey, retryNow);
     // v0.9.1（G-12v3）：重试轮次的唤醒子 pid ref（生命周期监视的退出观察）。
@@ -3724,7 +4389,7 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
   const failureNote = receiptFailureEvidence !== undefined
     ? `；⚠ 失败侦听：回执时刻 wake 日志已见失败证据（${receiptFailureEvidence.slice(0, 160)}）——本轮唤醒大概率失败（engine.jsonl wake-failed 将留痕、投递租约已/将被释放），消息 pull 兜底，请勿按已开工处理`
     : "";
-  return {
+  const success: WakeResult = {
     delivered: "wake",
     note:
       "spawned: 无头 --resume 已发起（fire-and-forget，非送达确认；" +
@@ -3753,6 +4418,23 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
       consumed: "pending",
     },
   };
+  // v0.9.8（S5）：steer 成功回执——抢占成功（旧回合已终止 ∧ 新回合已发起）带
+  // stopped + turn 两块实况；降级路径（空闲/交互式）只带结果词与原因（未终止、无新回合
+  // 抢占语义），并明说纠偏已随本次唤醒投递。
+  if (req.steer === undefined || steerClass === undefined) return success;
+  if (steerStopped !== undefined) {
+    return attachSteer(success, {
+      result: "preempted",
+      reason: `已终止旧回合（pid ${steerStopped.pid}，${steerStopped.graceful ? "graceful" : "forced"}，等待 ${steerStopped.waitedMs}ms）并以 steer 信封续跑新回合——纠偏是新回合首条指令；旧回合未落盘进度可能丢失`,
+      stopped: steerStopped,
+      // turn.nonce 落**不可反查摘要**（与 steer-turn-started 审计同值，可对拍）——真值
+      // 只存在于唤醒 prompt 与 registry/wake/ 真源（V091-01 纪律：工具回执不给可消耗令牌）。
+      turn: { nonce: wakeNonceDigest(token), startConfirmed: startOutcome.confirmed },
+    });
+  }
+  return attachSteer(success, {
+    reason: `${steerClass.reason}；纠偏已随本次唤醒投递（新回合首条指令=纠偏信封；未发生终止）`,
+  });
 }
 
 /**

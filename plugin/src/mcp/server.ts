@@ -16,12 +16,22 @@
  *
  * 组装链不变：composeCore = base → withTaskEdges → withGuards → withPeerDrain。
  * GuardedStdioTransport / startStaleSweeper / stdin EOF 纪律全部原样保留。
+ *
+ * v0.9.8（J3，方案 §二 组J）：**工具调用边界的插队提示**——`decorateToolCallsWith
+ * PendingInterruptNotice` 在本模块给 `server.tool()` 套一层：该会话每次 MCP 工具
+ * 调用返回时，若调用者邮箱里还有未读的 interrupt/steer 消息，就在**文本尾部**追加
+ * 一行「你有 N 条插队待读」，并在 **JSON 面**加可选键 `pendingInterrupt`；没有插队
+ * 时一个字节都不加（工具结果形状与 v0.9.7 逐字节一致）。语义不变、不新增工具、
+ * 不新增必填配置（不变式 1）。
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import { composeCore, resolveDeps, type PrimaryRegistry, type ToolDeps } from "./core.js";
+import { connectionKeyOf, identityStore } from "./identity.js";
+import { countPendingInterrupts } from "../core/mailbox.js";
+import type { ToolResult } from "./protocol.js";
 import { registerIdentifyTools } from "./tools-identify.js";
 import { registerTaskTools } from "./tools-tasks.js";
 import { registerReadTools } from "./tools-read.js";
@@ -36,7 +46,7 @@ import { stopPeerEndpoint } from "../transport/pipe.js";
 import { GuardedStdioTransport } from "../transport/mcpstdio.js";
 
 const SERVER_NAME = "zcode-crosschat";
-const SERVER_VERSION = "0.9.7";
+const SERVER_VERSION = "0.9.8";
 
 // v0.8.1（29 红队 M01 修复）：xc_doctor 的 action 形状在**入口模块**构建——本模块是
 // bundle 入口（模块体最后求值），此处用 zod 无初始化次序风险；而 doctor-tool.ts 若自建
@@ -51,6 +61,101 @@ const DOCTOR_ACTION_SHAPE = {
 } as const;
 
 let shuttingDown = false;
+
+// ---------------------------------------------------------------------------
+// v0.9.8（J3，方案 §二 组J）：工具调用边界的插队提示
+// ---------------------------------------------------------------------------
+
+/** J3 提示行（固定文案；N=该调用者邮箱里未读的 interrupt/steer 条数）。 */
+export function pendingInterruptNotice(count: number): string {
+  return `⛔ 你有 ${count} 条插队待读（interrupt/steer）——先 xc_read({scope:"inbox"}) 消费掉再继续；`
+    + "纠错消息在注入排布里置顶并单独预留预算、绝不降级成摘要。"
+    + "本提示每次工具调用都会重复，直到插队全部消费完为止（宿主无回合中注入原语，这是工具间隙的唯一提醒面）。";
+}
+
+/** 工具回调的最小形状（SDK `ToolCallback` 的结构面，避免在本模块依赖 SDK 泛型）。 */
+type ToolCallbackShape = (args: Record<string, unknown>, extra: unknown) => Promise<ToolResult>;
+
+/**
+ * 给单个工具回调套上「插队待读」提示（J3）。
+ *
+ * 顺序纪律：**先跑原 handler**（工具语义与副作用不变），再算纠错条数、追加提示。
+ * 条数取「调用者邮箱里 readAt/discardedAt 都缺席的 interrupt/steer 件」——与 J2 横幅
+ * 同一个谓词（core/mailbox.ts countPendingInterrupts）。未注册连接（identityStore
+ * 取不到身份）→ 不附：提示面不为难未注册调用方。
+ */
+export function withPendingInterruptNotice(
+  handler: ToolCallbackShape,
+  deps: ToolDeps,
+): ToolCallbackShape {
+  return async (args: Record<string, unknown>, extra: unknown): Promise<ToolResult> => {
+    const result = await handler(args, extra);
+    return await appendPendingInterruptNotice(result, deps, connectionKeyOf(extra));
+  };
+}
+
+/**
+ * J3 的落点：给一个已注册工具的返回结果附「插队待读」一行。
+ *
+ * - 文本尾部：**追加**一个 text 块（既有块逐字节不动——与 peer 排空面 content[2]
+ *   同一形态，J3 不改变任何工具结果语义）；
+ * - JSON 面：给能解析成对象的 text 块加可选键 `pendingInterrupt`（解析不了就只附文本行）；
+ * - **无插队不附**：count<=0 时原样返回（零结构变化、零额外 IO 之外的代价）。
+ */
+export async function appendPendingInterruptNotice(
+  result: ToolResult,
+  deps: ToolDeps,
+  connectionKey: string,
+): Promise<ToolResult> {
+  let count = 0;
+  try {
+    const me = identityStore.get(connectionKey);
+    if (me !== undefined) count = await countPendingInterrupts(deps.stateRoot, me.teamId, me.agentKey);
+  } catch {
+    count = 0; // 读不出邮箱就不附（不谎报「0 条插队」）
+  }
+  if (count <= 0) return result;
+  const notice = pendingInterruptNotice(count);
+  const content = [...(result.content ?? [])];
+  for (let i = 0; i < content.length; i += 1) {
+    const block = content[i] as { type?: string; text?: string } | undefined;
+    if (block === undefined || block.type !== "text" || typeof block.text !== "string") continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(block.text);
+    } catch {
+      continue;
+    }
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) continue;
+    content[i] = { type: "text", text: JSON.stringify({ ...(parsed as Record<string, unknown>), pendingInterrupt: count }, null, 2) };
+  }
+  content.push({ type: "text", text: notice });
+  return { ...result, content };
+}
+
+/**
+ * v0.9.8（J3）：把 `server.tool()` 的**注册面**套上插队提示——本模块在家族注册器
+ * 之前调用一次，之后注册的 10 个工具（发现面）全部带上提示。
+ *
+ * 实现选择（为什么在 server.ts 而不在 runCore）：runCore 在 mcp/core.ts（非本组文件域），
+ * 而「每次 MCP 工具调用返回」的公共收口就在本模块的注册面上；包装只换回调引用，
+ * 不改任何家族的 handler 签名，也不新增工具/必填配置（不变式 1）。
+ *
+ * 纪律：只包 `server.tool()`（真实 MCP 线的发现面）；`PrimaryRegistry` 的分发面
+ * （dispatchPrimary，测试与历史入口）不包——避免同一结果被附两次。
+ */
+export function decorateToolCallsWithPendingInterruptNotice(server: McpServer, deps: ToolDeps): void {
+  const target = server as unknown as { tool: (...args: unknown[]) => unknown };
+  const rawTool = target.tool.bind(server);
+  target.tool = (...args: unknown[]): unknown => {
+    const call = [...args];
+    const last = call.length > 0 ? call[call.length - 1] : undefined;
+    if (typeof last === "function") {
+      call[call.length - 1] = withPendingInterruptNotice(last as ToolCallbackShape, deps);
+    }
+    return rawTool(...call);
+  };
+}
 
 /** 优雅关闭：先摘注册表记录与管道端点，再退出。写失败/关闭失败都不得阻塞退出。 */
 async function shutdown(): Promise<void> {
@@ -67,6 +172,9 @@ async function shutdown(): Promise<void> {
 export async function main(): Promise<void> {
   const deps: ToolDeps = resolveDeps(process.cwd(), process.env);
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
+  // v0.9.8（J3）：先给注册面套上「插队待读」提示，再让家族注册器注册——
+  // 之后注册的 10 个工具每次调用返回都会带上那一行（无插队时不附）。
+  decorateToolCallsWithPendingInterruptNotice(server, deps);
   const core = composeCore(deps);
   const registry: PrimaryRegistry = new Map();
 

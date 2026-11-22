@@ -16,7 +16,8 @@
  *   `settings.model.available[].ref`（深扫描 `{providerId, modelId}` 对象；
  *   v0.9.7 W1 起同收 `{ref:{providerId,modelId}, reasoning:{levels:[{value,label}],
  *   defaultLevel}}` 真实形状，见 {@link collectModelRefs}）；
- *   `state.updated` 事件流不可依赖、仅作兜底；
+ *   `state.updated` 事件流不可依赖、仅作兜底（v0.9.8 D1 起合并按来源定序：
+ *   create 结果权威优先，兜底流只补空不覆盖，见 {@link ModelRefSource}）；
  * - FEASIBILITY P4：`session/send` accept 后 ≤3s 会话即落库，硬杀 app-server 不丢——
  *   因此 keeper 可随工具调用消亡（本文件 kill() 即 E4 的 child.kill() 同款）。
  *
@@ -101,6 +102,36 @@ function readReasoningLevels(raw: unknown): string[] {
 }
 
 /**
+ * v0.9.8（D1/V097-01）：一条模型枚举的**来源权威级**。
+ *
+ * - `create`：session/create **结果内联**枚举（P1 主路径，权威源——FEASIBILITY P1：
+ *   模型枚举主路径 = create 结果内联的 `settings.model.available[].ref`）；
+ * - `state.updated`：事件流兜底（协议事实明示「不可依赖、仅作兜底」——可能只带
+ *   `{providerId,modelId}`，也可能带陈旧/不一致的档位表）。
+ *
+ * 旧实现「首次命中即锁死 + 重复项只补空」没有权威排序：`state.updated` 先到会把
+ * 自己那份（可能错/旧的）档位表锁死，后到的 create 权威档位表反而只被「补空」
+ * 对待 → 首试按错档发 setModel（v0.9.8 方案 D1 的缺陷形态）。现在合并以来源定序：
+ * create 后到即覆盖兜底流已锁定的档位信息（非空值才覆盖），兜底流后到仍只补空。
+ */
+export type ModelRefSource = "create" | "state.updated";
+
+/** {@link collectModelRefs} 的合并上下文（来源权威级判据）。 */
+interface ModelCollectContext {
+  /** 本次吸收的来源；缺省 "state.updated"（兜底流）。 */
+  source?: ModelRefSource;
+  /**
+   * 来源账本：`providerId\u0000modelId` → 该条目当前锁定的来源。缺省 = 旧行为
+   * （无权威排序的纯补空合并）——仅供不关心权威级的直调方使用。
+   */
+  sources?: Map<string, ModelRefSource>;
+}
+
+function modelSourceKey(providerId: string, modelId: string): string {
+  return `${providerId}\u0000${modelId}`;
+}
+
+/**
  * 深度收集带 providerId+modelId 的对象（demo/bootstrap-sessions.mjs:74-87 同款，不假设层级）。
  *
  * v0.9.7（W1/R2）：**真实形状**解析。app-server `settings.model.available[]` 的实测
@@ -116,13 +147,14 @@ function readReasoningLevels(raw: unknown): string[] {
  * - 档位：`reasoning.levels[]` 每项可为字符串或 `{value,label}`（{@link readReasoningLevels}）；
  * - 缺省档：`reasoning.defaultLevel` 进 {@link ModelRef.defaultReasoningLevel}。
  *
- * 去重合并（同一 model 二次出现时补全首次缺失的档位信息）：主路径是 create 结果内联
- * 枚举（带完整 reasoning 段），`state.updated` 兜底流可能只带 `{providerId,modelId}`——
- * 旧实现「首次命中即锁死」会把后到者的档位表丢掉，故重复项只做**补空**不改已得值。
+ * 合并（v0.9.8 D1/V097-01 起按**来源权威级**定序，见 {@link ModelRefSource}）：
+ * - create（权威源）后到 → 用 create 的非空档位信息**覆盖**兜底流已锁定的值，
+ *   并把该条目来源改判 create；create 自身缺席的字段仍由兜底流补空（不抹除）；
+ * - state.updated（兜底）后到，或同源重复 → 只补空不改已得值（v0.9.7 原语义）。
  */
-function collectModelRefs(node: unknown, out: ModelRef[]): void {
+function collectModelRefs(node: unknown, out: ModelRef[], context: ModelCollectContext = {}): void {
   if (Array.isArray(node)) {
-    for (const entry of node) collectModelRefs(entry, out);
+    for (const entry of node) collectModelRefs(entry, out, context);
     return;
   }
   if (node !== null && typeof node === "object") {
@@ -133,6 +165,7 @@ function collectModelRefs(node: unknown, out: ModelRef[]): void {
     const providerId = typeof ref["providerId"] === "string" ? ref["providerId"] : flatProvider;
     const modelId = typeof ref["modelId"] === "string" ? ref["modelId"] : flatModel;
     if (providerId !== undefined && modelId !== undefined) {
+      const source = context.source ?? "state.updated";
       const reasoning = asRecord(record["reasoning"]);
       const levels = readReasoningLevels(reasoning["levels"]);
       const rawDefault = reasoning["defaultLevel"];
@@ -147,9 +180,18 @@ function collectModelRefs(node: unknown, out: ModelRef[]): void {
           reasoningLevels: levels,
           ...(defaultLevel !== undefined ? { defaultReasoningLevel: defaultLevel } : {}),
         });
+        context.sources?.set(modelSourceKey(providerId, modelId), source);
         return;
       }
-      // 重复项只补空（见上）：不覆盖已得的档位表/缺省档。
+      // v0.9.8（D1/V097-01）：权威源优先——create 后到即覆盖兜底流锁定的档位信息。
+      // 「非空才覆盖」双向成立：create 没给的字段不被抹掉，由兜底流/后续补空。
+      if (source === "create" && context.sources?.get(modelSourceKey(providerId, modelId)) !== "create") {
+        if (levels.length > 0) existing.reasoningLevels = levels;
+        if (defaultLevel !== undefined) existing.defaultReasoningLevel = defaultLevel;
+        context.sources?.set(modelSourceKey(providerId, modelId), "create");
+        return;
+      }
+      // 兜底流后到（或同源重复）：只补空（见上），不覆盖已得的档位表/缺省档。
       if (existing.reasoningLevels.length === 0 && levels.length > 0) {
         existing.reasoningLevels = levels;
       }
@@ -158,7 +200,7 @@ function collectModelRefs(node: unknown, out: ModelRef[]): void {
       }
       return;
     }
-    for (const value of Object.values(record)) collectModelRefs(value, out);
+    for (const value of Object.values(record)) collectModelRefs(value, out, context);
   }
 }
 
@@ -173,6 +215,12 @@ export class AppServerKeeper {
   readonly #pending = new Map<number, PendingRequest>();
   #nextId = 1;
   #models: ModelRef[] = [];
+  /**
+   * v0.9.8（D1/V097-01）：每条已枚举模型的**来源账本**（权威级判据；与 #models 同序
+   * 键）。不并入 ModelRef 本体——getModels() 的对外形状逐字节不变（v0.9.7 W1 锚点
+   * 测试按精确形状断言），权威排序只影响合并行为。
+   */
+  #modelSources = new Map<string, ModelRefSource>();
   #buffer = "";
   #closed = false;
 
@@ -254,8 +302,9 @@ export class AppServerKeeper {
     if (typeof msg["method"] === "string") {
       const method = msg["method"];
       // P1 兜底：state.updated 事件流里也可能出现模型枚举（主路径是 create 结果内联）。
+      // v0.9.8（D1/V097-01）：显式标注来源 = 兜底流——后到的 create 结果可覆盖它。
       if (method === "state.updated") {
-        collectModelRefs(msg["params"], this.#models);
+        collectModelRefs(msg["params"], this.#models, { source: "state.updated", sources: this.#modelSources });
         return;
       }
       const responder = this.#callbacks[method];
@@ -293,9 +342,15 @@ export class AppServerKeeper {
     });
   }
 
-  /** 吸收一个结果对象里的模型枚举（P1 主路径：session/create 结果内联 available[].ref）。 */
+  /**
+   * 吸收一个结果对象里的模型枚举（P1 主路径：session/create 结果内联 available[].ref）。
+   *
+   * v0.9.8（D1/V097-01）：本入口的吸收标记为**权威源**（create 结果）——同一模型
+   * 已被 state.updated 兜底流先行锁定（哪怕带了一份陈旧/不一致的档位表）时，此处
+   * 以 create 的非空档位信息覆盖之；合并语义见 {@link collectModelRefs}。
+   */
   absorbModels(value: unknown): void {
-    collectModelRefs(value, this.#models);
+    collectModelRefs(value, this.#models, { source: "create", sources: this.#modelSources });
   }
 
   /** 当前已枚举到的模型表快照（create 结果 + state.updated 兜底，按序去重）。 */

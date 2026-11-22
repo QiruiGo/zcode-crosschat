@@ -30,14 +30,14 @@
  * @module core/mailbox
  */
 import { randomUUID } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { readFile, readdir } from 'node:fs/promises';
 import { appendJsonl, readJsonl, rewriteJsonl, type MalformedLine } from './jsonl.js';
 import { writeFileAtomic, stripLeadingBom } from './atomic.js';
 import { sanitizeKey } from './sanitize.js';
 import { isRecord, isTeamMessage, normalizeMessage, TERMINAL_TASK_STATUSES, type TeamMessage, type TeamState } from './types.js';
 import { logEngineEvent } from './log.js';
 import { withFileLock, withProcessLock } from './lock.js';
-import { inboxFile, teamLockNames } from './paths.js';
+import { inboxDir, inboxFile, teamLockNames } from './paths.js';
 import { readTeam } from './teamstate.js';
 
 // ---------------------------------------------------------------------------
@@ -174,6 +174,76 @@ export function urgentFirst<T extends { ts: number; urgent?: boolean }>(items: r
     .map((x) => x.m);
 }
 
+// ---------------------------------------------------------------------------
+// v0.9.8（J1/J2/J3，方案 §二 组J）：interrupt/steer 纠错优先级（唯一实现）
+// ---------------------------------------------------------------------------
+
+/**
+ * interrupt/steer 纠错消息判定（**唯一实现**：注入排布 J1、回合首行横幅 J2、
+ * 工具调用边界提示 J3、inbox 消费窗口 J1 共用——复制的判据必然漂移）。
+ *
+ * 口径（写死）：
+ * - `interrupt === true`（v0.9 G-2 软中断元数据，xc_relay interrupt:true 写入）；
+ * - `steer === true`（v0.9.8 组 S 的硬插队元数据，xc_relay steer:true 写入）。
+ *
+ * steer 键的**容错读**：组 S 把 `steer` 落进 TeamMessage 白名单（core/types.ts）之前，
+ * 本函数按结构形状认布尔真值——组 S 一落盘即生效，不因字段冻结次序漏判；反过来
+ * 即便 steer 消息同时盖了 `interrupt:true`（组 S 的自然形态：中止+续跑也是纠偏），
+ * 两个键命中同一个判定，不会双计。
+ *
+ * 内容永不做判据（V090-13 纪律）：正文里写 "interrupt=true" 不升级优先级——
+ * 只有消息元数据驱动。
+ */
+export function isInterruptOrSteer(
+  message: { interrupt?: boolean; steer?: boolean },
+): boolean {
+  return message.interrupt === true || message.steer === true;
+}
+
+/**
+ * v0.9.8（J1）：interrupt/steer **置顶**的稳定呈现序（urgentFirst 之上再分一层）。
+ *
+ * 排序键：纠错(0) → urgent(1) → 普通(2)；类内 ts 升序（到达序），ts 相同按原下标。
+ * 无纠错消息时与 {@link urgentFirst} 逐元素同序（rank 退化为 urgent/普通两档）——
+ * 故接入本函数的读取面对 v0.9.7 数据零行为变化。
+ *
+ * 物序不动（JSONL 追加真源纪律）：只对已读入内存的数组排序，不回写磁盘。
+ */
+export function interruptFirst<
+  T extends { ts: number; urgent?: boolean; interrupt?: boolean; steer?: boolean },
+>(items: readonly T[]): T[] {
+  const rank = (m: T) => (isInterruptOrSteer(m) ? 0 : m.urgent === true ? 1 : 2);
+  return items
+    .map((m, i) => ({ m, i, r: rank(m) }))
+    .sort((a, b) => (a.r !== b.r ? a.r - b.r : a.m.ts - b.m.ts || a.i - b.i))
+    .map((x) => x.m);
+}
+
+/** 未读的纠错（interrupt/steer）条数——J2 横幅与 J3 工具边界提示的同一个数。 */
+export function countUnreadInterrupts(messages: readonly { readAt?: number; discardedAt?: number; interrupt?: boolean; steer?: boolean }[]): number {
+  return messages.filter((m) => m.readAt === undefined && m.discardedAt === undefined && isInterruptOrSteer(m)).length;
+}
+
+/**
+ * v0.9.8（J3）：一个邮箱里**待读的纠错条数**（读路径无锁；与 hook 的 unreadSummary
+ * 同纪律——纯读、不判定新鲜度、不丢弃，故计数可能偏大，永不误小）。
+ *
+ * 失败（IO/坏盘）→ 0：工具边界提示是尽力而为的面，读不出来就**不附那一行**
+ * （不谎报「0 条插队」）；调用方（mcp/server.ts）据此静默跳过。
+ */
+export async function countPendingInterrupts(
+  stateRoot: string,
+  teamId: string,
+  agentKey: string,
+): Promise<number> {
+  try {
+    const messages = await readUnreadMailbox(stateRoot, teamId, agentKey);
+    return countUnreadInterrupts(messages);
+  } catch {
+    return 0;
+  }
+}
+
 /**
  * Freshness adjudication, 1:1 port of mailbox.js:6-17.
  * A message is current when: not discarded; its source attempt (if any) is
@@ -305,6 +375,30 @@ export interface MailboxRead {
 }
 
 /**
+ * v0.9.8（J1，跨组契约）：**steer 元数据的读面宽容拷贝**。
+ *
+ * 背景：`steer` 布尔元数据由组 S（xc_relay steer:true）写入邮箱行，而字段白名单的
+ * 唯一权威在 core/types.ts 的 normalizeMessage（非本组文件域）。若不在这里补一层
+ * 宽容，`steer:true` 的消息一经过「读邮箱」就被静默剥掉——J1 的预留预算、J2 的
+ * 横幅、J3 的边界提示、J4 的状态全部看不见 steer，等于「steer 消息不参与积压优先级」。
+ *
+ * 纪律（与 urgent/interrupt 的宽容拷贝同口径）：
+ * - 只认**布尔真值**，非法值（字符串/数字/null）一律不认（不做静默裁剪）；
+ * - 只在本读面补这一个键，其余字段仍以 normalizeMessage 的归一结果为准；
+ * - 组 S 一旦把 `steer` 写进 types.ts 的白名单（`if (typeof value.steer === 'boolean') out.steer = value.steer;`），
+ *   本函数即成为无害的重复劳动（同值覆盖），可随之删除——跨组收敛点在此明示。
+ */
+function withSteerTolerance(normalized: TeamMessage, raw: unknown): TeamMessage {
+  if (!isRecord(raw)) return normalized;
+  // 只认布尔真值：字符串/数字/null/缺失一律不认（不做静默裁剪，urgent/interrupt 同口径）。
+  if (raw['steer'] !== true) return normalized;
+  // `steer` 尚未进 core/types.ts 的 TeamMessage（组 S 的字段域），故此处向下转型：
+  // 运行时多带一个布尔键，类型面仍以 TeamMessage 为准（消费侧一律走
+  // {@link isInterruptOrSteer} 的宽容形状读它，不靠类型系统）。
+  return { ...normalized, steer: true } as TeamMessage;
+}
+
+/**
  * Detailed read: whole mailbox split into the whitelisted view and rejected
  * named frames. Rejected frames are audited `{event:"frame-rejected"}`
  * (best-effort) while not yet disposed on disk; after the team-locked sweep in
@@ -325,7 +419,10 @@ async function readMailboxDetailed(
     malformed.push(info);
     onMalformed?.(info);
   };
-  const messages = (await readJsonl<TeamMessage>(file, isTeamMessage, collectingSink)).map(normalizeMessage);
+  // v0.9.8（J1）：steer 宽容拷贝（见 {@link withSteerTolerance} 的跨组契约注记）——
+  // 逐行从原始值补回布尔 steer，使「读邮箱」之后的每个面都能看见硬插队元数据。
+  const rawLines = await readJsonl<TeamMessage>(file, isTeamMessage, collectingSink);
+  const messages = rawLines.map((value) => withSteerTolerance(normalizeMessage(value), value));
   // v0.9.3（P0）：缺省坏行汇报 = 一次读取一条汇总审计 + 文件×60s 窗节流；调用方
   // 自带 onMalformed 时仍走原逐行回调（诊断面不变，审计由调用方负责）。
   if (onMalformed === undefined) await auditMalformedLines(stateRoot, file, malformed);
@@ -821,4 +918,98 @@ export function mailboxBody(recipient: string, messages: readonly TeamMessage[])
 /** Full wake-prompt mail section: receipt line first, then the body (mailbox.js:49-51). */
 export function mailboxPrompt(teamId: string, recipient: string, messages: readonly TeamMessage[]): string {
   return `${formatReceipt(teamId, recipient, messages.map((message) => message.id))}\n\n${mailboxBody(recipient, messages)}`;
+}
+
+// ---------------------------------------------------------------------------
+// v0.9.8（J4，方案 §二 组J）：一行消息状态（messageId → 状态阶梯）
+// ---------------------------------------------------------------------------
+
+/**
+ * J4 状态词表（**写死**，与 docs/V098-J4-MESSAGE-STATUS.md 同源）：
+ *
+ * | 状态 | 邮箱真源判据 |
+ * |---|---|
+ * | `queued` | 在主邮箱 ∧ ¬deliveredAt（排队等投递；含只盖了投递租约 `deliveryClaimedAt` 的形态） |
+ * | `delivered` | `deliveredAt` ∧ ¬consumedAt ∧ ¬readAt（已进对方邮箱，对方尚未知悉） |
+ * | `injected` | `consumedAt` ∧ ¬readAt（已进对方回合提示：钩子回合注入 / 唤醒全文 / 认领 / 历史分页） |
+ * | `read` | `readAt`（对方调了读取面 `xc_read({scope:"inbox"})`） |
+ * | `consumed` | 保留态：现行 `acknowledgeMailbox` 把 readAt/consumedAt **同时**盖章，故读取面消费恒报 `read`；`consumed` 只在 readAt 缺席而确认到齐时单独出现（与 `injected` 同条件，按读面优先归并） |
+ * | `held` | 躺在收方隔离区 `inbox/<key>.held.jsonl`（入站策略 hold，未经 xc_review 放行） |
+ * | `refused` | 该 id 解析为一条 `delivery-refused` 回执帧（入站策略 refuse 的凭据） |
+ * | `discarded` | `discardedAt`（陈旧 / 审批门拒 / 已作废） |
+ * | `unknown` | 本队任何邮箱（主箱 + 隔离区）都找不到该 id——**不是 8 态之一**：拒绝对未知 id 猜态 |
+ *
+ * 纪律：判据只读邮箱行上的印章与隔离区位置，**不读消息正文**（J4 权限模型要求
+ * 「不开放读别人邮箱内容」——返回行只有状态与 stamps，没有 content）。
+ */
+export type MessageStatus =
+  | "queued"
+  | "delivered"
+  | "injected"
+  | "read"
+  | "consumed"
+  | "held"
+  | "refused"
+  | "discarded"
+  | "unknown";
+
+/** 一条 `delivery-refused` 回执帧（guards.ts refuse 分支写给发送方的那条）。 */
+export function isDeliveryRefusedReceipt(message: TeamMessage): boolean {
+  const cls = classifyFrame(message.content);
+  return cls.kind === "frame" && cls.frameType === "delivery-refused";
+}
+
+/**
+ * J4 状态阶梯（纯函数；`held` = 该行是在隔离区读到的）。
+ *
+ * 优先级（写死，取第一个命中的）：held → refused → discarded → read → injected
+ * → delivered → queued。
+ */
+export function messageStatusOf(message: TeamMessage, held: boolean): MessageStatus {
+  if (held) return "held";
+  if (isDeliveryRefusedReceipt(message)) return "refused";
+  if (message.discardedAt !== undefined) return "discarded";
+  if (message.readAt !== undefined) return "read";
+  if (message.consumedAt !== undefined) return "injected";
+  if (message.deliveredAt !== undefined) return "delivered";
+  return "queued";
+}
+
+/** J4 状态查询可见的印章真值（不含正文——权限模型「不开放读别人邮箱内容」）。 */
+export interface MessageStatusStamps {
+  deliveredAt?: number;
+  consumedAt?: number;
+  readAt?: number;
+  discardedAt?: number;
+  deliveryClaimedAt?: number;
+}
+
+export function messageStatusStamps(message: TeamMessage): MessageStatusStamps {
+  return {
+    ...(message.deliveryClaimedAt !== undefined ? { deliveryClaimedAt: message.deliveryClaimedAt } : {}),
+    ...(message.deliveredAt !== undefined ? { deliveredAt: message.deliveredAt } : {}),
+    ...(message.consumedAt !== undefined ? { consumedAt: message.consumedAt } : {}),
+    ...(message.readAt !== undefined ? { readAt: message.readAt } : {}),
+    ...(message.discardedAt !== undefined ? { discardedAt: message.discardedAt } : {}),
+  };
+}
+
+/**
+ * 枚举一个队的全部邮箱键（主箱 `<key>.jsonl` 与隔离区 `<key>.held.jsonl` 并集）。
+ * 读不到目录（新队/无 inbox）→ 空数组（J4 查询据此报 unknown，不猜）。
+ */
+export async function listMailboxKeys(stateRoot: string, teamId: string): Promise<string[]> {
+  let names: string[];
+  try {
+    names = await readdir(inboxDir(stateRoot, teamId));
+  } catch {
+    return [];
+  }
+  const keys = new Set<string>();
+  for (const name of names) {
+    if (name.endsWith(".held.jsonl")) keys.add(name.slice(0, -".held.jsonl".length));
+    else if (name.endsWith(".jsonl")) keys.add(name.slice(0, -".jsonl".length));
+  }
+  keys.delete("");
+  return [...keys].sort();
 }

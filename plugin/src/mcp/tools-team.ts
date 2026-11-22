@@ -31,17 +31,22 @@ import { attemptWake } from "../engine/wake.js";
 import { bootstrapTimeoutFromEnv, provisionMember, ProvisionError } from "../engine/provision.js";
 import { LockBusyError, withRegistryThenTeamLocks, withTeamLock } from "../core/lock.js";
 import { logEngineEvent } from "../core/log.js";
-import { appendMailbox, createMessage, readMailbox, readUnreadMailbox, urgentFirst } from "../core/mailbox.js";
+import { appendMailbox, createMessage, readMailbox, urgentFirst } from "../core/mailbox.js";
 import { bindName, readSession, writeSession } from "../core/registry.js";
 import { sanitizeKey, validateMemberName } from "../core/sanitize.js";
 import { getTask, leadKeyOf, memberOpenTasks, newTeamState, readTeam, sortTasksForBoard, transitionTask, unblockTask, writeTeam, provisionStaleAfterMs, sweepStaleProvisioningLocked } from "../core/teamstate.js";
 import { taskJournalPath, writeArchive } from "../core/archive.js";
 // v0.8.0（A1，DESIGN-V0.8.md §3）：checkpoint 服务端落盘 + 容量水位推导（与 handoff/status 共用同一助手）。
+// v0.9.8（组 O D7/V097-21）：未读裁决统一到 core/checkpoint.ts 单一真源
+// （currentUnreadMessages/unreadCountFor：未读 ∧ 未丢弃 ∧ isCurrentMail）——本文件
+// 三处「未读」声明（checkpoint 第 5 章 / 投产 backlog / 停机留档索引）不再各自
+// readUnreadMailbox（不过 isCurrentMail，与全部观测面矛盾）。
 import {
   CHECKPOINT_JOURNAL_MAX_BYTES,
   capacityViewOf,
   checkpointStamp,
   checkpointUnreadRef,
+  currentUnreadMessages,
   writeCheckpoint,
   type CapacityView,
   type CheckpointWriteResult,
@@ -472,7 +477,16 @@ async function memberAdd(deps: ToolDeps, args: { name: string; model?: string; r
     });
 
     // ---- Phase 4（锁外）：投产边沿 E-e（§5.1/§6.1 step 7）----
-    const backlog = await readUnreadMailbox(stateRoot, me.teamId, plan.key);
+    // v0.9.8（组 O D7/V097-21）：backlog 判据与全部观测面统一（未读 ∧ 未丢弃 ∧
+    // isCurrentMail，core/checkpoint.ts currentUnreadMessages 单一真源）。旧实现
+    // readUnreadMailbox 不过新鲜度裁决——陈旧信封会触发一次投产唤醒，且回执/票文
+    // 报「邮箱有 N 条未读」而 panel/板面同刻报 0（V097-21 实测的同形矛盾：
+    // 「同一邮箱两面未读数不一致」）。锁外重读 team.json 只为拿新鲜度判据
+    // （读路径无锁纯读；读不到 → 空 backlog = 不唤醒，保守方向：不制造假回执）。
+    const backlogTeam = await readTeam(stateRoot, me.teamId);
+    const backlog = backlogTeam === undefined
+      ? []
+      : currentUnreadMessages(backlogTeam, await readMailbox(stateRoot, me.teamId, plan.key));
     let delivered: "wake" | "mailbox" | "skipped" = "skipped";
     let wakeNote: string | undefined;
     // v0.9.6（V095-14）：wake 态回执的结构化披露键（startConfirmed/wakeTiers/失败第三态）
@@ -636,7 +650,13 @@ async function archiveBeforeStop(deps: ToolDeps, key: string, sessionId: string,
   const tasks = (team?.tasks ?? [])
     .filter((t) => t.assignee === key && OPEN_TASK_STATUSES.includes(t.status))
     .map((t) => ({ taskId: t.id, title: t.title, status: t.status }));
-  const unread = (await readUnreadMailbox(deps.stateRoot, TEAM_ID, key)).map((m) => ({
+  // v0.9.8（组 O D7/V097-21）：留档未读索引与全部观测面同一判据（未读 ∧ 未丢弃 ∧
+  // isCurrentMail）——旧实现 readUnreadMailbox 会把所有观测面都不计的陈旧件写进
+  // 「未读索引」（同一邮箱两个数字的同形矛盾）。team 读失败 → 空索引（保守）。
+  const unread = (team === undefined
+    ? []
+    : currentUnreadMessages(team, await readMailbox(deps.stateRoot, TEAM_ID, key))
+  ).map((m) => ({
     msgId: m.id,
     from: m.from,
     ts: m.ts,
@@ -1538,7 +1558,11 @@ export async function handleTeamCheckpoint(deps: ToolDeps, args: { note?: string
     let unreadMessages: TeamMessage[];
     let unreadError: string | undefined;
     try {
-      unreadMessages = urgentFirst(await readUnreadMailbox(deps.stateRoot, me.teamId, me.agentKey));
+      // v0.9.8（组 O D7/V097-21）：第 5 章未读与全部观测面同一判据（未读 ∧ 未丢弃 ∧
+      // isCurrentMail，core/checkpoint.ts currentUnreadMessages 单一真源）——旧实现
+      // readUnreadMailbox 不过新鲜度裁决，checkpoint 会发布与 panel/status/板面
+      // 矛盾的未读数（V097-21：观测四面 0、checkpoint 2）。
+      unreadMessages = urgentFirst(currentUnreadMessages(team, await readMailbox(deps.stateRoot, me.teamId, me.agentKey)));
     } catch (err) {
       unreadMessages = [];
       unreadError = err instanceof Error ? err.message : String(err);

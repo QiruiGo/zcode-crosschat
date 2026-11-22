@@ -656,6 +656,43 @@ describe("C6-BUG-6：改名守卫对终态引用放行、挡路明细可执行�
     expect(String(payloadOf(blocked.result).reason)).toContain("unread");
     expect(payloadOf(blocked.result).mailboxCount).toBe(1);
   });
+
+  it("D7/V097-21：**陈旧件**（幽灵任务信封）不算未读——守卫与观测四面同数，不再被挡住改名", async () => {
+    // 缺陷签名（48-v097验收 V097-21 / 48-v098 验收 lane「互通与面板」端到端实测）：
+    // 同一邮箱 3 条未读其中 2 条幽灵任务陈旧件 → panel/status/team 板面/handoff/checkpoint
+    // 第 5 章全报 1，而改名守卫用 readUnreadMailbox（不过 isCurrentMail）报 3，成员被两条
+    // 所有观测面都不显示的未读数挡住改名。修法：守卫改走 core/checkpoint.ts 单一真源
+    // currentUnreadMessages（未读 ∧ 未丢弃 ∧ isCurrentMail）。
+    await anchorSession("sess-v081-d7");
+    setPeerServicesForTests(fakePeerServices({}));
+    const conn = nextConn();
+    await identify({ name: "ghosted", sessionId: "sess-v081-d7" }, conn);
+    const { appendMailbox, createMessage } = await import("../core/mailbox.js");
+    // 两条陈旧件：taskId 指向团队里不存在的任务（isCurrentMail 判 false）。
+    await appendMailbox(stateRoot, "default", "ghosted", createMessage("bob", "ghosted", "ghost 1", { taskId: "t-ghost-1" }));
+    await appendMailbox(stateRoot, "default", "ghosted", createMessage("bob", "ghosted", "ghost 2", { taskId: "t-ghost-2" }));
+    // 一条现行未读（无 taskId 的纯聊天信封恒现行）。
+    await appendMailbox(stateRoot, "default", "ghosted", createMessage("bob", "ghosted", "current one", {}));
+
+    // 三条信封都在（2 陈旧 + 1 现行）→ 守卫只数**现行**那 1 条：与 panel/status/team 板面/
+    // handoff/checkpoint 第 5 章同数（修复前这里报 3，正是 V097-21 的缺陷签名）。
+    setPeerSessionContext({ sessionId: "sess-v081-d7", name: "ghosted", pid: process.pid, root: peerRoot });
+    const blocked = await identify({ name: "ghosted2", sessionId: "sess-v081-d7" }, conn);
+    expect(blocked.result.isError).toBe(true);
+    expect(payloadOf(blocked.result).error).toBe("team_rename_blocked");
+    expect(String(payloadOf(blocked.result).reason)).toContain("unread");
+    expect(payloadOf(blocked.result).mailboxCount).toBe(1); // 陈旧 2 条不计（isCurrentMail 判 false）
+
+    // 消费掉那条现行件（两条陈旧件留着）→ 守卫放行，且 mailboxCount = 0 与观测面同数。
+    const { acknowledgeMailbox, readCurrentMailbox } = await import("../core/mailbox.js");
+    const current = await readCurrentMailbox(stateRoot, "default", "ghosted");
+    const currentIds = current.map((m) => m.id);
+    expect(currentIds).toHaveLength(1); // 只有那条现行件可被消费（陈旧件不在 current 集）
+    await acknowledgeMailbox(stateRoot, "default", "ghosted", currentIds, Date.now());
+
+    const ok = await identify({ name: "ghosted3", sessionId: "sess-v081-d7" }, conn);
+    expect(ok.result.isError).toBeFalsy();
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -61,6 +61,13 @@ const checkpointMocks = vi.hoisted(() => ({
   checkpointNudgeState: vi.fn(async () => ({ openTaskCount: 0, lastCheckpointAt: null, lastNudgeAt: null })),
   checkpointNudgeDecision: vi.fn((): { nudge: boolean; reason: string } => ({ nudge: false, reason: "no-active-task" })),
   renderCheckpointNudgeLine: vi.fn(() => ""),
+  // v0.9.8（组 O C1）：上下文体积提醒三件套（缺省「低于阈值」= 不注入，本文件用例零影响）
+  readContextSize: vi.fn(async (): Promise<{ bytes: number; messages: number }> => ({ bytes: 0, messages: 0 })),
+  contextNudgeDecision: vi.fn(
+    (): { nudge: boolean; reason: string; bytes: number; messages: number } =>
+      ({ nudge: false, reason: "below-threshold", bytes: 0, messages: 0 }),
+  ),
+  renderContextNudgeLine: vi.fn(() => ""),
   writeNudgeMarker: vi.fn(async (): Promise<void> => {}),
 }));
 

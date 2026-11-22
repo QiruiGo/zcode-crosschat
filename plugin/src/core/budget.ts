@@ -12,6 +12,11 @@
  * - 排布对齐 CC gca()（@9949851/@9950292）：逐条先截 item；总预算按 recency 新→旧花费；
  *   超支的最旧条目降一行摘要；保底一条；再超硬切。
  *
+ * v0.9.8（J1，方案 §二 组J）：**interrupt/steer 优先级排布**——纠错类块单独预留预算、
+ * 置顶、绝不降级成一行摘要；普通消息可让位（预算被优先级面占走后普通面可能整面省略）。
+ * 判定键 = {@link InjectBlock.priority}（装配面由 core/mailbox.ts 的 interrupt/steer
+ * 谓词打上；缺省 false ⇒ 与 v0.9.7 逐字节同行为）。
+ *
  * @module core/budget
  */
 
@@ -76,6 +81,12 @@ export interface InjectBlock {
   rendered: string;
   /** 超支时的一行摘要（含 msgId/from/origin 与省略说明）。 */
   summaryLine: string;
+  /**
+   * v0.9.8（J1）：纠错优先级（interrupt/steer）——true 时该块单独预留预算、置顶、
+   * 绝不降级成 {@link summaryLine} 摘要。装配面打标（core/mailbox.ts 谓词）；
+   * 缺省/undefined = 普通消息（v0.9.7 行为）。
+   */
+  priority?: boolean;
 }
 
 export interface LayoutResult {
@@ -111,14 +122,17 @@ export function injectBlockCost(
 }
 
 /**
- * 注入排布（R-17）。花费按 ts 新→旧（CC gca recency 语义）；输出保持传入顺序
- * （到达序，行为兼容优先）。调用方对被截的跨会话域条目已先行 store 全文（R-21）。
+ * 一组块的排布（v0.9.7 的原算法，J1 起抽成可复用原语）：
+ * 花费按 ts 新→旧（CC gca recency 语义）；输出保持传入顺序（到达序）。
+ *
+ * 返回的 `texts` 与入参**逐下标对齐**（undefined = 该块未以任何形态进入——调用方
+ * 决定这是「整条省略」还是「让位」）；`remaining` = 未花掉的预算。
  */
-export function layoutInjectBlocks(
+function placeGroup(
   blocks: readonly InjectBlock[],
   budget: InjectBudget,
   pointer: InjectPointer,
-): LayoutResult {
+): { texts: (string | undefined)[]; truncatedCount: number; degradedCount: number; remaining: number } {
   const itemCut = (b: InjectBlock): { text: string; cut: boolean } => cutInjectBlock(b, budget, pointer);
   const order = blocks.map((b, i) => ({ b, i }));
   order.sort((x, y) => y.b.ts - x.b.ts);            // 新→旧花费；稳定（ts 相同保序）
@@ -164,12 +178,108 @@ export function layoutInjectBlocks(
     }
     remaining = 0;
   }
-  const out = spent.filter((s): s is string => s !== undefined);
+  return { texts: spent, truncatedCount, degradedCount, remaining };
+}
+
+/** 面形状收口：{texts, counters} → LayoutResult（与 v0.9.7 的返回形状逐字段一致）。 */
+function finishLayout(
+  blockCount: number,
+  ordered: readonly string[],
+  counters: { truncatedCount: number; degradedCount: number },
+  totalChars: number,
+): LayoutResult {
   // budgetTruncated = 发生了任何降级（item 截断/摘要降级/整条省略/硬切）。
   // 修正（相对 DESIGN §6.3-1 初稿公式 `truncatedCount>0 || out.length<blocks.length`）：
   // 摘要降级在 out.length===blocks.length 且无 item 截断时也必须上报（CC gca
   // `budget_truncated` @9950292 语义；SPEC R-17 ③④）。
-  return { blocks: out, truncatedCount, budgetTruncated: truncatedCount > 0 || degradedCount > 0 || out.length < blocks.length, totalChars: budget.total - remaining };
+  return {
+    blocks: [...ordered],
+    truncatedCount: counters.truncatedCount,
+    budgetTruncated: counters.truncatedCount > 0 || counters.degradedCount > 0 || ordered.length < blockCount,
+    totalChars,
+  };
+}
+
+/**
+ * 注入排布（R-17）。花费按 ts 新→旧（CC gca recency 语义）；输出保持传入顺序
+ * （到达序，行为兼容优先）。调用方对被截的跨会话域条目已先行 store 全文（R-21）。
+ *
+ * v0.9.8（J1）：带 `priority:true`（interrupt/steer）的块走**优先级面**：
+ * 1. **单独预留预算**：预留 = Σ(优先级块 item 截断后成本)，钳在 budget.total 内；
+ * 2. **置顶**：优先级块排在普通块之前（类内保到达序）；
+ * 3. **绝不降级成摘要**：预留不够时硬切到剩余预算 + 指针（与「保底一条」同形态），
+ *    再不够则整条省略并计入 truncatedCount（budgetTruncated 披露），但**永不**产出
+ *    `summaryLine` 那种「已省略」占位——纠偏必须留下可读的开头与取全文指针。
+ * 普通消息用剩余预算走原算法（可为 0 → 整面让位）。
+ */
+export function layoutInjectBlocks(
+  blocks: readonly InjectBlock[],
+  budget: InjectBudget,
+  pointer: InjectPointer,
+): LayoutResult {
+  const priorityIdx: number[] = [];
+  const normalIdx: number[] = [];
+  blocks.forEach((b, i) => (b.priority === true ? priorityIdx : normalIdx).push(i));
+  // 无优先级块 ⇒ 与 v0.9.7 逐字节同路径（含 LayoutResult 形状）。
+  if (priorityIdx.length === 0) {
+    const placed = placeGroup(blocks, budget, pointer);
+    const ordered = placed.texts.filter((s): s is string => s !== undefined);
+    return finishLayout(blocks.length, ordered, placed, budget.total - placed.remaining);
+  }
+
+  let truncatedCount = 0;
+  let degradedCount = 0;
+  const spent: (string | undefined)[] = new Array<string | undefined>(blocks.length).fill(undefined);
+
+  // ① 优先级面：单独预留预算（Σ item 成本，钳在 total 内）
+  const priorityCost = priorityIdx.reduce((sum, i) => sum + injectBlockCost(blocks[i]!, budget, pointer), 0);
+  const reserve = Math.min(priorityCost, budget.total);
+  let reserveLeft = reserve;
+  let priorityPlaced = 0;
+  for (const i of priorityIdx) {
+    const b = blocks[i]!;
+    const cut = cutInjectBlock(b, budget, pointer);
+    if (cut.cut) truncatedCount += 1;
+    if (cut.text.length <= reserveLeft) {
+      spent[i] = cut.text;
+      reserveLeft -= cut.text.length;
+      priorityPlaced += 1;
+      continue;
+    }
+    // 绝不降级成摘要：硬切到剩余预留 + 指针（J1 硬口径）
+    truncatedCount += 1;
+    const hard = b.rendered.slice(0, Math.max(0, reserveLeft));
+    spent[i] = `${hard}\n${truncateNote(pointer, b.msgId, hard.length, b.rendered.length)}`;
+    reserveLeft = 0;
+    priorityPlaced += 1;
+    break;                                            // 预留用尽：后续优先级块整条省略
+  }
+  truncatedCount += priorityIdx.length - priorityPlaced;   // 被省略的优先级块（如实计数）
+  const priorityUsed = reserve - reserveLeft;
+
+  // ② 普通面：剩余预算（可为 0 → 让位，一条都不放）
+  const normalBudget: InjectBudget = { ...budget, total: Math.max(0, budget.total - priorityUsed) };
+  const normalBlocks = normalIdx.map((i) => blocks[i]!);
+  let totalChars = priorityUsed;
+  if (normalBlocks.length > 0) {
+    if (normalBudget.total > 0) {
+      const placed = placeGroup(normalBlocks, normalBudget, pointer);
+      truncatedCount += placed.truncatedCount;
+      degradedCount += placed.degradedCount;
+      normalIdx.forEach((idx, k) => { spent[idx] = placed.texts[k]; });
+      totalChars += normalBudget.total - placed.remaining;
+    } else {
+      degradedCount += normalBlocks.length;           // 让位：未以任何形态进入（R-24 降级计数）
+    }
+  }
+  // 输出序 = **优先级块在前**（置顶，J1）、普通块在后；两类内部各自保到达序。
+  // （普通-only 路径仍走 placeGroup 的到达序输出——两处刻意不同：置顶只属于纠错面。）
+  const ordered: string[] = [];
+  for (const i of [...priorityIdx, ...normalIdx]) {
+    const text = spent[i];
+    if (text !== undefined) ordered.push(text);
+  }
+  return finishLayout(blocks.length, ordered, { truncatedCount, degradedCount }, totalChars);
 }
 
 /** 字段截断（status/snapshot 任务 result/error 与邮箱 payload content 共用，R-23）。 */

@@ -87,6 +87,14 @@ const checkpointMocks = vi.hoisted(() => ({
     ageMin === undefined
       ? "[zcode-crosschat] 建议先 /xc-checkpoint（尚未落过检查点）"
       : `[zcode-crosschat] 建议先 /xc-checkpoint（距上次检查点 ${ageMin}min）`),
+  // v0.9.8（组 O C1）：上下文体积提醒三件套。缺省「低于阈值」⇒ 不注入、不写标记、不审计
+  // ——既有用例零影响；C1 专料在下方 describe 里逐例钉 mock。
+  readContextSize: vi.fn(async (): Promise<{ bytes: number; messages: number }> => ({ bytes: 0, messages: 0 })),
+  contextNudgeDecision: vi.fn(
+    (): { nudge: boolean; reason: string; bytes: number; messages: number; over?: "bytes" | "messages" | "both" } =>
+      ({ nudge: false, reason: "below-threshold", bytes: 0, messages: 0 }),
+  ),
+  renderContextNudgeLine: vi.fn(() => ""),
   writeNudgeMarker: vi.fn(async (): Promise<void> => {}),
 }));
 
@@ -211,6 +219,12 @@ describe("UserPromptSubmit 钩子：v0.8.0 检查点提醒", () => {
     checkpointMocks.checkpointNudgeDecision.mockReset();
     checkpointMocks.checkpointNudgeDecision.mockReturnValue({ nudge: false, reason: "no-active-task" });
     checkpointMocks.renderCheckpointNudgeLine.mockClear();
+    // v0.9.8（组 O C1）：同类重置——缺省回「低于阈值」（不注入）。
+    checkpointMocks.readContextSize.mockReset();
+    checkpointMocks.readContextSize.mockResolvedValue({ bytes: 0, messages: 0 });
+    checkpointMocks.contextNudgeDecision.mockReset();
+    checkpointMocks.contextNudgeDecision.mockReturnValue({ nudge: false, reason: "below-threshold", bytes: 0, messages: 0 });
+    checkpointMocks.renderContextNudgeLine.mockClear();
     checkpointMocks.writeNudgeMarker.mockReset();
     checkpointMocks.writeNudgeMarker.mockResolvedValue(undefined);
   });
@@ -219,6 +233,12 @@ describe("UserPromptSubmit 钩子：v0.8.0 检查点提醒", () => {
     return sharedMocks.logHookEvent.mock.calls
       .map((call) => call[1] as Record<string, unknown>)
       .filter((e) => e["event"] === "hook-checkpoint-nudge");
+  }
+
+  function contextNudgeEvents(): Array<Record<string, unknown>> {
+    return sharedMocks.logHookEvent.mock.calls
+      .map((call) => call[1] as Record<string, unknown>)
+      .filter((e) => e["event"] === "hook-context-nudge");
   }
 
   it("该提醒：提醒行并入 additionalContext，仍是一次 emit / 一行 / 一键", async () => {
@@ -367,6 +387,105 @@ describe("UserPromptSubmit 钩子：零注入块的 stdout 形状（C1-B03）", 
     const parsed = JSON.parse(captured[0]!) as Record<string, unknown>;
     expect(Object.keys(parsed)).toEqual(["additionalContext"]);
     expect(String(parsed["additionalContext"])).toContain("未读协作消息");
+  });
+
+  // --- v0.9.8（组 O C1）：上下文体积提醒（回合提醒面；48-v098 验收 lane「互通与面板」
+  //     端到端实测确认此前钩子侧零注入，方案要求「超阈值在 xc_overview(status) 与回合
+  //     提醒中各给一条」）。判据四态矩阵在 core/checkpoint-v098-o-d7-c1.test.ts 逐条
+  //     覆盖；这里只测钩子接线：emit → 一行注入 + 共用节流标记 + 审计。
+  //     本 describe 所在的 C1-B03 describe 没有 beforeEach（每个用例自带隔离），故这里
+  //     显式 isolate()：把未读/peer 信封/checkpoint 提醒全部按掉，只留 C1 一块可变。---
+  describe("v0.9.8 C1：上下文体积提醒", () => {
+    function isolate(): void {
+      sharedMocks.unreadSummary.mockResolvedValue({ count: 0, senders: [], messages: [] });
+      peerMocks.drainPeerQueue.mockResolvedValue([]);
+      checkpointMocks.checkpointNudgeState.mockResolvedValue({ openTaskCount: 0, lastCheckpointAt: null, lastNudgeAt: null });
+      checkpointMocks.checkpointNudgeDecision.mockReturnValue({ nudge: false, reason: "no-active-task" });
+      checkpointMocks.readContextSize.mockResolvedValue({ bytes: 0, messages: 0 });
+      checkpointMocks.contextNudgeDecision.mockReturnValue({ nudge: false, reason: "below-threshold", bytes: 0, messages: 0 });
+      checkpointMocks.renderContextNudgeLine.mockClear();
+      checkpointMocks.writeNudgeMarker.mockClear();
+      sharedMocks.auditHookFailure.mockClear();
+      sharedMocks.logHookEvent.mockClear();
+    }
+
+    function contextNudgeEvents(): Array<Record<string, unknown>> {
+      return sharedMocks.logHookEvent.mock.calls
+        .map((call) => call[1] as Record<string, unknown>)
+        .filter((e) => e["event"] === "hook-context-nudge");
+    }
+
+    /**
+     * C1 自己的审计（reason = 'prompt-submit-context-nudge'）。不能断言 auditHookFailure
+     * 「一次都没被调用」——本文件的 `<stateRoot>` 不是真目录，钩子的 refresh 步骤会
+     * 落一条既有的 'prompt-submit-refresh' 审计（与 C1 无关，既有行为）。
+     */
+    function contextNudgeAudits(): unknown[][] {
+      return sharedMocks.auditHookFailure.mock.calls
+        .filter((call) => (call as unknown[])[1] === "prompt-submit-context-nudge") as unknown[][];
+    }
+
+    it("超阈值 → 注入一行（含 xc_team checkpoint 建议与「不自动压缩」），并共用 .nudge 节流标记 + 审计", async () => {
+      isolate();
+      checkpointMocks.readContextSize.mockResolvedValue({ bytes: 5 * 1024 * 1024, messages: 12 });
+      checkpointMocks.contextNudgeDecision.mockReturnValue({
+        nudge: true, reason: "emit", bytes: 5 * 1024 * 1024, messages: 12, over: "bytes",
+      });
+      checkpointMocks.renderContextNudgeLine.mockReturnValue(
+        "[zcode-crosschat] 会话消息积压估算已超阈值（12 条 / 5242880 字节）——建议先 xc_team({action:\"checkpoint\"}) 落盘，再压缩或开新会话；本提醒只建议、不自动压缩。",
+      );
+
+      const captured = await runHook();
+      expect(captured).toHaveLength(1); // 仍是一次 write / 一行 JSON 单键
+      const parsed = JSON.parse(captured[0]!) as Record<string, unknown>;
+      expect(Object.keys(parsed)).toEqual(["additionalContext"]);
+      expect(String(parsed["additionalContext"])).toContain("xc_team({action:\"checkpoint\"})");
+      expect(String(parsed["additionalContext"])).toContain("不自动压缩");
+      expect(checkpointMocks.writeNudgeMarker).toHaveBeenCalledWith("<stateRoot>", "alice", expect.any(Number));
+      expect(contextNudgeEvents()).toHaveLength(1);
+      expect(contextNudgeEvents()[0]).toMatchObject({
+        sessionId: "sess-a", agentKey: "alice", reason: "emit", bytes: 5 * 1024 * 1024, messages: 12, over: "bytes",
+      });
+    });
+
+    it("低于阈值 → 不注入（additionalContext 空串）、不写标记、不审计（正常不打扰）", async () => {
+      isolate();
+      checkpointMocks.readContextSize.mockResolvedValue({ bytes: 1024, messages: 3 });
+      checkpointMocks.contextNudgeDecision.mockReturnValue({ nudge: false, reason: "below-threshold", bytes: 1024, messages: 3 });
+
+      const captured = await runHook();
+      expect(captured).toHaveLength(1);
+      expect(JSON.parse(captured[0]!)["additionalContext"]).toBe("");
+      expect(checkpointMocks.writeNudgeMarker).not.toHaveBeenCalled();
+      expect(contextNudgeEvents()).toHaveLength(0);
+      expect(contextNudgeAudits()).toHaveLength(0);
+    });
+
+    it("XC_CONTEXT_NUDGE=0（disabled）→ 不注入、不写标记、不审计", async () => {
+      isolate();
+      checkpointMocks.readContextSize.mockResolvedValue({ bytes: 9 * 1024 * 1024, messages: 900 });
+      checkpointMocks.contextNudgeDecision.mockReturnValue({ nudge: false, reason: "disabled", bytes: 9 * 1024 * 1024, messages: 900 });
+
+      const captured = await runHook();
+      expect(captured).toHaveLength(1);
+      expect(JSON.parse(captured[0]!)["additionalContext"]).toBe("");
+      expect(checkpointMocks.writeNudgeMarker).not.toHaveBeenCalled();
+      expect(contextNudgeEvents()).toHaveLength(0);
+      expect(contextNudgeAudits()).toHaveLength(0);
+    });
+
+    it("取数抛错 → 只审计不阻断（钩子永不失败会话），且不写节流标记", async () => {
+      isolate();
+      checkpointMocks.readContextSize.mockRejectedValue(new Error("stat boom"));
+
+      const captured = await runHook();
+      expect(captured).toHaveLength(1);
+      expect(JSON.parse(captured[0]!)["additionalContext"]).toBe("");
+      expect(checkpointMocks.writeNudgeMarker).not.toHaveBeenCalled();
+      expect(sharedMocks.auditHookFailure).toHaveBeenCalledWith(
+        "<stateRoot>", "prompt-submit-context-nudge", expect.any(Error),
+      );
+    });
   });
 });
 

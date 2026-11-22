@@ -34,7 +34,7 @@ import { okResult, ToolError, type ToolResult } from "./protocol.js";
 import { renderRegister } from "./render.js";
 import { connectionKeyOf, identityStore, xcRegister } from "./identity.js";
 import { withTeamLock, withRegistryThenTeamLocks } from "../core/lock.js";
-import { appendMailbox, createMessage, readMailbox, readUnreadMailbox } from "../core/mailbox.js";
+import { appendMailbox, createMessage, readMailbox } from "../core/mailbox.js";
 import { logEngineEvent } from "../core/log.js";
 import { readNames, readSession, unbindName, bindName, findInflightWakeNonce, WAKE_INFLIGHT_MS } from "../core/registry.js";
 import { sanitizeKey, validateMemberName } from "../core/sanitize.js";
@@ -43,7 +43,11 @@ import type { MemberRole } from "../core/types.js";
 import { memberOpenTasks, readTeam, writeTeam } from "../core/teamstate.js";
 import { revokeAttempt } from "../core/graph.js";
 import { peerRootFromEnv } from "../core/peerdir.js";
-import { carryCheckpointDir } from "../core/checkpoint.js";
+// v0.9.8（组 O D7 / V097-21）：未读判据收敛到 core/checkpoint.ts 单一真源
+// currentUnreadMessages（未读 ∧ 未丢弃 ∧ isCurrentMail）——与 panel / status / team 板面 /
+// checkpoint 第 5 章同一判据。改名守卫此前自带 readUnreadMailbox（只滤 readAt/discardedAt、
+// 不过 isCurrentMail），同一邮箱观测四面报 0 而守卫报 2，成员被幽灵未读挡住改名。
+import { carryCheckpointDir, currentUnreadMessages } from "../core/checkpoint.js";
 // v0.6.1（安全对-1 修复）：findLiveSessionIdHolder 唯一实现移入 core/peerregistry.ts
 // （队内轴 sid 归属校验也要用它；经 peer-services.ts import 会与 tools-team.ts 成环）。
 import { findLivePeerByName, findLiveSessionIdHolder } from "../core/peerregistry.js";
@@ -168,12 +172,14 @@ async function teamMemberCleanForRename(
   const terminalRefCount = team.tasks.filter(
     (t) => TERMINAL_TASK_STATUSES.includes(t.status) && (t.assignee === agentKey || t.createdBy === agentKey),
   ).length;
-  // 邮箱判据用**未读**（readUnreadMailbox）：已读历史只是留痕，换名后照旧躺在旧花名
-  // 的 inbox 文件里，没有功能路径会再读它；会锁死的是**未读**件（换名后旧箱不再被
-  // 任何工具面引用——成员视角按花名册键寻址，旧键已不在册）。v0.8.1 修正：旧实现用
-  // readMailbox 全史判定，「收到过任何消息」与「有未读」混同，是 C6-BUG-6 死胡同的
-  // 另一条触发路径（读完历史也改不了名）。
-  const unread = await readUnreadMailbox(stateRoot, teamId, agentKey);
+  // 邮箱判据用**未读**（未读 ∧ 未丢弃 ∧ isCurrentMail——v0.9.8 组 O D7/V097-21 起
+  // 统一到 core/checkpoint.ts 单一真源 currentUnreadMessages，与 panel/status/板面/
+  // checkpoint 第 5 章同一判据）。已读历史只是留痕，换名后照旧躺在旧花名的 inbox
+  // 文件里，没有功能路径会再读它；会锁死的是**现行未读**件（换名后旧箱不再被任何
+  // 工具面引用——成员视角按花名册键寻址，旧键已不在册）。v0.8.1 修正：旧实现用
+  // readMailbox 全史判定，「收到过任何消息」与「有未读」混同；v0.9.8 D7：再修掉
+  // 「陈旧件也算未读」——观测四面 0 而守卫 2 的矛盾（成员被幽灵未读挡住改名）。
+  const unread = currentUnreadMessages(team, await readMailbox(stateRoot, teamId, agentKey));
   if (openTaskIds.length > 0 || createdOpenIds.length > 0 || designatedPendingIds.length > 0) {
     const parts: string[] = [];
     if (openTaskIds.length > 0) parts.push(`open task(s) assigned to you: ${openTaskIds.join(", ")}`);

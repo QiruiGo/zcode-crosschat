@@ -25,6 +25,10 @@
  *   （B4）、尾窗截断每页披露 olderEventsOmitted（M04）、续读 offset 位置游标语义
  *   披露（B7）、预算刻度接 identify 的 contextChars 逐会话声明（B8）——逐项对应
  *   PROTOCOL §14.4 冻结式同步。
+ * - v0.9.8（组 O）增量：R2 成员行补可寻址名（team 板面 payload members[].peerName，
+ *   与 panel agents() 同一解析 peerNameBySessionId）；D7 未读判据收敛到
+ *   core/checkpoint.ts unreadCountFor 单一真源；C1 status 视图附上下文体积估算
+ *   （payload context 块 + 超阈值建议行，不自动压缩）。
  * - 无需注册即可调用（只读纪律，SKILL §1 保留）。
  */
 
@@ -54,7 +58,8 @@ import { sha256Of } from "../core/msgstore.js";
 import { lastTeamRecoveryNotice, teamRecoveryWarning } from "../core/teamstate.js";
 import { stalledTasks, stallThresholdMs, stallSuggestion, type StallFlag } from "../core/stall.js";
 import { staleThresholdMsFromEnv } from "./task-edges.js";
-import { getPeerServices } from "./peer-services.js";
+// v0.9.8（组 O R2）：成员行可寻址名的单一解析（panel agents() 与本 team 板面共用）。
+import { getPeerServices, peerNameBySessionId } from "./peer-services.js";
 // v0.8.1（C3-B8）：调用方 peer 会话上下文（contextChars 逐会话声名的旁路解析）。
 import { getPeerSessionContext } from "./peer-drain.js";
 import { leadKeyOf } from "./tools-team.js";
@@ -87,7 +92,19 @@ import { wakeGateStatus, type WakeGateStatus } from "../engine/wake.js";
 // v0.8.0（A3/A4）：时间线尾部窗口读 + 事件族归一化；checkpoint 年龄/容量 level 推导助手。
 // v0.8.1（C3-B4）：timelineTextField——文本视图控制字符清洗（JSON payload 不洗）。
 import { readTimeline, timelineTextField } from "../core/timeline.js";
-import { capacityLevelOf, latestCheckpoint } from "../core/checkpoint.js";
+// v0.9.8（组 O）：D7 未读裁决单一真源（panel/板面/checkpoint/守卫共用同一判据）+
+// C1 上下文体积估算取数/判据/文案（core/checkpoint.ts；与 checkpoint 提醒同族——
+// 超阈值只建议「先落盘再压缩/新会话」，不自动压缩）。
+import {
+  capacityLevelOf,
+  CONTEXT_NUDGE_BYTES,
+  CONTEXT_NUDGE_MESSAGES,
+  contextOverThreshold,
+  latestCheckpoint,
+  readMailboxBytes,
+  unreadCountFor,
+  type ContextSizeSample,
+} from "../core/checkpoint.js";
 import type { ToolDeps } from "./core.js";
 import { runCore } from "./core.js";
 
@@ -401,7 +418,7 @@ export const OverviewShape = {
   view: z.enum(["team", "peers", "panel", "timeline", "status"]).optional().describe(
     "缺省 team：任务板+成员+未读；peers：本机可寻址 peer 清单；panel：self+peers+members+tasks+入站策略+容量+停滞；"
     + "timeline：引擎日志时间线（ts 降序；limit 缺省 20 上限 100，offset=自最新往回跳过 N 条的位置游标，预算截断披露+续读指针，跳过行计 skippedEvents，尾窗截断每页披露 olderEventsOmitted）；"
-    + "status：紧凑状态视图（任务七态计数/stalled/容量色+水位/离线成员/checkpoint 年龄/未读数，替代状态栏）",
+    + "status：紧凑状态视图（任务七态计数/stalled/容量色+水位/离线成员/checkpoint 年龄/未读数/上下文体积估算（context 块+超阈值建议行，不自动压缩），替代状态栏）",
   ),
   history: z.boolean().optional().describe("附 lead 角色变更史（R-7）"),
   offset: z.number().int().min(0).optional().describe(
@@ -559,7 +576,10 @@ export function createTeamOverviewCore(deps: ToolDeps): TeamOverviewCore {
         // v0.7（C8，M4）离线成员挂载：同 capacity 纪律（扫描失败只丢观测块）。
         // v0.9（G-9）：只读 peer 扫描一次（offline 判死 + 成员活性两处共用），
         // 成员活性挂载同纪律（读失败只丢观测块）。
+        // v0.9.8（组 O R2）：同一次扫描供成员行可寻址名（peerName）解析——
+        // sessionId → 活跃 peer 花名（与 panel agents() 同一函数，两面一致）。
         const peerScan = team !== undefined ? await scanPeersSafe(deps, now) : null;
+        const peerNames = peerNameBySessionId(peerScan);
         const offlineMount = team !== undefined ? await offlineMembersMount(deps, team, now, peerScan) : null;
         const liveness = team !== undefined ? await livenessMount(deps, team, now, peerScan) : null;
         // v0.9.3（A2）：唤醒三级指标计数（engine.jsonl 尾部窗口；无唤醒不挂载）。
@@ -630,6 +650,10 @@ export function createTeamOverviewCore(deps: ToolDeps): TeamOverviewCore {
                 isLead: m.key === leadKeyOf(team),
                 // v0.9（G-9）：成员行暴露活性（三视图统一口径 {state, stateAgeMin, lastEventAgeMin}）。
                 ...(liveness?.views.get(m.key) !== undefined ? { liveness: liveness.views.get(m.key) } : {}),
+                // v0.9.8（组 O R2）：成员行补**可寻址名**——跨会话 peer 花名（ absent =
+                // 当前无活跃 peer 记录，仅队内 key 可达）。队内 key 恒在 `key` 列；
+                // 解析与 panel agents() 同一函数（peerNameBySessionId），两面一致。
+                ...(peerNames.get(m.sessionId) !== undefined ? { peerName: peerNames.get(m.sessionId)! } : {}),
               }))
             : snapshot.members,
           // v0.9（G-9）挂载点：liveness 三态计数（成员行已逐个带 liveness 细节）。
@@ -720,11 +744,17 @@ export function createTeamOverviewCore(deps: ToolDeps): TeamOverviewCore {
   };
 }
 
-/** 当前未读（未读 ∧ 未丢弃 ∧ isCurrentMail）计数（与 tools-read 的 countUnread 同口径）。 */
+/**
+ * 当前未读（未读 ∧ 未丢弃 ∧ isCurrentMail）计数。
+ * v0.9.8（组 O D7/V097-21）：判据收敛到 core/checkpoint.ts 的单一真源
+ * {@link unreadCountFor}——此前本文件自带一份内联过滤，与 snapshot countUnread /
+ * panel agents() / checkpoint 第 5 章 / 改名守卫是同判据的多份复制（复制的判据
+ * 必然漂移：V097-21 实测同一邮箱观测面 0、守卫/checkpoint 2）。本地保留同名
+ *  wrapper 只为最小改动（两处调用点与注释里的名字不变）。
+ */
 function countUnreadFor(team: TeamState, messages: readonly TeamMessage[]): number {
-  return messages.filter((m) => !m.readAt && !m.discardedAt && isCurrentMailFor(team, m)).length;
+  return unreadCountFor(team, messages);
 }
-import { isCurrentMail as isCurrentMailFor } from "../core/mailbox.js";
 import type { TeamMessage, TeamState } from "../core/types.js";
 
 // ---------------------------------------------------------------------------
@@ -1073,6 +1103,9 @@ function renderStatusLines(input: StatusRenderInput, level: StatusDegradeLevel):
  * 文本按精确分钟渲染（C5-BUG-C5-02：与 handoff 同粒度，不再按天向下取整）；
  * unread 与板面同口径 countUnreadFor。预算超限走固定降级序（unread 行 → checkpoint 行
  * → offline/stalled 明细 → capacity 明细），每级留名披露 truncated。
+ * v0.9.8（组 O C1）：附**上下文体积估算块** payload `context`（每成员邮箱字节/条数 +
+ * overThreshold 事实）与超阈值文本行（建议 checkpoint 后压缩/新会话；不自动压缩，
+ * XC_CONTEXT_NUDGE=0 可关；估算口径的诚实边界见 core/checkpoint.ts readContextSize）。
  */
 export async function statusView(deps: ToolDeps, connectionKey: string): Promise<ToolResult> {
   return runCore(deps.stateRoot, async () => {
@@ -1093,6 +1126,8 @@ export async function statusView(deps: ToolDeps, connectionKey: string): Promise
         capacity: null,
         checkpoints: {},
         unread: {},
+        // v0.9.8（组 O C1）：无团队 → 空估算块（键集与有团队时一致，形状稳定）。
+        context: { threshold: { bytes: CONTEXT_NUDGE_BYTES, messages: CONTEXT_NUDGE_MESSAGES }, byMember: {}, overThreshold: [] },
       });
     }
 
@@ -1134,14 +1169,23 @@ export async function statusView(deps: ToolDeps, connectionKey: string): Promise
     for (const t of team.tasks) counts[t.status] = (counts[t.status] ?? 0) + 1;
 
     // 未读（与板面同口径 countUnreadFor——观测面自洽）
+    // C1（v0.9.8 组 O）：同一循环顺带取上下文体积估算（messages = 本次已读条数，
+    // bytes 走 stat）——不为估算二次读盘；判据/阈值/文案属主 core/checkpoint.ts。
     const unreadEntries: Array<{ key: string; count: number }> = [];
     const unreadMap: Record<string, number> = {};
+    const contextByMember: Record<string, ContextSizeSample & { overThreshold: boolean }> = {};
     for (const m of team.members) {
       const msgs = await readMailbox(deps.stateRoot, teamId, m.key);
       const count = countUnreadFor(team, msgs);
       unreadMap[m.key] = count;
       unreadEntries.push({ key: m.key, count });
+      const bytes = await readMailboxBytes(deps.stateRoot, m.key, teamId);
+      const sample: ContextSizeSample = { bytes, messages: msgs.length };
+      contextByMember[m.key] = { ...sample, overThreshold: contextOverThreshold(sample) };
     }
+    const contextOverKeys = team.members
+      .map((m) => m.key)
+      .filter((key) => contextByMember[key]?.overThreshold === true);
 
     // 检查点年龄：me（已注册时）+ 全部花名册成员（无检查点记 (none)）
     const checkpointKeys: string[] = [];
@@ -1222,6 +1266,19 @@ export async function statusView(deps: ToolDeps, connectionKey: string): Promise
     if (watermarkFellBack) extraWarnings.push(MEM_WATERMARK_FALLBACK_WARNING);
     if (extraWarnings.length > 0) final.text = `${final.text}\n${extraWarnings.join("\n")}`;
 
+    // v0.9.8（组 O C1）：上下文体积提醒行——**只在超阈值且未设 XC_CONTEXT_NUDGE=0 时**
+    // 出现一次（status 是拉取式观测，不节流；回合提醒面的 30min 节流属钩子）。
+    // 放在固定降级序列**之后**（行序冻结纪律：不新增降级级、不动既有行序）。
+    if (contextOverKeys.length > 0 && deps.env['XC_CONTEXT_NUDGE'] !== '0') {
+      const detail = contextOverKeys
+        .map((key) => `${key}(${formatBytesShort(contextByMember[key]!.bytes)}/${contextByMember[key]!.messages} 条)`)
+        .join("、");
+      final.text =
+        `${final.text}\ncontext: ${detail} 超阈值`
+        + `（≥ ${formatBytesShort(CONTEXT_NUDGE_BYTES)} 或 ${CONTEXT_NUDGE_MESSAGES} 条）`
+        + '——建议先 xc_team({action:"checkpoint"}) 落盘，再压缩或开新会话；不自动压缩，XC_CONTEXT_NUDGE=0 可关';
+    }
+
     return okResult(final.text, {
       teamId,
       phase: team.phase,
@@ -1235,6 +1292,14 @@ export async function statusView(deps: ToolDeps, connectionKey: string): Promise
       },
       taskCounts: counts,
       stalled: stalled.length,
+      // v0.9.8（组 O C1）：上下文体积估算块（**事实恒在**——与 env 开关无关；
+      // 文本提醒行才受 XC_CONTEXT_NUDGE 控制）。byMember 每员一份 {bytes, messages,
+      // overThreshold}；overThreshold = 命中阈值的花名册键（空 = 全员正常）。
+      context: {
+        threshold: { bytes: CONTEXT_NUDGE_BYTES, messages: CONTEXT_NUDGE_MESSAGES },
+        byMember: contextByMember,
+        overThreshold: contextOverKeys,
+      },
       // v0.9.3（A2）：唤醒三级指标计数块（team/panel 文本行同源；status 文本行序归 render.ts）。
       ...(wakeTiers !== null ? wakeTiers.payload : {}),
       ...(stall.clamped ? { stalledThresholdClamped: true } : {}),
@@ -1280,7 +1345,7 @@ export function registerOverviewTools(
     "history:true appends leadHistory; view=peers: addressable cross-session peers (self/member/session rows, rowsTruncated pointer); " +
     "view=panel: self + peers + members (+ liveness per member row, 含 livenessSources) + task counts + inbound policy; " +
     "view=timeline: engine.jsonl timeline ordered by ts descending (limit defaults 20, max 100 with limitClamped disclosure; offset is a positional cursor skipping back N from the newest event — drifts under live appends; budget window with truncated pointer; skippedEvents counts unnormalizable lines; olderEventsOmitted disclosed on every page when the tail window truncates the file); " +
-    "view=status: compact status block (task counts by status / stalled / capacity level + watermark / offline members / member liveness in payload liveness block / checkpoint ages / unread counts — the no-statusline substitute). Does not require registration; writes snapshot.json (always the full board) only for view=team.";
+    "view=status: compact status block (task counts by status / stalled / capacity level + watermark / offline members / member liveness in payload liveness block / checkpoint ages / unread counts / context-size estimate (per-member mailbox bytes+messages, overThreshold facts + one advisory line when over threshold — suggests checkpoint then compress/new session, never auto-compresses, XC_CONTEXT_NUDGE=0 disables) — the no-statusline substitute). Does not require registration; writes snapshot.json (always the full board) only for view=team.";
   const handler = async (args: Record<string, unknown>, extra: unknown): Promise<ToolResult> =>
     handleOverview(deps, args as unknown as OverviewArgs, connectionKeyOf(extra));
   server.tool("xc_overview", description, OverviewShape, handler);

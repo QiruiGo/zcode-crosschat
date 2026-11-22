@@ -16,7 +16,8 @@
  * 5. crosschat：工具表补 handoff/checkpoint/timeline/status + 「交接与压缩防护」小节；
  * 6. 平台缺口如实声明（README/PROTOCOL/skill 含「无 PreCompact，故用提醒+一键」；
  *    且 PreCompact / 压缩钩子只以否定句式出现——不宣称自动压缩钩子）；
- * 7. 五处版本号统一 0.9.7（AC6 的静态面）。
+ * 7. 版本号一致性（AC6 的静态面）：四处版本文件 = 0.9.8，第五处文档面（README 安装段 +
+ *    CHANGELOG 最新条目）= 0.9.7 待文档 lane 改钉——两半分开钉，见 §8 注。
  */
 import { describe, expect, it } from 'vitest';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
@@ -326,21 +327,31 @@ describe('A5 文档：无 PreCompact，故用提醒+一键（ACCEPT15-1 文档�
 });
 
 // ---------------------------------------------------------------------------
-// 8. 版本五处统一（AC6 静态面）
+// 8. 版本号一致性（AC6 静态面）
+//
+// v0.9.8 注（集成员第 1 轮，2026-11-22）：本轮四组（W/M/O/P）并行改码，集成员把**四处版本文件**
+// 改钉 0.9.8（marketplace.json / plugin/.zcode-plugin/plugin.json / plugin/package.json /
+// plugin/src/mcp/server.ts 的 SERVER_VERSION）；文档 lane 本轮未跑，故**第五处**（README 安装段
+// 资产名/安装回显 + CHANGELOG 最新条目）仍指向最后一个已发布版本 0.9.7——v0.9.8 尚未 tag /
+// 发布，这是发布前的正确中间态，不是疏漏。
+//   下方两个 it 分别钉这两半。**文档 lane 落笔 v0.9.8 条目（CHANGELOG + README 安装段）时，
+//   把第五处 it 里的 0.9.7 字样连同 it 标题一起改钉 0.9.8**（v0.9.7 那次即由组 B 执行同一步，
+//   见该处旧注）。若只改版本文件不改这里 → 本文件红（本轮全量单测唯一的红正是如此：a5:334，
+//   expected '0.9.8' to be '0.9.7'）。
 // ---------------------------------------------------------------------------
 
-describe('A5 版本五处统一 0.9.7', () => {
-  it('package.json / plugin.json / marketplace.json / server.ts 四处 = 0.9.7', () => {
-    expect(JSON.parse(readRel('plugin/package.json')).version).toBe('0.9.7');
-    expect(JSON.parse(readRel('plugin/.zcode-plugin/plugin.json')).version).toBe('0.9.7');
-    expect(JSON.parse(readRel('marketplace.json')).plugins[0].version).toBe('0.9.7');
-    expect(readRel('plugin/src/mcp/server.ts')).toContain('const SERVER_VERSION = "0.9.7"');
+describe('A5 版本号一致性（四处版本文件 = 0.9.8；第五处文档面 = 0.9.7 待文档 lane 改钉）', () => {
+  it('package.json / plugin.json / marketplace.json / server.ts 四处 = 0.9.8', () => {
+    expect(JSON.parse(readRel('plugin/package.json')).version).toBe('0.9.8');
+    expect(JSON.parse(readRel('plugin/.zcode-plugin/plugin.json')).version).toBe('0.9.8');
+    expect(JSON.parse(readRel('marketplace.json')).plugins[0].version).toBe('0.9.8');
+    expect(readRel('plugin/src/mcp/server.ts')).toContain('const SERVER_VERSION = "0.9.8"');
   });
 
-  // v0.9.7 注（组 B）：四处版本文件由集成员改钉 0.9.7；第五处（README 安装段资产名/安装回显）
-  // 与 CHANGELOG 的 v0.9.7 条目由组 B 就地落笔，本断言同步改钉 0.9.7
-  // （v0.9.6 及更早条目仍在 CHANGELOG，按「最新条目 + 三条历史条目」口径只钉最新与既有的三条）。
-  it('README 安装段指向 0.9.7；CHANGELOG 含 v0.9.7/0.9.6/0.9.5/0.9.4 条目（第五处）', () => {
+  // 第五处（README 安装段资产名/安装回显 + CHANGELOG 最新条目）仍钉 0.9.7：v0.9.8 未 tag 未发布，
+  // README 指向最后一个已发布资产是发布前的正确状态。文档 lane 落笔 v0.9.8 条目后改钉此处。
+  // （v0.9.6 及更早条目仍在 CHANGELOG，按「最新条目 + 三条历史条目」口径只钉最新与既有的三条。）
+  it('README 安装段指向 0.9.7；CHANGELOG 含 v0.9.7/0.9.6/0.9.5/0.9.4 条目（第五处，待文档 lane 改钉）', () => {
     const readme = readRel('README.md');
     expect(readme).toContain('zcode-crosschat-0.9.7-prebuilt-slim.tar.gz');
     expect(readme).toContain('Installed plugin zcode-crosschat@dev-zcode-crosschat (0.9.7)');

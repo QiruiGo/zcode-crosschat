@@ -32,6 +32,15 @@
  * `level` 字段，handoff/status 视图都 import 本模块的推导助手）；checkpoint 路径与
  * latestCheckpoint 只此一处出，G2 不自行 join。
  *
+ * v0.9.8（组 O）增量：
+ * - **D7（V097-21）未读裁决单一真源**：currentUnreadMessages / unreadCountFor
+ *   （未读 ∧ 未丢弃 ∧ isCurrentMail）——panel 成员行、status/team 板面、checkpoint
+ *   第 5 章、改名守卫共用同一判据，修掉「同一邮箱观测面 0、守卫/checkpoint 2」的
+ *   四面矛盾（48-v097验收 V097-21 P2 mustFix）。
+ * - **C1 上下文体积提醒**：readContextSize（邮箱 JSONL 字节 + 条数的积压估算）+
+ *   contextNudgeDecision（阈值 + 与 checkpoint 提醒共用 30min 节流）+ 一行文案——
+ *   超阈值只「建议 checkpoint 后压缩/新会话」，**不自动压缩**；XC_CONTEXT_NUDGE=0 可关。
+ *
  * @module core/checkpoint
  */
 import { mkdir, readdir, readFile, rename, rm, stat } from 'node:fs/promises';
@@ -47,8 +56,20 @@ import {
   checkpointDir,
   checkpointFile,
   checkpointNudgeFile,
+  inboxFile,
 } from './paths.js';
-import { DEFAULT_TEAM_ID, type MemberRole, type MemberState, type Task, type TeamMessage } from './types.js';
+// v0.9.8（组 O D7/V097-21）：未读裁决的单一真源落在本模块——`isCurrentMail`
+// （core/mailbox.ts 的新鲜度裁决，1:1 移植）与读取面都从这里出，panel/板面/
+// checkpoint/守卫不再各写一份过滤条件（复制的判据必然漂移）。
+import { isCurrentMail, readMailbox } from './mailbox.js';
+import {
+  DEFAULT_TEAM_ID,
+  type MemberRole,
+  type MemberState,
+  type Task,
+  type TeamMessage,
+  type TeamState,
+} from './types.js';
 
 // --- 常量（代码常量，不进 userConfig；仅提醒开关走一个 env）--------------------
 
@@ -189,6 +210,41 @@ export function capacityViewOf(
 export function frontMatterCapacityLine(view: CapacityView | null): string {
   if (view === null) return 'capacity: {watermarkPct: n/a, freeGb: n/a, level: UNKNOWN}';
   return `capacity: {watermarkPct: ${view.watermarkPct.toFixed(1)}, freeGb: ${view.freeGb.toFixed(2)}, level: ${view.level}}`;
+}
+
+// --- 未读裁决单一真源（v0.9.8 组 O，D7 = V097-21）----------------------------
+
+/**
+ * 未读裁决（纯函数）：**未读 ∧ 未丢弃 ∧ isCurrentMail**。
+ *
+ * 缺陷事实（48-v097验收 V097-21，P2 mustFix）：观测面（panel/status/team 板面/
+ * snapshot/wake pending）按本判据计数，而改名守卫（mcp/tools-identify.ts
+ * `teamMemberCleanForRename`）与 checkpoint 第 5 章用 `readUnreadMailbox`
+ * （只滤 readAt/discardedAt，**不过 isCurrentMail**）——同一邮箱观测四面报 0、
+ * 守卫/checkpoint 报 2：成员被一条所有观测面都不显示的未读数挡住改名，
+ * checkpoint 发布与全部观测面矛盾的数字。
+ *
+ * 修法（47-v097方案 D7）：判据收敛到**本模块这一个函数**，五个消费面
+ * （mcp/tools-overview.ts countUnreadFor / mcp/peer-services.ts agents() 成员行 /
+ * mcp/tools-team.ts checkpoint+投产 backlog+停机留档 / 改名守卫）全部经它取数；
+ * 陈旧信封的丢弃仍归消费面 `readCurrentMailboxLocked`（观测面不动盘）。
+ *
+ * 落地时序（如实）：前四个消费面由组 O 在并行轮内接入；**改名守卫面**
+ * （mcp/tools-identify.ts `teamMemberCleanForRename`）的 adoption 由集成员在
+ * v0.9.8 集成阶段应用（48-v098 验收 lane「互通与面板」端到端实测确认此前未接线、
+ * 同一邮箱守卫报 3 而观测四面报 1），补丁原文见
+ * deepseek-crosschat/evidence/44-v098/fix-o/guard-adoption-tools-identify.md。
+ * 自此五面同判据，本注释与代码一致。
+ */
+export function currentUnreadMessages(team: TeamState, messages: readonly TeamMessage[]): TeamMessage[] {
+  return messages.filter(
+    (m) => m.readAt === undefined && m.discardedAt === undefined && isCurrentMail(team, m),
+  );
+}
+
+/** 未读计数（{@link currentUnreadMessages} 的长度；与各观测面逐键同值）。 */
+export function unreadCountFor(team: TeamState, messages: readonly TeamMessage[]): number {
+  return currentUnreadMessages(team, messages).length;
 }
 
 // --- 聚合输入（工具层取数后注入；now 一律外部注入保持纯度）-----------------------
@@ -1004,4 +1060,144 @@ export function checkpointUnreadRef(message: TeamMessage): CheckpointUnreadRef {
 export function journalDisplayPath(stateRoot: string, taskId: string): string {
   const rel = relative(stateRoot, taskJournalPath(stateRoot, taskId)).split('\\').join('/');
   return `.crosschat/${rel}`;
+}
+
+// --- C1 上下文体积估算与提醒（v0.9.8 组 O；49-v098方案 §二 组 C）-------------
+
+/**
+ * 会话消息体积阈值（字节）——邮箱 JSONL 的 stat.size 达到即算「积压」。
+ * 代码常量不进 userConfig（「0 新增必填配置」纪律；只有一个可关 env，
+ * 与 CHECKPOINT_NUDGE 家族同形态）。
+ */
+export const CONTEXT_NUDGE_BYTES = 4 * 1024 * 1024;
+
+/** 会话消息条数阈值——与 {@link CONTEXT_NUDGE_BYTES} 是**或**的关系（任一维度超即提醒）。 */
+export const CONTEXT_NUDGE_MESSAGES = 500;
+
+/** 关闭上下文提醒的 env（可关；与 XC_CHECKPOINT_NUDGE=0 同口径）。 */
+export const CONTEXT_NUDGE_ENV = 'XC_CONTEXT_NUDGE';
+export const CONTEXT_NUDGE_OFF = '0';
+
+/**
+ * 估算口径的诚实边界（49-v098方案 §五 边界同族）：插件是外挂 MCP server，
+ * **读不到宿主模型的真实上下文**（无此 API）；本模块能测的是「本会话（按花名册
+ * 键寻址的队内邮箱）累计的协作消息体积」——JSONL 文件字节 + 消息条数。它随
+ * 会话变长单调增长（已读历史按设计留在箱里留痕），是插件侧唯一可测的积压信号；
+ * 真实模型上下文通常远大于它，故阈值取保守值（超了不一定爆，不超也不保证不爆）。
+ * 文案据此只「建议」，不假装测到了模型上下文。
+ */
+export interface ContextSizeSample {
+  /** 邮箱 JSONL 文件字节数（stat.size；文件缺席/stat 失败 = 0）。 */
+  bytes: number;
+  /** 邮箱消息条数（解析成功的 TeamMessage 行数；读取失败 = 0）。 */
+  messages: number;
+}
+
+/** 邮箱文件字节数（stat.size；缺席/失败 → 0——估算面永不为难）。 */
+export async function readMailboxBytes(
+  stateRoot: string,
+  agentKey: string,
+  teamId: string = DEFAULT_TEAM_ID,
+): Promise<number> {
+  try {
+    return (await stat(inboxFile(stateRoot, teamId, sanitizeKey(agentKey)))).size;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * 上下文体积估算读数（钩子/status 面共用同一取数）：stat 取字节 + readMailbox 取条数。
+ * 读路径**无锁纯读**（§2.7-5；观测/估算面不动盘、不清扫）。
+ */
+export async function readContextSize(
+  stateRoot: string,
+  agentKey: string,
+  teamId: string = DEFAULT_TEAM_ID,
+): Promise<ContextSizeSample> {
+  let messages = 0;
+  try {
+    messages = (await readMailbox(stateRoot, teamId, agentKey)).length;
+  } catch {
+    messages = 0;
+  }
+  return { bytes: await readMailboxBytes(stateRoot, agentKey, teamId), messages };
+}
+
+export type ContextNudgeReason =
+  | 'disabled'         // XC_CONTEXT_NUDGE=0（可关）
+  | 'below-threshold'  // 两维度都在阈值内（正常态：不打扰）
+  | 'rate-limited'     // 超阈值但 30min 内已提醒过（与 checkpoint 提醒共用 .nudge 节流标记）
+  | 'emit';            // 超阈值且未被节流 → 该提醒
+
+export interface ContextNudgeInput {
+  env: NodeJS.ProcessEnv;
+  bytes: number;
+  messages: number;
+  /** `.nudge` 节流标记解析值（与 checkpointNudgeDecision 同一字段——两类提醒合计 30min 最多一条）。 */
+  lastNudgeAt: number | null;
+  now: number;
+}
+
+export interface ContextNudgeDecision {
+  nudge: boolean;
+  reason: ContextNudgeReason;
+  bytes: number;
+  messages: number;
+  /** emit 时命中的阈值维度（both = 字节与条数同时超）。 */
+  over?: 'bytes' | 'messages' | 'both';
+}
+
+/**
+ * 是否超阈值（**纯事实判定**：字节或条数任一达到阈值；与 env 开关/节流无关）。
+ * status 观测面的 `overThreshold` 事实键用它（关掉提醒不等于事实消失）。
+ */
+export function contextOverThreshold(sample: { bytes: number; messages: number }): boolean {
+  const bytes = Number.isFinite(sample.bytes) ? Math.max(0, Math.floor(sample.bytes)) : 0;
+  const messages = Number.isFinite(sample.messages) ? Math.max(0, Math.floor(sample.messages)) : 0;
+  return bytes >= CONTEXT_NUDGE_BYTES || messages >= CONTEXT_NUDGE_MESSAGES;
+}
+
+/**
+ * 上下文体积提醒判据（纯函数；判定顺序固定，负例可逐条单测）：
+ *   1. `XC_CONTEXT_NUDGE === "0"` → disabled（可关）；
+ *   2. 字节与条数都低于阈值 → below-threshold（**正常不打扰**）；
+ *   3. 超阈值但 `lastNudgeAt` 在 30min 内 → rate-limited（**超阈值也最多 30min 一条**）；
+ *   4. 其余 → emit。
+ *
+ * 节流标记与 checkpoint 提醒**共用** `.nudge`（readNudgeMarker/writeNudgeMarker）：
+ * 两类提醒都是「该去 checkpoint 了」的同族建议，30min 合计最多一条，不叠加刷屏。
+ * status 观测面不节流（拉取式观测：调用方主动查询时给当前事实）。
+ */
+export function contextNudgeDecision(input: ContextNudgeInput): ContextNudgeDecision {
+  const bytes = Number.isFinite(input.bytes) ? Math.max(0, Math.floor(input.bytes)) : 0;
+  const messages = Number.isFinite(input.messages) ? Math.max(0, Math.floor(input.messages)) : 0;
+  const base = { bytes, messages };
+  if (input.env[CONTEXT_NUDGE_ENV] === CONTEXT_NUDGE_OFF) {
+    return { nudge: false, reason: 'disabled', ...base };
+  }
+  const overBytes = bytes >= CONTEXT_NUDGE_BYTES;
+  const overMessages = messages >= CONTEXT_NUDGE_MESSAGES;
+  if (!overBytes && !overMessages) return { nudge: false, reason: 'below-threshold', ...base };
+  const thresholdMs = CHECKPOINT_NUDGE_MINUTES * 60_000;
+  if (input.lastNudgeAt !== null && input.now - input.lastNudgeAt <= thresholdMs) {
+    return { nudge: false, reason: 'rate-limited', ...base };
+  }
+  return {
+    nudge: true,
+    reason: 'emit',
+    ...base,
+    over: overBytes && overMessages ? 'both' : overBytes ? 'bytes' : 'messages',
+  };
+}
+
+/**
+ * 注入/观测文案（一行）。**不自动压缩**（平台无 PreCompact 钩子，插件也无权压）——
+ * 只建议「先 checkpoint 落盘 → 再压缩或开新会话」，并给续接指针。
+ */
+export function renderContextNudgeLine(sample: { bytes: number; messages: number }): string {
+  return `[zcode-crosschat] 会话消息积压估算已超阈值（${sample.messages} 条 / ${sample.bytes} 字节`
+    + ` ≥ ${CONTEXT_NUDGE_MESSAGES} 条 / ${CONTEXT_NUDGE_BYTES} 字节）`
+    + '——建议先 xc_team({action:"checkpoint"}) 落盘，再压缩或开新会话（xc_read({scope:"handoff"}) 续上）；'
+    + '本提醒只建议、不自动压缩；估算口径见 xc_overview({view:"status"}) 的 context 块；不需要可设 XC_CONTEXT_NUDGE=0。';
 }

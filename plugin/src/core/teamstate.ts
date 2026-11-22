@@ -17,6 +17,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { writeFileAtomic } from './atomic.js';
+import { appendMailbox, createMessage } from './mailbox.js';
 import { inboxDir, inboxFile, snapshotFile, teamBackupFile, teamCorruptFile, teamDir, teamFile } from './paths.js';
 import { sanitizeKey } from './sanitize.js';
 import {
@@ -554,6 +555,117 @@ export function memberOpenTasks(tasks: readonly Task[], assignee: string): Task[
 }
 
 // ---------------------------------------------------------------------------
+// v0.9.8（D2/V097-07）：**未认领单的回池判据**（assignee 空时按 to 匹配）。
+//
+// 缺陷形态：xc_dispatch 带 `to` 建单时任务只有受领人预留（task.to）、assignee 仍为
+// null（认领才落 assignee）。成员供给失败（state=failed）或停机（removed）后，旧回池
+// 判据只看 `task.assignee === key`（memberOpenTasks）——这些**未认领单**不在域内：
+// 他人 claim 得 not_assignee（to 硬闸）、失败/停机成员自己无法认领、pending 又不在
+// stale 清扫域 → 任务永久搁浅，创建者收不到任何回执（49-v098 方案 D2）。
+//
+// 修法：回池判据在 assignee 为空时改用 `to` 命中；命中单删除受领人预留（回共享
+// 待领池，与 revokeAttempt 的「引擎回池 = shared pending pool」同语义）并通知创建者。
+// ---------------------------------------------------------------------------
+
+/**
+ * 一名成员名下的**未认领单**（pending ∧ assignee===null ∧ to===key；纯函数）。
+ *
+ * 与 {@link memberOpenTasks} 正交：后者管「已认领在途」（assignee 命中），本函数管
+ * 「派了没人领」（to 命中）。blocked/claimed/in_progress 必然已有 assignee，不在此域。
+ */
+export function memberUnclaimedTasks(tasks: readonly Task[], key: string): Task[] {
+  return tasks.filter(
+    (task) => task.status === 'pending' && task.assignee === null && task.to === key,
+  );
+}
+
+/**
+ * 把一张未认领单**释放回共享待领池**（纯函数，锁内调用）：删除受领人预留 `to`
+ * （任何成员可认领，与 revokeAttempt 的安全对-3 口径一致）、记 history、刷新
+ * updatedAt/lastProgressTs。
+ *
+ * 状态机豁免同 revokeAttempt 家族：pending→pending 不是 xc_report 可走转移，这是
+ * **引擎特权**回池（原受领人供给失败/停机/超时，不可能再认领）。
+ * 幂等：非「pending ∧ 无 assignee ∧ to 命中」的单一律 no-op 返回 false。
+ */
+export function releaseUnclaimedTask(
+  task: Task,
+  options: { by?: string; now?: number; event?: string } = {},
+): boolean {
+  if (task.status !== 'pending' || task.assignee !== null || task.to === undefined) return false;
+  const now = options.now ?? Date.now();
+  delete task.to; // 引擎回池 = 共享待领池（与 graph.revokeAttempt 同口径）
+  appendTaskHistory(task, options.event ?? 'released-unclaimed', options.by ?? 'engine', undefined, now);
+  return true;
+}
+
+/**
+ * v0.9.8（D2/V097-07）：把一名**供给失败/停机**成员名下的未认领单回池 + 通知创建者
+ * （锁内读-改-写；repairTeamState 同款的「状态自愈」入口，调用方 = 供给失败面
+ * engine/provision.ts 的 catch 与 member-stop 面）。
+ *
+ * 一步到位（团队锁内）：
+ * 1. {@link memberUnclaimedTasks} 取该成员未认领单（pending ∧ assignee 空 ∧ to 命中）；
+ * 2. {@link releaseUnclaimedTask} 逐张删 to 回共享待领池 + writeTeam；
+ * 3. 逐张给 **createdBy** 投一条 task-receipt（status=failed，error 说明成员供给
+ *    失败/停机、任务已回池——与 member-stop 的回执帧同形同族）；
+ * 4. engine.jsonl 落 `member-unclaimed-repooled{name,taskIds,reason}`（观测面）。
+ *
+ * 幂等安全：无未认领单 = 零写零审计，返回空数组。任何 IO 失败只记审计不抛——
+ * 失败路径的清理不能掩盖原始供给错误（provision.ts catch 的调用纪律）。
+ */
+export async function repoolUnclaimedTasksForFailedMember(
+  stateRoot: string,
+  teamId: string,
+  key: string,
+  input: { reason: string; detail?: string; by?: string },
+): Promise<{ taskId: string; title: string; createdBy: string }[]> {
+  const released: { taskId: string; title: string; createdBy: string }[] = [];
+  const now = Date.now();
+  await withTeamLock(stateRoot, teamId, async () => {
+    const team = await readTeam(stateRoot, teamId);
+    if (team === undefined) return;
+    for (const task of memberUnclaimedTasks(team.tasks, key)) {
+      if (!releaseUnclaimedTask(task, { by: input.by ?? 'engine', now, event: 'released-member-unavailable' })) continue;
+      released.push({ taskId: task.id, title: task.title, createdBy: task.createdBy });
+    }
+    if (released.length === 0) return;
+    await writeTeam(stateRoot, team);
+    const detail = input.detail !== undefined && input.detail.trim() !== '' ? `: ${input.detail.trim().slice(0, 300)}` : '';
+    for (const entry of released) {
+      await appendMailbox(stateRoot, teamId, entry.createdBy, createMessage(
+        key,
+        entry.createdBy,
+        JSON.stringify({
+          type: 'task-receipt',
+          teamId,
+          taskId: entry.taskId,
+          status: 'failed',
+          error: `revoked: member "${key}" became unavailable (${input.reason})${detail}; task returned to the pending pool`,
+          title: entry.title,
+        }),
+        {
+          taskId: entry.taskId,
+          sourceTaskId: entry.taskId,
+          sourceTaskStatus: 'pending',
+          deliveryClaimedAt: now,
+        },
+      ));
+    }
+  });
+  if (released.length > 0) {
+    await logEngineEvent(stateRoot, {
+      event: 'member-unclaimed-repooled',
+      teamId,
+      name: key,
+      taskIds: released.map((entry) => entry.taskId),
+      reason: input.reason,
+    });
+  }
+  return released;
+}
+
+// ---------------------------------------------------------------------------
 // v0.9.1（G-13）：派单查重硬闸的纯判据（调用方 = mcp/tools-tasks.ts 的 xc_dispatch，
 // 持团队锁调用；本模块只出判据不持锁——与全模块纪律一致）。
 //
@@ -1004,6 +1116,13 @@ export interface SweptProvision {
   provisionedAt: number | undefined;
   /** 本次清扫使用的 deadline（记录自带或现算兜底）。 */
   deadline: number;
+  /**
+   * v0.9.8（D2/V097-07）：本次清扫**连带释放回池**的未认领单 id（该成员名下
+   * pending ∧ assignee 空 ∧ to 命中的派单）。absent = 无未认领单（旧行为）。
+   * 调用方（member-add 锁内 / UserPromptSubmit 钩子）writeTeam 即落盘；创建者
+   * 通知由供给失败面（engine/provision.ts）与派发面承担，纯函数不触达邮箱。
+   */
+  releasedTaskIds?: string[];
 }
 
 /** provisioning 超时写入 roster 的 error 文案（≤500 字符，与既有失败文案同族）。 */
@@ -1024,6 +1143,11 @@ export function provisionTimeoutError(startedAt: number | undefined, deadline: n
  * deadline 取值：记录自带 `provisionDeadlineAt`（v0.7.1 起 Phase 1 落盘，
  * 用的是**当时** lead server 的超时配置）优先；缺失（存量记录）按
  * `provisionedAt ?? joinedAt + staleAfterMs` 现算兜底。
+ *
+ * v0.9.8（D2/V097-07）：被置 failed 的成员，其名下**未认领单**连带释放回共享待领池
+ * （{@link releaseUnclaimedTask}：删 to + history）。没有这一步，供给超时（lead
+ * server 中途死亡）后派给该成员的单同样永久搁浅——他人 not_assignee、失败成员无法
+ * 认领、pending 不在清扫域。释放随本函数的调用方 writeTeam 一并落盘。
  */
 export function sweepStaleProvisioningLocked(
   team: TeamState,
@@ -1040,7 +1164,16 @@ export function sweepStaleProvisioningLocked(
     member.error = provisionTimeoutError(member.provisionedAt, deadline, staleAfterMs);
     member.lastSeen = now;
     member.provisionDeadlineAt = deadline; // 保留现场：审计/复诊可见本次判定依据
-    swept.push({ key: member.key, provisionedAt: member.provisionedAt, deadline });
+    // v0.9.8（D2/V097-07）：未认领单回池（见上方声明）。
+    const releasedTaskIds = memberUnclaimedTasks(team.tasks, member.key)
+      .filter((task) => releaseUnclaimedTask(task, { by: 'engine', now, event: 'released-provision-timeout' }))
+      .map((task) => task.id);
+    swept.push({
+      key: member.key,
+      provisionedAt: member.provisionedAt,
+      deadline,
+      ...(releasedTaskIds.length > 0 ? { releasedTaskIds } : {}),
+    });
   }
   return swept;
 }

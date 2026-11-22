@@ -306,6 +306,90 @@ export async function refreshPeerBaseRecord(
   await writePeerBaseRecord(root, next);
 }
 
+/**
+ * v0.9.8（D6/V097-16）：读基记录的**原始 JSON 对象**（含白名单外字段；缺失/坏记录 →
+ * undefined，不抛）。{@link readPeerBaseRecord} 的类型化返回会把白名单外字段藏进
+ * 编译期视野之外，「读旧→合并→写」要原样带回它们就必须读原始对象。
+ */
+export async function readPeerBaseRecordRaw(
+  root: string,
+  sessionId: string,
+): Promise<Record<string, unknown> | undefined> {
+  try {
+    const raw = stripLeadingBom(await readFile(peerBaseFile(root, sessionId), 'utf8'));
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined;
+    return parsed as Record<string, unknown>;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * v0.9.8（D6/V097-16）：基记录的**读旧→合并→写**（SessionStart 钩子面；替代旧的
+ * 「字段白名单整记录重建」）。
+ *
+ * 旧重建的三个失真（49-v098 方案 D6）：
+ * 1. `startedAt` 每次 SessionStart 重置为当前时刻（会话起始时刻不可观测）；
+ * 2. 本回合载荷没有 permission_mode 时键被丢掉，把先前记录的档类真源抹成未知
+ *    （fail-closed hold 的误判源）；
+ * 3. 白名单外的字段（其他写入面留下的/未来扩展的）整记录重建即消失。
+ *
+ * 合并口径（逐字段）：
+ * - `startedAt`：旧记录有数字即保留，缺失才落 `now`（只认首次）；
+ * - `permissionMode`：本回合载荷有值即刷新；**缺省时保留旧值**（新旧都没有则不落
+ *   该键——未知档类语义不变）；
+ * - `regToken`/`boundName`/`pid`：本回合有值即刷新，缺省保留旧值（与 v0.9.7 I1
+ *   identify 合并写同口径——两面的合并规则一致才不会互相抵消）；
+ * - `sessionId`/`cwd`/`source`/`lastSeen`：以本回合事实为准（source 缺省落 null，
+ *   与旧钩子行为一致）；
+ * - 其余键（白名单外）：原样保留。
+ *
+ * 原子性由调用方的锁保证（v0.9.8 D5：钩子侧读-改-写进 registry 锁）；本函数自身
+ * 只做「读-合并-原子写」。
+ *
+ * @returns 合并后的完整记录（测试/审计用）。
+ */
+export async function upsertPeerBaseRecord(
+  root: string,
+  sessionId: string,
+  patch: {
+    cwd: string;
+    permissionMode?: 'bypass' | 'prompting';
+    source: string | null;
+    /** startedAt 缺省取值与 lastSeen 的当前时刻。 */
+    now: number;
+    regToken?: string;
+    boundName?: string;
+    pid?: number;
+  },
+): Promise<Record<string, unknown>> {
+  const existing = await readPeerBaseRecordRaw(root, sessionId);
+  const keep = (key: string, incoming: unknown): Record<string, unknown> =>
+    incoming !== undefined
+      ? { [key]: incoming }
+      : existing !== undefined && existing[key] !== undefined
+        ? { [key]: existing[key] }
+        : {};
+  const merged: Record<string, unknown> = {
+    ...(existing ?? {}), // 白名单外字段原样保留（D6 第 3 条）
+    sessionId,
+    cwd: patch.cwd,
+    ...keep('permissionMode', patch.permissionMode),
+    source: patch.source,
+    // startedAt 只认首次（D6 第 1 条）：旧记录有数字即保留。
+    startedAt: typeof existing?.['startedAt'] === 'number' ? existing['startedAt'] : patch.now,
+    lastSeen: patch.now,
+    ...keep('regToken', patch.regToken),
+    ...keep('boundName', patch.boundName),
+    ...keep('pid', patch.pid),
+  };
+  // 写入面走既有原子写（tmp+rename）；形状是「已验证旧记录 + 本回合字段」的并集，
+  // 结构上满足 PeerBaseRecord（sessionId/cwd/startedAt/lastSeen 恒在场）。
+  await writePeerBaseRecord(root, merged as unknown as PeerBaseRecord);
+  return merged;
+}
+
 /** 读会话基记录；缺失或坏记录返回 undefined（不抛）。 */
 export async function readPeerBaseRecord(root: string, sessionId: string): Promise<PeerBaseRecord | undefined> {
   try {

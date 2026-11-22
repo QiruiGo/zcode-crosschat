@@ -490,10 +490,12 @@ describe("MEMBER_RULES_V2（守则 v2 全文，§3.4）", () => {
 });
 
 describe("场景白名单（§9.1 新增场景 prompt 组装）", () => {
-  it("WAKE_SCENES 覆盖 v0.1.0 三场景 + v0.2 六场景", () => {
+  it("WAKE_SCENES 覆盖 v0.1.0 三场景 + v0.2 六场景 + v0.9.8 steer", () => {
     expect(WAKE_SCENES).toEqual([
       "dispatch", "report", "message", "unblock", "idle", "cancel",
       "post-provision", "shutdown", "stale-sweep",
+      // v0.9.8（S1）：steer（终止→续跑）场景标签——engine.jsonl scene 可枚举审计。
+      "steer",
     ]);
   });
 

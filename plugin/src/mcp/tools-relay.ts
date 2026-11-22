@@ -34,6 +34,13 @@
  *   stop→send 尝试——插件不持有目标会话 wire），队内轴 payload 固定携带
  *   `interrupt:{requested,result:"deferred-next-turn",reason,envelope:"team-inbox"|absent}`
  *   如实回报；v0.9.2（V090-12）peer 轴显式 `envelope:"none"`+note（wire 冻结、无痕迹）。
+ * - steer：v0.9.8 起硬插队（组 S，方案 49-v098）——`steer:true`（可选参数，0 新增工具）
+ *   仅对**引擎供给成员且存在活唤醒回合**时执行「终止→resume 新回合」（终止/续跑机械在
+ *   engine/wake.ts：stopTurnForSteer + spawnResume）；目标空闲降级普通唤醒、交互式会话
+ *   降级软中断；权限仅 lead 或用户（origin=user）；失败如实回退软中断。steer 蕴含
+ *   interrupt 元数据（纠偏即插队），payload 的 interrupt 块改带 steer 三态
+ *   `{requested,result:"preempted"|"deferred-next-turn"|"unsupported",reason,stopped?,turn?}`。
+ *   peer 轴/跨 team 一律拒绝（steer_peer_axis_unsupported）。
  * - 撤回（v0.9 G-3）：`withdrawMessageIds`（仅队内轴，与 msg/urgent/interrupt/summary/
  *   source* 互斥）——只撤自己发给该目标的未读件：整行删除（mailbox.deleteMailboxMessages）
  *   + withdrawal-notice 通知帧 + engine 事件 + 尽力唤醒；含已读/非本人/不存在/已作废件
@@ -72,13 +79,13 @@ import { sanitizeKey } from "../core/sanitize.js";
 import { DEFAULT_TEAM_ID, memberState } from "../core/types.js";
 import type { TeamMessage, TeamState } from "../core/types.js";
 import { appendMailbox, classifyFrame, createMessage, deleteMailboxMessages, readMailbox } from "../core/mailbox.js";
-import { getTask, memberOpenTasks, readTeam } from "../core/teamstate.js";
+import { getTask, memberOpenTasks, readTeam, leadKeyOf } from "../core/teamstate.js";
 import { appendHeldMessage, readInboundPolicy } from "../core/policy.js";
 import { localPidDomain, peerInboxFile, peerKeyFile, peerRootFromEnv, readPeerBaseRecord } from "../core/peerdir.js";
 import { checkLinkContainment } from "../core/paths.js";
 import { peerRowsFromRecord, resolvePeerTarget, type PeerRow } from "../core/peeraddr.js";
 import { logPeerEvent, readPeerKeyFile, scanPeers, type PeerRecord } from "../core/peerregistry.js";
-import { uservoiceMatchAndConsume, verifyUservoiceStampAuthority } from "../core/uservoice.js";
+import { uservoiceMatchAndConsume, verifyUservoiceStampAuthority, type UservoiceMatch } from "../core/uservoice.js";
 import { isPeerQueueItem, type PeerQueueItem } from "../core/peermsg.js";
 import { sendPeerFrame, type MsgFrame } from "../transport/pipe.js";
 import { appendPeerEnvelopes, getPeerSessionContext } from "./peer-drain.js";
@@ -105,7 +112,7 @@ import {
   type ToolResult,
 } from "./protocol.js";
 import { renderMessage, type WakeReceiptState } from "./render.js";
-import { attemptWake, findDuplicateMail, type MailIdentity, type WakeDeferral } from "../engine/wake.js";
+import { attemptWake, findDuplicateMail, type MailIdentity, type SteerDirective, type SteerOutcome, type WakeDeferral } from "../engine/wake.js";
 import type { ToolDeps } from "./core.js";
 
 /** v1 单队固定 default（与 tools.ts 同规）。 */
@@ -122,6 +129,8 @@ interface WakeReceipt extends WakeReceiptState {
   wakeLog?: string;
   note?: string;
   wakeDeferred?: WakeDeferral;
+  /** v0.9.8（S5）：steer 三态回执（steer 请求才有；随结果透出进 payload interrupt 块）。 */
+  steer?: SteerOutcome;
 }
 
 // ---------------------------------------------------------------------------
@@ -133,6 +142,7 @@ export const RelayShape = {
   msg: z.string().min(1).optional().describe("消息正文（/xc-say 场景必须逐字引用用户原话——origin=user 盖章按字节匹配）。仅在 withdrawMessageIds 撤回模式下可省略"),
   urgent: z.boolean().optional().describe("插队：排到目标所有未读之前 + 尽力推送唤醒"),
   interrupt: z.boolean().optional().describe("软中断（v0.9 G-2）：发结构化 INTERRUPT 信封（urgent 置顶语义不变）；宿主无回合中注入原语，收方在下一回合 inbox-check 撞见后按安全点纪律回确认，payload 如实回报"),
+  steer: z.boolean().optional().describe("硬插队（v0.9.8 组 S）：仅对引擎供给成员且存在活唤醒回合时执行「终止旧回合 → --resume 新回合，纠偏作新回合首条指令」；目标空闲降级为普通唤醒；交互式会话降级为软中断（回执 unsupported，请人工 Esc）。仅 lead 或用户（origin=user）可用；成员互发一律拒绝（只允许软 interrupt）；peer 轴拒绝。不传 = 不触发任何终止（soft-interrupt/urgent 语义不变）"),
   summary: z.string().optional().describe("一句话摘要（peer 轴帧携带；队内轴进审计）"),
   sourceTaskId: z.string().optional().describe("与 sourceAttemptId 成对；任务上下文关联（过期自动作废）"),
   sourceAttemptId: z.string().optional(),
@@ -467,6 +477,7 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
    * delivered/wakeLog/note/wakeDeferred，把 WakeResult 的 startConfirmed/wakeTiers/
    * wakeFailureSeen/failureEvidence 结构性丢掉（45b 补正：relay 面四键全文件零命中，
    * 只有 note 文本披露）。现在四键随结果原样转交调用方进回执 payload + 人可读行。
+   * v0.9.8（S1/S5）：steer 指令透传（attemptWake 执行终止→续跑）+ steer 三态回执透出。
    */
   async function wake(
     toAgentKey: string,
@@ -475,8 +486,11 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
     receiptIds: readonly string[],
     ticket: string,
     urgent: boolean,
+    steer?: SteerDirective,
   ): Promise<WakeReceipt> {
     if (toSessionId === null) {
+      // v0.9.8（S5）：无 sid 的目标连唤醒都发不起——steer 的抢占更无从谈起
+      // （没有回合可终止），回执如实落 unsupported/deferred（由调用方带入 steer 块）。
       return { delivered: "mailbox", note: "target has no sessionId on file" };
     }
     const res = await attemptWake({
@@ -490,6 +504,7 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
       ticket,
       env,
       ...(urgent ? { urgent: true } : {}),
+      ...(steer !== undefined ? { steer } : {}),
     });
     return {
       delivered: res.delivered,
@@ -500,6 +515,7 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
       ...(res.wakeTiers !== undefined ? { wakeTiers: res.wakeTiers } : {}),
       ...(res.wakeFailureSeen === true ? { wakeFailureSeen: true } : {}),
       ...(res.failureEvidence !== undefined ? { failureEvidence: res.failureEvidence } : {}),
+      ...(res.steer !== undefined ? { steer: res.steer } : {}),
     };
   }
 
@@ -521,7 +537,7 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
         // 通知帧 + engine 事件 + 尽力唤醒（不带 urgent——撤回本身不是插队请求）。
         const withdrawIds = args.withdrawMessageIds;
         if (withdrawIds !== undefined) {
-          const offenders = (["msg", "urgent", "interrupt", "summary", "sourceTaskId", "sourceAttemptId", "refs"] as const)
+          const offenders = (["msg", "urgent", "interrupt", "steer", "summary", "sourceTaskId", "sourceAttemptId", "refs"] as const)
             .filter((k) => args[k] !== undefined);
           if (offenders.length > 0) {
             throw invalidParamsError(
@@ -634,7 +650,10 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
         const refs = await resolveMessageRefs(workspace, args.refs);
 
         // C1 语义归一：interrupt 蕴含 urgent（§3.1）。
-        const interruptRequested = args.interrupt === true;
+        // v0.9.8（S1）：steer 蕴含 interrupt——纠偏即插队（软中断信封 + urgent 排序），
+        // 抢占成功时另有终止→续跑；降级路径（空闲/交互式）就是软中断本体。
+        const steerRequested = args.steer === true;
+        const interruptRequested = args.interrupt === true || steerRequested;
         const urgent = args.urgent === true || interruptRequested;
         const content = args.msg;
         const now = Date.now();
@@ -706,6 +725,68 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
           }
         }
 
+        // v0.9.8（S4）：**steer 权限闸前置**——在入站策略（hold/refuse 会落盘）之前：
+        // 拒绝时一个字节都不落箱，连隔离区都不进（「成员→成员一律拒绝」的纪律形态）。
+        // lead 直判（无需盖章）；非 lead 才提前算 origin=user 依据。为不改变非 steer
+        // 路径的盖章顺序（held/refuse 不消耗用户原话印章的既有语义），盖章抽成
+        // **记忆化闭包**：非 steer 路径仍在原位置首次求值（顺序逐字节不变）；steer 路径
+        // 在此提前求值一次——显式取舍：被拒/被暂存的 steer 消息也会消耗那条用户原话
+        // 印章（steer 是高权限请求，调用方应为授权判定付出这一次性成本）。
+        type StampOutcome = UservoiceMatch | { hit: false; reason: string };
+        let cachedStamp: StampOutcome | undefined;
+        const computeStamp = async (): Promise<StampOutcome> => {
+          if (cachedStamp !== undefined) return cachedStamp;
+          cachedStamp = toolFrameType !== undefined
+            ? { hit: false, reason: "machine-frame-exempt (C6/C7)" }
+            : await (async () => {
+                // v0.9.1（G-11）：me.voiceOwner = 本连接经唤醒 nonce 证明继承的原会话
+                // （wakeToken 路径转记）。盖章核验据此承认共享 sid 的无头续跑——不再因
+                // 桌面原会话（elsewhere 活进程）持有同一 sid 而拒章；无证明（hook/peer
+                // 注册）时恒缺失，拒绝线不放松（安全面不回退）。
+                const authority = await verifyUservoiceStampAuthority(
+                  peerRootFromEnv(env), stateRoot, me.sessionId,
+                  { voiceOwner: me.voiceOwner },
+                );
+                if (!authority.ok) {
+                  await logEngineEvent(stateRoot, {
+                    event: "uservoice-stamp-refused",
+                    sessionId: me.sessionId,
+                    reason: authority.reason,
+                  });
+                  return { hit: false as const, reason: authority.reason };
+                }
+                return await uservoiceMatchAndConsume(peerRootFromEnv(env), me.sessionId, content, now, env);
+              })();
+          return cachedStamp;
+        };
+        if (steerRequested) {
+          const steerTeam = await readTeam(stateRoot, me.teamId);
+          const steerLeadKey = steerTeam !== undefined ? leadKeyOf(steerTeam) : null;
+          const isLead = steerLeadKey !== null && steerLeadKey !== "" && me.agentKey === steerLeadKey;
+          const isUser = isLead || (await computeStamp()).hit === true;
+          if (!isLead && !isUser) {
+            await logEngineEvent(stateRoot, {
+              event: "steer-rejected",
+              teamId: me.teamId,
+              from: me.agentKey,
+              to: toKey,
+              reason: "steer is lead/user only; member-to-member steer is refused (soft interrupt stays allowed)",
+            });
+            throw new ToolError(
+              {
+                error: "steer_not_authorized",
+                to: toKey,
+                from: me.agentKey,
+                leadKey: steerLeadKey,
+                message: `steer_not_authorized: "${me.agentKey}" is neither the team lead nor a user-stamped session `
+                  + "(origin=user) — steer (terminate→resume) is restricted to the lead or the user; "
+                  + "members may still send a soft interrupt (interrupt:true) or an urgent message",
+              },
+              "steer is lead/user only; members may use interrupt:true (soft interrupt) instead",
+            );
+          }
+        }
+
         // 入站策略（§7.4-I4）：chat 路径前置裁决（与 guards.ts guardedMessage 同口径；
         // 组装链包装时 accept 双读无害、hold/refuse 外层短路后内层不可达）。
         // hold 暂存件保留 urgent（审阅接受后插队不丢）；refuse 回写白名单帧不唤醒。
@@ -730,6 +811,7 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
             messageId: msg.id,
             ...(urgent ? { urgent: true } : {}),
             ...(interruptRequested ? { interruptRequested: true } : {}),
+            ...(steerRequested ? { steerRequested: true } : {}),
             ...(refs !== undefined ? { refCount: refs.length } : {}),
           });
           return okResult(
@@ -743,7 +825,17 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
               policy: "hold",
               ...(urgent ? { urgent: true } : {}),
               // held 件不带 envelope 标注——信封未进可读邮箱（接受审阅后随元数据渲染）。
-              ...(interruptRequested ? { interrupt: interruptBlock(false) } : {}),
+              // v0.9.8（S5）：steer 请求被 hold 挡下 → 回执明说「steer 未执行」（消息在
+              // 隔离区，既没唤醒也没终止）；不写普通 interrupt 块让调用方误以为已投递。
+              ...(steerRequested
+                ? {
+                    interrupt: {
+                      requested: true as const,
+                      result: "deferred-next-turn" as const,
+                      reason: `入站策略 hold（source=${policy.source}）——消息在隔离区，steer 未执行（无唤醒、无终止）；xc_review({action:"accept"}) 放行后随下次投递生效`,
+                    },
+                  }
+                : interruptRequested ? { interrupt: interruptBlock(false) } : {}),
               ...(refs !== undefined ? { refs } : {}),
             },
           );
@@ -779,27 +871,9 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
         // v0.7（C6，E4 §7.3）：C6/C7 机器帧免盖章——B 的 prompt 逐字包含请求帧文本时，
         // UserPromptSubmit 钩子会把机器请求当用户原话存档、relay 同文即盖章
         // （engine.jsonl uservoice-hit 实测）；机器帧不应有用户亲述语义。
-        const stamp = toolFrameType !== undefined
-          ? { hit: false as const, reason: "machine-frame-exempt (C6/C7)" }
-          : await (async () => {
-              // v0.9.1（G-11）：me.voiceOwner = 本连接经唤醒 nonce 证明继承的原会话
-              // （wakeToken 路径转记）。盖章核验据此承认共享 sid 的无头续跑——不再因
-              // 桌面原会话（elsewhere 活进程）持有同一 sid 而拒章；无证明（hook/peer
-              // 注册）时恒缺失，拒绝线不放松（安全面不回退）。
-              const authority = await verifyUservoiceStampAuthority(
-                peerRootFromEnv(env), stateRoot, me.sessionId,
-                { voiceOwner: me.voiceOwner },
-              );
-              if (!authority.ok) {
-                await logEngineEvent(stateRoot, {
-                  event: "uservoice-stamp-refused",
-                  sessionId: me.sessionId,
-                  reason: authority.reason,
-                });
-                return { hit: false as const, reason: authority.reason };
-              }
-              return await uservoiceMatchAndConsume(peerRootFromEnv(env), me.sessionId, content, now, env);
-            })();
+        // v0.9.8（S4）：改调记忆化闭包 computeStamp——steer 权限闸（上方，入站策略之前）
+        // 可能已提前求值；非 steer 路径在此首次求值，顺序与旧实现逐字节等价。
+        const stamp = await computeStamp();
 
         const out = await withTeamLock(stateRoot, me.teamId, async () => {
           const team = await readTeam(stateRoot, me.teamId);
@@ -976,6 +1050,8 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
         let sentNote: string | undefined;
         // v0.9.7（W3/V096-24）：wake 回执的三态快照（45b 补正立项的 relay 残面）。
         let wakeReceipt: WakeReceiptState | undefined;
+        // v0.9.8（S5）：steer 三态回执（steer 请求且真的走了投递路径才有）。
+        let steerOutcome: SteerOutcome | undefined;
         if (out.delivered === "duplicate") {
           delivered = "duplicate";
         } else if (toolFrameType === "tool_request") {
@@ -994,7 +1070,17 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
             requestId: toolRequestCheck?.frame.requestId ?? null,
           });
         } else {
-          const sent = await wake(toKey, out.toSessionId, "message", [out.messageId], out.content, urgent);
+          // v0.9.8（S1）：steer 请求 → 场景标签 "steer"（engine.jsonl 可枚举审计）+
+          // steer 指令（发起者/用户原话标记；终止→续跑机械在 engine/wake.ts）。
+          const sent = await wake(
+            toKey,
+            out.toSessionId,
+            steerRequested ? "steer" : "message",
+            [out.messageId],
+            out.content,
+            urgent,
+            steerRequested ? { by: me.agentKey, ...(stamp.hit ? { viaUser: true } : {}) } : undefined,
+          );
           delivered = sent.delivered;
           // v0.9.5（A4/V094-06）：note 透传（回执 payload `note` 字段 + 人可读行）。
           sentNote = sent.note;
@@ -1003,7 +1089,9 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
           if (sent.wakeDeferred !== undefined) wakeDeferred = sent.wakeDeferred;
           // v0.9.7（W3/V096-24）：三态键透传（renderMessage 传 startConfirmed 与失败措辞；
           // payload 四键全带）。
+          // v0.9.8（S5）：steer 三态回执透出（payload interrupt 块改带 steer 形状）。
           wakeReceipt = sent;
+          steerOutcome = sent.steer;
         }
         await logEngineEvent(stateRoot, {
           event: "message",
@@ -1014,6 +1102,10 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
           delivered,
           ...(urgent ? { urgent: true } : {}),
           ...(interruptRequested ? { interruptRequested: true } : {}),
+          // v0.9.8（S1）：steer 请求与结果词进审计（三态可枚举对账）。
+          ...(steerRequested
+            ? { steerRequested: true, ...(steerOutcome !== undefined ? { steerResult: steerOutcome.result } : {}) }
+            : {}),
           ...(args.summary !== undefined ? { summary: args.summary } : {}),
           ...(toolFrameType !== undefined ? { frame: toolFrameType } : {}),
           // v0.9.1（G-10）：引用条数进审计（路径与 sha256 已在消息真源里，审计只记计数）。
@@ -1060,6 +1152,23 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
         // 「已发起唤醒（非送达确认）」；payload 的 `note` 字段承载 attemptWake 原文。
         // v0.9.7（W3/V096-24）：wake 态行再传 startConfirmed（未见启动证据两态）与
         // 失败第三态措辞（两轮唤醒全失败 → 不再写「已发起唤醒」）；payload 补四键。
+        // v0.9.8（S5）：steer 请求时 interrupt 块改带 **steer 三态**
+        // （{requested,result:"preempted"|"deferred-next-turn"|"unsupported",reason,
+        // stopped?,turn?}）——与普通 interrupt 的 {requested,result,reason,envelope}
+        // 形状不同（PROTOCOL §7 的 steer 形态）；没有 steer 时逐字节不变（冻结契约不减）。
+        // steerOutcome 缺席（duplicate / C6 帧禁唤醒 / 无 sid）= steer 机械未跑，
+        // 如实合成 deferred 块（不假装抢占过）。
+        const steerBlock: SteerOutcome | undefined = steerRequested
+          ? steerOutcome ?? {
+              requested: true,
+              result: "deferred-next-turn",
+              reason: out.delivered === "duplicate"
+                ? "消息与既有未读件重复（duplicate）——未重新投递，steer 未执行；既有件即纠偏载体（pull 兜底可读）"
+                : toolFrameType === "tool_request"
+                  ? "C6/C7 协议帧不唤醒投递（tool-request 禁令）——steer 未执行；收方下回合读箱即处理"
+                  : "目标无 sessionId 记录（无法终止/续跑）——steer 未执行，纠偏留在邮箱（pull 兜底）",
+            }
+          : undefined;
         return okResult(
           renderMessage(
             out.messageId,
@@ -1069,6 +1178,7 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
             sentNote,
             wakeReceipt?.startConfirmed,
             wakeReceipt,
+            steerBlock,
           ),
           {
             messageId: out.messageId,
@@ -1081,7 +1191,10 @@ export function createTeamRelayCore(deps: ToolDeps): TeamRelayCore {
             ...(urgent ? { urgent: true } : {}),
           // v0.9（G-2）：信封标注只在消息真实落箱（非 duplicate）时携带——duplicate
           // 返回的是既有消息，未必带 interrupt 元数据，不得虚报。
-          ...(interruptRequested ? { interrupt: interruptBlock(out.delivered !== "duplicate") } : {}),
+          // v0.9.8（S5）：steer 请求 → interrupt 块 = steer 三态（见 steerBlock）。
+          ...(steerBlock !== undefined
+            ? { interrupt: steerBlock }
+            : interruptRequested ? { interrupt: interruptBlock(out.delivered !== "duplicate") } : {}),
           ...(delivered === "duplicate" ? { duplicate: true } : {}),
           // v0.9.1（G-10）：refs 回显（duplicate 返回既有件——其引用集可能与本次不同，
           // 故只在真实落箱时回显，避免虚报「这条带了新引用」）。
@@ -1133,6 +1246,21 @@ export async function relayPeerSend(
   interruptRequested: boolean,
 ): Promise<ToolResult> {
   const { stateRoot, env } = deps;
+  // v0.9.8（S4）：**跨 team / peer 轴 steer 拒绝**——steer 的终止→续跑机械只持有队内
+  // 引擎供给成员的会话证据（team.json identity=engine + registry 会话记录 pid）；peer 轴
+  // 目标是别的插件的活会话，插件无权终止，也没有车道证据。显式拒收，不静默降级。
+  if (args.steer === true) {
+    throw new ToolError(
+      {
+        error: "steer_peer_axis_unsupported",
+        to: target,
+        axis: "peer",
+        message: "steer (terminate→resume) is team-axis only: the peer axis is a foreign plugin session "
+          + "with no engine-member evidence and no termination right — use interrupt:true (soft interrupt) instead",
+      },
+      "steer is team-axis only; peer targets accept interrupt:true (soft interrupt) only",
+    );
+  }
   // v0.9（G-3）：撤回是队内邮箱语义（messageId + readAt 真源都在 team inbox）——peer
   // 队列没有可撤的真源（管道即达/文件退化件无未读簿），显式拒收，不静默降级。
   if (args.withdrawMessageIds !== undefined) {
@@ -1602,6 +1730,9 @@ export function registerRelay(
     "urgent=true queues it ahead of every unread message and best-effort pushes a wake; interrupt=true sends a structured soft-interrupt " +
     "envelope (urgent ordering unchanged) — the host has no mid-turn injection primitive, so the receiver sees it at its next inbox check " +
     "and acks per the safety-point discipline (finish the current atomic operation, start nothing new, reply to confirm); the payload reports this honestly. " +
+    "steer=true (optional, v0.9.8 group S) hard-preempts an ENGINE-supplied member that has a live wake turn: terminate the old turn (graceful WM_CLOSE first, force kill only after XC_STEER_GRACE_MS, default 8s) then --resume a new turn whose first instruction is the steer envelope (correction body ≤2KB + taskId/journal pointer; the envelope states the previous turn was aborted and unsaved progress may be lost). " +
+    "Degrades honestly: idle target → plain wake; interactive session → soft interrupt with interrupt.result=\"unsupported\" (only the user can Esc). " +
+    "Lead or user (origin=user) only — member-to-member steer is refused (soft interrupt stays allowed); the peer axis is refused (steer_peer_axis_unsupported). " +
     "withdrawMessageIds (team axis only, v0.9) withdraws your own still-unread messages: all-or-nothing — any read/foreign/missing/discarded id, or a withdrawal-notice frame itself (notices are the accounting anchor and are never withdrawable), rejects the whole order with per-item status. " +
     "refs (optional, v0.9.1 G-10) attaches file references to the message: each entry must be a real regular file inside the workspace (path+sha256, computed when omitted; the same three hard gates as xc_report evidence), and the receiver's envelope renders a \"open that path with Read\" hint — references are never inlined and never base64. " +
     "forwardOf was removed in v0.6: write the body directly, send annotations as a separate message. " +

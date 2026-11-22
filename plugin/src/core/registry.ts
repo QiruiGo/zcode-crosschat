@@ -435,14 +435,30 @@ export async function createWakeNonce(
  * 「一张坏票」降级成「一张被跳过的票」：其余票据照常参与判定，审计指向坏文件。
  * 与 {@link coerceWakeNonce} 的宽容读取同族（形状不合法早已按 undefined 跳过），
  * 差别只在 JSON 语法层——此前它走的是 throw 分支。
+ *
+ * v0.9.8（D4/V097-12）：**读取错误也按坏票处理**。旧实现的 readFile catch 只放行
+ * ENOENT，其余 errno（票据路径被换成**目录**的 EISDIR、权限被收的 EACCES/EPERM 等）
+ * 原样上抛 → 同样把三个扫描点整单选成 internal（形态与 F-2 同族：一张问题票拖垮
+ * 所有 dispatch/relay，且回执不知指向哪个文件）。现在非 ENOENT 读取失败与坏 JSON
+ * 同口径：跳过该票 + 审计 `wake-ticket-corrupt{path,error}`（error 带 errno 与原文，
+ * 运维可分辨「写坏了」与「读不了」），返回 undefined。ENOENT（真缺席）语义不变。
  */
 export async function readWakeNonce(stateRoot: string, token: string): Promise<WakeNonce | undefined> {
   let raw: string;
   try {
     raw = await readFile(wakeFile(stateRoot, token), 'utf8');
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
-    throw error;
+    const code = (error as NodeJS.ErrnoException).code;
+    // v0.9.8（D4/V097-12）：ENOENT = 票据真缺席（语义不变、无审计）；其余读取错误
+    // （EISDIR/EACCES/EPERM…）= 问题票：跳过 + 审计指向文件，不再整单 internal。
+    if (code === 'ENOENT') return undefined;
+    await logEngineEvent(stateRoot, {
+      event: 'wake-ticket-corrupt',
+      path: wakeFile(stateRoot, token),
+      error: `${code ?? 'unknown'}: ${error instanceof Error ? error.message : String(error)}`,
+      reason: 'read-failed',
+    });
+    return undefined;
   }
   let parsedJson: unknown;
   try {
@@ -453,6 +469,7 @@ export async function readWakeNonce(stateRoot: string, token: string): Promise<W
       event: 'wake-ticket-corrupt',
       path: wakeFile(stateRoot, token),
       error: error instanceof Error ? error.message : String(error),
+      reason: 'parse-failed',
     });
     return undefined;
   }

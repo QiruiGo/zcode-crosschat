@@ -22,6 +22,9 @@
  * self/task/member 口径差异由本模块的纯函数钉死（selectHandoffTasks /
  * handoffUnreadView），工具层只负责取数。
  *
+ * v0.9.8（组 O R2）：第 1 章身份内联「可寻址队友」名单（队内 key / peer 名，
+ * payload `roster` 同帽）——与 xc_overview 成员行同一解析源注入，两面一致。
+ *
  * @module core/handoff
  */
 import type { MemberRole, MemberState, Task, TaskPriority, TaskStatus, TeamMessage, TeamState } from './types.js';
@@ -47,6 +50,12 @@ export const HANDOFF_POOL_MAX = 10;
 export const HANDOFF_UNREAD_MAX = 5;
 /** 基础帽：建议下一步条数（§4.2 ≤5）。 */
 export const HANDOFF_SUGGESTIONS_MAX = 5;
+/**
+ * v0.9.8（组 O R2）：可寻址队友名单的基础帽（章 1 内联渲染，超限披露「等 N 人」；
+ * payload 同帽裁切——C2-B5 纪律：文本与 JSON 不分裂）。章 1 永不被降级，故名单
+ * 体积必须自带上界，否则超大花名册会把 4000 字符预算挤爆、连坐降级其他章。
+ */
+export const HANDOFF_ROSTER_MAX = 10;
 
 // ---------------------------------------------------------------------------
 // 类型（input = 工具层注入的数据；payload = 冻结的七要素面）
@@ -111,6 +120,18 @@ export interface HandoffUnread {
   withheld?: 'subjects';
 }
 
+/**
+ * v0.9.8（组 O R2）：可寻址名条目——「谁能被直接找到、用什么名字找到」。
+ * `key` = 队内花名册键（队内 `xc_relay({to:"<key>"})` 直达，恒在）；
+ * `peerName` = 跨会话 peer 花名（absent = 当前无活跃 peer 记录，仅队内可达）。
+ * 工具层经 peer-services 的 peerNameBySessionId 解析后注入（本模块无 I/O）。
+ */
+export interface HandoffRosterEntry {
+  key: string;
+  peerName?: string;
+  isLead?: boolean;
+}
+
 /** 容量（level 由 core/checkpoint.ts 的推导助手产出——三视图同一口径）。 */
 export interface HandoffCapacity {
   watermarkPct: number;
@@ -147,6 +168,12 @@ export interface HandoffInput {
   stalled: StallFlag[];
   /** 我的在途任务 id（task 视角的单在途规则提示用；self 视角可为 null）。 */
   myOpenTaskId: string | null;
+  /**
+   * v0.9.8（组 O R2）：可寻址队友名单（工具层解析后注入；self 由本模块剔除——
+   * 自己的队内键已在身份行 `agent:` 给出）。absent = 调用方未提供（旧形状兼容），
+   * 此时第 1 章不出寻址行、payload 无 `roster` 键。
+   */
+  roster?: readonly HandoffRosterEntry[];
   /**
    * v0.8.1（29 红队 C2-B3 修复）：**连续性指针**（仅 self 视角由工具层在「本包三要素
    * 全空」时算出并注入）——花名册里有成员的会话已不在场、却持有开放任务/未读/检查点，
@@ -201,6 +228,12 @@ export type HandoffPayload = {
   warnings?: string[];
   /** member 视角在场（§4.4：未读只给计数）。 */
   unreadWithheld?: 'subjects';
+  /**
+   * v0.9.8（组 O R2）：可寻址队友名单（payload 与第 1 章文本**同帽**裁切——C2-B5）。
+   * 每项 {key, peerName?, isLead?}；key 恒在（队内可达），peerName absent = 仅队内。
+   * absent = 调用方未提供 roster 输入（旧形状兼容）。
+   */
+  roster?: Array<{ key: string; peerName?: string; isLead?: boolean }>;
 };
 
 export interface HandoffAssembly {
@@ -465,6 +498,15 @@ function checkpointEmptyLine(input: HandoffInput): string {
   return '（无检查点：/xc-checkpoint 可一键落盘）';
 }
 
+/**
+ * R2：队友可寻址名单（self 剔除 + 基础帽）——**文本面与 payload 共用同一组数**
+ * （C2-B5 纪律：`cappedItems.roster.shown === payload.roster.length` 恒成立）。
+ */
+function rosterEntries(input: HandoffInput): { all: readonly HandoffRosterEntry[]; shown: readonly HandoffRosterEntry[] } {
+  const all = (input.roster ?? []).filter((e) => e.key !== input.identity.agentKey);
+  return { all, shown: all.slice(0, HANDOFF_ROSTER_MAX) };
+}
+
 /** 固定降级序列的某一级渲染（body 不含截断尾行；尾行由 compose 拼）。 */
 function renderBody(input: HandoffInput, level: DegradeLevel, suggestions: readonly string[]): RenderedBody {
   const droppedSet = new Set<string>();
@@ -479,6 +521,24 @@ function renderBody(input: HandoffInput, level: DegradeLevel, suggestions: reado
     `- agent: ${id.agentKey} | team: ${id.teamId} | lead: ${id.leadKey ?? '(none)'}`
     + ` | role: ${id.role ?? '(not on roster)'} | state: ${id.memberState ?? '(not on roster)'} | isLead: ${id.isLead}`,
   );
+  // v0.9.8（组 O R2）：可寻址名——自己的队内键即身份行的 `agent:`（xc_relay({to:...})
+  // 直达）；此处列**队友**的两种地址（队内 key 恒在 / peer 名 absent = 仅队内可达），
+  // 与 xc_overview 成员行（team 板面 + panel）同一解析源，两面一致、可直接复制。
+  const roster = rosterEntries(input);
+  const rosterAll = roster.all;
+  const rosterShown = roster.shown;
+  if (rosterAll.length > 0) {
+    const detail = rosterShown
+      .map((e) =>
+        `${e.key}${e.isLead === true ? '(lead)' : ''}（队内 ${e.key}`
+        + `${e.peerName !== undefined && e.peerName !== '' ? ` / peer ${e.peerName}` : ' / 仅队内'}）`)
+      .join('、');
+    lines.push(
+      `- 可寻址队友: ${detail}`
+      + (rosterAll.length > rosterShown.length ? ` 等 ${rosterAll.length} 人` : ''),
+    );
+    lines.push('- 直连: 队内 xc_relay({to:"<队内 key>"})；跨会话 xc_relay({to:"<peer 名>"})（列了 peer 名的成员）——不必经过 lead');
+  }
 
   // 2. 任务（L3 降级：只留第 1 条）
   lines.push(chapter2Title(input.filter));
@@ -633,6 +693,8 @@ export function assembleHandoff(input: HandoffInput): HandoffAssembly {
   const unreadShown = unreadShownCount(level, input.unread.top.length);
   const suggestionsShown = suggestionsShownCount(level, suggestions);
   const suggestionsRawTotal = suggestionsTotal(input, suggestions);
+  // v0.9.8（组 O R2）：队友名单的文本/payload 同帽（self 剔除后取前 N）。
+  const roster = rosterEntries(input);
   const cappedItems: Record<string, { shown: number; total: number }> = {};
   if (tasksShown < input.tasks.length) cappedItems.tasks = { shown: tasksShown, total: input.tasks.length };
   if (poolShown < input.poolTotal) cappedItems.pool = { shown: poolShown, total: input.poolTotal };
@@ -643,6 +705,10 @@ export function assembleHandoff(input: HandoffInput): HandoffAssembly {
   }
   if (suggestionsShown < suggestionsRawTotal) {
     cappedItems.suggestions = { shown: suggestionsShown, total: suggestionsRawTotal };
+  }
+  // R2：名单被基础帽裁切时留名（shown 恒等于 payload.roster.length——C2-B5）。
+  if (roster.shown.length < roster.all.length) {
+    cappedItems.roster = { shown: roster.shown.length, total: roster.all.length };
   }
   const anyCapped = Object.keys(cappedItems).length > 0;
 
@@ -673,6 +739,16 @@ export function assembleHandoff(input: HandoffInput): HandoffAssembly {
     checkpoint: input.checkpoint,
     suggestions: suggestions.slice(0, suggestionsShown),
     filter: input.filter,
+    // v0.9.8（组 O R2）：可寻址队友名单（与第 1 章文本同帽；absent = 调用方未提供）。
+    ...(roster.all.length > 0
+      ? {
+          roster: roster.shown.map((e) => ({
+            key: e.key,
+            ...(e.peerName !== undefined ? { peerName: e.peerName } : {}),
+            ...(e.isLead !== undefined ? { isLead: e.isLead } : {}),
+          })),
+        }
+      : {}),
     ...(level >= 1 || anyCapped
       ? {
           truncated: {

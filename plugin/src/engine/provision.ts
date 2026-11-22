@@ -22,9 +22,12 @@
  * （member-tools 负责）；本模块从不 resume 一个正被其他 keeper 持有的会话——keeper
  * 生命周期被限制在单次 provisionMember 调用内。
  *
- * 本模块不触碰磁盘真源（wakeToken nonce 写入是唯一例外，registry/wake/<token>.json，
+ * 本模块的磁盘纪律：wakeToken nonce 写入是既有例外（registry/wake/<token>.json，
  * 与 v0.1.0 attemptWake 同款新文件原子写）；roster/names 的正式变更由 member-tools 在
- * registry→team 锁序内完成。
+ * registry→team 锁序内完成。v0.9.8（D2/V097-07）新增第二条例外：**供给失败路径**经
+ * core/teamstate.ts 的 repoolUnclaimedTasksForFailedMember 把该成员未认领单回池并
+ * 通知创建者（团队锁内读-改-写的状态自愈，repairTeamState 同族；幂等且 IO 失败只
+ * 记审计不抛）——没有它，provisioning 期间收到的派发单在失败后永久搁浅。
  */
 
 import { DEFAULT_TEAM_ID } from "../core/types.js";
@@ -32,7 +35,7 @@ import { createWakeNonce, readNames } from "../core/registry.js";
 // v0.7.1（故障注-1 修复）：超时默认值与 env 解析迁入 core/teamstate.ts（provisioning
 // deadline 的清扫方含钩子，钩子只能 import M1）；此处 import 自用并按原路径转出，
 // 既有导入方（tools-team.ts 等）不变。
-import { bootstrapTimeoutFromEnv } from "../core/teamstate.js";
+import { bootstrapTimeoutFromEnv, repoolUnclaimedTasksForFailedMember } from "../core/teamstate.js";
 // v0.7.1 起的原路径转出（既有导入方 tools-team.ts 等）不动。
 export {
   DEFAULT_MEMBER_BOOTSTRAP_TIMEOUT_MS,
@@ -197,6 +200,10 @@ export function resolveReasoningFallbackTarget(
 /** 模型选择（§6.2 步骤②：provider 过滤 → model 精确命中否则首个；档位显式优先，
  * 缺省取模型自报缺省档/表末位兜底——v0.9.7 W1）。
  *
+ * v0.9.8（D1/V097-01）：缺省路径的档位名与模型**声明表**交叉校验——自报缺省档不在
+ * 声明表里 → 回退表末位 + `reasoningFallback{from,to}`（调用方落
+ * `member-reasoning-fallback` 审计），不把错档发给 setModel 首试。
+ *
  * v0.9.4（A7）：**显式 model 匹配不到 → 显式报错**（附可用 modelId 列表），不再静默取
  * 枚举首个。旧行为（`?? pool[0]!`）把「配错了 model」呈现成「用了一个别的模型」：
  * 建员回执写的还是请求的 model 名（ProvisionResult.modelId 取 chosen），调用方无从
@@ -236,14 +243,32 @@ export function pickModel(
     // 只声明 low/medium/high 的 step-5-preview 首试 setModel 失败（R2 残留）。
     // 现在缺省配置首试即取 defaultLevel（step-5-preview 实测 defaultLevel="high"，
     // 与其档位表末位一致）：0 次失败重试。
-    const fallbackFromTable = (): string => {
+    //
+    // v0.9.8（D1/V097-01）：**档位名与声明表交叉校验**——自报缺省档不在模型自己的
+    // 声明表里（枚举数据自相矛盾；权威合并前的陈旧兜底流也曾把错档锁进来）→ 回退
+    // 档位表末位并记 reasoningFallback，由 provision 侧落
+    // `member-reasoning-fallback{from,to}` 审计（「错档注入 → 审计/回退」的验收
+    // 口径）；不发一个声明表里没有的档位去赌 setModel 首试。声明表为空（模型未
+    // 声明）时无判据可交叉，维持原样（setModel 重试链兜底）。
+    const fallbackFromTable = (): { reasoningLevel: string; reasoningFallback?: { from: string; to: string } } => {
       const declaredDefault = hit.defaultReasoningLevel?.trim();
-      if (declaredDefault !== undefined && declaredDefault !== "") return declaredDefault;
-      return levels.length > 0 ? levels[levels.length - 1]! : "max";
+      if (declaredDefault !== undefined && declaredDefault !== "") {
+        if (levels.length === 0 || levels.includes(declaredDefault)) {
+          return { reasoningLevel: declaredDefault };
+        }
+        const target = levels[levels.length - 1]!;
+        return {
+          reasoningLevel: target,
+          reasoningFallback: { from: declaredDefault, to: target },
+        };
+      }
+      return { reasoningLevel: levels.length > 0 ? levels[levels.length - 1]! : "max" };
     };
     const preferReasoning = options.preferReasoning;
     if (preferReasoning === undefined || preferReasoning.trim() === "") {
-      return { reasoningLevel: fallbackFromTable() }; // 未配置 = 没有意图：模型自报缺省档 → 档位表末位（最高声明档）
+      // 未配置 = 没有意图：模型自报缺省档 → 档位表末位（最高声明档）→ "max"；
+      // v0.9.8（D1）起自报缺省档先与声明表交叉校验，非法即回退并记降级（审计）。
+      return fallbackFromTable();
     }
     // v0.9.6（R2）：显式**非法档位**（不是可辨认的档位名）→ 显式报错，不静默降级。
     if (!KNOWN_REASONING_TIERS.includes(preferReasoning.trim())) {
@@ -605,6 +630,21 @@ export async function provisionMember(deps: ToolDeps, spec: ProvisionSpec): Prom
       } catch {
         /* 回收是失败路径的尽力清理：失败不掩盖原始供给错误（事件面已有 wake-failed 家族） */
       }
+    }
+    // v0.9.8（D2/V097-07）：供给失败 → 该成员名下**未认领单**回池 + 通知创建者。
+    // 形态：成员 provisioning 期间收到的派发单只有 `to` 没有 `assignee`（认领才落
+    // assignee）——供给失败后旧实现任其永久搁浅（他人 claim 得 not_assignee、失败
+    // 成员无法认领、pending 不在 stale 清扫域、创建者零回执）。回池判据（to 命中 ∧
+    // assignee 空）与释放/通知实现在 core/teamstate.ts 的
+    // repoolUnclaimedTasksForFailedMember（团队锁内读-改-写，幂等；IO 失败只记审计
+    // 不抛——不掩盖原始供给错误）。先于下方回收证据重抛：两条清理路径都要走到。
+    try {
+      await repoolUnclaimedTasksForFailedMember(deps.stateRoot, teamId, spec.key, {
+        reason: "provision-failed",
+        detail: err instanceof Error ? err.message : String(err),
+      });
+    } catch {
+      /* 回池是失败路径的尽力清理：失败不掩盖原始供给错误（函数自身已吞 IO 错） */
     }
     if (revocationDigest !== undefined && err instanceof ProvisionError) {
       throw new ProvisionError(

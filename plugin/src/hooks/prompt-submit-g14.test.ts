@@ -85,6 +85,13 @@ const checkpointMocks = vi.hoisted(() => ({
     ageMin === undefined
       ? "[zcode-crosschat] 建议先 /xc-checkpoint（尚未落过检查点）"
       : `[zcode-crosschat] 建议先 /xc-checkpoint（距上次检查点 ${ageMin}min）`),
+  // v0.9.8（组 O C1）：上下文体积提醒三件套（缺省「低于阈值」= 不注入，本文件用例零影响）
+  readContextSize: vi.fn(async (): Promise<{ bytes: number; messages: number }> => ({ bytes: 0, messages: 0 })),
+  contextNudgeDecision: vi.fn(
+    (): { nudge: boolean; reason: string; bytes: number; messages: number } =>
+      ({ nudge: false, reason: "below-threshold", bytes: 0, messages: 0 }),
+  ),
+  renderContextNudgeLine: vi.fn(() => ""),
   writeNudgeMarker: vi.fn(async (): Promise<void> => {}),
 }));
 

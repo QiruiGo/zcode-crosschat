@@ -154,6 +154,51 @@ export function wakeReceiptFailurePhrase(wake: WakeReceiptState | undefined): st
 }
 
 /**
+ * v0.9.8（S5，组 S）：**steer 回执的三态结构化输入**——字段与 engine/wake.ts 的
+ * {@link SteerOutcome} 同形（requested/result/reason/stopped/turn）：
+ * - `result:"preempted"`：终止→续跑真发生（stopped + turn 两块实况在场）；
+ * - `result:"deferred-next-turn"`：降级（目标空闲/闸挡下/终止或 spawn 失败）——
+ *   纠偏随投递送达，收方下回合生效；
+ * - `result:"unsupported"`：交互式会话（插件无权终止，只有用户 Esc）。
+ *
+ * 人可读行由 {@link steerReceiptPhrase} 产出——三态措辞分流，失败/降级不写「抢占成功」。
+ */
+export interface SteerReceiptState {
+  requested: true;
+  result: "preempted" | "deferred-next-turn" | "unsupported";
+  reason: string;
+  stopped?: { pid: number; graceful: boolean; waitedMs: number };
+  turn?: { nonce: string; startConfirmed: boolean };
+}
+
+/**
+ * v0.9.8（S5）：steer 回执的人可读短语（三态分流；无 steer → undefined）。
+ *
+ * - preempted：⛔ 抢占成功 + 终止实况（pid/graceful|forced/等待 ms）+ 新回合启动两态 +
+ *   「未落盘进度可能丢失」披露（强杀副作用，方案 §五 边界）；
+ * - deferred-next-turn：⛔ steer 降级 + 原因（idle/闸挡/失败）——不写「已抢占」；
+ * - unsupported：⛔ 不支持抢占 + 原因（交互式会话只有用户 Esc）+ 软中断兜底指引。
+ */
+export function steerReceiptPhrase(steer: SteerReceiptState | undefined): string | undefined {
+  if (steer === undefined || steer.requested !== true) return undefined;
+  if (steer.result === "preempted") {
+    const stopped = steer.stopped !== undefined
+      ? `（终止 pid ${steer.stopped.pid}，${steer.stopped.graceful ? "graceful" : "forced"}，等待 ${steer.stopped.waitedMs}ms）`
+      : "";
+    const turn = steer.turn !== undefined
+      ? steer.turn.startConfirmed
+        ? "；新回合已启动（start-confirmed）"
+        : "；新回合已发起但未见启动证据（非送达确认）"
+      : "";
+    return `⛔ steer 抢占成功${stopped}：旧回合已终止，纠偏是新回合首条指令${turn}；旧回合未落盘进度可能丢失`;
+  }
+  if (steer.result === "unsupported") {
+    return `⛔ steer 不支持抢占：${steer.reason}`;
+  }
+  return `⛔ steer 降级（未抢占）：${steer.reason}`;
+}
+
+/**
  * xc_relay 主消息路径（队内轴；peer 轴发送走 relayPeerSend 自己的信封渲染）的一行摘要。
  *
  * v0.9.5（A4/V094-06）：**文案如实**——旧实现三态都写 "delivered via X"：
@@ -173,6 +218,10 @@ export function wakeReceiptFailurePhrase(wake: WakeReceiptState | undefined): st
  *
  * v0.9.7（W3/V096-24）：wake 分支再补**失败第三态** `wake`（WakeReceiptState）——
  * 回执时刻已见失败证据时文本行改写失败措辞（不再写「已发起唤醒」），并保留 note 原文。
+ *
+ * v0.9.8（S5）：补第八个可选参 `steer`（SteerReceiptState）——steer 请求时文本行追加
+ * 三态短语（⛔ 抢占成功/降级/不支持）；缺省（undefined）输出与 v0.9.7 逐字节一致
+ * （旧调用方零行为变化）。
  */
 export function renderMessage(
   messageId: string,
@@ -182,20 +231,26 @@ export function renderMessage(
   note?: string,
   startConfirmed?: boolean,
   wake?: WakeReceiptState,
+  steer?: SteerReceiptState,
 ): string {
+  const steerPhrase = steerReceiptPhrase(steer);
   if (delivered === "mailbox") {
     const reason = note !== undefined && note.trim() !== "" ? `：${note}` : "";
-    return `Message ${shortId(messageId)} ${from} → ${to} ${renderDeliveryOutcome("mailbox")}${reason}.`;
+    return `Message ${shortId(messageId)} ${from} → ${to} ${renderDeliveryOutcome("mailbox")}${reason}`
+      + (steerPhrase !== undefined ? `；${steerPhrase}` : "") + ".";
   }
   if (delivered === "duplicate") {
-    return `Message ${shortId(messageId)} ${from} → ${to} 未重发（已存在同文未读件，duplicate；pull 兜底可读）.`;
+    return `Message ${shortId(messageId)} ${from} → ${to} 未重发（已存在同文未读件，duplicate；pull 兜底可读）`
+      + (steerPhrase !== undefined ? `；${steerPhrase}` : "") + ".";
   }
   const reason = note !== undefined && note.trim() !== "" ? `：${note}` : "";
   const failure = wakeReceiptFailurePhrase(wake);
   if (failure !== undefined) {
-    return `Message ${shortId(messageId)} ${from} → ${to} ${failure}${reason}.`;
+    return `Message ${shortId(messageId)} ${from} → ${to} ${failure}${reason}`
+      + (steerPhrase !== undefined ? `；${steerPhrase}` : "") + ".";
   }
-  return `Message ${shortId(messageId)} ${from} → ${to} ${renderDeliveryOutcome("wake", startConfirmed)}${reason}.`;
+  return `Message ${shortId(messageId)} ${from} → ${to} ${renderDeliveryOutcome("wake", startConfirmed)}${reason}`
+    + (steerPhrase !== undefined ? `；${steerPhrase}` : "") + ".";
 }
 
 // ---------------------------------------------------------------------------

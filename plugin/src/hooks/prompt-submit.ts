@@ -57,15 +57,23 @@ import { queueItemToInjectBlock, renderPeerEnvelope } from '../core/peerenvelope
 import { uservoiceWrite } from '../core/uservoice.js';
 // v0.5（R-23 面 A）：接收方注入预算与排布（属主 core/budget.ts，M1）。
 import { contextCharsFromEnv, layoutInjectBlocks, receiverInjectBudget } from '../core/budget.js';
+// v0.9.8（J2）：插队/纠偏判据——与 J1 注入排布、J3 工具边界提示同一个谓词
+// （core/mailbox.ts 唯一实现；M4 → M1 纪律不变）。
+import { isInterruptOrSteer } from '../core/mailbox.js';
 // v0.9.1（G-14）：回合开始强提醒的「已完成未接力」判据（纯函数属主 core/teamstate.ts，M1）
 // 与任务板读取——M4 → M1 纪律不变（不碰 engine/MCP）。
 import { DEFAULT_TEAM_ID } from '../core/types.js';
 import { readTeam, unrelayedCompletedTasks } from '../core/teamstate.js';
 // v0.8.0（A1，DESIGN-V0.8.md §3.5）：检查点提醒（判据/取数/文案属主 core/checkpoint.ts）。
+// v0.9.8（组 O C1）：同族增「上下文体积提醒」三件套（判据四态/取数/文案，
+// 与 checkpoint 提醒共用 .nudge 节流标记——30min 合计最多一条）。
 import {
   checkpointNudgeDecision,
   checkpointNudgeState,
+  contextNudgeDecision,
+  readContextSize,
   renderCheckpointNudgeLine,
+  renderContextNudgeLine,
   writeNudgeMarker,
 } from '../core/checkpoint.js';
 
@@ -110,6 +118,37 @@ function renderTurnStartReminder(input: {
   );
 }
 
+/**
+ * v0.9.8（J2，方案 §二 组J）：**回合首行插队/纠偏横幅**。
+ *
+ * 口径（写死）：
+ * 1. **第一行**：有 interrupt/steer 未读时，注入文本的**第一行**就是
+ *    「⛔ 插队/纠偏待处理（N 条）」——先于事故摘要（A3）、未读强提醒（G-14）、
+ *    peer 信封与检查点提醒（调用方最后 unshift，天然置顶）；
+ * 2. **再列普通未读**：横幅说明纠错已置顶预留预算，并给出其余普通未读条数；
+ * 3. **无插队不出现**：纠错条数 0 → 根本不产块（数据即收口条件，与 G-14/A3 同口径）；
+ * 4. **平台边界如实声明**：宿主无回合中注入原语，横幅只能注入上下文，不声称能拦工具调用。
+ *
+ * 判据来源 = {@link unreadSummary} 的 messages（纯读、不丢弃），与 J3 的工具边界提示
+ * 同一个谓词（core/mailbox.ts isInterruptOrSteer）——三面不漂移。
+ */
+function renderInterruptBanner(input: {
+  agentKey: string;
+  count: number;
+  senders: readonly string[];
+  normalCount: number;
+}): string {
+  const senders = input.senders.length > 0 ? `：来自 ${input.senders.join('、')}` : '';
+  const normal = input.normalCount > 0
+    ? `，再处理其余 ${input.normalCount} 条普通未读`
+    : '（本回合没有其他普通未读）';
+  return `⛔ 插队/纠偏待处理（${input.count} 条）${senders}[zcode-crosschat]。`
+    + '这些消息在注入排布里置顶并单独预留预算、绝不降级成摘要；'
+    + '请把 xc_read({scope:"inbox"}) 作为本回合第一个动作执行完'
+    + normal
+    + '。平台边界（如实声明）：宿主无回合中注入原语，本横幅只能注入上下文，不能否决或拦截任何工具调用。';
+}
+
 async function main(): Promise<void> {
   const stdin = readStdinPayload();
   const ctx = resolveHookContext('UserPromptSubmit', stdin);
@@ -150,6 +189,8 @@ async function main(): Promise<void> {
   }
 
   const blocks: string[] = [];
+  // v0.9.8（J2）：回合首行插队/纠偏横幅（在下方 names 块里算出来，main 末尾置顶）。
+  let interruptBanner: string | undefined;
 
   // --- v0.3：跨会话 peer 信封注入（面 A：保证路径）---
   try {
@@ -251,6 +292,26 @@ async function main(): Promise<void> {
             unrelayed,
           }),
         );
+        // v0.9.8（J2）：纠错（interrupt/steer）条数与发送方——横幅在 main 末尾
+        // **最后** unshift，故它才是文本第一行（先于事故摘要与未读强提醒）。
+        // 判据与 J3 工具边界提示同源（core/mailbox.ts isInterruptOrSteer）。
+        const interruptMessages = summary.messages.filter((m) => isInterruptOrSteer(m));
+        if (interruptMessages.length > 0) {
+          interruptBanner = renderInterruptBanner({
+            agentKey,
+            count: interruptMessages.length,
+            senders: [...new Set(interruptMessages.map((m) => m.from))],
+            normalCount: summary.count - interruptMessages.length,
+          });
+          await logHookEvent(ctx.stateRoot, {
+            event: 'hook-prompt-submit-interrupt',
+            sessionId: ctx.sessionId,
+            name: agentKey,
+            interrupt: interruptMessages.length,
+            senders: [...new Set(interruptMessages.map((m) => m.from))],
+            unread: summary.count,
+          });
+        }
         await logHookEvent(ctx.stateRoot, {
           event: 'hook-prompt-submit-unread',
           sessionId: ctx.sessionId,
@@ -305,6 +366,52 @@ async function main(): Promise<void> {
     }
   }
 
+  // --- v0.9.8（组 O C1）：上下文体积提醒（回合提醒面；48-v098 验收 lane「互通与面板」
+  //     实测确认此前该面零注入，方案要求「超阈值在 xc_overview(status) 与回合提醒中
+  //     各给一条」，故补上钩子这一处）---
+  // 判据四态（core/checkpoint.ts contextNudgeDecision）：disabled（XC_CONTEXT_NUDGE=0）/
+  // below-threshold（两维度都在阈值内——**正常不打扰**）/ rate-limited（超阈值但 30min
+  // 内已提醒过）/ emit。节流与上面的 checkpoint 提醒**共用 .nudge 标记**：谁先写，
+  // 另一方 30min 内不出（两类「该去 checkpoint」的建议不叠加刷屏）。
+  // 取数口径诚实边界：插件读不到宿主模型上下文，测的是该会话花名册键对应邮箱的
+  // 字节+条数积压（唯一可测信号）——文案不假装测到模型窗口。
+  // agentKey 同样沿用 names[0]（未注册会话没有「我的邮箱」，不提醒）。
+  // 任何异常只审计不阻断（钩子永不失败会话）。
+  if (names.length > 0) {
+    const agentKey = names[0]!;
+    try {
+      const now = Date.now();
+      const sample = await readContextSize(ctx.stateRoot, agentKey);
+      const decision = contextNudgeDecision({
+        env: process.env,
+        bytes: sample.bytes,
+        messages: sample.messages,
+        lastNudgeAt: (await checkpointNudgeState(ctx.stateRoot, agentKey, process.env, now)).lastNudgeAt,
+        now,
+      });
+      if (decision.nudge) {
+        // 与 checkpoint 提醒同一个节流标记：先写后注入（写失败仍注入——提醒比记账重要）。
+        try {
+          await writeNudgeMarker(ctx.stateRoot, agentKey, now);
+        } catch (error) {
+          await auditHookFailure(ctx.stateRoot, 'context-nudge-marker-failed', error);
+        }
+        blocks.push(renderContextNudgeLine(sample));
+        await logHookEvent(ctx.stateRoot, {
+          event: 'hook-context-nudge',
+          sessionId: ctx.sessionId,
+          agentKey,
+          reason: decision.reason,
+          bytes: decision.bytes,
+          messages: decision.messages,
+          ...(decision.over !== undefined ? { over: decision.over } : {}),
+        });
+      }
+    } catch (error) {
+      await auditHookFailure(ctx.stateRoot, 'prompt-submit-context-nudge', error);
+    }
+  }
+
   // --- v0.9.2（A3，方案 §二 组A）：回合开始**事故摘要**（看门狗未覆盖时的最后保险）---
   // 判据：自上一回合（registry lastTurnTs）至今，engine.jsonl 里有成员死亡 / limbo
   // 降级 / 唤醒失败三类事件 → 注入置顶块（计数 + 点名 + 处置指引 + 平台边界声明）。
@@ -332,6 +439,10 @@ async function main(): Promise<void> {
       await auditHookFailure(ctx.stateRoot, 'prompt-submit-incident-summary', error);
     }
   }
+
+  // v0.9.8（J2）：插队/纠偏横幅**最后** unshift ⇒ 它就是注入文本的第一行
+  // （先于事故摘要/未读强提醒/peer 信封/检查点提醒）。无纠错 → 零注入。
+  if (interruptBanner !== undefined) blocks.unshift(interruptBanner);
 
   // 一次 emit、一次输出（stdout 严格单键单行，hooks/shared.ts 契约）。
   // v0.8.1（29 红队 C1-B03 修复）：零注入块时也输出一行 JSON（additionalContext=""）
