@@ -41,6 +41,12 @@ vi.mock("./shared.js", async (importOriginal) => {
   };
 });
 
+// v0.9.6 r2（V096-12）：票据消费成功路径现在固定调用 writeAdoptAnchorsForHostServers
+// （真实 PowerShell 枚举轮询 [0,800,1600]，~4s/次钩子运行）——runSessionStartHook 真路径
+// 不可注入，单跑 ~4.4s/例贴默认 testTimeout=5s，全量满载下必超时（05:59 全量实跑 2 红）。
+// 只放宽时间预算、不放宽任何断言（vitest.config.ts 同纪律：retry 吸收抖动、判据不放松）。
+vi.setConfig({ testTimeout: 30_000 });
+
 const dirs: string[] = [];
 
 beforeEach(() => {

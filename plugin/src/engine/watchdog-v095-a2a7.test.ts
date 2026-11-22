@@ -157,18 +157,33 @@ describe("v0.9.5 A2/V094-13：新鲜度三源合判（peer 记录之外的死亡
     expect(readEngineEvents().filter((e) => e["event"] === "member-dead")).toHaveLength(1);
   });
 
-  it("负例（v0.9.2 A2 口径保留）：三源全窗外（peer 无记录 + witness/lastEventTs 2h 前）→ 存量死记录静音", async () => {
+  it("v0.9.6 A3/V095-07：三源全窗外（peer 无记录 + witness/lastEventTs 2h 前）+ 常规轮 → 首见死亡默认告警（宁误报一次，附【首见】标注）", async () => {
+    // v0.9.5 口径（本例原为负例）：三源全过期 → 存量死记录静默认领（notify:'sent'，
+    // 零事件零审计）。V095-07 推翻：t2 实测形态（引擎成员未 peer 注册 + 无工具回合 +
+    // 台账无历史，回合 >10min 后进程死）三源必然全过期——静默 = 真崩溃被吞。v0.9.6 起
+    // **常规轮首见一律告警**（宁误报一次）；「窗外静音」只保留在补扫轮（resume）的
+    // 补扫窗（≤7 天）之外（见 watchdog-v096-fixd.test.ts）。
     await seedTeam();
     await seedCrashedMember({ witnessAgeMs: 2 * 3_600_000, lastEventAgeMs: 2 * 3_600_000 });
     const summary = await sweepMembersOnce(deps());
-    expect(summary.dead).toEqual([]); // 只记录不告警
-    expect(readEngineEvents().filter((e) => e["event"] === "member-dead")).toHaveLength(0);
-    // 台账认领为已处置（不留给重发队列——没有通知可补）
+    expect(summary.dead).toEqual(["b"]);
+    expect(summary.firstSightDead).toEqual(["b"]);
+    const events = readEngineEvents().filter((e) => e["event"] === "member-dead");
+    expect(events).toHaveLength(1);
+    // 首见标注（宁误报一次）：lead 能把启动期存量死记录形态的误报安全忽略
+    const inboxFile = join(root, "teams", "default", "inbox", "a.jsonl");
+    const mail = readFileSync(inboxFile, "utf8");
+    expect(mail).toContain("【首见】");
+    expect(mail).toContain("宁误报一次");
+    // 台账按复合键认领；通知落地后转 sent（不留给重发队列）
     const state = JSON.parse(readFileSync(join(root, "capacity", "watchdog-state.json"), "utf8")) as {
       members: Record<string, { state: string; notify?: string }>;
     };
-    expect(state.members["b"]?.state).toBe("dead");
-    expect(state.members["b"]?.notify).toBe("sent");
+    expect(state.members["b|sess_b"]?.state).toBe("dead");
+    expect(state.members["b|sess_b"]?.notify).toBe("sent");
+    // 同化身同一次死亡不重复
+    expect((await sweepMembersOnce(deps())).dead).toEqual([]);
+    expect(readEngineEvents().filter((e) => e["event"] === "member-dead")).toHaveLength(1);
   });
 });
 

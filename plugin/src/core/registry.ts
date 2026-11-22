@@ -19,6 +19,8 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, readdir } from 'node:fs/promises';
 import { readdirSync, readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { join } from 'node:path';
 import { writeFileAtomic } from './atomic.js';
 import { wakeDir, wakeFile, namesFile, sessionsDir, sessionFile, witnessFile, witnessDir } from './paths.js';
 import { logEngineEvent } from './log.js';
@@ -560,6 +562,88 @@ export function adoptByPpidEnabledFromEnv(env: NodeJS.ProcessEnv = process.env):
 }
 
 /**
+ * v0.9.6 r2（V096-12）：绑定锚时窗常量（采纳护栏 6 的锚新鲜度判据）。
+ *
+ * - {@link ADOPT_ANCHOR_MAX_PREBIRTH_MS}：锚的 ts 允许早于本 server 进程诞生时刻的
+ *   上限。正常形态下钩子（写锚方）与 server 是宿主同时拉起的子进程，锚 ts ≥ server
+ *   诞生时刻（实测桌面宿主：插件 server 在宿主启动 +6.7s 拉起、钩子按会话启动触发，
+ *   锚恒晚于 server 诞生）；窗口只为「钩子先于 server 拉起」的启动序留余量（钩子侧
+ *   另有 ≤2.4s 轮询兜底，见 hooks/session-start.ts）。超过窗口的锚 = 前任 server 的
+ *   残锚（server pid 被复用且本会话钩子未写锚的复合形态）→ 不猜。
+ * - {@link ADOPT_ANCHOR_MAX_CLOCK_SKEW_MS}：锚 ts 落在未来超过此值 = 时钟异常/伪造
+ *   → 不猜。
+ */
+export const ADOPT_ANCHOR_MAX_PREBIRTH_MS = 30_000;
+export const ADOPT_ANCHOR_MAX_CLOCK_SKEW_MS = 5_000;
+
+// ---------------------------------------------------------------------------
+// 宿主唤醒子事实（V096-21）：宿主 cmdline 的 --resume <sid> 自证
+// ---------------------------------------------------------------------------
+
+/** 宿主进程唤醒子探测结果（v0.9.6 r3，V096-21）。 */
+export interface HostResumeProbe {
+  /** false = 宿主 cmdline 不可读（枚举失败）——fail-closed，不猜。 */
+  available: boolean;
+  /** 宿主 cmdline 里 `--resume` 后的 sid token；非唤醒子宿主（桌面 app-server/交互
+   * CLI）没有该 token → undefined。 */
+  resumeSid?: string;
+}
+
+/**
+ * 读一个进程的完整命令行（PowerShell Get-CimInstance；wmic 在新 Win11 已移除——实测
+ * 本机 26300 不可用，单拍实测 ~0.74s）。失败/超时 → undefined（fail-closed）。
+ */
+function readProcessCommandLineViaCim(pid: number): string | undefined {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
+  try {
+    const result = spawnSync(
+      'powershell.exe',
+      [
+        '-NoProfile', '-NonInteractive', '-Command',
+        `Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}' | Select-Object -ExpandProperty CommandLine`,
+      ],
+      { timeout: 6_000, encoding: 'utf8', windowsHide: true },
+    );
+    if (result.status !== 0) return undefined;
+    const out = (result.stdout ?? '').trim();
+    return out === '' ? undefined : out;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * v0.9.6 r3（V096-21）：探测一个进程是否是**针对某会话的唤醒子 CLI**。
+ *
+ * 唤醒子由引擎以 `<zcodeExe> <zcodeCjs> --resume <sessionId> --prompt …` 拉起
+ * （engine/resume-cli.ts spawnDirect），其 cmdline 自带目标 sid。桌面 app-server
+ * /交互 CLI 的 cmdline 没有该 token。
+ *
+ * **为什么这是绑定锚的归属判据**：锚写入缺陷（回二实测 R4）的根因是钩子枚举宿主
+ * 子进程时无法区分「唯一的本插件 server 子进程属于哪个会话」——任意先于钩子在位的
+ * 外来 server 子进程都会被误绑。宿主 cmdline 的 `--resume <sid>` 是**宿主自身的
+ * 派生命令**：钩子（其 stdin payload 也带同一 sid）只有在本宿主 cmdline 的 resume
+ * sid 与本会话 sid 一致时，才能断定「本宿主是为本会话拉起的单会话唤醒子」，此时
+ * 宿主下唯一本插件 server 子进程才可归属到本会话；桌面多会话宿主（非 --resume）
+ * 一律不写锚（该拓扑归属不可判定 → 采纳面拒绝，回落 wakeToken 票据兜底）。
+ *
+ * options.readCommandLine 供测试注入（生产走 CIM）。
+ */
+export function probeHostResumeSidSync(
+  hostPid: number,
+  options: { readCommandLine?: (pid: number) => string | undefined } = {},
+): HostResumeProbe {
+  // pid 自身非法即无从探测（fail-closed）——注入读取器也先过本闸（防御纵深）。
+  if (!Number.isSafeInteger(hostPid) || hostPid <= 0) return { available: false };
+  const commandLine = (options.readCommandLine ?? readProcessCommandLineViaCim)(hostPid);
+  if (commandLine === undefined) return { available: false };
+  const normalized = commandLine.replaceAll('\\', '/');
+  const match = /--resume\s+(\S+)/.exec(normalized);
+  if (match === null || match[1] === undefined) return { available: true };
+  return { available: true, resumeSid: match[1].replace(/^"|"$/g, '') };
+}
+
+/**
  * v0.9.5（A6/V094-03）：**回滚一次性票据**（SessionStart 钩子专用）——票据已置
  * `used` 而随后的身份绑定失败（锁忙/花名被别人持有/本会话已有别的 boundName）时，
  * 把票据恢复为未用形态，保住 wake prompt 承诺的 **wakeToken 兜底路径**可用
@@ -581,6 +665,13 @@ export async function restoreWakeNonce(stateRoot: string, stored: StoredWakeNonc
  * 与钩子同父进程（都是宿主会话拉的子进程）——server 读自己的 `process.ppid` 即可
  * 定位「本连接所属会话」的记录，无需宿主注入 sid。多条记录同 pid（一个宿主进程跑
  * 多个会话）→ 返回 undefined（歧义不猜，回落 not_registered 让调用方显式 identify）。
+ *
+ * v0.9.6（A1/V095-01）：**不可解析记录计入歧义面**——本目录里任何「有文件但解析不出
+ * 会话记录」的条目（JSON 坏/结构不符/读得了名字读不了内容）都可能是一个 pid 命中的
+ * 第二会话（V095-01 的 C3.b 实测：损坏的兄弟记录被跳过 → 恰一条可解析命中 → 歧义闸
+ * 被旁路 → 采纳他人身份）。现在损坏条目 >0 时一律不采纳（宁可 2 次调用兜底）；记录
+ * 是可重建状态（下个 SessionStart 重锚），删除损坏文件即恢复。列表在册但读取时
+ * ENOENT（列表→读取间隙被删）按真缺席处理，不计入。
  */
 export async function readSessionByHostPid(stateRoot: string, pid: number): Promise<SessionRecord | undefined> {
   if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
@@ -592,13 +683,35 @@ export async function readSessionByHostPid(stateRoot: string, pid: number): Prom
     throw error;
   }
   let found: SessionRecord | undefined;
+  let unparseable = 0;
   for (const entry of entries) {
     if (!entry.endsWith('.json')) continue;
-    const record = await readSession(stateRoot, entry.slice(0, -'.json'.length));
-    if (record === undefined || record.pid !== pid) continue;
+    const sessionId = entry.slice(0, -'.json'.length);
+    let raw: string;
+    try {
+      raw = await readFile(sessionFile(stateRoot, sessionId), 'utf8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      unparseable++;
+      continue;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      unparseable++;
+      continue;
+    }
+    const coerced = coerceSessionRecord(parsed, sessionId);
+    if (!coerced.ok) {
+      unparseable++;
+      continue;
+    }
+    if (coerced.record.pid !== pid) continue;
     if (found !== undefined) return undefined; // 歧义：一个 pid 对多个会话，不猜
-    found = record;
+    found = coerced.record;
   }
+  if (unparseable > 0) return undefined; // v0.9.6（A1）：损坏记录在场 → 歧义面不干净，不采纳
   return found;
 }
 
@@ -608,6 +721,15 @@ export async function readSessionByHostPid(stateRoot: string, pid: number): Prom
  * tools-tasks/tools-relay/peer-services/guards）。同步小文件读只在「连接首次要求
  * 身份」时发生一次（采纳后进内存缓存），与钩子的 readFileSync(0) 同族口径。
  * 判据与异步版逐字一致：恰一条 pid 命中才返回，多条/零条 → undefined。
+ *
+ * v0.9.6（A1/V095-01）：**不可解析记录计入歧义面**（与异步版同步修）——目录里任何
+ * 「有文件但解析不出会话记录」的条目（JSON 坏/结构不符/读得了名字读不了内容）都可能
+ * 是一个 pid 命中的第二会话；V095-01 的 C3.b 实测：损坏的兄弟记录被 `continue` 跳过
+ * （旧注释「坏行/坏文件不拦判据」正是被利用的旁路）→ 恰一条可解析命中 → 「恰一条才
+ * 采纳」只在可解析记录上成立 → 歧义闸失效 → 采纳他人身份。现在损坏条目 >0 时一律
+ * 返回 undefined（宁可 2 次调用兜底，不许错绑）；记录是可重建状态（下个 SessionStart
+ * 重锚），删除损坏文件即恢复。列表在册但读取时 ENOENT（列表→读取间隙被删）按真缺席
+ * 处理，不计入。
  */
 export function readSessionByHostPidSync(stateRoot: string, pid: number): SessionRecord | undefined {
   if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
@@ -618,26 +740,35 @@ export function readSessionByHostPidSync(stateRoot: string, pid: number): Sessio
     return undefined; // 无 sessions 目录/不可读：无证据（不猜）
   }
   let found: SessionRecord | undefined;
+  let unparseable = 0;
   for (const entry of entries) {
     if (!entry.endsWith('.json')) continue;
     const sessionId = entry.slice(0, -'.json'.length);
     let raw: string;
     try {
       raw = readFileSync(sessionFile(stateRoot, sessionId), 'utf8');
-    } catch {
-      continue; // 单文件读失败跳过（与 readSession 的 ENOENT 口径一致）
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue; // 列表→读取间隙被删：真缺席
+      unparseable++; // 读得了名字读不了内容：证据在场但不可解析 → 计入歧义面
+      continue;
     }
     let parsed: unknown;
     try {
       parsed = JSON.parse(raw);
     } catch {
-      continue; // 坏行/坏文件不拦判据（durable boundary 同款宽容）
+      unparseable++; // 坏 JSON：可能是被隐藏的第二会话 → 计入歧义面（V095-01 C3.b）
+      continue;
     }
     const coerced = coerceSessionRecord(parsed, sessionId);
-    if (!coerced.ok || coerced.record.pid !== pid) continue;
+    if (!coerced.ok) {
+      unparseable++; // 结构不符：同上，不猜
+      continue;
+    }
+    if (coerced.record.pid !== pid) continue;
     if (found !== undefined) return undefined; // 歧义：一个 pid 对多个会话，不猜
     found = coerced.record;
   }
+  if (unparseable > 0) return undefined; // v0.9.6（A1）：损坏记录在场 → 歧义面不干净，不采纳
   return found;
 }
 
@@ -645,6 +776,97 @@ export interface StoredWakeNonce {
   /** Token the nonce is stored under. */
   token: string;
   nonce: WakeNonce;
+}
+
+// ---------------------------------------------------------------------------
+// registry/adopt-anchor/<serverPid>.json —— 会话↔server 进程绑定锚（V096-12）
+// ---------------------------------------------------------------------------
+
+/**
+ * v0.9.6 r2（V096-12）：**会话↔server 进程绑定锚**——ppid 采纳的第 6 道护栏的数据源。
+ *
+ * 缺陷形态（回二 V096-12，P1）：开启档下本连接的 sessions/<sid>.json 与 peers/base/
+ * <sid>.json 双缺时，round-1 的基记录佐证面只剩受害者一条（恰等于 pid 命中记录的
+ * sid），唯一性判据无法区分「本连接就是该会话」与「本连接是另一个零痕迹会话」→
+ * 未注册连接零凭据采纳受害者身份（领单+冒名 completed 实测）。根因：盘上一切证据都
+ * 绑定在 sid 上，server 进程没有任何「我就是这个会话」的自证通道。
+ *
+ * 修法：SessionStart 钩子消费唤醒票据后，枚举宿主进程的直接子进程里**本插件的
+ * MCP server**（cmdline 匹配 <pluginRoot>/dist/mcp/server.mjs，实测宿主同时携带多个
+ * 插件的 server.mjs，必须按插件根路径限定），把「本会话 ↔ 该 server 进程 pid」写成
+ * 绑定锚。server 进程的 pid 是**活进程事实**（状态文件伪造不了「我的 pid 被本会话
+ * 钩子锚定」这一条——除非伪造者连锚一起写，那属 README 已知限制 12 同机伪造边界）；
+ * 采纳面读自己的 pid 对应的锚，恰一条且 sid/宿主 pid/时窗全部吻合才采纳。
+ *
+ * 写入纪律（hooks/session-start.ts）：
+ * - 仅开启档票据路径（bindWakeTicketIdentity，票据消费成功后）——采纳人群就是被唤醒
+ *   成员；普通会话不写（默认档行为逐字节不变）；
+ * - 恰一个 server 子进程才写（宿主挂多个本插件 server 连接时无法归属 → 不写，采纳
+ *   面 refuse）；零个（枚举失败/未起）→ 不写；两者都审计（adopt-anchor-written /
+ *   adopt-anchor-skipped）；
+ * - 锁外原子写、尽力而为，失败只审计钩子不失败——锚缺失时采纳面一律拒绝（fail-
+ *   closed，回落 wakeToken 票据兜底 2 次调用）。
+ */
+export interface AdoptAnchor {
+  /** 写锚的钩子所锚定的会话（= 票据的 sid）。 */
+  sessionId: string;
+  /** 写锚的钩子的父进程 = 宿主进程 pid（与 hookSessionPid 同值）。 */
+  hostPid: number;
+  /** 被绑定的本插件 MCP server 进程 pid（锚文件名）。 */
+  serverPid: number;
+  /** 写锚时刻（钩子运行时刻）。 */
+  ts: number;
+}
+
+/** `registry/adopt-anchor/`：会话↔server 进程绑定锚目录（workspace 状态根内）。 */
+export function adoptAnchorDir(stateRoot: string): string {
+  return join(stateRoot, 'registry', 'adopt-anchor');
+}
+
+/** `registry/adopt-anchor/<serverPid>.json`：单个 server 进程的绑定锚。 */
+export function adoptAnchorFile(stateRoot: string, serverPid: number): string {
+  return join(adoptAnchorDir(stateRoot), `${serverPid}.json`);
+}
+
+/** 写一条绑定锚（整文件原子写；调用方 best-effort，失败只审计）。 */
+export async function writeAdoptAnchor(stateRoot: string, anchor: AdoptAnchor): Promise<void> {
+  await mkdir(adoptAnchorDir(stateRoot), { recursive: true });
+  await writeFileAtomic(adoptAnchorFile(stateRoot, anchor.serverPid), JSON.stringify(anchor, null, 2));
+}
+
+/**
+ * 读一条绑定锚（同步——采纳面 IdentityStore.require 是同步函数；undefined = 不存在
+ * 或不可解析/结构不符，**两种都按「无锚」拒绝**，fail-closed 不猜）。
+ */
+export function readAdoptAnchorSync(stateRoot: string, serverPid: number): AdoptAnchor | undefined {
+  if (!Number.isSafeInteger(serverPid) || serverPid <= 0) return undefined;
+  let raw: string;
+  try {
+    raw = readFileSync(adoptAnchorFile(stateRoot, serverPid), 'utf8');
+  } catch {
+    return undefined; // 缺失/不可读：无锚证据（不猜，采纳面拒绝）
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined; // 坏 JSON：无锚证据（不猜）
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined;
+  const rec = parsed as Record<string, unknown>;
+  const sessionId = rec['sessionId'];
+  const hostPid = rec['hostPid'];
+  const anchorServerPid = rec['serverPid'];
+  const ts = rec['ts'];
+  if (
+    typeof sessionId !== 'string' || sessionId.trim() === '' ||
+    typeof hostPid !== 'number' || !Number.isSafeInteger(hostPid) || hostPid <= 0 ||
+    typeof anchorServerPid !== 'number' || !Number.isSafeInteger(anchorServerPid) || anchorServerPid <= 0 ||
+    typeof ts !== 'number' || !Number.isFinite(ts)
+  ) {
+    return undefined; // 结构不符：无锚证据（不猜）
+  }
+  return { sessionId, hostPid, serverPid: anchorServerPid, ts };
 }
 
 /**

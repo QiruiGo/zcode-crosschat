@@ -13,13 +13,20 @@
  * 3. 不绕过既有闸：采纳不是注册（name_taken/session_id_in_use/takeover/removed 门
  *    在 xc_identify 路径原样生效；票据已由钩子一次性消费；不设 voiceOwner）；
  * 4. 盘读异常 → 不采纳。
+ *
+ * v0.9.6（A1/V095-01）护栏 5：钩子基记录佐证——本宿主（ppid）在本工作区锚定的
+ * 基记录（peers/base/<sid>.json）必须恰一条且等于 pid 命中记录的 sid 才采纳
+ * （防「本会话记录缺失 + 同宿主他记录成唯一命中」串号）；损坏记录（workspace 侧与
+ * 基记录两侧）计入歧义面 → 不采纳。本文件正例的种子按钩子产出形态补写基记录；
+ * 串号形态与佐证细则的定向判据见 identity-v096-a1.test.ts。
  */
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
 import { identityStore, adoptHookBoundIdentity } from "./identity.js";
-import { writeSession } from "../core/registry.js";
+import { writeAdoptAnchor, writeSession } from "../core/registry.js";
+import { writePeerBaseRecord } from "../core/peerdir.js";
 import type { SessionRecord } from "../core/types.js";
 import { notRegisteredError } from "./protocol.js";
 
@@ -30,16 +37,20 @@ let stateRoot: string;
 // v0.9.5（A1/V094-02）：ppid 采纳默认关（XC_ADOPT_BY_PPID=1 才启用）——本文件锁
 // 「开启档」的四道护栏回归，beforeEach 显式开启；默认关闭与多记录不采纳的定向判据
 // 见 identity-v095-a1.test.ts。
+// v0.9.6（A1/V095-01）：采纳护栏 5（钩子基记录佐证）按 XC_MESSAGING_DIR 读机器全局
+// 基记录——本文件逐用例隔离到临时 peerRoot，避免读到本机真实基记录（非确定性）。
 beforeEach(() => {
   process.env["XC_ADOPT_BY_PPID"] = "1";
   workspace = mkdtempSync(join(tmpdir(), "xc-a6-adopt-ws-"));
   stateRoot = join(workspace, ".crosschat");
   mkdirSync(join(stateRoot, "registry", "sessions"), { recursive: true });
+  process.env["XC_MESSAGING_DIR"] = join(workspace, "peer-root");
   dirs.push(workspace);
 });
 
 afterEach(() => {
   delete process.env["XC_ADOPT_BY_PPID"];
+  delete process.env["XC_MESSAGING_DIR"];
 });
 
 afterAll(() => {
@@ -55,8 +66,20 @@ afterAll(() => {
 /** 本测试进程的 ppid（= 真实宿主持有的pid 语义在测试里的对位：一个活进程）。 */
 const HOST_PID = process.ppid;
 
+/**
+ * v0.9.6 r3（V096-21）：护栏 6b 宿主探测注入——测试进程 ppid 的 cmdline 没有
+ * --resume（真实 CIM 探测必然拒绝），正例注入「宿主是本会话唤醒子」的对位事实；
+ * 生产走真实探测（probeHostResumeSidSync）。拒绝用例在更早的护栏返回，不触发探测。
+ */
+function probeFor(sessionId: string): { available: boolean; resumeSid?: string } {
+  return { available: true, resumeSid: sessionId };
+}
+
 async function seedRecord(record: Partial<SessionRecord> & { sessionId: string }): Promise<void> {
-  await writeSession(stateRoot, {
+  // v0.9.6（A1/V095-01）：采纳护栏 5 要求「本宿主锚定的会话」有钩子基记录佐证
+  // （peers/base/<sid>.json，SessionStart 钩子每回合无锁必写）——种子按钩子产出形态
+  // 一并写基记录（pid/cwd/regToken/boundName 与 workspace 侧同值），正例才可达。
+  const full = {
     cwd: workspace,
     startedAt: 1,
     lastSeen: 1,
@@ -65,7 +88,27 @@ async function seedRecord(record: Partial<SessionRecord> & { sessionId: string }
     // 见 identity-v095-a1.test.ts。
     regToken: "rt-seed-v094-adoption",
     ...record,
-  } as SessionRecord);
+  } as SessionRecord;
+  await writeSession(stateRoot, full);
+  await writePeerBaseRecord(process.env["XC_MESSAGING_DIR"]!, {
+    sessionId: full.sessionId,
+    cwd: full.cwd,
+    source: null,
+    startedAt: full.startedAt,
+    lastSeen: full.lastSeen,
+    ...(full.regToken !== undefined ? { regToken: full.regToken } : {}),
+    ...(full.pid !== undefined ? { pid: full.pid } : {}),
+    ...(full.boundName !== undefined ? { boundName: full.boundName } : {}),
+  });
+  // v0.9.6 r2（V096-12）：采纳护栏 6 要求钩子绑定锚（本 server 进程 pid ↔ 会话）——
+  // 种子按钩子产出形态一并写锚（测试进程 pid 充当 server pid 对位）。多记录用例的
+  // 锚内容不参与判定（记录歧义在更早的护栏拒绝）。
+  await writeAdoptAnchor(stateRoot, {
+    sessionId: full.sessionId,
+    hostPid: process.ppid,
+    serverPid: process.pid,
+    ts: Date.now(),
+  });
 }
 
 /** 快照 stateRoot 下所有文件的内容（护栏 5：采纳不写盘的对拍基线）。 */
@@ -85,7 +128,7 @@ function snapshotStateRoot(): Map<string, string> {
 describe("v0.9.4 A6：adoptHookBoundIdentity（四道护栏）", () => {
   it("【护栏1·锚点】唯一匹配（pid+cwd+boundName）→ 采纳成功，require 不再 not_registered", async () => {
     await seedRecord({ sessionId: "sess_woken", pid: HOST_PID, boundName: "m1", liveness: "running" });
-    const adopted = adoptHookBoundIdentity(workspace);
+    const adopted = adoptHookBoundIdentity(workspace, undefined, { hostResumeProbe: probeFor("sess_woken") }); // r3：注入宿主唤醒子事实
     expect(adopted).toBeDefined();
     expect(adopted!.agentKey).toBe("m1");
     expect(adopted!.sessionId).toBe("sess_woken");
@@ -141,7 +184,7 @@ describe("v0.9.4 A6：adoptHookBoundIdentity（四道护栏）", () => {
   it("【护栏5】采纳不写盘：stateRoot 内容逐字节不变（只写内存缓存）", async () => {
     await seedRecord({ sessionId: "sess_woken", pid: HOST_PID, boundName: "m1" });
     const before = snapshotStateRoot();
-    const adopted = adoptHookBoundIdentity(workspace);
+    const adopted = adoptHookBoundIdentity(workspace, undefined, { hostResumeProbe: probeFor("sess_woken") });
     expect(adopted).toBeDefined();
     identityStore.bind("conn-a6-writecheck", adopted!);
     const after = snapshotStateRoot();
@@ -151,14 +194,14 @@ describe("v0.9.4 A6：adoptHookBoundIdentity（四道护栏）", () => {
 
   it("【护栏3】采纳身份不设 voiceOwner（uservoice 唤醒续跑证明只认 wakeToken 路径）", async () => {
     await seedRecord({ sessionId: "sess_woken", pid: HOST_PID, boundName: "m1" });
-    const adopted = adoptHookBoundIdentity(workspace);
+    const adopted = adoptHookBoundIdentity(workspace, undefined, { hostResumeProbe: probeFor("sess_woken") });
     expect(adopted!.voiceOwner).toBeUndefined();
     expect(identityStore.voiceOwnerForSession("sess_woken")).toBeUndefined();
   });
 
   it("缓存：采纳后删除盘上记录 → 连接仍持有身份（不再读盘、不改盘）", async () => {
     await seedRecord({ sessionId: "sess_woken", pid: HOST_PID, boundName: "m1" });
-    const adopted = adoptHookBoundIdentity(workspace);
+    const adopted = adoptHookBoundIdentity(workspace, undefined, { hostResumeProbe: probeFor("sess_woken") });
     expect(adopted).toBeDefined();
     identityStore.bind("conn-cache", adopted!);
     // 删掉盘上记录：已采纳的连接仍持有身份（缓存生效，且删除本身不是产品行为）
@@ -185,7 +228,7 @@ describe("v0.9.4 A6：adoptHookBoundIdentity（四道护栏）", () => {
   it("stat 口径：采纳前后 stateRoot 目录 mtime 不变（不新建/不删文件）", async () => {
     await seedRecord({ sessionId: "sess_woken", pid: HOST_PID, boundName: "m1" });
     const before = statSync(stateRoot).mtimeMs;
-    adoptHookBoundIdentity(workspace);
+    adoptHookBoundIdentity(workspace, undefined, { hostResumeProbe: probeFor("sess_woken") });
     expect(statSync(stateRoot).mtimeMs).toBe(before);
   });
 });

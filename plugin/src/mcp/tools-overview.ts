@@ -68,7 +68,7 @@ import { pidAlive } from "../core/lock.js";
 // v0.9（G-9，PROTOCOL §12.4）：成员活性视图（三视图统一口径，单一实现）。
 import { readSession, readSessionWitness } from "../core/registry.js";
 import { memberLivenessView, sweepOwnerGuard, type SessionLivenessView, type SweepOwnerGuard } from "../core/liveness.js";
-import { SWEEPABLE_TASK_STATUSES, TASK_STATUSES, type SessionWitness, type SessionWitnessKind } from "../core/types.js";
+import { SWEEPABLE_TASK_STATUSES, TASK_STATUSES, type SessionWitness, type SessionWitnessKind, type TaskStatus } from "../core/types.js";
 // C3 容量挂载（M6）+ v0.8.1（C4-O1）：水位越界回落披露助手。
 import {
   capacityCacheFile,
@@ -243,14 +243,36 @@ async function offlineMembersMount(deps: ToolDeps, team: TeamState, now: number,
         pidEvidence.set(member.key, undefined);
       }
     }
+    // v0.9.6（A8/V095-21）：注入 stale 阈值 → 每个命中任务带 requeueAtMs（待回池的预计
+    // 回池时刻），Offline 行与板面任务行 / handoff / 死亡文案四面同口径。
     const members = offlineMembers(team, scan, now, threshold.ms, {
       sessionPidFor: (member) => pidEvidence.get(member.key),
+      requeueStaleMs: staleMs,
     });
     if (members.length === 0 && !threshold.clamped && !threshold.fellBack) return null;
     return { members, lines: members.map(offlineMemberLine), clamped: threshold.clamped, fellBack: threshold.fellBack };
   } catch {
     return null;
   }
+}
+
+/**
+ * v0.9.6（A8/V095-21）：板面任务行的「待回池 + 回池时刻」标注（纯函数）——任务挂在
+ * **已判死（pid-dead）**的属主名下且仍属 stale 清扫域（claimed/in_progress）时，该任务
+ * 会在 stale 阈值到期后被自动回池（graph.staleTasks 同判据）；此前的冻结窗内，板面行 /
+ * Offline 行 / handoff 待回池面 / 死亡文案四面统一显示「待回池 + updatedAt+阈值」。
+ * 返回 undefined = 不标注（属主未判死 / 任务不在清扫域 / 已回池无属主）。
+ */
+function requeuePendingAtMs(
+  task: { assignee: string | null; status: string; updatedAt: number },
+  liveness: LivenessMount | null,
+  staleMs: number,
+): number | undefined {
+  if (task.assignee === null) return undefined;
+  // StatusSnapshotTask.status 是宽容 string（core/snapshot.ts）；清扫域判据按值域收缩。
+  if (!SWEEPABLE_TASK_STATUSES.includes(task.status as TaskStatus)) return undefined;
+  if (liveness?.views.get(task.assignee)?.state !== 'dead') return undefined;
+  return task.updatedAt + staleMs;
 }
 
 /**
@@ -515,7 +537,9 @@ export function createTeamOverviewCore(deps: ToolDeps): TeamOverviewCore {
         // v0.6（C5）：停滞挂载（team 视图；blocked 超阈以 blocked-long 单列）。
         // v0.8.1（C4-F2）：阈值解析三态一次算完（clamped 钳制 / fellBack 非法回落），
         // 与 offline 家族同款两级披露（payload 键 + WARNING）——0/负数/非数字不再静默。
-        const stall = stallThresholdMs(deps.env, staleThresholdMsFromEnv(deps.env));
+        // v0.9.6（A8/V095-21）：stale 阈值一次取值两用（stall 挂载 + 板面待回池标注）。
+        const staleMs = staleThresholdMsFromEnv(deps.env);
+        const stall = stallThresholdMs(deps.env, staleMs);
         const stalled = team !== undefined ? stalledTasks(team.tasks, now, stall.ms) : [];
         const stallClamped = team !== undefined && stall.clamped;
         const stallFellBack = team !== undefined && stall.fellBack;
@@ -562,11 +586,18 @@ export function createTeamOverviewCore(deps: ToolDeps): TeamOverviewCore {
         const payload = {
           ...snapshot,
           // r4（V090-01 观测）：豁免期数进任务板行（机器可读；仅被豁免的超阈任务带）。
+          // v0.9.6（A8/V095-21）：死亡成员名下的未回池任务 → 板面行统一「待回池 + 回池
+          // 时刻」（requeuePending/requeueAtMs）——与 Offline 行 / handoff 待回池面 /
+          // 死亡文案四面同口径，冻结窗内不再出现「建议重派 vs 任务仍 claimed」的矛盾。
           tasks: windowedTasks.map((t) => {
             const exempt = exemptPeriods.get(t.id);
-            return exempt === undefined
+            const requeueAtMs = requeuePendingAtMs(t, liveness, staleMs);
+            const withRequeue = requeueAtMs === undefined
               ? t
-              : { ...t, sweepExemptPeriods: exempt.periods, sweepExemptReason: exempt.reason };
+              : { ...t, requeuePending: true, requeueAtMs };
+            return exempt === undefined
+              ? withRequeue
+              : { ...withRequeue, sweepExemptPeriods: exempt.periods, sweepExemptReason: exempt.reason };
           }),
           ...(args.history === true && team !== undefined
             ? {

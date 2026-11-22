@@ -29,15 +29,20 @@
  */
 
 import { createHash, randomUUID } from "node:crypto";
+import { readdirSync, readFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { invalidParamsError, notRegisteredError, ToolError } from "./protocol.js";
 import { withRegistryThenTeamLocks } from "../core/lock.js";
 import { validateMemberName } from "../core/sanitize.js";
 import {
   WAKE_INFLIGHT_MS,
+  ADOPT_ANCHOR_MAX_CLOCK_SKEW_MS,
+  ADOPT_ANCHOR_MAX_PREBIRTH_MS,
   adoptByPpidEnabledFromEnv,
   bindName,
   consumeWakeNonce,
+  probeHostResumeSidSync,
+  readAdoptAnchorSync,
   readNames,
   readSession,
   readSessionByHostPidSync,
@@ -45,7 +50,7 @@ import {
   unbindName,
   writeSession,
 } from "../core/registry.js";
-import { readPeerBaseRecord, writePeerBaseRecord } from "../core/peerdir.js";
+import { peerBaseDir, peerBaseFile, peerRootFromEnv, readPeerBaseRecord, writePeerBaseRecord } from "../core/peerdir.js";
 import { resolveStateRoot, teamFile } from "../core/paths.js";
 import { newTeamState, noteTeamReset, readTeam, writeTeam } from "../core/teamstate.js";
 import { logEngineEvent } from "../core/log.js";
@@ -130,11 +135,13 @@ export class IdentityStore {
    * 记录成唯一命中时，ppid 采纳会错绑身份（rogue 领走他人任务）——宁可 2 次调用，
    * 不许错绑，故默认关闭（开关解析见 core/registry.ts adoptByPpidEnabledFromEnv）。
    */
-  require(connectionKey: string): BoundIdentity {
+  require(connectionKey: string, options?: { hostResumeProbe?: { available: boolean; resumeSid?: string } }): BoundIdentity {
     const bound = this.#byConnection.get(connectionKey);
     if (bound) return bound;
     if (!adoptByPpidEnabledFromEnv()) throw notRegisteredError();
-    const adopted = adoptHookBoundIdentity();
+    // v0.9.6 r3（V096-21）：options 透传护栏 6b 的宿主探测（生产走真实 CIM 探测；
+    // 测试经此注入宿主 cmdline 事实——spawnImpl 同款注入纪律）。
+    const adopted = adoptHookBoundIdentity(process.cwd(), process.env, options);
     if (adopted !== undefined) {
       this.bind(connectionKey, adopted);
       return adopted;
@@ -195,26 +202,105 @@ export const identityStore = new IdentityStore();
  * v0.9.5（A1/V094-02）：**整面默认关**（`XC_ADOPT_BY_PPID=1` 才启用；env 参数注入
  * 供测试，生产读进程环境）+ 护栏 1 追加 **token 项**——记录必须带锚定令牌
  * `regToken`（SessionStart 钩子铸造/延续，hooks/session-start.ts）：无令牌的记录
- * 不是钩子锚定形态（存量手写/伪造记录），不采纳。残余边界如实：token 是**在场性**
- * 校验而非凭据出示（server 进程拿不到令牌真值可比对的对象），V094-02 的
- * 「本会话记录缺失 + 同宿主陈旧记录成唯一命中」形态在开启档下仍有理论残余——
- * 主防线是默认关闭（宁可 2 次调用），开启是运营者对单宿主单会话拓扑的显式背书。
+ * 不是钩子锚定形态（存量手写/伪造记录），不采纳。
+ *
+ * v0.9.6（A1/V095-01）：对抗轮把上述「理论残余」做成了行为级复现（C3/C8：同宿主
+ * 记录缺失/损坏 → 歧义闸旁路 → rogue 零凭据领单+冒名 completed）。两条补强：
+ * - **护栏 5（②）：钩子基记录佐证**——SessionStart 钩子在本回合**无锁必写**机器全局
+ *   基记录 `peers/base/<sid>.json`（hooks/session-start.ts，含宿主 pid + cwd，v0.9.4
+ *   A1 起）。本函数按 `process.ppid` 同步扫描基记录（cwd 过滤到本工作区），得到
+ *   「本宿主进程在本工作区锚定了哪些会话」的**独立事实**：宿主锚定的 sid 必须**恰一
+ *   条且等于** pid 命中的会话记录 sid，才允许采纳——本会话记录缺失时（V094-02 锁预算
+ *   形态）基记录仍会说出第二个会话的存在 → 拒；勾子从未锚定（无基记录）→ 无证据 →
+ *   拒。回退票据兜底（wakeToken xc_identify，2 次调用）。
+ * - **①：不可解析记录计入歧义面**——{@link readSessionByHostPidSync}（registry.ts）
+ *   与本函数的基记录扫描都不再把「有文件但解析不出记录」的条目静默跳过：损坏条目
+ *   可能是一个 pid 命中的第二会话，损坏在场 → 歧义面不干净 → 不采纳（C3.b 旁路关闭）。
+ *
+ * v0.9.6 r2（V096-12，P1）：基记录佐证对本连接**两记录双缺**形态仍然失守——佐证面
+ * 只剩受害者一条（恰等于 pid 命中记录 sid），唯一性判据区分不了「本连接就是该会话」
+ * 与「本连接是另一个零痕迹会话」（端到端实测：采纳→claim→冒名 completed）。根因：
+ * 盘上一切证据绑定在 sid 上，server 进程没有任何「我就是这个会话」的自证通道。
+ * **护栏 6：钩子绑定锚**——SessionStart 钩子消费唤醒票据后枚举宿主子进程里本插件的
+ * MCP server（cmdline 匹配插件根路径下的 dist/mcp/server.mjs），把「本会话 ↔ 该
+ * server 进程 pid」写成绑定锚（registry/adopt-anchor/<serverPid>.json，恰一个子进程
+ * 才写，{@link readAdoptAnchorSync}）。server pid 是**活进程事实**：本连接读自己
+ * pid 的锚，无锚（钩子没跑/没起 server/枚举失败/双缺形态）→ 不采纳；锚的宿主 pid/
+ * 时窗/sid 与 pid 命中记录任一不符 → 不采纳。恰一子进程才写的纪律使「宿主挂多个
+ * 本插件 server 连接」形态天然无锚 → 全部 refuse（归属不了就不猜）。
+ *
+ * v0.9.6 r3（V096-21，P1）：护栏 6 的「恰一个子进程」判据**无法归属**——钩子区分
+ * 不了唯一的本插件 server 子进程属于哪个会话（正是写锚要解决的问题本身）：实测受害
+ * 者会话的钩子把锚写到先于其在位的外来 server 子进程（宿主下恰一个本插件 server）
+ * → 恶意连接读自身 pid 的锚全吻合 → 零凭据采纳受害者并冒名 completed。修法（双向
+ * 闭合，锚只在归属可判定的拓扑存在）：
+ * - **写侧（hooks/session-start.ts）**：宿主必须是**本会话的唤醒子 CLI**——宿主
+ *   cmdline 含 `--resume <本 sid>`（引擎 spawnDirect 拉起形态，{@link probeHostResumeSidSync}）
+ *   才写锚；桌面 app-server/交互宿主（非 --resume，一个宿主可能承载多会话/多条
+ *   server 连接）一律不写锚；
+ * - **读侧（护栏 6b，本函数）**：server **独立复核**同一宿主事实——本连接宿主
+ *   （ppid）cmdline 的 resume sid 必须等于 pid 命中记录的 sessionId，宿主 cmdline
+ *   不可读/无 resume token/不一致 → 不采纳。锚即使被误写/残留在本进程 pid 下，宿主
+ *   派生命令这一活进程事实不符即拒。
+ *
+ * 残余边界（如实声明）：token/基记录/锚/宿主 cmdline 都是**在场性**校验而非凭据
+ * 出示；同机进程可写状态文件（README 已知限制 12 同族边界，不做签名/哈希链）。锚
+ * 只在「宿主为本会话唤醒子」的拓扑存在——该拓扑下宿主是单会话 CLI，唯一的本插件
+ * server 子进程在启动序上只能由本宿主为本会话拉起（外来子进程需同机代码执行，属
+ * 边界）；桌面多会话宿主的采纳整体关闭（归属不可判定 → 拒绝，回落 wakeToken 票据
+ * 兜底）。legacy 会话（V096-13）连接无锚照旧拒绝回落显式 identify。
  */
 export function adoptHookBoundIdentity(
   workspace: string = process.cwd(),
   env: NodeJS.ProcessEnv = process.env,
+  options: { hostResumeProbe?: { available: boolean; resumeSid?: string } } = {},
 ): BoundIdentity | undefined {
   try {
     if (!adoptByPpidEnabledFromEnv(env)) return undefined; // v0.9.5（A1）：默认关
     const stateRoot = resolveStateRoot(workspace);
     const record = readSessionByHostPidSync(stateRoot, process.ppid);
-    if (record === undefined) return undefined; // 护栏 1：零条/多条命中
+    if (record === undefined) return undefined; // 护栏 1：零条/多条命中（v0.9.6 起：损坏条目在场同样拒绝）
     if (record.cwd !== workspace) return undefined; // 护栏 1：cwd 不一致（别的会话）
     if (record.regToken === undefined || record.regToken.trim() === '') {
       return undefined; // 护栏 1（v0.9.5 A1 增补）：无锚定令牌 = 非钩子锚定形态
     }
     const name = record.boundName;
     if (name === undefined || name.trim() === '') return undefined; // 护栏 1：无绑定名
+    // 护栏 5（v0.9.6 A1/V095-01 ②）：钩子基记录佐证——本宿主（ppid）在本工作区必须
+    // 恰好锚定这一个会话。基记录是钩子每回合无锁必写的机器全局事实（pid+cwd），
+    // 不依赖 workspace 侧会话记录写成功——本会话记录缺失（V094-02 形态）时它仍能
+    // 说出第二个会话的存在。无证据/多会话/不一致 → 不采纳（回退票据兜底）。
+    const baseSids = readPeerBaseSidsByHostPidSync(peerRootFromEnv(env), process.ppid, workspace);
+    if (baseSids === undefined) return undefined; // 基记录目录不可读/无任何佐证：不猜
+    if (baseSids.corrupt > 0) return undefined; // ①（基记录层）：损坏基记录 = 可能有被隐藏的第二会话
+    if (baseSids.sids.length !== 1 || baseSids.sids[0] !== record.sessionId) {
+      return undefined; // ②：宿主锚定了多个会话（歧义）或 pid 命中记录与佐证不一致 → 不采纳
+    }
+    // 护栏 6（v0.9.6 r2，V096-12）：钩子绑定锚——本 server 进程的 pid 必须被本会话的
+    // 钩子显式锚定（锚文件按本进程 pid 寻址）。零痕迹会话（两记录双缺/钩子未跑）在此
+    // 关闭：无锚 → 不采纳；锚的宿主 pid/时窗/sid 与命中记录不符 → 不采纳。
+    const anchor = readAdoptAnchorSync(stateRoot, process.pid);
+    if (anchor === undefined) return undefined; // 无锚：本连接的会话从未被钩子锚定到本进程
+    if (anchor.hostPid !== process.ppid) return undefined; // 锚属于别的宿主（宿主 pid 复用/错位）→ 不猜
+    const serverBirthMs = Date.now() - process.uptime() * 1000;
+    if (anchor.ts < serverBirthMs - ADOPT_ANCHOR_MAX_PREBIRTH_MS) {
+      return undefined; // 锚先于本进程存在（陈旧锚/宿主与 server pid 双重复用形态）→ 不猜
+    }
+    if (anchor.ts > Date.now() + ADOPT_ANCHOR_MAX_CLOCK_SKEW_MS) {
+      return undefined; // 未来时刻的锚（时钟异常/伪造）→ 不猜
+    }
+    if (anchor.sessionId !== record.sessionId) {
+      return undefined; // 锚绑定的会话 ≠ pid 命中记录的会话 → 不猜
+    }
+    // 护栏 6b（v0.9.6 r3，V096-21）：宿主唤醒子事实独立复核——本连接宿主（ppid）
+    // cmdline 的 resume sid 必须等于命中记录的 sessionId。写侧（钩子）已按同一事实
+    // 限制锚的落盘；本侧复核使误写/残留/伪造的锚也无法生效（宿主派生命令是活进程
+    // 事实，与状态文件可伪造性分属两个域）。
+    const hostResume = options.hostResumeProbe ?? probeHostResumeSidSync(process.ppid);
+    if (!hostResume.available || hostResume.resumeSid === undefined
+      || hostResume.resumeSid !== record.sessionId) {
+      return undefined; // 宿主不是本会话的唤醒子 CLI → 锚与宿主事实矛盾 → 不猜
+    }
     return {
       sessionKey: `xc:${DEFAULT_TEAM_ID}:${name}`,
       teamId: DEFAULT_TEAM_ID,
@@ -229,6 +315,100 @@ export function adoptHookBoundIdentity(
   } catch {
     return undefined; // 护栏 4：盘读异常不采纳
   }
+}
+
+/**
+ * v0.9.6（A1/V095-01 ②）：宿主 pid 的**钩子基记录佐证面**（同步扫描，供采纳护栏 5）。
+ *
+ * 读机器全局 `peers/base/<sid>.json` 目录（SessionStart 钩子每回合无锁必写，含宿主
+ * pid + cwd——hooks/session-start.ts），按「pid == 本宿主 ∧ cwd == 本工作区」过滤出
+ * 本宿主进程在本工作区锚定过的会话 sid 集合。它是 workspace 侧 sessions/ 记录之外的
+ * **独立事实源**：本会话的 workspace 记录写失败（锁预算，V094-02 形态）时基记录仍在，
+ * 采纳面据此发现「宿主锚定了第二个会话」而拒绝把唯一 pid 命中错当自己。
+ *
+ * 返回值：
+ * - `undefined`：基记录目录不可读/不存在（无任何佐证证据——不猜，调用方不采纳）；
+ * - `{ sids, corrupt }`：sids = 过滤后的 sid 集合（去重）；corrupt = 「有文件但解析
+ *   不出基记录」的条目数（① 同族纪律：损坏基记录可能是被隐藏的第二会话，corrupt>0
+ *   → 调用方不采纳）。
+ *
+ * 过滤细则（与 workspace 侧扫描同款保守口径）：
+ * - 文件名即 sid；内部 sessionId 字段与文件名不一致 → 计入 corrupt（篡改/错位形态
+ *   不猜）；与 readPeerBaseRecord 的 isPeerBaseRecord 同款 schema 判据
+ *   （sessionId/cwd/startedAt/lastSeen 必备）；
+ * - 无 `pid` 字段 = v0.9.4 以前的存量基记录（无法归因宿主）→ 跳过：不佐证、也不
+ *   制造歧义。**如实口径（v0.9.6 r2，V096-13）**：跳过 ≠ 该会话的连接会被采纳——
+ *   legacy 会话的连接没有钩子绑定锚（其会话从未经 0.9.6 钩子的票据路径锚定到任何
+ *   server pid），采纳护栏 6（{@link readAdoptAnchorSync}）一律拒绝并回落显式
+ *   identify；「同宿主 legacy 老会话 + 新版会话并存」时老会话连接 not_registered，
+ *   不会因新会话记录恰为唯一 pid 命中而误采纳（承诺的回落由此成立）。
+ * - pid 在场但非正整数 → 计入 corrupt；pid 指向别的宿主 / cwd 别的工作区 → 跳过；
+ * - 列表在册但读取时 ENOENT（列表→读取间隙被删）按真缺席处理；其他读错误计入
+ *   corrupt。同步小文件读与 {@link readSessionByHostPidSync} 同族口径（仅连接首次
+ *   要求身份时发生一次）。
+ */
+function readPeerBaseSidsByHostPidSync(
+  peerRoot: string,
+  pid: number,
+  workspace: string,
+): { sids: string[]; corrupt: number } | undefined {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
+  let entries: string[];
+  try {
+    entries = readdirSync(peerBaseDir(peerRoot));
+  } catch {
+    return undefined; // 无 base 目录/不可读：无佐证证据（不猜）
+  }
+  const sids = new Set<string>();
+  let corrupt = 0;
+  for (const entry of entries) {
+    if (!entry.endsWith('.json')) continue;
+    const fileSessionId = entry.slice(0, -'.json'.length);
+    let raw: string;
+    try {
+      raw = readFileSync(peerBaseFile(peerRoot, fileSessionId), 'utf8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue; // 真缺席
+      corrupt++;
+      continue;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      corrupt++;
+      continue;
+    }
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      corrupt++;
+      continue;
+    }
+    const rec = parsed as Record<string, unknown>;
+    const sessionId = rec['sessionId'];
+    const cwd = rec['cwd'];
+    if (
+      typeof sessionId !== 'string' || sessionId.trim() === '' ||
+      typeof cwd !== 'string' ||
+      typeof rec['startedAt'] !== 'number' || typeof rec['lastSeen'] !== 'number'
+    ) {
+      corrupt++; // 非基记录形态（schema 判据不过）：不猜
+      continue;
+    }
+    if (sessionId !== fileSessionId) {
+      corrupt++; // 内部 sid 与文件名错位：篡改/错位形态 → 计入歧义面
+      continue;
+    }
+    const recPid = rec['pid'];
+    if (recPid === undefined) continue; // v0.9.4 以前存量基记录：无法归因宿主，不参与
+    if (typeof recPid !== 'number' || !Number.isSafeInteger(recPid) || recPid <= 0) {
+      corrupt++; // pid 字段坏：不猜
+      continue;
+    }
+    if (recPid !== pid) continue; // 别的宿主进程
+    if (cwd !== workspace) continue; // 别的工作区
+    sids.add(sessionId);
+  }
+  return { sids: [...sids], corrupt };
 }
 
 /** 从 SDK 请求 extra 提取连接键（stdio：undefined → "__stdio__"）。 */

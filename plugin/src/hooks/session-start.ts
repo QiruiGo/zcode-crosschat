@@ -31,6 +31,25 @@
  *   （core/registry.ts restoreWakeNonce）——wake prompt 承诺的 wakeToken 兜底路径
  *   不再因「已消费」断裂（旧实现只审计不回滚，兜底必失败）。
  *
+ * v0.9.6 r2 增量（回二 V096-12，P1）：**会话↔server 进程绑定锚**——开启档票据消费
+ * 成功后枚举宿主子进程里本插件的 MCP server（cmdline 匹配
+ * <pluginRoot>/dist/mcp/server.mjs；宿主同时携带其他插件的 server.mjs，必须按插件
+ * 根路径限定），把「本会话 ↔ 该 server 进程 pid」写成绑定锚
+ * （registry/adopt-anchor/<serverPid>.json，core/registry.ts AdoptAnchor）。MCP
+ * 连接的 ppid 采纳据此获得「我就是这个会话」的自证通道（server pid 是活进程事实，
+ * 零痕迹会话无法借他人记录冒名）。恰一个本插件 server 子进程才写；零个/多个不写并
+ * 审计（adopt-anchor-written / adopt-anchor-skipped）——锚缺失时采纳面一律拒绝
+ * （fail-closed，回落 wakeToken 票据兜底）。默认档不写锚（行为逐字节不变）。
+ *
+ * v0.9.6 r3 增量（回三 V096-21，P1）：**绑定锚归属闸**——回二的「恰一个 server 子
+ * 进程」判据无法回答「这个子进程属于哪个会话」（正是写锚要解决的问题本身）：实测
+ * 受害者会话的钩子把锚写到先于其在位的外来 server 子进程（宿主下恰一个本插件
+ * server）→ 恶意连接读自身 pid 的锚全吻合 → 零凭据采纳受害者。修法：宿主必须是
+ * **本会话的唤醒子 CLI**——宿主 cmdline 含 `--resume <本 sid>`（engine spawnDirect
+ * 的拉起形态）才写锚；桌面 app-server/交互宿主（非 --resume）一律不写锚（该拓扑
+ * 归属不可判定，采纳回落票据兜底）。server 侧护栏 6b（mcp/identity.ts）独立复核
+ * 同一宿主事实，双向闭合。
+ *
  * 降级规则不变：无 sessionId → 不锚定（静默 exit 0）；任何异常 → engine.jsonl 审计 → exit 0。
  *
  * Build entry: dist/hooks/session-start.mjs (scripts/build.mjs).
@@ -50,12 +69,17 @@ import {
 } from './shared.js';
 // v0.9.4（A6）：票据消费 + 身份绑定的 M1 原语（M4 → M1 纪律：只 import core）。
 import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   adoptByPpidEnabledFromEnv,
   consumeWakeTicketForSession,
+  probeHostResumeSidSync,
   readNames,
   readSession,
   restoreWakeNonce,
+  writeAdoptAnchor,
   writeNames,
   writeSession,
 } from '../core/registry.js';
@@ -78,6 +102,196 @@ import { logEngineEvent } from '../core/log.js';
 export function hookSessionPid(): number | undefined {
   const ppid = process.ppid;
   return Number.isSafeInteger(ppid) && ppid > 0 ? ppid : undefined;
+}
+
+// ---------------------------------------------------------------------------
+// v0.9.6 r2（V096-12）：会话↔server 进程绑定锚（采纳护栏 6 的数据源）
+// ---------------------------------------------------------------------------
+
+/** 绑定锚枚举的轮询拍点（毫秒偏移；首拍命中即写，未命中逐拍重试，总窗 ~1.6s）。 */
+export const ADOPT_ANCHOR_POLL_SCHEDULE_MS: readonly number[] = [0, 800, 1600];
+
+/** cmdline 归一化（Windows 路径分隔/大小写不敏感语义）。 */
+function normalizePathForMatch(value: string): string {
+  return value.replaceAll('\\', '/').toLowerCase();
+}
+
+/**
+ * 本插件 MCP server 的 cmdline 判据（归一化后的绝对路径片段）。
+ * pluginRoot 取 ZCODE_PLUGIN_ROOT（生产钩子由宿主注入），缺省从本钩子自身位置推导
+ * （构建产物 <pluginRoot>/dist/hooks/session-start.mjs → 上两级即插件根）。测试经
+ * {@link listPluginServerChildPids} 的 options 显式注入 enumerate/marker，不依赖推导。
+ */
+function pluginServerMarker(pluginRoot: string): string {
+  return normalizePathForMatch(join(pluginRoot, 'dist', 'mcp', 'server.mjs'));
+}
+
+function defaultPluginRoot(): string {
+  const fromEnv = process.env['ZCODE_PLUGIN_ROOT'];
+  if (typeof fromEnv === 'string' && fromEnv.trim() !== '') return fromEnv.trim();
+  try {
+    return dirname(dirname(fileURLToPath(import.meta.url)));
+  } catch {
+    return process.cwd();
+  }
+}
+
+/**
+ * 宿主子进程枚举（PowerShell Get-CimInstance；wmic 在新 Win11 已移除——实测本机
+ * 26300 不可用）。单拍实测 ~0.74s。失败/超时/解析不出 → []（fail-closed：无锚 →
+ * 采纳面护栏 6 拒绝，回落 wakeToken 票据兜底）。
+ */
+function enumerateHostChildrenViaCim(hostPid: number): Array<{ pid: number; commandLine: string }> {
+  try {
+    const result = spawnSync(
+      'powershell.exe',
+      [
+        '-NoProfile', '-NonInteractive', '-Command',
+        `Get-CimInstance Win32_Process -Filter 'ParentProcessId=${hostPid}' | `
+        + 'Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress',
+      ],
+      { timeout: 6_000, encoding: 'utf8', windowsHide: true },
+    );
+    const stdout = (result.stdout ?? '').trim();
+    if (result.status !== 0 || stdout === '') return [];
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(stdout);
+    } catch {
+      return [];
+    }
+    const rows = Array.isArray(parsed) ? parsed : [parsed];
+    const out: Array<{ pid: number; commandLine: string }> = [];
+    for (const row of rows) {
+      if (typeof row !== 'object' || row === null) continue;
+      const rec = row as Record<string, unknown>;
+      const pid = rec['ProcessId'];
+      const commandLine = rec['CommandLine'];
+      if (typeof pid !== 'number' || !Number.isSafeInteger(pid) || pid <= 0) continue;
+      out.push({ pid, commandLine: typeof commandLine === 'string' ? commandLine : '' });
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * v0.9.6 r2（V096-12）：枚举宿主进程的直接子进程里**本插件的 MCP server**。
+ * 判据 = cmdline 归一化后包含 `<pluginRoot>/dist/mcp/server.mjs`——宿主同时携带其他
+ * 插件的 server.mjs（实测：video-generation/zcode-context/pdf 等），必须按插件根
+ * 路径限定，不能只匹配文件名。
+ */
+export function listPluginServerChildPids(
+  hostPid: number,
+  options: {
+    pluginRoot?: string;
+    enumerate?: (hostPid: number) => Array<{ pid: number; commandLine: string }>;
+  } = {},
+): number[] {
+  if (!Number.isSafeInteger(hostPid) || hostPid <= 0) return [];
+  const marker = pluginServerMarker(options.pluginRoot ?? defaultPluginRoot());
+  const rows = (options.enumerate ?? enumerateHostChildrenViaCim)(hostPid);
+  const pids: number[] = [];
+  for (const row of rows) {
+    if (normalizePathForMatch(row.commandLine).includes(marker)) pids.push(row.pid);
+  }
+  return pids;
+}
+
+/**
+ * v0.9.6 r2（V096-12）：写**会话↔server 进程绑定锚**（core/registry.ts AdoptAnchor；
+ * 采纳护栏 6 的数据源）。票据消费成功后调用（仅开启档到达此处；默认档行为不变）。
+ *
+ * 纪律：
+ * - **宿主必须是本会话的唤醒子 CLI**（v0.9.6 r3，V096-21）：宿主 cmdline 须含
+ *   `--resume <本 sid>`（引擎 spawnDirect 的拉起形态）——桌面 app-server/交互宿主
+ *   一律不写锚：一个宿主挂多个会话/多条 server 连接时，钩子无法把「唯一的本插件
+ *   server 子进程」归属到具体会话（回二实测 R4：外来 server 子进程被误绑受害者
+ *   sid → 零凭据采纳）。锚缺失时采纳面护栏 6 一律拒绝（fail-closed），回落
+ *   wakeToken 票据兜底 2 次调用；
+ * - **恰一个本插件 server 子进程才写**——零个（枚举失败/server 未起/启动序未到）与
+ *   多个（无法归属到具体连接）都不写；
+ * - 轮询兜底启动序（钩子先于 server 拉起的形态）：未命中逐拍重试（总窗 ~1.6s+枚举
+ *   耗时），首拍命中立即写；
+ * - 尽力而为：任何异常只审计（auditHookFailure），钩子永不失败；
+ * - 审计事件 adopt-anchor-written / adopt-anchor-skipped（reason: no-host-pid |
+ *   host-cmdline-unavailable | host-not-wake-resume | host-resume-sid-mismatch |
+ *   no-server-child | ambiguous-server-children）。
+ */
+export async function writeAdoptAnchorsForHostServers(input: {
+  stateRoot: string;
+  sessionId: string;
+  hostPid: number | undefined;
+  now: number;
+  /** 测试注入（替代真实 PowerShell 宿主 cmdline 探测）。 */
+  hostProbe?: { available: boolean; resumeSid?: string };
+  /** 测试注入（替代真实 PowerShell 枚举）。 */
+  lister?: (hostPid: number) => number[];
+  /** 测试注入（缩短/取消轮询）。 */
+  pollScheduleMs?: readonly number[];
+}): Promise<void> {
+  try {
+    if (input.hostPid === undefined) {
+      await logEngineEvent(input.stateRoot, {
+        event: 'adopt-anchor-skipped', reason: 'no-host-pid', sessionId: input.sessionId,
+      }).catch(() => undefined);
+      return;
+    }
+    // v0.9.6 r3（V096-21）：宿主唤醒子归属闸——宿主 cmdline 必须含 --resume <本 sid>。
+    // 非唤醒子宿主（桌面 app-server 承载多会话/交互 CLI）上「唯一 server 子进程」无法
+    // 归属到本会话（回二 R4 实测外来子进程被误绑）→ 一律不写锚。
+    const hostProbe = input.hostProbe ?? probeHostResumeSidSync(input.hostPid);
+    if (!hostProbe.available) {
+      await logEngineEvent(input.stateRoot, {
+        event: 'adopt-anchor-skipped', reason: 'host-cmdline-unavailable', sessionId: input.sessionId, hostPid: input.hostPid,
+      }).catch(() => undefined);
+      return;
+    }
+    if (hostProbe.resumeSid === undefined || hostProbe.resumeSid !== input.sessionId) {
+      await logEngineEvent(input.stateRoot, {
+        event: 'adopt-anchor-skipped',
+        reason: hostProbe.resumeSid === undefined ? 'host-not-wake-resume' : 'host-resume-sid-mismatch',
+        sessionId: input.sessionId,
+        hostPid: input.hostPid,
+        ...(hostProbe.resumeSid !== undefined ? { resumeSid: hostProbe.resumeSid } : {}),
+      }).catch(() => undefined);
+      return;
+    }
+    const schedule = input.pollScheduleMs ?? ADOPT_ANCHOR_POLL_SCHEDULE_MS;
+    const lister = input.lister ?? ((pid: number) => listPluginServerChildPids(pid));
+    let serverPids: number[] = [];
+    for (const delay of schedule) {
+      if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+      serverPids = lister(input.hostPid);
+      if (serverPids.length > 0) break;
+    }
+    if (serverPids.length === 0) {
+      await logEngineEvent(input.stateRoot, {
+        event: 'adopt-anchor-skipped', reason: 'no-server-child', sessionId: input.sessionId, hostPid: input.hostPid,
+      }).catch(() => undefined);
+      return;
+    }
+    if (serverPids.length > 1) {
+      await logEngineEvent(input.stateRoot, {
+        event: 'adopt-anchor-skipped', reason: 'ambiguous-server-children', count: serverPids.length,
+        sessionId: input.sessionId, hostPid: input.hostPid,
+      }).catch(() => undefined);
+      return;
+    }
+    const serverPid = serverPids[0]!;
+    await writeAdoptAnchor(input.stateRoot, {
+      sessionId: input.sessionId,
+      hostPid: input.hostPid,
+      serverPid,
+      ts: input.now,
+    });
+    await logEngineEvent(input.stateRoot, {
+      event: 'adopt-anchor-written', sessionId: input.sessionId, hostPid: input.hostPid, serverPid,
+    }).catch(() => undefined);
+  } catch (error) {
+    await auditHookFailure(input.stateRoot, 'session-start-adopt-anchor', error);
+  }
 }
 
 /** v0.9.4（A6）：一次票据消费 + 自动绑定的结局（审计/测试用）。 */
@@ -119,6 +333,16 @@ async function bindWakeTicketIdentity(input: {
 }): Promise<WakeTicketBindingOutcome> {
   const consumed = await consumeWakeTicketForSession(input.stateRoot, { sid: input.sessionId, now: input.now });
   if (consumed === undefined) return { bound: false, detail: 'no-ticket' };
+  // v0.9.6 r2（V096-12）：会话↔server 进程绑定锚（采纳护栏 6 的数据源）——票据
+  // 消费成功即写（先于绑定尝试；绑定失败/回滚时锚仍在，模型回合可显式 identify，
+  // 采纳面则因 boundName 缺失照旧拒绝）。恰一个本插件 server 子进程才写，零/多个
+  // 不写并审计；锚缺失时采纳面护栏 6 一律拒绝（fail-closed，回退票据兜底）。
+  await writeAdoptAnchorsForHostServers({
+    stateRoot: input.stateRoot,
+    sessionId: input.sessionId,
+    hostPid: input.pid,
+    now: input.now,
+  });
   const name = consumed.nonce.name ?? consumed.nonce.agentKey;
 
   /**

@@ -161,6 +161,17 @@ export const WATCHDOG_FRESH_DEATH_MS = 10 * 60_000;
 export const WATCHDOG_RESUME_CATCHUP_MAX_MS = 7 * 24 * 60 * 60_000;
 
 /**
+ * v0.9.6（A4/V095-13）：恢复判据的**下界钳制**（ms，60s）——扫描间隔必须同时超过
+ * `2×周期` 与本下界才判恢复。为什么必须有下界：事件循环的同步停顿（GC / 杀毒扫描 /
+ * 磁盘冻结 / Atomics.wait，实测 3.56s）会让定时器错过若干节拍，间隔远超 2×周期
+ * （周期配小时以内时）——v0.9.5 的判据把这类停顿误判成「休眠恢复」，不仅落误报
+ * `watchdog-resume` 事件，还会把补扫窗收缩到 gapMs 造成窗内死亡静音（V095-13）。
+ * 真实休眠/挂起/停机是分钟级形态；本下界以下的一律按正常节拍处理（常规 10min
+ * 新鲜窗照常覆盖窗内死亡，无静音面）。
+ */
+export const WATCHDOG_RESUME_GAP_FLOOR_MS = 60_000;
+
+/**
  * v0.9.5（A7）：恢复事件的**去重窗**（ms）——多把扫描（每 MCP server 一把）同刻恢复时
  * 只让第一把落 `watchdog-resume` 事件（共享台账记 lastResumeAt；窗内后来的不再记）。
  * 与节拍同量级（2×周期、60s 兜底）：真第二次休眠恢复间隔远大于此，不会被误吞。
@@ -171,6 +182,35 @@ export const WATCHDOG_RESUME_DEDUP_MS = 120_000;
 function withWatchdogStateLock<T>(stateRoot: string, fn: () => Promise<T> | T): Promise<T> {
   return withProcessLock(`watchdog-state:${resolve(stateRoot)}`, () =>
     withFileLock(stateRoot, WATCHDOG_STATE_LOCK_NAME, fn, { waitMs: WATCHDOG_LOCK_WAIT_MS }));
+}
+
+/**
+ * v0.9.6（A2/V095-06）：看门狗台账的成员键 = `(成员名, sessionId)` **复合键**。
+ *
+ * 为什么必须复合：v0.9.5 及之前台账按键（成员名）记账，**不含 sid**——同名重供给
+ * （xc_team member-add 幂等重供给，换新会话 = 新化身）后，新化身死在首个扫描节拍内时
+ * `previous.state==='dead'` 直接把告警吞掉（V095-06 实测：零事件零告警，且死亡文案
+ * 自荐的正是这条重供给路径——「按它说的做，下一次死亡就被静音」）。复合键让每个
+ * 化身独立记账：旧化身（旧 sid）的死亡已认领不影响新化身（新 sid）的死亡照常告警。
+ *
+ * 形态：`${memberKey}|${sessionId}`。成员名经 sanitizeKey 只含字母/数字/连字符、
+ * sessionId 由插件生成，两者都不含 `|`——复合键可无歧义识别；**不含 `|` 的键是
+ * v0.9.5 及之前的旧格式条目**（见 sweepMembersOnce 内的 legacy 迁移）。
+ */
+export function watchdogLedgerKey(memberKey: string, sessionId: string): string {
+  return `${memberKey}|${sessionId}`;
+}
+
+/**
+ * v0.9.6（A4/V095-10+13）：**补扫窗口**（ms）= `min(max(gapMs, 常规新鲜窗), 7 天上界)`。
+ *
+ * v0.9.5 的取值是 `min(gapMs, 7d)`——短恢复（gap 130s）会把新鲜窗从常规 10min **收缩**
+ * 到 gapMs，死亡证据年龄 ≈ gapMs 恰落窗外 → 补扫比常规更聋的静音（V095-10 实测）。
+ * 修法：窗取 `max(gapMs, WATCHDOG_FRESH_DEATH_MS)`（补扫只许**放宽**不许收缩常规窗），
+ * 再钳 7 天上界（A7 防误报原口径保留：月级停机不翻远古死记录）。
+ */
+export function watchdogCatchupWindowMs(gapMs: number): number {
+  return Math.min(Math.max(gapMs, WATCHDOG_FRESH_DEATH_MS), WATCHDOG_RESUME_CATCHUP_MAX_MS);
 }
 
 /**
@@ -265,8 +305,10 @@ export interface WatchdogSweepSummary {
   wakes: Array<{ to: string; delivered: string; note?: string }>;
   /**
    * v0.9.5（A7）：休眠/停机恢复补扫态（undefined = 本轮是正常间隔，零补扫事件）。
-   * `gapMs` = 实际扫描间隔（> 2×周期才判恢复）；`catchupWindowMs` = 补扫窗口
-   * （min(gapMs, WATCHDOG_RESUME_CATCHUP_MAX_MS)），窗口内死亡按补扫告警。
+   * `gapMs` = 实际扫描间隔（> max(2×周期, 恢复下界 60s) 才判恢复，V095-13）；
+   * `catchupWindowMs` = 补扫窗口**生效值**（v0.9.6 A4/V095-10 起 =
+   * min(max(gapMs, 常规新鲜窗 10min), WATCHDOG_RESUME_CATCHUP_MAX_MS)——短恢复不再
+   * 收缩常规窗），窗口内死亡按补扫告警。
    */
   resume?: { gapMs: number; catchupWindowMs: number };
   /** 本轮跳过的原因（认领锁忙 = 另一把扫描正在做；undefined = 正常跑完）。 */
@@ -314,17 +356,18 @@ async function backfillMemberDeadEvents(
 /**
  * v0.9.3 打回第 1 轮（V093-04）：通知落地后把台账里的死亡条目改 `notify:'sent'`
  * （best-effort：锁忙/写失败就留给下一轮重发——宁可重发一条，不永久静音）。
+ * v0.9.6（A2/V095-06）：入参为**台账复合键**（{@link watchdogLedgerKey}，(成员,会话)）。
  */
-async function markDeathNotified(stateRoot: string, keys: readonly string[], now: number): Promise<void> {
-  if (keys.length === 0) return;
+async function markDeathNotified(stateRoot: string, ledgerKeys: readonly string[], now: number): Promise<void> {
+  if (ledgerKeys.length === 0) return;
   try {
     await withWatchdogStateLock(stateRoot, async () => {
       const locked = await readWatchdogState(stateRoot);
       let dirty = false;
-      for (const key of keys) {
-        const entry = locked.members[key];
+      for (const ledgerKey of ledgerKeys) {
+        const entry = locked.members[ledgerKey];
         if (entry === undefined || entry.state !== 'dead' || entry.notify === 'sent') continue;
-        locked.members[key] = { ...entry, notify: 'sent' };
+        locked.members[ledgerKey] = { ...entry, notify: 'sent' };
         dirty = true;
       }
       if (dirty) await writeWatchdogState(stateRoot, locked);
@@ -337,10 +380,12 @@ async function markDeathNotified(stateRoot: string, keys: readonly string[], now
 /**
  * v0.9.3 打回第 1 轮（V093-04）：登记一次 pending 重发尝试——成功 ⇒ 'sent'；失败 ⇒  attempts+1，
  * 达上限 ⇒ 'failed' + `watchdog-notify-failed` 事件（把「告知通道持续不通」变成可见错误面）。
+ * v0.9.6（A2/V095-06）：台账定位用**复合键**（{@link watchdogLedgerKey}，(成员,会话)）；
+ * 事件 `member` 字段仍是成员名（审计按成员身份读）。
  */
 async function recordRenotifyAttempt(
   stateRoot: string,
-  keys: readonly string[],
+  entries: ReadonlyArray<{ memberKey: string; ledgerKey: string }>,
   delivered: boolean,
   teamId: string,
   now: number,
@@ -349,25 +394,25 @@ async function recordRenotifyAttempt(
     await withWatchdogStateLock(stateRoot, async () => {
       const locked = await readWatchdogState(stateRoot);
       let dirty = false;
-      for (const key of keys) {
-        const entry = locked.members[key];
+      for (const { memberKey, ledgerKey } of entries) {
+        const entry = locked.members[ledgerKey];
         if (entry === undefined || entry.state !== 'dead') continue;
         const attempts = (entry.notifyAttempts ?? 0) + 1;
         if (delivered) {
-          locked.members[key] = { ...entry, notify: 'sent', notifyAttempts: attempts, lastNotifyAttemptAt: now };
+          locked.members[ledgerKey] = { ...entry, notify: 'sent', notifyAttempts: attempts, lastNotifyAttemptAt: now };
         } else if (attempts >= WATCHDOG_NOTIFY_MAX_ATTEMPTS) {
-          locked.members[key] = { ...entry, notify: 'failed', notifyAttempts: attempts, lastNotifyAttemptAt: now };
+          locked.members[ledgerKey] = { ...entry, notify: 'failed', notifyAttempts: attempts, lastNotifyAttemptAt: now };
           await logEngineEvent(stateRoot, {
             event: 'watchdog-notify-failed',
             teamId,
-            member: key,
+            member: memberKey,
             attempts,
             reason: 'no-live-recipients',
             note: '成员死亡告警的重发次数已用尽仍无人可通知（lead 死且无其他活成员/全员不可寻址）——'
               + '请用 xc_overview 核对后用 xc_dispatch 重派其名下任务，或 xc_team({action:"member-add"}) 幂等重供给',
           });
         } else {
-          locked.members[key] = { ...entry, notifyAttempts: attempts, lastNotifyAttemptAt: now };
+          locked.members[ledgerKey] = { ...entry, notifyAttempts: attempts, lastNotifyAttemptAt: now };
         }
         dirty = true;
       }
@@ -451,8 +496,9 @@ async function wakeChildExited(lifecycleFile: string): Promise<boolean> {
  * 只记录不告警（v0.9.2 A2「启动期存量死记录不当事故」原口径）。
  *
  * `windowMs`（v0.9.5 A7）：新鲜窗——正常扫描用 {@link WATCHDOG_FRESH_DEATH_MS}；
- * 休眠恢复补扫轮传 catchup 窗（min(gapMs, WATCHDOG_RESUME_CATCHUP_MAX_MS)），
- * 窗口内死亡按补扫口径告警（不静音）。
+ * 休眠恢复补扫轮传生效补扫窗（v0.9.6 A4/V095-10 起 = min(max(gapMs, 常规新鲜窗),
+ * WATCHDOG_RESUME_CATCHUP_MAX_MS)，见 {@link watchdogCatchupWindowMs}），窗口内死亡
+ * 按补扫口径告警（不静音）。
  */
 function recentLifeEvidence(
   scan: PeerScanResult,
@@ -483,20 +529,44 @@ function recentLifeEvidence(
  * 文案漂移）；`firstSight` = 台账无历史下的首见即死（文案如实注明，免得 lead 以为是迁移）。
  * `catchUp`（v0.9.5 A7）= 本轮是休眠恢复补扫轮（freshness 窗为补扫窗口）——文案如实注明
  * 「补扫」，lead 能分辨这是扫描盲区追认的死亡而非实时检出。
+ *
+ * v0.9.6（A3/V095-07）：首见死亡**默认告警**（宁误报一次）后，首见文案分两态：
+ * - 采到近期存活证据 → 「按近期存活证据判为新鲜死亡」（v0.9.5 A2 原文案）；
+ * - 未采到任何新鲜证据 → 如实注明「首见且无近期存活证据，宁误报一次不静音」，lead 可据此
+ *   把启动期存量死记录形态的误报安全忽略。
+ *
+ * v0.9.6（A8/V095-21 + A2/V095-06）：尾段统一「待回池 + 回池时刻」口径——任务在 stale
+ * 清扫到期前是冻结的（回池时刻见 xc_overview 板面各任务 requeueAtMs），不再把「用
+ * xc_dispatch 重派」写成当下可执行的动作（冻结窗内去待领池找不到任务，四面矛盾的文案面）；
+ * 重供给建议附「(成员,会话) 独立记账」说明——v0.9.5 台账按键记账时，按文案走 member-add
+ * 重供给恰是下一次死亡被静音的原因（V095-06 的「自荐误导」），复合键记账后该路径不再静音，
+ * 文案如实注明。
  */
-function renderMemberDeadText(key: string, sessionId: string, isLead: boolean, firstSight: boolean, catchUp = false): string {
+function renderMemberDeadText(
+  key: string,
+  sessionId: string,
+  isLead: boolean,
+  firstSight: boolean,
+  catchUp = false,
+  freshEvidence = true,
+): string {
   const head = firstSight
     ? (catchUp
       ? `成员 "${key}" 进程已亡（pid-dead，sid ${sessionId}；休眠/扫描中断后补扫——死亡落在本轮补扫窗口内，按补扫口径告警不静音）`
-      : `成员 "${key}" 进程已亡（pid-dead，sid ${sessionId}；看门狗台账无该成员历史，按近期存活证据判为新鲜死亡）`)
+      : freshEvidence
+        ? `成员 "${key}" 进程已亡（pid-dead，sid ${sessionId}；看门狗台账无该成员历史，按近期存活证据判为新鲜死亡）`
+        : `成员 "${key}" 进程已亡（pid-dead，sid ${sessionId}；【首见】看门狗台账无该成员历史且未采到近期存活证据——`
+          + `按首见死亡宁误报一次告警；若属启动期存量死记录/长期离队形态可安全忽略本条）`)
     : isLead
       ? `lead "${key}" 进程已亡（pid-dead）`
       : `成员 "${key}" 进程已亡（pid-dead，sid ${sessionId}）`;
   const tail = isLead
     ? '——其会话与 MCP server 已不存在，队内推送面随之中断；在册队友已收到本通知，请接手指令：'
-      + '用 xc_dispatch 重派其名下任务，或用 xc_team({action:"member-add"}) 幂等重供给。'
-    : '——其会话/无头回合已不存在；名下任务请用 xc_overview 核对后用 xc_dispatch 重派，'
-      + '或用 xc_team({action:"member-add"}) 幂等重供给。';
+      + '名下任务已冻结待回池（预计回池时刻见 xc_overview 板面各任务 requeueAtMs），回池后用 xc_dispatch 重派，'
+      + '或用 xc_team({action:"member-add"}) 幂等重供给（重供给按 (成员,会话) 独立记账，新会话的死亡照常告警）。'
+    : '——其会话/无头回合已不存在；名下任务已冻结待回池（预计回池时刻见 xc_overview 板面各任务 requeueAtMs），'
+      + '回池后用 xc_dispatch 重派，或用 xc_team({action:"member-add"}) 幂等重供给'
+      + '（重供给按 (成员,会话) 独立记账，新会话的死亡照常告警）。';
   return head + tail;
 }
 
@@ -508,7 +578,8 @@ function renderRenotifyText(keys: readonly string[], leadKey: string, leadCurren
   return head
     + `以下成员的死亡告警此前只完成了台账认领、通知未落地（认领与通知非原子，或引擎进程崩在两者之间），现重发：${keys.join(', ')}。`
     + '消息不丢：以上事项均以邮箱为兜底（pull 可读、降级后可重投）。请用 xc_overview 看在册成员活性与未读，'
-    + '用 xc_dispatch 重派，或用 xc_team({action:"member-add"}) 幂等重供给崩溃成员。';
+    + '其名下任务已冻结待回池（预计回池时刻见板面 requeueAtMs），回池后用 xc_dispatch 重派，'
+    + '或用 xc_team({action:"member-add"}) 幂等重供给（重供给按 (成员,会话) 独立记账）。';
 }
 
 /**
@@ -582,8 +653,8 @@ function renderRoundIncidents(
   return (
     `${head}\n${lines.join('\n')}\n`
     + '消息不丢：以上事项均以邮箱为兜底（pull 可读、降级后可重投）。'
-    + '请用 xc_overview 看在册成员活性与未读，用 xc_dispatch 重派，'
-    + '或用 xc_team({action:"member-add"}) 幂等重供给崩溃成员。'
+    + '请用 xc_overview 看在册成员活性与未读；死亡成员名下任务已冻结待回池（预计回池时刻见板面 requeueAtMs），'
+    + '回池后用 xc_dispatch 重派，或用 xc_team({action:"member-add"}) 幂等重供给（重供给按 (成员,会话) 独立记账）。'
     + '本告警来自 MCP server 内的看门狗定时器（XC_WATCHDOG_MS 缺省 60s，0=关；每会话一把扫描，'
     + '跨进程认领保证同一次事故只有一个通告者）；看门狗全部随进程死亡时，由 UserPromptSubmit 的回合开始事故摘要兜底。'
   );
@@ -629,9 +700,12 @@ function planRecipients(input: {
 
 /** 一轮扫描的恢复补扫输入（v0.9.5 A7；startMemberWatchdog 的定时器面检测产出）。 */
 export interface WatchdogResumeInput {
-  /** 实际扫描间隔（ms；> 2×周期才判恢复）。 */
+  /** 实际扫描间隔（ms；> max(2×周期, 恢复下界 60s) 才判恢复，V095-13）。 */
   gapMs: number;
-  /** 补扫窗口（ms；= min(gapMs, WATCHDOG_RESUME_CATCHUP_MAX_MS)）。 */
+  /**
+   * 补扫窗口（ms）。v0.9.6（A4/V095-10）起 sweep 面把它钳制到 ≥ 常规新鲜窗
+   * （{@link watchdogCatchupWindowMs} 的定时器面公式；此处防御纵深）——补扫不许比常规更聋。
+   */
   catchupWindowMs: number;
 }
 
@@ -705,10 +779,17 @@ export async function sweepMembersOnce(
   };
   const { stateRoot, env } = deps;
   const teamId = DEFAULT_TEAM_ID;
+  // v0.9.6（A4/V095-10）：补扫窗的**生效值**在下界钳制到常规新鲜窗（≥10min）——调用方
+  // （定时器面）已按 watchdogCatchupWindowMs 取 max(gap,10min)；此处再钳一道（防御纵深），
+  // 任何以旧公式 min(gap,7d) 形态传入的窗口都不会把新鲜窗收缩到常规窗以下（补扫不许比
+  // 常规更聋）。事件与 summary 如实记生效值。
+  const catchupWindowMs = options.resume === undefined
+    ? WATCHDOG_FRESH_DEATH_MS
+    : Math.max(options.resume.catchupWindowMs, WATCHDOG_FRESH_DEATH_MS);
   // v0.9.5（A7）：恢复补扫事件——共享台账去重（一次恢复恰一条；多把扫描同刻恢复时
   // 第一把落事件，其余只按补扫口径跑）。锁忙/写失败不阻断补扫本身。
   if (options.resume !== undefined) {
-    summary.resume = { gapMs: options.resume.gapMs, catchupWindowMs: options.resume.catchupWindowMs };
+    summary.resume = { gapMs: options.resume.gapMs, catchupWindowMs };
     try {
       await withWatchdogStateLock(stateRoot, async () => {
         const ledger = await readWatchdogResumeLedger(stateRoot);
@@ -718,10 +799,10 @@ export async function sweepMembersOnce(
         await logEngineEvent(stateRoot, {
           event: 'watchdog-resume',
           gapMs: options.resume!.gapMs,
-          catchupWindowMs: options.resume!.catchupWindowMs,
+          catchupWindowMs,
           via: 'watchdog',
-          note: '扫描间隔超过 2×周期（休眠/挂起/停机恢复）——本轮按补扫口径处理：'
-            + `补扫窗口（≤${Math.round(options.resume!.catchupWindowMs / 3_600_000)}h）内的死亡照常告警（不静音）`,
+          note: '扫描间隔超过 2×周期且不低于恢复下界（休眠/挂起/停机恢复）——本轮按补扫口径处理：'
+            + `补扫窗口（≤${Math.round(catchupWindowMs / 3_600_000)}h，且不低于常规新鲜窗）内的死亡照常告警（不静音）`,
         });
       });
     } catch (error) {
@@ -777,15 +858,16 @@ export async function sweepMembersOnce(
         // 会话记录 lastEventTs（hooks 回合边界 + 工具心跳）与引擎证言 ts。V094-13
         // 实测形态：引擎成员从未 peer 注册（每次工具调用的 server 短命、干净注销），
         // 旧判据只扫 peer 记录 → 90 秒前还活着的成员被当存量死记录永久静音。
-        // v0.9.5（A7）：补扫轮的新鲜窗 = catchupWindowMs（min(gapMs, 7 天)）——窗口内
-        // 死亡按补扫告警（不静音）；正常轮维持 WATCHDOG_FRESH_DEATH_MS。
+        // v0.9.6（A4/V095-10）：补扫轮的新鲜窗 = 生效补扫窗（max(gap,常规 10min) 钳 7 天
+        // 上界，见入口的 catchupWindowMs）——窗口内死亡按补扫告警（不静音）；正常轮维持
+        // WATCHDOG_FRESH_DEATH_MS。
         let witnessTs: number | undefined;
         try {
           witnessTs = (await readSessionWitness(stateRoot, sessionId))?.ts;
         } catch {
           witnessTs = undefined; // 证言读失败 = 该源无声（不猜）
         }
-        const freshWindowMs = options.resume?.catchupWindowMs ?? WATCHDOG_FRESH_DEATH_MS;
+        const freshWindowMs = catchupWindowMs;
         const recentLife = recentLifeEvidence(
           scan,
           sessionId,
@@ -878,25 +960,46 @@ export async function sweepMembersOnce(
     // 发过就按没发过处理，补发一次后转 'sent'（V093-04 起口径；「缺省按 sent、不为历史
     // 死亡补炸」的旧注释随两段式告知作废——权威见 watchdog-state.ts 同名字段文档与
     // watchdog-v093-notify-atomicity.test.ts 的旧格式例）。
-    const renotifyPending: Array<{ key: string; sessionId: string; at: number; evidence: string }> = [];
+    const renotifyPending: Array<{ key: string; sessionId: string; ledgerKey: string; at: number; evidence: string }> = [];
     let state: WatchdogState;
     try {
       state = await withWatchdogStateLock(stateRoot, async () => {
         const locked = await readWatchdogState(stateRoot);
+        // v0.9.6（A2/V095-06）：复合键迁移——v0.9.5 及之前的台账按键（成员名）记账，不含
+        // 会话维度。旧格式条目（键不含 `|`）无法判定其死亡属于哪个化身：保留会被复合键
+        // 查找永远错过（垃圾增长），映射到当前 sid 则可能把旧化身的死亡错记到新化身头上
+        // （重供给后的首拍死亡被吞——恰是本修复要消除的形态）。按「宁误报不静音」方向：
+        // 旧格式条目一次性清除、此后按复合键重新记账——升级后已死成员的死亡至多重报一条
+        // （宁误报一次，且 V095-07 起首见默认告警会把它重新抬出来），不再可能静音。
+        // 同轮顺手把台账收敛为**当前花名册的投影**：不在册成员、以及仍在册但 sid 已换
+        // （重供给/重绑——member-add 把 roster sid 置空/换新即「重供给时清 dead 态」的
+        // 等效面）的旧化身条目一律删除——它们永远不会再被复合键查中，保留只会无界增长；
+        // 当前 sid 的条目（含本轮刚认领的死亡）不受影响。
+        const currentLedgerKeys = new Set<string>();
+        for (const member of team.members) {
+          const sid = typeof member.sessionId === 'string' && member.sessionId !== '' ? member.sessionId : null;
+          if (sid !== null) currentLedgerKeys.add(watchdogLedgerKey(member.key, sid));
+        }
+        for (const ledgerKey of Object.keys(locked.members)) {
+          if (!currentLedgerKeys.has(ledgerKey)) delete locked.members[ledgerKey];
+        }
         for (const hit of deathCandidates) {
-          const previous = locked.members[hit.key];
-          if (previous?.state === 'dead') continue; // 已判死：同一死亡不重复告警
-          if (previous === undefined && !hit.recentLife) {
-            // 首见且无近期存活证据 = 台账无历史（全新状态根 / 状态文件损坏被删）撞上存量死
-            // 记录：只记录不告警（v0.9.2 A2 原口径——启动期存量死记录不当事故），且不留给
-            // 重发队列（没有通知可补）。
-            locked.members[hit.key] = {
+          const ledgerKey = watchdogLedgerKey(hit.key, hit.sessionId);
+          const previous = locked.members[ledgerKey];
+          if (previous?.state === 'dead') continue; // 已判死：同一化身（同 sid）的同一次死亡不重复告警
+          // v0.9.6（A3/V095-07）：首见死亡**默认告警**（宁误报一次，文案附「首见」标注）。
+          // v0.9.5 的「首见 + 无近期存活证据 → 静默认领」只保留在**补扫轮**（resume）：
+          // 补扫窗（≤7 天）是 A7 的防误报上界——窗外（远古）死记录不翻旧账；常规轮不再
+          // 静音：t2 实测形态（引擎成员未 peer 注册 + 无工具回合 + 台账无历史，长回合中
+          // 进程死）三源全过期，静默认领零审计零告警——正是「宁误报一次」要堵的形态。
+          if (previous === undefined && !hit.recentLife && summary.resume !== undefined) {
+            locked.members[ledgerKey] = {
               state: 'dead', at: now, liveness: 'pid-dead', evidence: 'process-dead', notify: 'sent',
             };
             continue;
           }
           const firstSight = previous === undefined;
-          locked.members[hit.key] = {
+          locked.members[ledgerKey] = {
             state: 'dead', at: now, liveness: 'pid-dead', evidence: 'process-dead', notify: 'pending',
           };
           summary.dead.push(hit.key);
@@ -913,33 +1016,52 @@ export async function sweepMembersOnce(
           });
           incidents.push({
             kind: 'member-dead',
-            text: renderMemberDeadText(hit.key, hit.sessionId, hit.key === leadKey, firstSight, summary.resume !== undefined),
+            text: renderMemberDeadText(
+              hit.key,
+              hit.sessionId,
+              hit.key === leadKey,
+              firstSight,
+              summary.resume !== undefined,
+              hit.recentLife,
+            ),
           });
         }
-        // 非迁移成员刷新快照：活过来即重新武装；往轮已死者保持 dead（不因一次扫描抖动重新武装）。
-        for (const [key, liveness] of livenessByKey) {
-          const previous = locked.members[key];
+        // 非迁移成员刷新快照（复合键，V095-06）：活过来即重新武装；往轮已死者保持 dead
+        // （不因一次扫描抖动重新武装）。同一成员换 sid（重供给/重绑）= 新化身独立记账。
+        for (const member of team.members) {
+          if (memberState(member) === 'removed') continue;
+          const refreshSid = typeof member.sessionId === 'string' && member.sessionId !== '' ? member.sessionId : null;
+          if (refreshSid === null) continue;
+          const liveness = livenessByKey.get(member.key);
+          if (liveness === undefined) continue;
+          const ledgerKey = watchdogLedgerKey(member.key, refreshSid);
+          const previous = locked.members[ledgerKey];
           if (previous === undefined) {
-            locked.members[key] = { state: liveness === 'pid-dead' ? 'dead' : 'alive', at: now, liveness };
+            locked.members[ledgerKey] = { state: liveness === 'pid-dead' ? 'dead' : 'alive', at: now, liveness };
             continue;
           }
           if (previous.state === 'dead' && liveness !== 'pid-dead') {
-            locked.members[key] = { state: 'alive', at: now, liveness };
+            locked.members[ledgerKey] = { state: 'alive', at: now, liveness };
           }
         }
         // v0.9.3 打回第 1 轮（V093-04）：重发队列——死亡已认领但**告知状态不明**的条目：
-        // `notify:'pending'`（新两段式：认领了、通知未确认落地）或字段缺省（旧版本/手写/
-        // 陈旧备份恢复的行——无从证明通知发过，按「没发过」处理，补发一次），且认领已久
-        // （宽限一个节拍，等本轮通知落地）且未超次数上限。含往轮遗留（进程崩溃/通知失败）。
-        for (const [key, entry] of Object.entries(locked.members)) {
-          if (entry.state !== 'dead') continue;
+        // `notify:'pending'`（两段式：认领了、通知未确认落地）或字段缺省（手写/陈旧备份
+        // 恢复的行——无从证明通知发过，按「没发过」处理，补发一次），且认领已久（宽限一个
+        // 节拍，等本轮通知落地）且未超次数上限。v0.9.6（V095-06）：按在册成员的复合键遍历。
+        for (const member of team.members) {
+          if (memberState(member) === 'removed') continue;
+          const sessionId = typeof member.sessionId === 'string' && member.sessionId !== '' ? member.sessionId : null;
+          if (sessionId === null) continue;
+          const ledgerKey = watchdogLedgerKey(member.key, sessionId);
+          const entry = locked.members[ledgerKey];
+          if (entry === undefined || entry.state !== 'dead') continue;
           if (entry.notify === 'sent' || entry.notify === 'failed') continue;
           if (now - entry.at < WATCHDOG_NOTIFY_RETRY_MS) continue;
           if ((entry.notifyAttempts ?? 0) >= WATCHDOG_NOTIFY_MAX_ATTEMPTS) continue;
-          const sessionId = team.members.find((m) => m.key === key)?.sessionId;
           renotifyPending.push({
-            key,
-            sessionId: typeof sessionId === 'string' ? sessionId : '',
+            key: member.key,
+            sessionId,
+            ledgerKey,
             at: entry.at,
             evidence: entry.evidence ?? '',
           });
@@ -1180,7 +1302,17 @@ export async function sweepMembersOnce(
           await notifyAndWake(deps, teamId, recipients, text, 'message', summary);
           // v0.9.3 打回第 1 轮（V093-04）：通知已发出 → 台账改 'sent'（best-effort；写失败
           // 的代价是下一轮重发一条，方向是「宁可重发，不永久静音」）。
-          await markDeathNotified(stateRoot, summary.dead, now);
+          // v0.9.6（A2/V095-06）：按台账复合键定位（summary.dead 是成员名）。
+          await markDeathNotified(
+            stateRoot,
+            summary.dead
+              .map((key) => {
+                const sid = deathCandidates.find((c) => c.key === key)?.sessionId;
+                return sid === undefined ? undefined : watchdogLedgerKey(key, sid);
+              })
+              .filter((k): k is string => k !== undefined),
+            now,
+          );
         }
       }
     }
@@ -1215,7 +1347,13 @@ export async function sweepMembersOnce(
         note: '死亡告警此前只完成台账认领、通知未落地（认领与通知非原子 / 进程崩在两者之间 / 台账陈旧恢复）——按 pending 补发；'
           + 'member-dead 事件按「是否已有」条件式补发（一次死亡一条，A3 事故摘要不双计）',
       });
-      await recordRenotifyAttempt(stateRoot, keys, delivered, teamId, now);
+      await recordRenotifyAttempt(
+        stateRoot,
+        renotifyPending.map((entry) => ({ memberKey: entry.key, ledgerKey: entry.ledgerKey })),
+        delivered,
+        teamId,
+        now,
+      );
     }
     return summary;
   } catch (error) {
@@ -1234,10 +1372,20 @@ export async function sweepMembersOnce(
  *
  * v0.9.5（A7）：**休眠恢复检测**——定时器面记录两次点火的真实墙钟间隔（机器休眠/
  * 挂起时进程与定时器一同冻结，恢复后第一次点火的真实间隔 = 休眠时长，Node 定时器
- * 把错过节拍合并成一次点火）：间隔 > 2×周期 ⇒ 本轮按补扫口径跑（`watchdog-resume`
- * 事件 + 补扫窗口内死亡照常告警，不静音）。检测放在定时器面而非 sweep 内部：
- * sweep 的 `now` 可被测试注入（合成时刻会伪造出假间隔），真实墙钟只在定时器面流动。
- * 补扫事件由共享台账去重（每 MCP server 一把扫描，恢复同刻只落一条事件）。
+ * 把错过节拍合并成一次点火）：间隔 > `max(2×周期, WATCHDOG_RESUME_GAP_FLOOR_MS)` ⇒
+ * 本轮按补扫口径跑（`watchdog-resume` 事件 + 补扫窗口内死亡照常告警，不静音）。
+ * 检测放在定时器面而非 sweep 内部：sweep 的 `now` 可被测试注入（合成时刻会伪造出假
+ * 间隔），真实墙钟只在定时器面流动。补扫事件由共享台账去重（每 MCP server 一把扫描，
+ * 恢复同刻只落一条事件）。
+ *
+ * v0.9.6（A4/V095-13）：间隔判据加**下界钳制**——仅超 2×周期不判恢复，还须超过
+ * 60s 下界：事件循环的秒级同步停顿（GC/杀毒/磁盘冻结，实测 3.56s）在周期较短的配置下
+ * 也会超 2×周期，v0.9.5 会误落 resume 事件并把补扫窗收缩到 gapMs 造成静音；下界以下
+ * 一律按正常节拍跑（常规新鲜窗照常覆盖，无静音面）。
+ *
+ * v0.9.6（A4/V095-10）：补扫窗口 = {@link watchdogCatchupWindowMs}
+ * （min(max(gapMs, 常规 10min 新鲜窗), 7 天上界)）——短恢复不再把新鲜窗**收缩**到
+ * gapMs（补扫不许比常规更聋），月级 hiatus 的 7 天防误报上界保留。
  *
  * @param intervalMs 测试注入的轮询间隔；缺省 env `XC_WATCHDOG_MS`（0 = 关，返回 undefined）。
  */
@@ -1247,16 +1395,16 @@ export function startMemberWatchdog(
 ): NodeJS.Timeout | undefined {
   const interval = intervalMs ?? watchdogIntervalMsFromEnv(deps.env);
   if (!Number.isFinite(interval) || interval <= 0) return undefined;
+  // 恢复判据阈值：2×周期（扫描耗时余量）与 60s 下界（事件循环停顿不是休眠，V095-13）取大。
+  const resumeThresholdMs = Math.max(2 * interval, WATCHDOG_RESUME_GAP_FLOOR_MS);
   // 上一次定时器点火的真实时刻（undefined = 首轮，无间隔可比）。
   let lastFireAt: number | undefined;
   const timer = setInterval(() => {
     const firedAt = Date.now();
     const gapMs = lastFireAt !== undefined ? Math.max(0, firedAt - lastFireAt) : undefined;
     lastFireAt = firedAt;
-    // 间隔 > 2×周期 = 休眠/挂起/停机恢复（正常节拍下间隔 ≈ 周期；2× 留出扫描耗时余量）。
-    // 补扫窗口 = min(gapMs, WATCHDOG_RESUME_CATCHUP_MAX_MS)：防超长 hiatus 翻出远古死记录。
-    const resume = gapMs !== undefined && gapMs > 2 * interval
-      ? { gapMs, catchupWindowMs: Math.min(gapMs, WATCHDOG_RESUME_CATCHUP_MAX_MS) }
+    const resume = gapMs !== undefined && gapMs > resumeThresholdMs
+      ? { gapMs, catchupWindowMs: watchdogCatchupWindowMs(gapMs) }
       : undefined;
     void sweepMembersOnce(deps, undefined, resume !== undefined ? { resume } : {}).catch(() => undefined); // sweepMembersOnce 自带兜底，双保险
   }, interval);

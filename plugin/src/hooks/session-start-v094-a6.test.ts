@@ -49,6 +49,16 @@ vi.mock("./shared.js", async (importOriginal) => {
   };
 });
 
+// v0.9.6 r2（V096-12）：bindWakeTicketIdentity 在票据消费成功后调用
+// writeAdoptAnchorsForHostServers（会话↔server 绑定锚），其默认轮询
+// ADOPT_ANCHOR_POLL_SCHEDULE_MS=[0,800,1600] 用真实 PowerShell 子进程枚举
+// （listPluginServerChildPids）——每个消费票据的钩子运行固定多花 ~4s。
+// 本文件全部判据走 runSessionStartHook 真路径（不注入 lister/pollScheduleMs），
+// 单跑 ~4.4s/例已贴 vitest 默认 testTimeout=5s；全量并行满载下 ~5.2s/次必超时
+// （05:59 全量实跑：4 次 attempt×5s≈20.8s 红）。只放宽时间预算、不放宽任何断言
+// （与 vitest.config.ts「retry 吸收负载抖动、不放宽判据」同纪律）。
+vi.setConfig({ testTimeout: 30_000 });
+
 const dirs: string[] = [];
 
 // v0.9.5（A1/V094-02）：ppid 采纳默认关——钩子的票据消费+自动绑定随之默认关

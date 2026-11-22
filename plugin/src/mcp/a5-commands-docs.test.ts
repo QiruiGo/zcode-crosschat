@@ -329,24 +329,24 @@ describe('A5 文档：无 PreCompact，故用提醒+一键（ACCEPT15-1 文档�
 // 8. 版本五处统一（AC6 静态面）
 // ---------------------------------------------------------------------------
 
-describe('A5 版本五处统一 0.9.5', () => {
-  it('package.json / plugin.json / marketplace.json / server.ts 四处 = 0.9.5', () => {
-    expect(JSON.parse(readRel('plugin/package.json')).version).toBe('0.9.5');
-    expect(JSON.parse(readRel('plugin/.zcode-plugin/plugin.json')).version).toBe('0.9.5');
-    expect(JSON.parse(readRel('marketplace.json')).plugins[0].version).toBe('0.9.5');
-    expect(readRel('plugin/src/mcp/server.ts')).toContain('const SERVER_VERSION = "0.9.5"');
+describe('A5 版本五处统一 0.9.6', () => {
+  it('package.json / plugin.json / marketplace.json / server.ts 四处 = 0.9.6', () => {
+    expect(JSON.parse(readRel('plugin/package.json')).version).toBe('0.9.6');
+    expect(JSON.parse(readRel('plugin/.zcode-plugin/plugin.json')).version).toBe('0.9.6');
+    expect(JSON.parse(readRel('marketplace.json')).plugins[0].version).toBe('0.9.6');
+    expect(readRel('plugin/src/mcp/server.ts')).toContain('const SERVER_VERSION = "0.9.6"');
   });
 
-  // v0.9.5 发布 lane 注：四处版本文件已 0.9.5；第五处（README 安装段资产名/安装回显）
-  // 已随发布 lane 就地改为 0.9.5，本断言同步改钉 0.9.5；CHANGELOG 的 v0.9.5 条目
-  // 也由发布 lane 落笔（v0.9.3/v0.9.4 条目此前由 B1 补钉）。
-  it('README 安装段指向 0.9.5；CHANGELOG 含 v0.9.5/0.9.2/0.9.1/0.9.0 条目（第五处）', () => {
+  // v0.9.6 注（组 B）：四处版本文件由集成员改钉 0.9.6；第五处（README 安装段资产名/安装回显）
+  // 与 CHANGELOG 的 v0.9.6 条目由组 B 就地落笔，本断言同步改钉 0.9.6
+  // （v0.9.5 及更早条目仍在 CHANGELOG，按「最新条目 + 三条历史条目」口径只钉最新与既有的三条）。
+  it('README 安装段指向 0.9.6；CHANGELOG 含 v0.9.6/0.9.2/0.9.1/0.9.0 条目（第五处）', () => {
     const readme = readRel('README.md');
-    expect(readme).toContain('zcode-crosschat-0.9.5-prebuilt-slim.tar.gz');
-    expect(readme).toContain('Installed plugin zcode-crosschat@dev-zcode-crosschat (0.9.5)');
+    expect(readme).toContain('zcode-crosschat-0.9.6-prebuilt-slim.tar.gz');
+    expect(readme).toContain('Installed plugin zcode-crosschat@dev-zcode-crosschat (0.9.6)');
     expect(readme).toContain('8 个斜杠命令');
     const changelog = readRel('CHANGELOG.md');
-    expect(changelog).toContain('**v0.9.5**（2026-11-21，v0.9.4 对抗轮 4 条 P2');
+    expect(changelog).toContain('**v0.9.6**（2026-11-22，真实复测缺陷 R1/R2');
     expect(changelog).toContain('**v0.9.2**（2026-11-20，');
     expect(changelog).toContain('**v0.9.1**（2026-11-19，v0.8.1 首日生产实测第二批教训');
     expect(changelog).toContain('**v0.9.0**（2026-11-19，首日生产实测九缺口修复');

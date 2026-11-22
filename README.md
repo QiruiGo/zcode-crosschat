@@ -20,15 +20,15 @@
 
 ### 第 1 步：下载并解包
 
-1. 打开 <https://github.com/QiruiGo/zcode-crosschat/releases>，下载资产 **`zcode-crosschat-0.9.5-prebuilt-slim.tar.gz`**（约 1.7MB；v0.9.4 起生产包已裁掉 node_modules 与测试文件）。**保留原文件名**——随包发布的 `.sha256` 校验和按原名录，改名后校验会失败。
-2. （可选）校验完整性：在文件所在目录执行 `sha256sum -c zcode-crosschat-0.9.5-prebuilt-slim.tar.gz.sha256`（PowerShell 可用 `Get-FileHash` 对照 `.sha256` 文件里的值），期望输出 `OK`。
+1. 打开 <https://github.com/QiruiGo/zcode-crosschat/releases>，下载资产 **`zcode-crosschat-0.9.6-prebuilt-slim.tar.gz`**（约 1.7MB；v0.9.4 起生产包已裁掉 node_modules 与测试文件）。**保留原文件名**——随包发布的 `.sha256` 校验和按原名录，改名后校验会失败。
+2. （可选）校验完整性：在文件所在目录执行 `sha256sum -c zcode-crosschat-0.9.6-prebuilt-slim.tar.gz.sha256`（PowerShell 可用 `Get-FileHash` 对照 `.sha256` 文件里的值），期望输出 `OK`。
 3. 解包（Windows 10+ 自带 tar，PowerShell / Git Bash 均可）：
 
    ```bash
-   tar -xzf zcode-crosschat-0.9.5-prebuilt-slim.tar.gz
+   tar -xzf zcode-crosschat-0.9.6-prebuilt-slim.tar.gz
    ```
 
-   得到目录 `zcode-crosschat-0.9.5/`（下称「解包目录」，其下应有 `marketplace.json`）。
+   得到目录 `zcode-crosschat-0.9.6/`（下称「解包目录」，其下应有 `marketplace.json`）。
 
 ### 第 2 步：安装
 
@@ -43,11 +43,11 @@ zcode 命令行**不在系统 PATH 里**（它是桌面版内置的入口），�
 ```bash
 ZC() { ELECTRON_RUN_AS_NODE=1 "<安装目录>/ZCode.exe" "<安装目录>/resources/<variant>/zcode.cjs" "$@"; }
 
-ZC plugins marketplace add "<解包目录>/zcode-crosschat-0.9.5"
+ZC plugins marketplace add "<解包目录>/zcode-crosschat-0.9.6"
 # 期望：Added marketplace dev-zcode-crosschat (1 plugins)
 
 ZC plugins install zcode-crosschat@dev-zcode-crosschat
-# 期望：Installed plugin zcode-crosschat@dev-zcode-crosschat (0.9.5) [enabled]
+# 期望：Installed plugin zcode-crosschat@dev-zcode-crosschat (0.9.6) [enabled]
 ```
 
 **PowerShell**：
@@ -55,7 +55,7 @@ ZC plugins install zcode-crosschat@dev-zcode-crosschat
 ```powershell
 function ZC { $env:ELECTRON_RUN_AS_NODE = "1"; & "<安装目录>\ZCode.exe" "<安装目录>\resources\<variant>\zcode.cjs" @args }
 
-ZC plugins marketplace add "<解包目录>/zcode-crosschat-0.9.5"
+ZC plugins marketplace add "<解包目录>/zcode-crosschat-0.9.6"
 ZC plugins install zcode-crosschat@dev-zcode-crosschat
 ```
 
@@ -132,6 +132,7 @@ ZC plugins list
 
 - `zcode_exe` / `zcode_cjs`：**通常留空即可**——插件自动探测本机 zcode 安装（自动探测仅在 Windows 上实现）；探测失败时运行 `xc_doctor`（或看报错文案），会告诉你填什么、去哪里找；
 - `member_model`：留空 = 自动选第一个可用模型——它可能是当前账号不可用的模型；若建员因模型失败，失败回执会给出可选模型与填写指引，届时再填本项即可。
+- `member_reasoning`：缺省**留空**（v0.9.6 起，留空 = 不指定档位、由模型自身声明档位表取最高）。生效口径：由插件设置（userConfig）经 manifest 注入进程——**进程级 env `XC_MEMBER_REASONING` 会被该注入覆盖，单独设进程级 env 不生效**；模型不支持所配档位时按 high → medium → 省略 有界降级（审计 `member-reasoning-fallback`，回执披露实际档位；详见 [docs/LIMITATIONS.md](docs/LIMITATIONS.md) 第 25 条）。
 
 然后在一个会话里：
 
@@ -197,7 +198,7 @@ ZC plugins list
 | `wake_enabled` | `false` | 推送唤醒总开关（**交互会话**口径）。v0.9 起分层：引擎供给成员免开关自动唤醒；交互式会话维持默认关闭防打扰，需要时在工作区 `.crosschat/config.json` 一行开启（文件优先级高于本项，改文件即生效）。开启后派发/回传在目标无人值守时用无头回合唤醒（失败回落邮箱投递） |
 | `zcode_exe` / `zcode_cjs` | 空 | 留空 = 自动探测本机安装；显式配置后严格校验，无效即报错不静默回落 |
 | `max_members` | `8` | 活成员上限（lead、failed、removed 不计）。触顶时报错 `team_at_member_cap`，payload 分报 `activeMembers`（当前活成员数）与 `activeAfterAdd`（本次写入后的数目） |
-| `member_model` / `member_provider` / `member_reasoning` | 空 / 空 / `max` | 新建成员会话的模型与推理档位 |
+| `member_model` / `member_provider` / `member_reasoning` | 空 / 空 / 留空 | 新建成员会话的模型与推理档位（`member_reasoning` 进程级 env 不生效——由插件设置经 manifest 注入，见「lead-成员团队自动开工」节生效口径） |
 | `member_bootstrap_timeout_ms` | `300000` | 建员等待欢迎回合上限（毫秒）。超时判据随 provisioning 记录落盘（deadline=本值+60s 宽限）：lead 的 MCP server 中途死亡也不会让成员永久卡 provisioning——后续 `xc_team member-add` 调用或任一存活会话的回合钩子把过期记录清扫为 failed（审计 `member-provision-timeout`、名额释放、同名重试干净接管） |
 | `inbound_mode` | `accept` | 队内自由消息入站裁决：accept / hold / refuse（协议帧不受影响） |
 | `stale_task_minutes` | `30` | 在途任务超时无更新且无在途唤醒 → 清扫回待领并回执（blocked 不在清扫域）。**`0`/负数/非数字 = 回落缺省 30min**（不是立即清扫、也不是关闭清扫；想调小窗口就设正值，如 `1`） |
@@ -209,7 +210,7 @@ ZC plugins list
 
 ## 已知限制与威胁模型
 
-24 条已知限制（平台缺口、威胁模型边界与「不修行为」的如实声明）与 v0.6 口径威胁模型已搬家至 [docs/LIMITATIONS.md](docs/LIMITATIONS.md)（v0.9.4 B3：README 正文 ≤220 行预算，内容零丢失、逐条可比对）。
+26 条已知限制（平台缺口、威胁模型边界与「不修行为」的如实声明；v0.9.6 起含 25/26 两条行为边界）与 v0.6 口径威胁模型见 [docs/LIMITATIONS.md](docs/LIMITATIONS.md)（v0.9.4 B3 自 README 搬家：README 正文 ≤220 行预算，内容零丢失、逐条可比对）。
 
 ## 版本记录
 

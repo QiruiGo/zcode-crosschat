@@ -103,6 +103,16 @@ export interface OfflineTaskInfo {
    * 不再对豁免任务谎称「requeued to the pending pool」。absent = 旧调用方（默认 true）。
    */
   requeued?: boolean;
+  /**
+   * v0.9.6（A8/V095-21）：该任务**待回池**的预计回池时刻（epoch ms）——属主已判离线
+   * 而任务尚未被 stale 清扫回池的冻结窗内，四面（xc_overview 板面任务行 / Offline 行 /
+   * handoff 待回池面 / 死亡告警文案）统一显示「待回池 + 此时刻」，不再出现
+   * 「overview 建议重派 vs 任务仍 claimed vs 待领池找不到」的矛盾。
+   * 口径 = `task.updatedAt + stale 清扫阈值`（与 graph.staleTasks 同判据；实际回池可能
+   * 晚至一个清扫节拍，或在途 wake nonce 豁免会再顺延）。absent = 任务已回池 / 调用方
+   * 未注入 stale 阈值（opts.requeueStaleMs；旧调用方零变化）。
+   */
+  requeueAtMs?: number;
 }
 
 /** 一名被判离线的成员 + 其名下**判据命中**的非终态任务。 */
@@ -209,9 +219,21 @@ export function offlineMembers(
   scan: PeerScanResult,
   now: number,
   thresholdMs: number,
-  opts: { staleMs?: number; sessionPidFor?: (member: TeamMember) => SessionPidEvidence | undefined } = {},
+  opts: {
+    staleMs?: number;
+    sessionPidFor?: (member: TeamMember) => SessionPidEvidence | undefined;
+    /**
+     * v0.9.6（A8/V095-21）：stale 清扫阈值（ms，XC_STALE_TASK_MINUTES 的生效值）——
+     * 注入后每个命中任务带 `requeueAtMs = task.updatedAt + 本值`（待回池的预计回池时刻，
+     * 见 {@link OfflineTaskInfo.requeueAtMs}）。不注入 = 旧调用方零变化（字段缺席）。
+     */
+    requeueStaleMs?: number;
+  } = {},
 ): OfflineMember[] {
   const out: OfflineMember[] = [];
+  const requeueStaleMs = typeof opts.requeueStaleMs === 'number' && Number.isFinite(opts.requeueStaleMs) && opts.requeueStaleMs > 0
+    ? opts.requeueStaleMs
+    : undefined;
   for (const member of team.members) {
     const liveness = memberLiveness(member, scan, now, {
       staleMs: opts.staleMs,
@@ -232,6 +254,10 @@ export function offlineMembers(
         title: task.title,
         status: task.status,
         idleForMin: Math.round(idleMs / 60_000),
+        // v0.9.6（A8/V095-21）：待回池的预计回池时刻（updatedAt + stale 阈值，与
+        // graph.staleTasks 同判据）。任务被豁免/在途 nonce 顺延时时刻会漂移——展示面
+        // 口径如实按「无干扰时的清扫到期时刻」。
+        ...(requeueStaleMs !== undefined ? { requeueAtMs: task.updatedAt + requeueStaleMs } : {}),
       });
       if (evidence === null) evidence = verdict.evidence;
     }
@@ -284,15 +310,30 @@ export function offlineThresholdMsFromEnv(
 /**
  * 转交建议文案（单源：sweeper 的 lead 通知与 overview 行共用，避免两处文案漂移）。
  * 不新增工具/动作——「回池 / 转交指定成员」由 lead 用现成 xc_dispatch 完成（§4.2）。
+ *
+ * v0.9.6（A8/V095-21）：process-dead 文案不再谎称「名下任务已回池」——死亡成员的
+ * 任务在 stale 清扫到期前是**冻结**的（仍 claimed/in_progress 挂在死者名下，待领池
+ * 找不到），如实写「由 stale 清扫按阈值自动回池 + 板面 requeueAtMs 时刻」。
  */
 export function offlineSuggestion(evidence: OfflineEvidence): string {
   if (evidence === 'process-dead') {
-    return '成员进程已亡（崩溃残留记录）——名下任务已回池，用 xc_dispatch 重派给指定成员';
+    return '成员进程已亡（崩溃残留记录）——名下任务由 stale 清扫按阈值自动回池'
+      + '（板面 offlineMembers[].tasks[].requeueAtMs 为预计回池时刻），回池后用 xc_dispatch 重派给指定成员';
   }
   return '任务长时间无进展且判定该成员离线——用 xc_dispatch 重派给指定成员或 xc_team({action:"cancel"})';
 }
 
-/** overview 文本行的成员片段（§4.3 行格式：`<名>(证据, 名下任务 n 个 → 建议 xc_dispatch 重派)`）。 */
+/**
+ * overview 文本行的成员片段（§4.3 行格式：`<名>(证据, 名下任务 n 个 → 建议 xc_dispatch 重派)`）。
+ *
+ * v0.9.6（A8/V095-21）：任务带 `requeueAtMs`（调用方注入 requeueStaleMs）时，行内
+ * 如实列出「待回池 <taskId>@<ISO 时刻>」——与板面任务行 / handoff 待回池面 / 死亡
+ * 文案四面同口径；不带 requeueAtMs（旧调用方）时行格式逐字节不变。
+ */
 export function offlineMemberLine(member: OfflineMember): string {
-  return `${member.key}(${member.evidence}, 名下任务 ${member.tasks.length} 个 → 建议 xc_dispatch 重派)`;
+  const requeueable = member.tasks.filter((t) => typeof t.requeueAtMs === 'number');
+  const requeueNote = requeueable.length === member.tasks.length && requeueable.length > 0
+    ? `：待回池 ${requeueable.map((t) => `${t.taskId}@${new Date(t.requeueAtMs!).toISOString()}`).join(', ')}`
+    : '';
+  return `${member.key}(${member.evidence}, 名下任务 ${member.tasks.length} 个${requeueNote} → 建议 xc_dispatch 重派)`;
 }

@@ -26,7 +26,11 @@ import { identityStore } from "./identity.js";
 import { withTeamLock } from "../core/lock.js";
 import { sanitizeKey } from "../core/sanitize.js";
 import { getTask, leadKeyOf, memberOpenTasks, readTeam, sortTasksForBoard, unsatisfiedDependencies } from "../core/teamstate.js";
-import { memberState } from "../core/types.js";
+// v0.9.6（A8/V095-21）：死亡成员名下任务的「待回池 + 回池时刻」面——判死判据与
+// xc_overview 成员行同源（memberLivenessView 现场派生 pid 证据，V094-13 单一派生点）。
+import { memberLivenessView } from "../core/liveness.js";
+import { readSession } from "../core/registry.js";
+import { memberState, SWEEPABLE_TASK_STATUSES } from "../core/types.js";
 import { lastProgressTs, stallThresholdMs, stalledTasks } from "../core/stall.js";
 import { staleThresholdMsFromEnv } from "./task-edges.js";
 import { capacityCacheFile, judgeCapacity, sampleCapacity } from "../core/capacity.js";
@@ -629,6 +633,78 @@ async function latestCheckpointSafe(
 /** 连续性指针最多点几个不在场成员（建议行长度有界；其余只计数）。 */
 const HANDOFF_CONTINUITY_HOLDERS_MAX = 3;
 
+/** 待回池面最多列几条（与 HANDOFF_POOL_MAX 同量级；其余只计数披露）。 */
+const HANDOFF_REQUEUE_MAX = 10;
+
+/** 一条「死亡成员名下、尚未回池」的任务（handoff 待回池面的一行）。 */
+interface HandoffRequeueItem {
+  taskId: string;
+  title: string;
+  assignee: string;
+  status: string;
+  /** 预计回池时刻（epoch ms）= task.updatedAt + stale 清扫阈值（graph.staleTasks 同判据）。 */
+  requeueAtMs: number;
+}
+
+/**
+ * v0.9.6（A8/V095-21）：死亡成员名下尚未回池的任务清单（handoff 待回池面取数）。
+ *
+ * 为什么必须有这个面：死亡成员的任务在 stale 清扫到期前是**冻结**的——仍 claimed/
+ * in_progress 挂在死者名下、不在待领池（pending），而 xc_overview 的 Offline 行/
+ * 死亡文案却说「建议 xc_dispatch 重派」，接手会话按提示去待领池找不到任务（V095-21
+ * 四面矛盾之一）。本清单与板面任务行 requeuePending/requeueAtMs、Offline 行、死亡
+ * 文案四面同口径：同一任务、同一 `updatedAt + stale 阈值` 时刻。
+ *
+ * 判死判据与 xc_overview 成员行同源：只读 peer 扫描（sweep:false）+ 会话记录
+ * （memberLivenessView 现场派生 pid 证据——V094-13 单一派生点）。扫描失败 → 空清单
+ * （该面静默降级，不猜进程死、不崩接手包）。
+ */
+async function deadMemberRequeueTasks(
+  deps: ToolDeps,
+  team: TeamState,
+  now: number,
+  staleMs: number,
+): Promise<HandoffRequeueItem[]> {
+  let scan;
+  try {
+    scan = await scanPeers(peerRootFromEnv(deps.env), now, { sweep: false });
+  } catch {
+    return []; // 扫描不可用 = 判死判据降级（不猜；该面静默缺席）
+  }
+  const deadKeys = new Set<string>();
+  for (const m of team.members) {
+    let record;
+    try {
+      record = await readSession(deps.stateRoot, m.sessionId);
+    } catch {
+      record = undefined; // 读失败 = 无记录（memberLivenessView 保守 idle）
+    }
+    // 与 overview livenessMount 同参形态：pid 证据不注入 → memberLivenessView 现场派生
+    //（core/liveness.ts 单一派生点），三面同判据不漂移。
+    const view = memberLivenessView(m, record, scan, now);
+    if (view.state === 'dead') deadKeys.add(m.key);
+  }
+  return team.tasks
+    .filter((t) => t.assignee !== null && deadKeys.has(t.assignee) && SWEEPABLE_TASK_STATUSES.includes(t.status))
+    .map((t) => ({
+      taskId: t.id,
+      title: t.title,
+      assignee: t.assignee!,
+      status: t.status,
+      requeueAtMs: t.updatedAt + staleMs,
+    }));
+}
+
+/** handoff 待回池面的文本块（追加在七章之后；payload 另带 requeuePending 数组）。 */
+function renderRequeuePendingNote(items: readonly HandoffRequeueItem[], total: number): string {
+  const lines = items.map((t) =>
+    `- ${t.taskId}（${t.assignee}，${t.status}）待回池——预计回池时刻 ${new Date(t.requeueAtMs).toISOString()}`);
+  const more = total > items.length ? `\n（另有 ${total - items.length} 条待回池任务略去，xc_overview 板面 requeuePending 列全量）` : "";
+  return `[待回池] 死亡成员名下任务尚未回池（与 xc_overview 板面 requeuePending/Offline 行/死亡文案同口径；`
+    + `现在 claim 会得 task_not_pending——等 stale 清扫到期自动回池后可认领，或 xc_dispatch 派新单 / xc_team({action:"cancel"})）：\n`
+    + `${lines.join("\n")}${more}`;
+}
+
 /** 一位「不在场但持有状态」的花名册成员（连续性指针的一行）。 */
 interface AbsentStateHolder {
   key: string;
@@ -859,7 +935,21 @@ async function readHandoffScope(deps: ToolDeps, args: ReadArgs, connectionKey: s
     ...(continuityHint !== undefined ? { continuityHint } : {}),
     ...(warnings.length > 0 ? { warnings } : {}),
   });
-  return okResult(assembled.text, assembled.payload);
+  // v0.9.6（A8/V095-21）：待回池面——死亡成员名下的冻结任务在七章之后如实列出
+  // 「待回池 + 预计回池时刻」（文本块 + payload.requeuePending），与 xc_overview 板面
+  // 任务行 / Offline 行 / 死亡告警文案四面同口径；接手会话按旧文案去待领池找不到任务
+  // 的矛盾由此收口。空清单 = 无死亡成员持有清扫域任务（面缺席，七章形状不变）。
+  // 文本面与 payload 同一裁切（HANDOFF_REQUEUE_MAX；C2-B5 同纪律——shown 一致不分裂）。
+  const requeueAll = await deadMemberRequeueTasks(deps, team, now, staleThresholdMsFromEnv(deps.env));
+  const requeueShown = requeueAll.slice(0, HANDOFF_REQUEUE_MAX);
+  const requeueNote = requeueShown.length === 0
+    ? undefined
+    : renderRequeuePendingNote(requeueShown, requeueAll.length);
+  const text = requeueNote === undefined ? assembled.text : `${assembled.text}\n${requeueNote}`;
+  const payload = requeueNote === undefined
+    ? assembled.payload
+    : { ...assembled.payload, requeuePending: requeueShown };
+  return okResult(text, payload);
   });
 }
 

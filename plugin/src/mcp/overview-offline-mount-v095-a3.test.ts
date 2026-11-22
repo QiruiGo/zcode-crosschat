@@ -91,11 +91,13 @@ describe("v0.9.5 A3/V094-14：offlineMembers 挂载接 pid 证据（无 peer 记
       evidence: "process-dead",
       sessionId: "sess-a3-m1",
     });
-    expect((members![0]!["tasks"] as Array<Record<string, unknown>>)[0]).toMatchObject({
-      taskId,
-      status: "in_progress",
-    });
-    // 回池通知行（建议 xc_dispatch 重派）
-    expect(text).toContain("Offline: m1(process-dead, 名下任务 1 个 → 建议 xc_dispatch 重派)");
+    const hitTask = (members![0]!["tasks"] as Array<{ taskId: string; status: string; requeueAtMs?: number }>)[0]!;
+    expect(hitTask).toMatchObject({ taskId, status: "in_progress" });
+    // v0.9.6（A8/V095-21）：挂载注入 stale 阈值 → 命中任务带待回池的预计回池时刻
+    expect(typeof hitTask.requeueAtMs).toBe("number");
+    // 回池通知行（建议 xc_dispatch 重派）+ V095-21 待回池标注（与 payload 同一时刻）
+    expect(text).toContain(
+      `Offline: m1(process-dead, 名下任务 1 个：待回池 ${taskId}@${new Date(hitTask.requeueAtMs!).toISOString()} → 建议 xc_dispatch 重派)`,
+    );
   });
 });

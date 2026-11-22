@@ -16,8 +16,9 @@
  *   认领已久（≥ WATCHDOG_NOTIFY_RETRY_MS）的条目由下一轮**重发**（次数上限内），达上限置
  *   `'failed'` 并落 `watchdog-notify-failed` 事件（把静音变成可见错误面）。
  * - **首见即死按新鲜度分流**：台账无历史时，peer 心跳 lastSeen 落在 WATCHDOG_FRESH_DEATH_MS
- *   窗内 ⇒ 刚发生的死亡，照常告警（文案注明台账无历史）；窗外 ⇒ 存量死记录，只记录不告警
- *   （v0.9.2 A2「启动期存量死记录不当事故」原口径保留）。
+ *   窗内 ⇒ 刚发生的死亡，照常告警（文案注明台账无历史）。v0.9.6（A3/V095-07）修订：
+ *   窗外的首见死亡**默认告警**（文案附【首见】标注，宁误报一次）——v0.9.2 A2 的「存量死
+ *   记录静默」只保留在补扫轮的补扫窗（≤7 天）之外；下方存量死记录例已按新口径改写。
  * - 旧格式行（无 notify 字段）按 `'pending'` 读：无从证明通知发过就按没发过处理，补发一次
  *   后转 `'sent'`（V093-04 起口径；下方「旧格式/陈旧备份」例锁死该行为——集成重冻轮修正：
  *   本行原与代码/测试例矛盾的 `'sent'` 旧注释作废）。
@@ -177,7 +178,7 @@ describe("V093-04：看门狗告知两段式（常量与台账形状）", () => 
     expect(eventsOf("member-dead")).toHaveLength(1);
     // 通知已发出 ⇒ 台账 'sent'
     const afterFirst = await readWatchdogState(root);
-    expect(afterFirst.members["b"]?.notify).toBe("sent");
+    expect(afterFirst.members["b|sess_b"]?.notify).toBe("sent");
     // 三件套齐（既有契约不回归）
     const leadBox = await readMailbox(root, "default", "a");
     expect(leadBox).toHaveLength(1);
@@ -207,8 +208,8 @@ describe("V093-04①：认领了但通知未落地 → 下一轮重发（不再�
     const crashed: WatchdogState = {
       version: 1,
       members: {
-        a: { state: "alive", at: now, liveness: "live" },
-        b: {
+        "a|sess_a": { state: "alive", at: now, liveness: "live" },
+        "b|sess_b": {
           state: "dead", at: now - 5 * 60_000, liveness: "pid-dead",
           evidence: "process-dead", notify: "pending",
         },
@@ -237,8 +238,8 @@ describe("V093-04①：认领了但通知未落地 → 下一轮重发（不再�
     expect(leadBox[0]!.content).toContain("现重发");
     // 台账转 sent ⇒ 下一轮不再重发（不轰炸）
     const after = await readWatchdogState(root);
-    expect(after.members["b"]?.notify).toBe("sent");
-    expect(after.members["b"]?.notifyAttempts).toBe(1);
+    expect(after.members["b|sess_b"]?.notify).toBe("sent");
+    expect(after.members["b|sess_b"]?.notifyAttempts).toBe(1);
 
     const second = await sweepMembersOnce(deps());
     expect(second.renotified).toEqual([]);
@@ -267,8 +268,8 @@ describe("V093-04①：认领了但通知未落地 → 下一轮重发（不再�
     await writeWatchdogState(root, {
       version: 1,
       members: {
-        a: { state: "alive", at: now, liveness: "live" },
-        b: {
+        "a|sess_a": { state: "alive", at: now, liveness: "live" },
+        "b|sess_b": {
           state: "dead", at: now - 5 * 60_000, liveness: "pid-dead",
           evidence: "process-dead", notify: "pending",
         },
@@ -314,8 +315,8 @@ describe("V093-04①：认领了但通知未落地 → 下一轮重发（不再�
     await writeWatchdogState(root, {
       version: 1,
       members: {
-        a: { state: "alive", at: now, liveness: "live" },
-        b: { state: "dead", at: now - 5 * 60_000, liveness: "pid-dead", evidence: "process-dead" },
+        "a|sess_a": { state: "alive", at: now, liveness: "live" },
+        "b|sess_b": { state: "dead", at: now - 5 * 60_000, liveness: "pid-dead", evidence: "process-dead" },
       },
       limbo: {},
       nonces: {},
@@ -339,7 +340,7 @@ describe("V093-04①：认领了但通知未落地 → 下一轮重发（不再�
     expect(second.renotified).toEqual([]);
     expect(eventsOf("member-dead")).toHaveLength(1);
     expect((await readMailbox(root, "default", "a")).length).toBe(1);
-    expect((await readWatchdogState(root)).members["b"]?.notify).toBe("sent");
+    expect((await readWatchdogState(root)).members["b|sess_b"]?.notify).toBe("sent");
   });
 
   it("上限：无人可通知（lead 死 + 无其他活成员）→ 计数增长，达上限置 failed + watchdog-notify-failed 事件", async () => {
@@ -356,7 +357,7 @@ describe("V093-04①：认领了但通知未落地 → 下一轮重发（不再�
     await writeWatchdogState(root, {
       version: 1,
       members: {
-        a: {
+        "a|sess_a": {
           state: "dead", at: now - 5 * 60_000, liveness: "pid-dead",
           evidence: "process-dead", notify: "pending",
         },
@@ -370,8 +371,8 @@ describe("V093-04①：认领了但通知未落地 → 下一轮重发（不再�
       await sweepMembersOnce(deps());
     }
     const after = await readWatchdogState(root);
-    expect(after.members["a"]?.notify).toBe("failed");
-    expect(after.members["a"]?.notifyAttempts).toBe(WATCHDOG_NOTIFY_MAX_ATTEMPTS);
+    expect(after.members["a|sess_a"]?.notify).toBe("failed");
+    expect(after.members["a|sess_a"]?.notifyAttempts).toBe(WATCHDOG_NOTIFY_MAX_ATTEMPTS);
     expect(eventsOf("watchdog-notify-failed")).toHaveLength(1);
     expect(eventsOf("watchdog-notify-failed")[0]!["member"]).toBe("a");
 
@@ -413,22 +414,33 @@ describe("V093-04②：台账无历史时的首见即死（新鲜死亡告警 / 
     expect(eventsOf("member-dead")).toHaveLength(1);
   });
 
-  it("存量死记录：台账被删 + 成员早死（peer 心跳在窗外）→ 只记录不告警（v0.9.2 A2 原口径保留）", async () => {
+  it("v0.9.6 A3/V095-07：台账被删 + 成员早死（peer 心跳在窗外）→ 首见死亡**默认告警**（宁误报一次，文案附【首见】标注）", async () => {
+    // 旧口径（v0.9.2 A2 保留到 v0.9.5）：窗外死记录静默认领——被 V095-07 推翻：
+    // t2 实测（未 peer 注册 + 无工具回合 + 台账无历史）三源全过期即被静默认领，
+    // 零事件零审计零告警。v0.9.6 起常规轮首见一律告警；静默只保留在补扫轮的
+    // 7 天防误报上界之外（见 watchdog-v096-fixd.test.ts 的 resume 反例）。
     await seedTeam();
     await seedPeerRecord("sess_a", process.pid, Date.now());
     const now = Date.now();
-    // b 20 分钟前就亡了（超出 10min 新鲜窗）——启动期/台账丢失后的存量死记录
+    // b 20 分钟前就亡了（超出 10min 新鲜窗）——启动期/台账丢失后的存量死记录形态
     await seedDeadPeer("sess_b", now - 20 * 60_000);
 
     const summary = await sweepMembersOnce(deps());
-    expect(summary.dead).toEqual([]);
-    expect(summary.firstSightDead).toEqual([]);
-    expect(eventsOf("member-dead")).toHaveLength(0);
-    expect((await readMailbox(root, "default", "a")).length).toBe(0);
-    // 仍落账（往轮已死，不因一次扫描抖动重新武装）且不给重发队列留条目
+    expect(summary.dead).toEqual(["b"]);
+    expect(summary.firstSightDead).toEqual(["b"]);
+    expect(eventsOf("member-dead")).toHaveLength(1);
+    // 首见标注：文案如实注明「无近期存活证据、宁误报一次」，lead 可安全忽略存量形态
+    const leadBox = await readMailbox(root, "default", "a");
+    expect(leadBox.length).toBe(1);
+    expect(leadBox[0]!.content).toContain("【首见】");
+    expect(leadBox[0]!.content).toContain("宁误报一次");
+    // 仍落账（复合键，往轮已死不因扫描抖动重新武装）且通知后转 sent（不给重发队列留条目）
     const after = await readWatchdogState(root);
-    expect(after.members["b"]?.state).toBe("dead");
-    expect(after.members["b"]?.notify).toBe("sent");
+    expect(after.members["b|sess_b"]?.state).toBe("dead");
+    expect(after.members["b|sess_b"]?.notify).toBe("sent");
     expect((await sweepMembersOnce(deps())).renotified).toEqual([]);
+    // 不重复：第二轮起同化身同一次死亡不再告警
+    expect((await sweepMembersOnce(deps())).dead).toEqual([]);
+    expect(eventsOf("member-dead")).toHaveLength(1);
   });
 });

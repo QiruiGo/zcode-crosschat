@@ -207,23 +207,40 @@ export function renderTeamInit(teamId: string, leadKey: string, alreadyLead: boo
  * 确认）；mailbox 降级（wake-skipped：分层闸/在途 nonce/成员状态/容量闸/spawn 失败）
  * 只写「仅落邮箱（未唤醒）」。旧文案统一写 "delivered to X via mailbox"——"delivered"
  * 会被读成「已送达」，A3 判据（wake-skipped 场景禁出现已送达/已消费）据此收口。
+ *
+ * v0.9.6（V095-14）：wake 态增**启动两态**参数——`startConfirmed:false`（已发起但
+ * 未见启动证据）不再与确认态混写同一句。缺省（undefined）保持 v0.9.4 措辞（旧调用方
+ * 零行为变化）；与 render.ts 的同名函数措辞逐字一致（两处组装链由定向测试对拍锁定）。
  */
-export function renderDeliveryOutcome(delivered: "wake" | "mailbox"): string {
+export function renderDeliveryOutcome(delivered: "wake" | "mailbox", startConfirmed?: boolean): string {
   return delivered === "wake"
-    ? "已发起唤醒（wake，非送达确认）"
+    ? startConfirmed === false
+      ? "已发起唤醒但未见启动证据（wake，非送达确认）"
+      : "已发起唤醒（wake，非送达确认）"
     : "仅落邮箱（未唤醒，pull 兜底）";
 }
 
-export function renderIdle(from: string, to: string, delivered: "wake" | "mailbox"): string {
-  return `Idle notification from ${from} to ${to}: ${renderDeliveryOutcome(delivered)}.`;
+export function renderIdle(from: string, to: string, delivered: "wake" | "mailbox", startConfirmed?: boolean): string {
+  return `Idle notification from ${from} to ${to}: ${renderDeliveryOutcome(delivered, startConfirmed)}.`;
 }
 
-export function renderCancel(taskId: string, cancelledBy: string, receiptTo: string, delivered: "wake" | "mailbox"): string {
-  return `Task ${taskId} cancelled by ${cancelledBy}; receipt sent to ${receiptTo}（${renderDeliveryOutcome(delivered)}）.`;
+export function renderCancel(
+  taskId: string,
+  cancelledBy: string,
+  receiptTo: string,
+  delivered: "wake" | "mailbox",
+  startConfirmed?: boolean,
+): string {
+  return `Task ${taskId} cancelled by ${cancelledBy}; receipt sent to ${receiptTo}（${renderDeliveryOutcome(delivered, startConfirmed)}）.`;
 }
 
-export function renderLeadTransfer(from: string, to: string, delivered: "wake" | "mailbox"): string {
-  return `Lead role transferred from ${from} to ${to}. This is a metadata role: no tasks, mailboxes or registrations moved (new lead notice: ${renderDeliveryOutcome(delivered)}).`;
+export function renderLeadTransfer(
+  from: string,
+  to: string,
+  delivered: "wake" | "mailbox",
+  startConfirmed?: boolean,
+): string {
+  return `Lead role transferred from ${from} to ${to}. This is a metadata role: no tasks, mailboxes or registrations moved (new lead notice: ${renderDeliveryOutcome(delivered, startConfirmed)}).`;
 }
 
 export function renderLeadRelease(released: boolean, teamId: string): string {
@@ -450,6 +467,7 @@ async function memberAdd(deps: ToolDeps, args: { name: string; model?: string; r
     await logEngineEvent(stateRoot, {
       event: "member-added", teamId: me.teamId, name: plan.key, sessionId: result.sessionId,
       providerId: result.providerId, modelId: result.modelId, reasoningLevel: result.reasoningLevel,
+      ...(result.reasoningFallback !== undefined ? { reasoningFallback: result.reasoningFallback } : {}),
       reprovisioned: result.reprovisioned, by: me.agentKey,
     });
 
@@ -457,6 +475,12 @@ async function memberAdd(deps: ToolDeps, args: { name: string; model?: string; r
     const backlog = await readUnreadMailbox(stateRoot, me.teamId, plan.key);
     let delivered: "wake" | "mailbox" | "skipped" = "skipped";
     let wakeNote: string | undefined;
+    // v0.9.6（V095-14）：wake 态回执的结构化披露键（startConfirmed/wakeTiers/失败第三态）
+    // ——旧实现只透传 delivered+note，payload 无启动面（grep 零命中，adv3-F1）。
+    let wakeStartConfirmed: boolean | undefined;
+    let wakeTiers: { spawnOk: "ok"; childAlive: "ok" | "no"; consumed: "pending" } | undefined;
+    let wakeFailureSeen: boolean | undefined;
+    let failureEvidence: string | undefined;
     if (backlog.length > 0) {
       const sent = await attemptWake({
         stateRoot,
@@ -478,9 +502,15 @@ async function memberAdd(deps: ToolDeps, args: { name: string; model?: string; r
       });
       delivered = sent.delivered;
       wakeNote = sent.note;
+      wakeStartConfirmed = sent.startConfirmed;
+      wakeTiers = sent.wakeTiers;
+      wakeFailureSeen = sent.wakeFailureSeen;
+      failureEvidence = sent.failureEvidence;
       await logEngineEvent(stateRoot, {
         event: "post-provision-wake", teamId: me.teamId, name: plan.key,
         backlog: backlog.length, delivered: sent.delivered,
+        ...(sent.startConfirmed !== undefined ? { startConfirmed: sent.startConfirmed } : {}),
+        ...(sent.wakeFailureSeen === true ? { wakeFailureSeen: true } : {}),
       });
     }
 
@@ -489,14 +519,16 @@ async function memberAdd(deps: ToolDeps, args: { name: string; model?: string; r
     const recoveredFromTimeout = plan.swept.includes(plan.key);
     // v0.9.4（A3）：backlog 投递结果的文案分流——wake 成功才可写「已发起唤醒」；
     // 降级/未唤醒只写「仅落邮箱（未唤醒）」，禁出现已送达/已消费字样。
+    // v0.9.6（V095-14）：wake 态文本追加启动两态（未见证据时不再只写「已发起」）。
     const backlogText = backlog.length > 0
       ? delivered === "wake"
-        ? `; backlog ${backlog.length} message(s) → wake（已发起唤醒，非送达确认）`
+        ? `; backlog ${backlog.length} message(s) → ${renderDeliveryOutcome("wake", wakeStartConfirmed)}`
         : `; backlog ${backlog.length} message(s) → mailbox（仅落邮箱，未唤醒）`
       : "";
     return okResult(
       `Member "${plan.key}" ready (session ${result.sessionId}, ` +
         `${result.providerId}/${result.modelId} reasoning ${result.reasoningLevel}` +
+        `${result.reasoningFallback !== undefined ? `（降级自 ${result.reasoningFallback.from}，R2 审计 member-reasoning-fallback）` : ""}` +
         `${result.reprovisioned ? ", reprovisioned" : ""}` +
         `${recoveredFromTimeout ? ", previous provisioning attempt had timed out (swept to failed)" : ""})` +
         `${backlogText}.`,
@@ -505,7 +537,10 @@ async function memberAdd(deps: ToolDeps, args: { name: string; model?: string; r
         sessionId: result.sessionId,
         state: "ready",
         identity: "engine",
+        // v0.9.6（R2）：model 块与 reasoningFallback 都带**实际生效**档位（缺省配置
+        // 首试即成功；降级路径如实披露 from→to，不再虚报所配档位）。
         model: { providerId: result.providerId, modelId: result.modelId, reasoningLevel: result.reasoningLevel },
+        ...(result.reasoningFallback !== undefined ? { reasoningFallback: result.reasoningFallback } : {}),
         reprovisioned: result.reprovisioned,
         ...(recoveredFromTimeout ? { recovered: "provision-timeout" as const } : {}),
         welcomeResponse: truncate(result.welcomeResponse),
@@ -513,6 +548,11 @@ async function memberAdd(deps: ToolDeps, args: { name: string; model?: string; r
         ...(result.turnProviderId === undefined ? {} : { turnProviderId: result.turnProviderId }),
         backlog: backlog.length,
         delivered,
+        // v0.9.6（V095-14）：wake 态的启动确认/三级指标/失败第三态结构化键。
+        ...(wakeStartConfirmed !== undefined ? { startConfirmed: wakeStartConfirmed } : {}),
+        ...(wakeTiers !== undefined ? { wakeTiers } : {}),
+        ...(wakeFailureSeen === true ? { wakeFailureSeen: true } : {}),
+        ...(failureEvidence !== undefined ? { failureEvidence } : {}),
         ...(wakeNote === undefined ? {} : { note: wakeNote }),
       },
     );
@@ -539,11 +579,19 @@ async function memberAdd(deps: ToolDeps, args: { name: string; model?: string; r
     }
     await logEngineEvent(stateRoot, {
       event: "member-add-failed", teamId: me.teamId, name: plan.key, error: detail, by: me.agentKey,
+      // v0.9.6（R1②）：供给失败留票回收的结构化披露（与 wake-nonce-revoked 审计同源）。
+      ...(err instanceof ProvisionError && err.nonceRevocation !== undefined
+        ? { nonceRevoked: err.nonceRevocation }
+        : {}),
     });
     throw new ToolError({
       error: "member_provision_failed",
       name: plan.key,
       detail: truncate(detail, 500),
+      // v0.9.6（R1②）：失败回执含回收证据（结构化键，不受 detail 500 字符截断影响）。
+      ...(err instanceof ProvisionError && err.nonceRevocation !== undefined
+        ? { nonceRevoked: err.nonceRevocation }
+        : {}),
       message:
         `member "${plan.key}" provisioning failed: ${detail} — ` +
         "roster state=failed; retry xc_team {action:\"member-add\"} with the same name (idempotent reprovision, §6.4)",
@@ -791,6 +839,11 @@ async function memberStop(deps: ToolDeps, args: { name: string; reason?: string;
   // ---- 锁外：尽力唤醒成员收尾（§6.1「尽力唤醒（成员按守则 7 收尾）」）----
   let delivered: "wake" | "mailbox" | "skipped" = "skipped";
   let wakeNote: string | undefined;
+  // v0.9.6（V095-14）：wake 态的结构化披露键（同 member-add 投产唤醒口径）。
+  let wakeStartConfirmed: boolean | undefined;
+  let wakeTiers: { spawnOk: "ok"; childAlive: "ok" | "no"; consumed: "pending" } | undefined;
+  let wakeFailureSeen: boolean | undefined;
+  let failureEvidence: string | undefined;
   if (out.toSessionId.trim() !== "") {
     const sent = await attemptWake({
       stateRoot,
@@ -807,13 +860,17 @@ async function memberStop(deps: ToolDeps, args: { name: string; reason?: string;
     });
     delivered = sent.delivered;
     wakeNote = sent.note;
+    wakeStartConfirmed = sent.startConfirmed;
+    wakeTiers = sent.wakeTiers;
+    wakeFailureSeen = sent.wakeFailureSeen;
+    failureEvidence = sent.failureEvidence;
   }
 
   return okResult(
     `Member "${out.key}" removed (state removed` +
       `${out.stopReason === undefined ? "" : `, reason: ${out.stopReason}`}); ` +
       `requeued tasks: ${out.revoked.map((r) => r.taskId).join(", ") || "none"}; ` +
-      `shutdown notice → ${delivered}` +
+      `shutdown notice → ${delivered === "skipped" ? "skipped（未尝试唤醒）" : renderDeliveryOutcome(delivered, wakeStartConfirmed)}` +
       `${out.archive !== undefined ? `; archive → ${out.archive.dir}` : ""}` +
       `${out.archive?.skippedJournals !== undefined && out.archive.skippedJournals.length > 0
         ? `; archive journals skipped (link containment, V092R-07): ${out.archive.skippedJournals.join(", ")}`
@@ -826,6 +883,10 @@ async function memberStop(deps: ToolDeps, args: { name: string; reason?: string;
       revokedTasks: out.revoked,
       shutdownMessageId: out.shutdownMessageId,
       shutdownWake: delivered,
+      ...(wakeStartConfirmed !== undefined ? { startConfirmed: wakeStartConfirmed } : {}),
+      ...(wakeTiers !== undefined ? { wakeTiers } : {}),
+      ...(wakeFailureSeen === true ? { wakeFailureSeen: true } : {}),
+      ...(failureEvidence !== undefined ? { failureEvidence } : {}),
       ...(out.archive !== undefined ? { archive: out.archive } : {}),
       ...(out.archiveError !== undefined ? { archiveError: out.archiveError } : {}),
       ...(wakeNote === undefined ? {} : { note: wakeNote }),
@@ -1074,10 +1135,15 @@ export function createLeadToolCore(deps: ToolDepsLike): LeadToolCore {
         });
 
         // 锁外唤醒（§2.7-4）：mailboxOnly 门控/无 sessionId → mailbox 兜底，消息不丢。
+        // v0.9.6（V095-14）：wake 态回执带启动确认/三级指标/失败第三态结构化键。
         let delivered: "wake" | "mailbox" = "mailbox";
         let note: string | undefined = prepared.mailboxOnly
           ? "caller is provisioning/failed: mailbox-only (R1 gate, §5.1 E-c)"
           : undefined;
+        let wakeStartConfirmed: boolean | undefined;
+        let wakeTiers: { spawnOk: "ok"; childAlive: "ok" | "no"; consumed: "pending" } | undefined;
+        let wakeFailureSeen: boolean | undefined;
+        let failureEvidence: string | undefined;
         if (!prepared.mailboxOnly && prepared.toSessionId !== null) {
           const sent = await attemptWake({
             stateRoot,
@@ -1092,6 +1158,10 @@ export function createLeadToolCore(deps: ToolDepsLike): LeadToolCore {
           });
           delivered = sent.delivered;
           note = sent.note ?? note;
+          wakeStartConfirmed = sent.startConfirmed;
+          wakeTiers = sent.wakeTiers;
+          wakeFailureSeen = sent.wakeFailureSeen;
+          failureEvidence = sent.failureEvidence;
         }
         await logEngineEvent(stateRoot, {
           event: "idle",
@@ -1101,11 +1171,16 @@ export function createLeadToolCore(deps: ToolDepsLike): LeadToolCore {
           delivered,
           mailboxOnly: prepared.mailboxOnly,
           messageId: prepared.messageId,
+          ...(wakeFailureSeen === true ? { wakeFailureSeen: true } : {}),
         });
-        return okResult(renderIdle(me.agentKey, prepared.to, delivered), {
+        return okResult(renderIdle(me.agentKey, prepared.to, delivered, wakeStartConfirmed), {
           to: prepared.to,
           delivered,
           ...(prepared.mailboxOnly ? { mailboxOnly: true } : {}),
+          ...(wakeStartConfirmed !== undefined ? { startConfirmed: wakeStartConfirmed } : {}),
+          ...(wakeTiers !== undefined ? { wakeTiers } : {}),
+          ...(wakeFailureSeen === true ? { wakeFailureSeen: true } : {}),
+          ...(failureEvidence !== undefined ? { failureEvidence } : {}),
           ...(note !== undefined ? { note } : {}),
         });
       });
@@ -1186,8 +1261,13 @@ export function createLeadToolCore(deps: ToolDepsLike): LeadToolCore {
         });
 
         // 锁外唤醒 createdBy（§2.7-4）；取消者即 createdBy 时不自唤醒。
+        // v0.9.6（V095-14）：wake 态回执带启动确认/三级指标/失败第三态结构化键。
         let delivered: "wake" | "mailbox" = "mailbox";
         let note: string | undefined;
+        let wakeStartConfirmed: boolean | undefined;
+        let wakeTiers: { spawnOk: "ok"; childAlive: "ok" | "no"; consumed: "pending" } | undefined;
+        let wakeFailureSeen: boolean | undefined;
+        let failureEvidence: string | undefined;
         if (prepared.createdBy !== me.agentKey && prepared.createdBySessionId !== null) {
           const sent = await attemptWake({
             stateRoot,
@@ -1202,6 +1282,10 @@ export function createLeadToolCore(deps: ToolDepsLike): LeadToolCore {
           });
           delivered = sent.delivered;
           note = sent.note;
+          wakeStartConfirmed = sent.startConfirmed;
+          wakeTiers = sent.wakeTiers;
+          wakeFailureSeen = sent.wakeFailureSeen;
+          failureEvidence = sent.failureEvidence;
         }
         for (const item of prepared.deadlock?.wakePlan ?? []) {
           if (item.to === me.agentKey || item.sessionId === null) continue;
@@ -1232,12 +1316,16 @@ export function createLeadToolCore(deps: ToolDepsLike): LeadToolCore {
           delivered,
           ...(deadlockedCount > 0 ? { deadlocked: deadlockedCount } : {}),
         });
-        return okResult(renderCancel(prepared.taskId, me.agentKey, prepared.createdBy, delivered), {
+        return okResult(renderCancel(prepared.taskId, me.agentKey, prepared.createdBy, delivered, wakeStartConfirmed), {
           taskId: prepared.taskId,
           status: "cancelled",
           cancelledBy: me.agentKey,
           receiptTo: prepared.createdBy,
           delivered,
+          ...(wakeStartConfirmed !== undefined ? { startConfirmed: wakeStartConfirmed } : {}),
+          ...(wakeTiers !== undefined ? { wakeTiers } : {}),
+          ...(wakeFailureSeen === true ? { wakeFailureSeen: true } : {}),
+          ...(failureEvidence !== undefined ? { failureEvidence } : {}),
           ...(deadlockedCount > 0
             ? { deadlocked: prepared.deadlock?.deadlocked.map((d) => ({ taskId: d.taskId, createdBy: d.createdBy, deadlockedBy: d.deadlockedBy, woken: d.woken })) }
             : {}),
@@ -1304,8 +1392,13 @@ export function createLeadToolCore(deps: ToolDepsLike): LeadToolCore {
           type: "lead-transfer", teamId: me.teamId, from: me.agentKey, to: prepared.to, status: "completed",
         }), { deliveryClaimedAt: Date.now() });
         await appendMailbox(stateRoot, me.teamId, me.agentKey, receipt);
+        // v0.9.6（V095-14）：wake 态回执带启动确认/三级指标/失败第三态结构化键。
         let delivered: "wake" | "mailbox" = "mailbox";
         let note: string | undefined;
+        let wakeStartConfirmed: boolean | undefined;
+        let wakeTiers: { spawnOk: "ok"; childAlive: "ok" | "no"; consumed: "pending" } | undefined;
+        let wakeFailureSeen: boolean | undefined;
+        let failureEvidence: string | undefined;
         if (prepared.toSessionId !== null && prepared.toSessionId !== "") {
           const sent = await attemptWake({
             stateRoot,
@@ -1320,6 +1413,10 @@ export function createLeadToolCore(deps: ToolDepsLike): LeadToolCore {
           });
           delivered = sent.delivered;
           note = sent.note ?? note;
+          wakeStartConfirmed = sent.startConfirmed;
+          wakeTiers = sent.wakeTiers;
+          wakeFailureSeen = sent.wakeFailureSeen;
+          failureEvidence = sent.failureEvidence;
         }
         await refreshSnapshotBestEffort(stateRoot, me.teamId);
         await logEngineEvent(stateRoot, {
@@ -1330,13 +1427,17 @@ export function createLeadToolCore(deps: ToolDepsLike): LeadToolCore {
           ...(reason === undefined ? {} : { reason }),
           messageId: prepared.noticeId,
         });
-        return okResult(renderLeadTransfer(me.agentKey, prepared.to, delivered), {
+        return okResult(renderLeadTransfer(me.agentKey, prepared.to, delivered, wakeStartConfirmed), {
           teamId: me.teamId,
           from: me.agentKey,
           to: prepared.to,
           leadSince: now,
           messageId: prepared.noticeId,
           delivered,
+          ...(wakeStartConfirmed !== undefined ? { startConfirmed: wakeStartConfirmed } : {}),
+          ...(wakeTiers !== undefined ? { wakeTiers } : {}),
+          ...(wakeFailureSeen === true ? { wakeFailureSeen: true } : {}),
+          ...(failureEvidence !== undefined ? { failureEvidence } : {}),
           ...(note !== undefined ? { note } : {}),
         });
       });
@@ -1646,7 +1747,12 @@ export async function handleTeamUnblock(deps: ToolDeps, args: { taskId: string; 
     });
 
     // 锁外尽力唤醒认领者（无开放任务/供给中/removed → 只入箱）。
+    // v0.9.6（V095-14）：wake 态回执带启动确认/三级指标/失败第三态结构化键。
     let delivered: "wake" | "mailbox" | "skipped" = "skipped";
+    let wakeStartConfirmed: boolean | undefined;
+    let wakeTiers: { spawnOk: "ok"; childAlive: "ok" | "no"; consumed: "pending" } | undefined;
+    let wakeFailureSeen: boolean | undefined;
+    let failureEvidence: string | undefined;
     if (prepared.assignee !== null && prepared.messageId !== undefined && prepared.toSessionId !== null) {
       const team = await readTeam(deps.stateRoot, me.teamId);
       const memberRecord = team?.members.find((m) => m.key === prepared.assignee);
@@ -1663,6 +1769,10 @@ export async function handleTeamUnblock(deps: ToolDeps, args: { taskId: string; 
           env: deps.env,
         });
         delivered = sent.delivered;
+        wakeStartConfirmed = sent.startConfirmed;
+        wakeTiers = sent.wakeTiers;
+        wakeFailureSeen = sent.wakeFailureSeen;
+        failureEvidence = sent.failureEvidence;
       }
     }
     await logEngineEvent(deps.stateRoot, {
@@ -1672,14 +1782,30 @@ export async function handleTeamUnblock(deps: ToolDeps, args: { taskId: string; 
       by: me.agentKey,
       status: prepared.status,
       delivered,
+      ...(wakeFailureSeen === true ? { wakeFailureSeen: true } : {}),
     });
+    // v0.9.6（O3/B2）：回执措辞如实化——旧文案 `notice delivered via ${delivered}` 把
+    // mailbox 读成「已送达」、skipped 读成「已投递」，与其余路径（renderDeliveryOutcome：
+    // wake=已发起非送达确认；mailbox=仅落邮箱未唤醒）口径分裂。按实际发生的事分流：
+    // wake → 启动两态措辞；mailbox → 仅落邮箱；skipped 分两子态——通知已入箱但未尝试
+    // 唤醒（成员有开放任务/状态门控命中）vs 无通知可投（back=pending：任务回池，无认领
+    // 者通知可投）——两种情况都不许被读成「已投递」。
+    const unblockNoticeText = delivered === "skipped"
+      ? prepared.messageId !== undefined
+        ? "已入箱（未尝试唤醒：成员有开放任务或状态门控命中；pull 兜底）"
+        : "无通知可投（任务回 pending 池，无认领者通知）；未尝试唤醒"
+      : renderDeliveryOutcome(delivered, wakeStartConfirmed);
     return okResult(
-      `Task ${prepared.taskId} unblocked (status=${prepared.status}); notice delivered via ${delivered}.`,
+      `Task ${prepared.taskId} unblocked (status=${prepared.status}); notice ${unblockNoticeText}.`,
       {
         taskId: prepared.taskId,
         status: prepared.status,
         unblockedBy: me.agentKey,
         delivered,
+        ...(wakeStartConfirmed !== undefined ? { startConfirmed: wakeStartConfirmed } : {}),
+        ...(wakeTiers !== undefined ? { wakeTiers } : {}),
+        ...(wakeFailureSeen === true ? { wakeFailureSeen: true } : {}),
+        ...(failureEvidence !== undefined ? { failureEvidence } : {}),
         ...(args.unblockNote !== undefined ? { unblockNote: args.unblockNote } : {}),
       },
     );

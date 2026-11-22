@@ -101,9 +101,14 @@ describe("xc_overview team 视图：C8 offlineMembers 挂载", () => {
       evidence: "process-dead",
       sessionId: "sess-off-m1",
     });
-    expect((members![0]!["tasks"] as Array<Record<string, unknown>>)[0]).toMatchObject({ taskId: t1, status: "in_progress" });
-    // 文本行（§4.3 行格式）
-    expect(text).toContain("Offline: m1(process-dead, 名下任务 1 个 → 建议 xc_dispatch 重派)");
+    const hitTask = (members![0]!["tasks"] as Array<{ taskId: string; status: string; requeueAtMs?: number }>)[0]!;
+    expect(hitTask).toMatchObject({ taskId: t1, status: "in_progress" });
+    // v0.9.6（A8/V095-21）：挂载注入 stale 阈值 → 命中任务带待回池的预计回池时刻
+    expect(typeof hitTask.requeueAtMs).toBe("number");
+    // 文本行（§4.3 行格式 + V095-21 待回池标注）：与 payload requeueAtMs 同一时刻
+    expect(text).toContain(
+      `Offline: m1(process-dead, 名下任务 1 个：待回池 ${t1}@${new Date(hitTask.requeueAtMs!).toISOString()} → 建议 xc_dispatch 重派)`,
+    );
     // lead（a）名下无任务 → 不进清单
     expect(members!.some((m) => m["key"] === "a")).toBe(false);
   });

@@ -171,8 +171,8 @@ describe("v0.9.2 A2：成员看门狗", () => {
     expect(first.scannedMembers).toBe(2);
     expect(eventsOf("member-dead")).toHaveLength(0);
     const stateAfterFirst = await readWatchdogState(root);
-    expect(stateAfterFirst.members["a"]?.state).toBe("alive");
-    expect(stateAfterFirst.members["b"]?.state).toBe("alive");
+    expect(stateAfterFirst.members["a|sess_a"]?.state).toBe("alive");
+    expect(stateAfterFirst.members["b|sess_b"]?.state).toBe("alive");
     // 状态文件真源落在方案指定的位置
     expect(existsSync(watchdogStateFile(root))).toBe(true);
 
@@ -209,8 +209,8 @@ describe("v0.9.2 A2：成员看门狗", () => {
     expect(eventsOf("watchdog-wake")).toHaveLength(1);
     expect(await readMailbox(root, "default", "a")).toHaveLength(1);
     const stateAfterThird = await readWatchdogState(root);
-    expect(stateAfterThird.members["b"]?.state).toBe("dead");
-    expect(stateAfterThird.members["b"]?.evidence).toBe("process-dead");
+    expect(stateAfterThird.members["b|sess_b"]?.state).toBe("dead");
+    expect(stateAfterThird.members["b|sess_b"]?.evidence).toBe("process-dead");
 
     // 「换进程不重复」：重读状态（模拟 server 重启后的新一轮）仍判 dead、无新迁移
     const fourth = await sweepMembersOnce(deps());
@@ -398,7 +398,7 @@ describe("v0.9.2 A2：成员看门狗", () => {
     clearInterval(timer!);
     // 跑过至少一轮：状态文件已落账（成员快照）
     const state = await readWatchdogState(root);
-    expect(Object.keys(state.members).sort()).toEqual(["a", "b"]);
+    expect(Object.keys(state.members).sort()).toEqual(["a|sess_a", "b|sess_b"]);
   });
 });
 

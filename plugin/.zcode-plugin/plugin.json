@@ -1,6 +1,6 @@
 {
   "name": "zcode-crosschat",
-  "version": "0.9.5",
+  "version": "0.9.6",
   "description": "Agent-team collaboration for independent ZCode sessions: a lead coordinates engine-provisioned teammate sessions, members self-start via prompt protocol, and a file mailbox remains the source of truth. v0.3 adds the cross-session peer axis: a machine-global peer registry, named-pipe transport, name-as-address addressing, and accept/hold/refuse inbound policy. v0.5 makes the lead a transferable metadata role, keeps user-spoken text verifiable end to end (origin=user), and bounds every injection surface by the receiver's declared context budget. v0.6 repositions for long-horizon multi-session tasks: the tool surface converges to 10 tools, with urgent user-intervention relay, blocked state + priority, stall detection, memory watermarking, and archive/journal handoff. v0.7 adds cross-session tool-call delegation with per-request approval (still 10 tools, no new tool), offline task handoff driven by real process-death evidence, and compression advice on capacity red; the v0.6 legacy-name shims are removed (breaking: old names return the standard not-found error). v0.8 adds handoff and compression protection with no new tool and no new required config: one-command server-side checkpoints (xc_team action checkpoint, 20 kept per member), a 30-second handoff packet (xc_read scope handoff, 7 elements, 4000-char budget with per-section truncation disclosure), an engine-log timeline and a compact status view (xc_overview views timeline/status); because the platform has no PreCompact hook and no native statusline, compression protection is a one-key checkpoint plus a light UserPromptSubmit reminder (30-minute threshold, XC_CHECKPOINT_NUDGE=0 disables).",
   "description_i18n": {
     "en": "Lead-teammate collaboration across independent ZCode sessions plus a cross-session peer axis: machine-global peer registry, named-pipe transport, name-as-address addressing, accept/hold/refuse inbound policy, and structured attribution envelopes on every inbound peer message. v0.5: the lead is a transferable metadata role, user-spoken text stays verifiable end to end (origin=user), and every injection surface is bounded by the receiver's declared context budget. v0.7: cross-session tool-call delegation with per-request approval files (still 10 tools), offline task handoff keyed on real process-death evidence, and compression advice on capacity red. v0.8: handoff and compression protection with no new tool and no new required config — server-side checkpoints (xc_team action checkpoint, newest 20 per member), a 30-second handoff packet (xc_read scope handoff, 7 elements, 4000-char budget with per-section truncation disclosure), engine-log timeline and compact status views (xc_overview views timeline/status); no PreCompact hook and no native statusline on this platform, so compression protection is a one-key checkpoint plus a light UserPromptSubmit reminder (30-minute threshold, XC_CHECKPOINT_NUDGE=0 disables).",
@@ -82,9 +82,9 @@
     },
     "member_reasoning": {
       "type": "string",
-      "default": "max",
+      "default": "",
       "title": "成员推理档位",
-      "description": "成员会话的 reasoningLevel（默认 max）。"
+      "description": "成员会话的 reasoningLevel。缺省**留空**（v0.9.6 起）：留空 = 不指定档位，由模型自身声明档位表取最高生效——任何模型（含只声明 low/high 的 step-5-preview 类）首试即成功。旧缺省 \"max\" 在不支持 max 的模型上会让 member-add 首试 setModel 失败并留下孤儿唤醒票（v0.9.6 R1/R2 根因），故改为空。可填 minimal/low/medium/high/xhigh/max：所配档位不被模型支持时按 high → medium → 省略 有界降级（审计 member-reasoning-fallback{from,to}，回执披露实际生效档位），不是合法档位名的取值直接报错；正常供给不降级。注意：本设置经 manifest 注入进程 env XC_MEMBER_REASONING，进程级单独设置该 env 会被本项的注入值覆盖（留空注入空串=不指定档位）。"
     },
     "member_bootstrap_timeout_ms": {
       "type": "number",

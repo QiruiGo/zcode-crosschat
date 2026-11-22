@@ -62,15 +62,21 @@ export function renderReport(taskId: string, status: string, receiptTo: string |
 /**
  * v0.9.4（A3，tools-team 同款措辞）：通知类回执的投递结果措辞——wake 成功才可写
  * 「已发起唤醒」（且仍非送达确认）；mailbox 降级（wake-skipped：分层闸/在途 nonce/
- * 成员状态/容量闸/spawn 失败）只写「仅落邮箱（未唤醒）」。v0.9.5（A4/V094-06）把它
+ * 成员状态/容量闸/spawn 失败）只写「仅落邮箱（未唤醒，pull 兜底）」。v0.9.5（A4/V094-06）把它
  * 提升到本模块供 {@link renderMessage} 复用——xc_relay 主消息路径旧文案
  * "delivered via mailbox" 会把「仅落邮箱」读成「已送达」，A4 判据（wake-skipped 场景
  * 禁出现已送达/已消费）据此收口。与 tools-team.ts 的同名函数措辞逐字一致（两处
  * 分属不同组装链；文案漂移由两侧定向测试逐字对拍锁定）。
+ *
+ * v0.9.6（V095-14）：wake 态增**启动两态**参数——`startConfirmed:false`（已发起但
+ * 未见启动证据）不再与确认态混写同一句（adv3-F1 TC3：两态披露只进 note 散文）。
+ * 缺省（undefined）保持 v0.9.4 措辞（旧调用方零行为变化）。
  */
-export function renderDeliveryOutcome(delivered: "wake" | "mailbox"): string {
+export function renderDeliveryOutcome(delivered: "wake" | "mailbox", startConfirmed?: boolean): string {
   return delivered === "wake"
-    ? "已发起唤醒（wake，非送达确认）"
+    ? startConfirmed === false
+      ? "已发起唤醒但未见启动证据（wake，非送达确认）"
+      : "已发起唤醒（wake，非送达确认）"
     : "仅落邮箱（未唤醒，pull 兜底）";
 }
 
@@ -86,8 +92,20 @@ export function renderDeliveryOutcome(delivered: "wake" | "mailbox"): string {
  *   同样失实，改为「未重发」；
  * - `wake` 保持「已发起（非送达确认）」口径——「送达」只在消费确认后才可写。
  * `note`（WakeResult.note）缺省/空串不渲染（duplicate 路径没有 note）。
+ *
+ * v0.9.6（V095-14/adv3-F1）：wake 分支补两态参数 `startConfirmed`（调用方可从
+ * WakeResult.startConfirmed 透传）并**渲染 note**——旧实现 wake 分支丢弃 note
+ * （mailbox 分支才带），「已发起但未见启动证据」与失败侦听措辞进不了文本行。
+ * 三个可选参都缺省时输出与 v0.9.5 逐字节一致（旧调用方零行为变化）。
  */
-export function renderMessage(messageId: string, from: string, to: string, delivered: string, note?: string): string {
+export function renderMessage(
+  messageId: string,
+  from: string,
+  to: string,
+  delivered: string,
+  note?: string,
+  startConfirmed?: boolean,
+): string {
   if (delivered === "mailbox") {
     const reason = note !== undefined && note.trim() !== "" ? `：${note}` : "";
     return `Message ${shortId(messageId)} ${from} → ${to} ${renderDeliveryOutcome("mailbox")}${reason}.`;
@@ -95,7 +113,8 @@ export function renderMessage(messageId: string, from: string, to: string, deliv
   if (delivered === "duplicate") {
     return `Message ${shortId(messageId)} ${from} → ${to} 未重发（已存在同文未读件，duplicate；pull 兜底可读）.`;
   }
-  return `Message ${shortId(messageId)} ${from} → ${to} ${renderDeliveryOutcome("wake")}.`;
+  const reason = note !== undefined && note.trim() !== "" ? `：${note}` : "";
+  return `Message ${shortId(messageId)} ${from} → ${to} ${renderDeliveryOutcome("wake", startConfirmed)}${reason}.`;
 }
 
 // ---------------------------------------------------------------------------

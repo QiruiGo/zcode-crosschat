@@ -276,7 +276,7 @@ describe("v0.9.2 打回 V092-01：看门狗认领的跨进程互斥", () => {
     expect([first, second].every((s) => s["skipped"] === undefined || s["skipped"] === "state-lock-busy")).toBe(true);
     // 状态台账只记一次
     const state = await readWatchdogState(root);
-    expect(state.members["b"]?.state).toBe("dead");
+    expect(state.members["b|sess_b"]?.state).toBe("dead");
   }, 60_000);
 
   it("【锚点·同进程并发】Promise.all 四把扫描 → 恰一套告警（in-process 队列 + 文件锁）", async () => {

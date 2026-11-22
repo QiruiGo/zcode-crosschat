@@ -148,7 +148,7 @@ import { readJsonl } from "../core/jsonl";
 import { inboxFile } from "../core/paths";
 import { logEngineEvent } from "../core/log";
 import { pidAlive, withTeamLock } from "../core/lock";
-import { wakeLifecycleFile, wakeLogFile, engineLogFile, wakeDir, logsDir } from "../core/paths";
+import { wakeLifecycleFile, wakeLogFile, engineLogFile, wakeDir, wakeFile, logsDir } from "../core/paths";
 import { dirname, join, resolve } from "node:path";
 import { writeFileAtomic } from "../core/atomic.js";
 import {
@@ -176,14 +176,14 @@ import {
   adoptByPpidEnabledFromEnv,
   consumeWakeNonce,
   createWakeNonce,
-  findInflightWakeNonce,
   isWakeNonceFresh,
   readSession,
   readWakeNonce,
+  type StoredWakeNonce,
   WAKE_INFLIGHT_MS,
 } from "../core/registry";
 import { sanitizeKey } from "../core/sanitize";
-import { memberState, memberIdentity, isTeamMessage, type TeamMember, type TeamMessage, type TeamState } from "../core/types";
+import { memberState, memberIdentity, isTeamMessage, type TeamMember, type TeamMessage, type TeamState, type WakeNonce } from "../core/types";
 import { spawnResume, type WakeSpawnConfig } from "./resume-cli";
 import { explicitSpawnConfigError, resolveZcodeSpawnConfig, type ResolvedSpawnConfig } from "./zcode-locate";
 // v0.9.2（A4-c）：limbo 告警节流台账（与 engine/watchdog.ts 的看门狗清扫共用真源）。
@@ -553,6 +553,179 @@ export function deliveryAttemptVerdict(
   const inFlight = ledger.inflightNonce
     || ledger.lifecycleStarts.some((start) => !start.exited && now - start.ts < WAKE_INFLIGHT_MS);
   return { attempted, inFlight };
+}
+
+// ─────────────── 在途票的活体证据过滤 + 失败票据回收（v0.9.6 R1） ───────────────
+
+/**
+ * v0.9.6（R1①）：无生命周期证据的新鲜票据的**短宽限窗**（ms）。attemptWake 在
+ * createWakeNonce 之后**同步**写 lifecycle start 头行（毫秒级）；本窗口只为「票据刚
+ * 签发、头行还没来得及落盘」的进程内竞态兜底。30s 足以覆盖极端调度/盘慢；而供给失败
+ * 等场景留下的**无 spawn 票据**（没有 lifecycle 账，R1 的孤儿票形态）过窗即不再算
+ * 在途——旧实现按 15min nonce TTL 全窗压制派单（41-v095 real-smoke A §三：member-add
+ * 失败留票 → 其后 15 分钟 dispatch 全被 wake-skipped(inflight-nonce) 压制）。
+ */
+export const WAKE_TICKET_GRACE_MS = 30_000;
+
+/** v0.9.6（R1②）：供给失败场景票据回收的固定原因值（票据 JSON `revoked.reason` 与审计事件共用）。 */
+export const WAKE_NONCE_REVOKE_PROVISION_FAILED = "provision-failed";
+
+/**
+ * v0.9.6（R1②）：**显式回收一张未消费的唤醒票据**（成员供给失败时，本 attempt 签发的
+ * 票据不能继续充当在途唤醒标记）。
+ *
+ * 写入形态：票据 JSON 增 `used:true` + `revoked:{reason,at}`——
+ * - `used:true` 让 `isWakeNonceFresh` 两面（MCP/钩子）都立即排除它：不再计入在途去重，
+ *   也不能再被 xc_identify/钩子消费绑定身份（回收=作废，不是消费）；
+ * - `revoked{reason:"provision-failed"}` 是回收证据：coerceWakeNonce 会剥离未知字段，
+ *   故本证据以原始 JSON 形态持久在盘（法证面直读），并以 `wake-nonce-revoked` 事件
+ *   双通道留痕（摘要进共享日志，真值不出状态根）。
+ *
+ * 幂等：票据不存在/已 used → 不改盘（revoked:false + alreadyUsed），调用方据此决定
+ * 回执措辞；重入（已带 revoked）同样不改盘。任何 IO 失败按「未回收」返回，不抛——
+ * 回收是失败路径的尽力清理，不得掩盖原始供给错误。
+ */
+export async function revokeWakeNonceForProvisionFailure(
+  stateRoot: string,
+  token: string,
+  opts: { teamId: string; agentKey: string; sid: string; now?: number },
+): Promise<{ revoked: boolean; alreadyUsed: boolean; digest: string }> {
+  const digest = wakeNonceDigest(token);
+  const file = wakeFile(stateRoot, token);
+  const now = opts.now ?? Date.now();
+  let raw: string | undefined;
+  try {
+    raw = await readFile(file, "utf8");
+  } catch {
+    return { revoked: false, alreadyUsed: false, digest }; // 票据不存在：无可回收
+  }
+  let stored: Record<string, unknown>;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      return { revoked: false, alreadyUsed: false, digest };
+    }
+    stored = parsed as Record<string, unknown>;
+  } catch {
+    return { revoked: false, alreadyUsed: false, digest }; // 坏票不猜（readWakeNonce 面同口径）
+  }
+  if (stored["used"] === true) {
+    return { revoked: false, alreadyUsed: true, digest }; // 已消费：无需回收
+  }
+  if (stored["revoked"] !== undefined) {
+    return { revoked: false, alreadyUsed: false, digest }; // 已回收：幂等重入
+  }
+  try {
+    await writeFileAtomic(file, JSON.stringify({
+      ...stored,
+      used: true,
+      revoked: { reason: WAKE_NONCE_REVOKE_PROVISION_FAILED, at: now },
+    }, null, 2));
+  } catch {
+    return { revoked: false, alreadyUsed: false, digest }; // 回收失败如实回报（不掩盖原错误）
+  }
+  await logEngineEvent(stateRoot, {
+    event: "wake-nonce-revoked",
+    reason: WAKE_NONCE_REVOKE_PROVISION_FAILED,
+    teamId: opts.teamId,
+    to: opts.agentKey,
+    sid: opts.sid,
+    // v0.9.1 打回第 1 轮（V091-01）同口径：共享日志只记摘要。
+    nonce: digest,
+    note: "成员供给失败：本 attempt 签发的唤醒票据已显式回收（used+revoked 落盘），不留 15min 在途标记压制派单（v0.9.6 R1②）",
+  });
+  return { revoked: true, alreadyUsed: false, digest };
+}
+
+/** 单张票据的 lifecycle 账行集（读失败/缺文件 → 空账；与 readDeliveryAttemptLedger 同口径）。 */
+async function readTicketLifecycleLines(
+  stateRoot: string,
+  agentKey: string,
+  ticketTs: number,
+): Promise<Array<Record<string, unknown>>> {
+  return readWakeLifecycleLines(wakeLifecycleFile(stateRoot, agentKey, ticketTs));
+}
+
+/**
+ * v0.9.6（R1①）：一张新鲜票据是否「有活体证据」（纯函数，单测直测）——在途去重只认
+ * 这类票据，孤儿票（供给失败留票等从未 spawn 的票据）不再压制派单。
+ *
+ * 判据（与 deliveryAttemptVerdict 的在途面同一族，锚点对齐）：
+ * - 账里有**本票据**的 start 证据（`wake-child-start` 头行，或启动确认落账的
+ *   `wake-child-start-confirmed`/`-unconfirmed` 行——重试轮账没有独立头行，靠确认行
+ *   识别；行带 nonce 摘要，摘要不匹配的行不算本票据的证据）且**无 exit 尾行**
+ *   = 子进程仍在途 → 在途（去重照旧，§2.5-3 语义不变）；
+ * - 账里 start 证据带 exit 尾行（子进程已消失）或本票据根本没有 start 证据：
+ *   仅当票据签发未过 {@link WAKE_TICKET_GRACE_MS} 短宽限窗（头行未及落盘的竞态兜底）
+ *   才算在途；过窗即孤儿/死票 → 不在途。
+ *
+ * 边界（如实声明）：强杀唤醒子可能导致 exit 尾行缺失（41-v095 §五-4 实测）——该形态
+ * 在窗内仍按在途处理（保守方向：迟唤醒，不双唤醒），属信号边界，不在本轮修。
+ */
+export function wakeTicketHasLiveEvidence(
+  lines: ReadonlyArray<Record<string, unknown>>,
+  nonceDigest: string,
+  ticketTs: number,
+  now: number,
+  graceMs: number = WAKE_TICKET_GRACE_MS,
+): boolean {
+  const starts = lines.filter(
+    (line) =>
+      line["event"] === "wake-child-start"
+      || line["event"] === "wake-child-start-confirmed"
+      || line["event"] === "wake-child-start-unconfirmed",
+  );
+  const mine = starts.filter((line) => line["nonce"] === undefined || line["nonce"] === nonceDigest);
+  if (mine.length > 0 && !lines.some((line) => line["event"] === "wake-child-exit")) {
+    return true; // 本票据已 spawn 且子进程未见退出：在途（正常去重语义保留）
+  }
+  // 无本票据的 spawn 证据（孤儿/死票）：只认短宽限窗内的刚签发票
+  return now - ticketTs <= graceMs;
+}
+
+/**
+ * v0.9.6（R1①）：{@link findInflightWakeNonce} 的**活体证据**版——在途去重（§2.5-3）
+ * 的判据从「存在 fresh 票据」收紧为「存在有活体证据的 fresh 票据」：
+ * 1. 新鲜（未 used ∧ 未过 15min TTL）∧ agentKey/teamId/sid 匹配（与旧版逐条一致）；
+ * 2. 再按 {@link wakeTicketHasLiveEvidence} 过滤——lifecycle 账有本票据的 start 证据
+ *    且无 exit 尾行（子进程在途），或票据在短宽限窗内签发。
+ * 多张命中取 **ts 最新**（与旧版同语义）。供给失败留票、消费失败的死票不再压制派单；
+ * 正常在途票（spawn 了、子进程活着）照旧去重——R1 修复不得牺牲现有去重语义（方案 §二-5）。
+ */
+export async function findLiveInflightWakeNonce(
+  stateRoot: string,
+  agentKey: string,
+  options: { teamId?: string; sid?: string; now?: number; graceMs?: number } = {},
+): Promise<StoredWakeNonce | undefined> {
+  const now = options.now ?? Date.now();
+  const graceMs = options.graceMs ?? WAKE_TICKET_GRACE_MS;
+  let entries: string[];
+  try {
+    entries = await readdir(wakeDir(stateRoot));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
+  }
+  const candidates: Array<StoredWakeNonce> = [];
+  for (const entry of entries) {
+    if (!entry.endsWith('.json')) continue;
+    const token = entry.slice(0, -'.json'.length);
+    const nonce = await readWakeNonce(stateRoot, token);
+    if (nonce === undefined) continue;
+    if (!isWakeNonceFresh(nonce, now)) continue;
+    if (nonce.agentKey !== agentKey) continue;
+    if (options.teamId !== undefined && nonce.teamId !== options.teamId) continue;
+    if (options.sid !== undefined && nonce.sid !== options.sid) continue;
+    candidates.push({ token, nonce });
+  }
+  candidates.sort((a, b) => b.nonce.ts - a.nonce.ts); // ts 最新优先（与 findInflightWakeNonce 同语义）
+  for (const candidate of candidates) {
+    const lines = await readTicketLifecycleLines(stateRoot, agentKey, candidate.nonce.ts);
+    if (wakeTicketHasLiveEvidence(lines, wakeNonceDigest(candidate.token), candidate.nonce.ts, now, graceMs)) {
+      return candidate;
+    }
+  }
+  return undefined;
 }
 
 // ─────────────────────────── sessionNotFound 自动重试（v0.9 G-8） ───────────────────────────
@@ -2074,7 +2247,10 @@ export interface WakeLifecycleWatchConfig {
   wakeLog: string;
   /** 生命周期日志文件（start 头行已由 attemptWake 在 spawn 前写下）。 */
   lifecycleFile: string;
-  /** 投递盖章时刻（spawn 成功；limbo/wake-slow 两个计时都从它起算）。 */
+  /** 投递盖章时刻（spawn 成功；limbo/wake-slow 两个计时都从它起算）。
+   * v0.9.6（V095-15）：**重试轮传首轮 spawn 时刻**（继承原 attempt 时间线——重试的
+   * markMailboxDelivered 因 mailbox first-wins 从不落邮箱行，锚 retryNow 等于锚一个
+   * 邮箱里不存在的章，双窗口 2.7× 失真，41-v095 adv3-F2 实测）。 */
   stampedAt: number;
   /**
    * v0.9.4（A4）：**真正发起 spawn 的时刻**（attemptWake 在调 spawnResume 前取
@@ -2082,8 +2258,17 @@ export interface WakeLifecycleWatchConfig {
    * 状态门/容量闸/nonce 落盘/租约/prompt 组装）。wake-consumed 的两个计时窗口
    * （waitedFromSpawnMs / waitedFromDeliveredMs）分别以它为起点，两者之差即 spawn
    * 延迟——「spawn 已发起」与「已盖章」之间的耗时从此在指标面可见，不再混为一个数。
+   * v0.9.6（V095-15）：重试轮同样锚**首轮 spawn 时刻**（双窗口都从用户感知的发起
+   * 时刻起算，数值可解释）；重试轮自己的时间锚点单列 {@link retryStampedAt}。
    */
   spawnedAt: number;
+  /**
+   * v0.9.6（V095-15）：**重试轮自己的重盖章时刻**（markMailboxDelivered 的 retryNow，
+   * 单列字段）——主轮 undefined。它在邮箱里没有对应的章（first-wins 保留原轮
+   * deliveredAt），单列是为了「审计有据」而不冒充双窗口的锚。wake-consumed /
+   * wake-discarded 事件在重试轮带 `retried:true` + 本字段，消费面可解释锚点。
+   */
+  retryStampedAt?: number;
   /**
    * v0.9.4（A2）：启动确认结算的读取器（attemptWake 在 startLatch.confirm 落账后置位）。
    * exit 尾行的「是否确认」字段据此如实记：true/false = 已结算；undefined = 监视器
@@ -2341,12 +2526,57 @@ export function startWakeLifecycleWatch(cfg: WakeLifecycleWatchConfig): WakeLife
             () => undefined, // 轮询读不审计坏行（审计归读取面）
           );
           const byId = new Map(rows.map((m) => [m.id, m]));
-          const settled = cfg.receiptIds.every((id) => {
+          // v0.9.6（V095-16/adv3-F3）：**settled 只认 consumedAt/readAt**——结构性丢弃
+          // （frame-rejected 的 discardedAt）不再计为 consumed（旧实现三字段同判：
+          // 收方审计 consumed=0 与漏斗 consumed=1 当面矛盾）。discardedAt 单列
+          // `discarded` 桶：批次全体落定但含丢弃 → `wake-discarded` 事件（带两桶明细），
+          // 漏斗第三级保持「真消费」口径可分。
+          const consumedIds = cfg.receiptIds.filter((id) => {
             const message = byId.get(id);
             return message !== undefined
-              && (message.consumedAt !== undefined || message.readAt !== undefined || message.discardedAt !== undefined);
+              && (message.consumedAt !== undefined || message.readAt !== undefined);
           });
-          if (settled) {
+          const discardedOnlyIds = cfg.receiptIds.filter((id) => {
+            const message = byId.get(id);
+            return message !== undefined
+              && message.consumedAt === undefined
+              && message.readAt === undefined
+              && message.discardedAt !== undefined;
+          });
+          const allSettled =
+            consumedIds.length + discardedOnlyIds.length === cfg.receiptIds.length;
+          if (allSettled && discardedOnlyIds.length > 0) {
+            // 全部落定但含丢弃件：wake-discarded 单列（不进 consumed 漏斗），收工。
+            const waitedFromSpawnMs = Math.max(0, now - cfg.spawnedAt);
+            const waitedFromDeliveredMs = Math.max(0, now - cfg.stampedAt);
+            const consumedPart = consumedIds.length > 0 ? consumedIds : undefined;
+            await logEngineEvent(cfg.stateRoot, {
+              event: "wake-discarded",
+              scene: cfg.scene,
+              teamId: cfg.teamId,
+              to: cfg.to,
+              nonce: wakeNonceDigest(cfg.nonce),
+              sid: cfg.sid,
+              receiptIds: [...cfg.receiptIds],
+              consumedIds,
+              discardedIds: discardedOnlyIds,
+              ...(consumedPart !== undefined ? { consumedPart } : {}),
+              waitedFromSpawnMs,
+              waitedFromDeliveredMs,
+              note: "本批回执消息含结构性丢弃（frame-rejected 等 discardedAt 落定）——不计入 consumed 漏斗（V095-16）；丢弃原因见收方 frame-rejected 审计",
+            });
+            appendWakeLifecycle(cfg.lifecycleFile, {
+              event: "wake-discarded",
+              messageIds: [...cfg.receiptIds],
+              consumedIds,
+              discardedIds: discardedOnlyIds,
+              sid: cfg.sid,
+              scene: cfg.scene,
+            });
+            stop(); // 批次全部落定（消费/丢弃）：本轮投递的生命周期职责已尽
+            return;
+          }
+          if (allSettled && consumedIds.length === cfg.receiptIds.length) {
             consumedSignaled = true;
             // v0.9.4（A4）：双计时窗口——waitedFromSpawnMs 从 spawn 时刻起算（唤醒
             // 「发起」到「消费」的真实时延，含 spawn 前开销之外的等待），
@@ -2354,6 +2584,8 @@ export function startWakeLifecycleWatch(cfg: WakeLifecycleWatchConfig): WakeLife
             // 两者之差 = spawnedAt − stampedAt = spawn 前开销（闸门/nonce/租约/prompt）。
             // waitedMs 保留旧字段名（方案「保留旧字段名兼容」），取值与
             // waitedFromSpawnMs 一致（方案「waitedMs 从 spawn 起算」）。
+            // v0.9.6（V095-15）：重试轮的 stampedAt/spawnedAt 锚**首轮 spawn 时刻**
+            //（继承原 attempt 时间线），重试轮自己的重盖章时刻单列 retryStampedAt。
             const waitedFromSpawnMs = Math.max(0, now - cfg.spawnedAt);
             const waitedFromDeliveredMs = Math.max(0, now - cfg.stampedAt);
             await logEngineEvent(cfg.stateRoot, {
@@ -2367,6 +2599,7 @@ export function startWakeLifecycleWatch(cfg: WakeLifecycleWatchConfig): WakeLife
               waitedFromSpawnMs,
               waitedFromDeliveredMs,
               waitedMs: waitedFromSpawnMs,
+              ...(cfg.retryStampedAt !== undefined ? { retried: true, retryStampedAt: cfg.retryStampedAt } : {}),
             });
             appendWakeLifecycle(cfg.lifecycleFile, {
               event: "wake-consumed",
@@ -2376,6 +2609,7 @@ export function startWakeLifecycleWatch(cfg: WakeLifecycleWatchConfig): WakeLife
               waitedFromSpawnMs,
               waitedFromDeliveredMs,
               waitedMs: waitedFromSpawnMs,
+              ...(cfg.retryStampedAt !== undefined ? { retried: true, retryStampedAt: cfg.retryStampedAt } : {}),
             });
             stop(); // 消费确认到齐：本轮投递的生命周期职责已尽
           }
@@ -2624,6 +2858,15 @@ export interface WakeResult {
    */
   startConfirmed?: boolean;
   /**
+   * v0.9.6（V095-14/adv3-F1）：**失败第三态**——回执时刻对 wake 日志的有界回读已见
+   * 失败证据（sessionNotFound 等正向失败形态，findWakeFailureEvidence 同判据）时置 true。
+   * 异步失败（回执之后才落盘）不在本键覆盖内：仍由 engine.jsonl wake-failed 事件、
+   * urgent 告知与邮箱 pull 兜底（fire-and-forget 边界如实声明，不假装能预知未来）。
+   */
+  wakeFailureSeen?: boolean;
+  /** v0.9.6（V095-14）：失败证据原文快照（≤300 字符；与 wakeFailureSeen 成对出现）。 */
+  failureEvidence?: string;
+  /**
    * v0.9.3（A2）：唤醒**三级指标**的回执面快照（wake 态才有）——`spawn-ok` /
    * `child-alive` / `consumed` 三级拆分（方案 §一 A2「回执与 overview 改用三级」）。
    * `consumed` 在回执时刻**恒为 pending**：消费确认是异步的（consumedAt/readAt 回写），
@@ -2739,8 +2982,42 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
   // 位置在预判通过处：此刻 gate.enabled 恒 true（engine-member 免开关同算恢复）。
   await resetWakeOffTracker(stateRoot);
 
-  // 2. 在途 nonce 去重（§2.5-3）。
-  const inflight = await findInflightWakeNonce(stateRoot, toKey, { teamId: req.teamId, now });
+  // 2. v0.9.6（R1③，含 V095-23）：**成员状态门控先于在途 nonce 去重**——闸序倒置时
+  // （旧实现 inflight 闸在前），孤儿票在途的 failed/removed 成员会被误标
+  // `inflight-nonce`（跳过原因/回执 note 双面失实，V095-23），调用方无从知道真正该做
+  // 的是重供给/改派。成员状态门控（DESIGN-V0.2 §6.3 双向门控 + §7.3.3「E-a/E-b/E-c
+  // 唤醒路径检查 state」）：provisioning/failed/removed 的成员只入箱、不唤醒——
+  // provisioning 期间 resume 会与 app-server 持有并发（V5 未验证区）；removed 成员不再
+  // 被唤醒。位置在 createWakeNonce **之前**：跳过路径不落 nonce，避免 15min 在途标记
+  // 挡住供给完成后的 E-e 投产唤醒。团队不存在/成员不在册 → 与 v0.1.0 行为一致（放行）；
+  // W2 的 state 可选字段以 §6.5 宽容语义读取（缺省 "ready"=放行，旧数据零行为变化）。
+  // v0.9：成员记录复用步骤 0 的一次读盘（memberState 访问器=旧内联读取同语义）。
+  const gateState = target !== undefined
+    && (memberState(target) === "provisioning" || memberState(target) === "failed" || memberState(target) === "removed")
+    ? memberState(target)
+    : undefined;
+  if (gateState !== undefined) {
+    // v0.9.6（R1③）：逐态原因 + 行动指引——failed/removed 给出明确的下一步（重供给/
+    // 改派），不再只有一句「只入箱不唤醒」（R1 验收：failed 成员的 dispatch 给出明确
+    // 原因/改派指引）。
+    const guidance = gateState === "provisioning"
+      ? "目标成员供给中（resume 会与 app-server 持有并发，V5 未验证区），只入箱不唤醒；供给完成后投产唤醒（E-e）自动补投"
+      : gateState === "failed"
+        ? "目标成员供给失败（state=failed），只入箱不唤醒——修复供给根因后用 xc_team({action:\"member-add\"}) 同名幂等重供给，或把任务改派/自领"
+        : "目标成员已移除（state=removed），不再唤醒——请把任务改派其他成员，或重新 xc_team({action:\"member-add\"}) 建员后重发";
+    const reason = `member-state:${gateState}: ${guidance}（DESIGN-V0.2 §6.3/§7.3.3）`;
+    await logEngineEvent(stateRoot, {
+      event: "wake-skipped", reason, scene: req.reason, teamId: req.teamId, to: toKey, memberState: gateState,
+    });
+    // v0.9.4（A3）：降级回执如实写「仅落邮箱（未唤醒）」——禁出现已送达/已消费。
+    return { delivered: "mailbox", note: mailboxOnlyNote(reason) };
+  }
+
+  // 2.5 在途 nonce 去重（§2.5-3）。v0.9.6（R1①）：改用**活体证据**过滤版——只有
+  // 「lifecycle 账有本票据的 start 证据且子进程未见退出，或票据在短宽限窗内签发」的
+  // 新鲜票据才算在途；供给失败留票等孤儿票（无 spawn 证据）不再压制派单。正常在途票
+  // （spawn 了、子进程活着）照旧去重——R1 修复不牺牲现有去重语义（方案 §二-5）。
+  const inflight = await findLiveInflightWakeNonce(stateRoot, toKey, { teamId: req.teamId, now });
   if (inflight !== undefined) {
     const d = decideDelivery({ wakeGate: gate, ownerAbsent: req.ownerAbsent, inflight: true });
     await logEngineEvent(stateRoot, {
@@ -2751,26 +3028,6 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
     });
     // v0.9.4（A3）：降级回执如实写「仅落邮箱（未唤醒）」——禁出现已送达/已消费。
     return { delivered: "mailbox", note: mailboxOnlyNote(d.reason) };
-  }
-
-  // 2.5 v0.2 成员状态门控（DESIGN-V0.2 §6.3 双向门控 + §7.3.3「E-a/E-b/E-c 唤醒路径
-  // 检查 state」）：provisioning/failed/removed 的成员只入箱、不唤醒——provisioning
-  // 期间 resume 会与 app-server 持有并发（V5 未验证区）；removed 成员不再被唤醒。
-  // 位置在 createWakeNonce **之前**：跳过路径不落 nonce，避免 15min 在途标记挡住
-  // 供给完成后的 E-e 投产唤醒。团队不存在/成员不在册 → 与 v0.1.0 行为一致（放行）；
-  // W2 的 state 可选字段以 §6.5 宽容语义读取（缺省 "ready"=放行，旧数据零行为变化）。
-  // v0.9：成员记录复用步骤 0 的一次读盘（memberState 访问器=旧内联读取同语义）。
-  const gateState = target !== undefined
-    && (memberState(target) === "provisioning" || memberState(target) === "failed" || memberState(target) === "removed")
-    ? memberState(target)
-    : undefined;
-  if (gateState !== undefined) {
-    const reason = `member-state:${gateState}: 目标成员供给中/失败/已移除，只入箱不唤醒（DESIGN-V0.2 §6.3/§7.3.3）`;
-    await logEngineEvent(stateRoot, {
-      event: "wake-skipped", reason, scene: req.reason, teamId: req.teamId, to: toKey, memberState: gateState,
-    });
-    // v0.9.4（A3）：降级回执如实写「仅落邮箱（未唤醒）」——禁出现已送达/已消费。
-    return { delivered: "mailbox", note: mailboxOnlyNote(reason) };
   }
 
   // 3.7 v0.5.3（A5 修复）：显式 spawn 配置无效（XC_ZCODE_EXE/XC_ZCODE_CJS 配置了但路径
@@ -3107,6 +3364,19 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
   // 退出仍记 null：不猜）。
   startConfirmedRef.value = startOutcome.confirmed;
 
+  // v0.9.6（V095-14/adv3-F1）：回执时刻的**失败第三态**——启动确认结算后对 wake 日志
+  // 做一次有界回读：快失败证据（sessionNotFound 等）此刻已在盘上时，回执如实披露
+  // 「已发起但已见失败证据」（payload wakeFailureSeen/failureEvidence + note），不再让
+  // 「已发起唤醒」成为调用方拿到的最后一句、失败只活在 1s 后的 engine 事件里。只读
+  // 不清账：租约释放/nonce 消费/wake-failed 事件仍归失败侦听（startFailureWatch），
+  // 两者对同一份日志同判据，互不重复记账。日志尚未出现/读失败 → 不表态（不误报）。
+  let receiptFailureEvidence: string | undefined;
+  try {
+    receiptFailureEvidence = findWakeFailureEvidence(readFileSync(logFile, "utf8"));
+  } catch {
+    receiptFailureEvidence = undefined; // 日志尚未落盘：按「未知」处理，不虚构失败
+  }
+
   // v0.9（G-8）：sessionNotFound 的单次自动重试（方案 §一 G-8「投递遇 sessionNotFound →
   // 复用既有唤醒机械（resume/OpenSession 跳板）自动重试恰一次 + engine 事件留痕；
   // 再失败如实回执附恢复动作；重试幂等（不得双投）」）。
@@ -3138,7 +3408,8 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
       ? memberState(rebound)
       : undefined;
     const retryGate = resolveWakeGate(stateRoot, req.env, rebound);
-    const retryInflight = await findInflightWakeNonce(stateRoot, toKey, { teamId: req.teamId, now: retryNow });
+    // v0.9.6（R1①）：重试前复检的在途闸同用活体证据版——孤儿票不触发 wake-retry-skipped。
+    const retryInflight = await findLiveInflightWakeNonce(stateRoot, toKey, { teamId: req.teamId, now: retryNow });
     // v0.9.1（G-12-b）：容量闸对重试同等有效——重试也是一次 spawn，内存红线期重试
     // 只会放大 OOM（事故当日「重试波 = 主控重发消息的新 spawn，本身是内存放大器」）。
     // 复检不过 → 不 spawn、不重开租约，落 wake-retry-skipped（冷却原因写进 reason）。
@@ -3204,12 +3475,14 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
     const retryChildPidRef: { pid: number | undefined } = { pid: undefined };
     // v0.9.4（A4）：重试轮次的 spawn 时刻与（A2）确认结算读取位。
     const retryStartConfirmedRef: { value: boolean | undefined } = { value: undefined };
+    // v0.9.6（V095-15）：重试轮自己的 spawn 时刻——不再作双窗口锚（锚首轮 spawn），
+    // 仅作 wake-retry 事件的审计字段（重试自身的发起时刻）。
     let retrySpawnedAt = retryNow;
     // v0.9.2（A1）：重试轮次的启动证据闩（与主路径的 startLatch 各自独立）。
     const retryStartLatch = createWakeStartLatch();
     let retryPid: number | undefined;
     try {
-      // v0.9.4（A4）：spawn 时刻（调 spawnResume 前取；与 stampedAt 之差 = spawn 前开销）。
+      // v0.9.4（A4）：spawn 时刻（调 spawnResume 前取；审计面披露重试自身的发起时刻）。
       retrySpawnedAt = Date.now();
       const spawned = (req.spawn ?? spawnResume)({
         cfg: isResolvedSpawnConfig(resolvedCfg)
@@ -3274,6 +3547,9 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
       // v0.9.1 打回第 1 轮（V091-01）：只记 nonce 摘要。
       nonce: wakeNonceDigest(retryToken),
       wakeLog: retryLogFile, receiptIds: retryIds, reason: evidence,
+      // v0.9.6（V095-15）：重试自身的发起时刻（审计面；双窗口锚仍是首轮 spawn）。
+      retrySpawnedAt,
+      retryStampedAt: retryNow,
       ...(req.urgent === true ? { urgent: true } : {}),
     });
     // v0.9.3（A2）第一级指标（重试轮次：sessionNotFound 自动重绑后的 spawn 成功）。
@@ -3286,6 +3562,13 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
     startFailureWatch(retryLogFile, true, { nonce: retryToken, sid, ids: retryIds, now: retryNow });
     // v0.9.1（G-12v3）：重试也是一次盖章（markMailboxDelivered）——生命周期监视对
     // 重试轮次同等生效（exit 尾行/limbo 降级/假成功检测从重试盖章时刻起算）。
+    // v0.9.6（V095-15/adv3-F2）：**双窗口锚首轮 spawn 时刻**——旧实现 stampedAt=retryNow，
+    // 但重试的 markMailboxDelivered 因 mailbox first-wins（deliveredAt: message.deliveredAt ?? now）
+    // 从不落邮箱行：事件窗口锚着一个邮箱里不存在的章（真实 1854ms 报 5034ms，2.7× 失真）。
+    // 现在 stampedAt/spawnedAt 都继承原 attempt 的 spawn 时刻（用户感知的投递起点，真实
+    // 在盘时刻），重试轮自己的重盖章时刻单列 retryStampedAt（wake-consumed 事件带
+    // retried:true + 该字段，消费面可解释锚点）；retrySpawnedAt 仍由 wake-retry 事件的
+    // ts 承载。limbo/wake-slow 从首轮 spawn 起算 = 重试不额外续命（与邮箱行的原章一致）。
     startWakeLifecycleWatch({
       stateRoot,
       teamId: req.teamId,
@@ -3295,10 +3578,10 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
       scene: req.reason,
       wakeLog: retryLogFile,
       lifecycleFile: wakeLifecycleFile(stateRoot, toKey, retryNow),
-      stampedAt: retryNow,
-      // v0.9.4（A4）：重试轮次的 spawn 时刻（双窗口起点；与 stampedAt 之差 = 重试的
-      // spawn 前开销）。v0.9.4（A2）：确认结算读取位（exit 尾行「是否确认」）。
-      spawnedAt: retrySpawnedAt,
+      stampedAt: spawnedAt,
+      // v0.9.6（V095-15）：双窗口都锚首轮 spawn（见上）。v0.9.4（A2）：确认结算读取位。
+      spawnedAt,
+      retryStampedAt: retryNow,
       getStartConfirmed: () => retryStartConfirmedRef.value,
       getChildPid: () => retryChildPidRef.pid,
       pollMs: req.lifecyclePollMs ?? WAKE_LIFECYCLE_POLL_MS,
@@ -3402,6 +3685,12 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
   // v0.9.3（A2）：note 追加**三级指标**口径——回执面只看前两级（spawn-ok / child-alive），
   // 第三级（consumed）由 engine 事件 wake-consumed 与邮箱真源异步交付（见 wakeTiers）。
   const warningNote = gate.warning !== undefined ? `；${gate.warning}` : "";
+  // v0.9.6（V095-14）：失败第三态的回执措辞与 payload——启动确认（confirmed）/ 未见证据
+  //（!confirmed）/ 失败（wake 日志已见失败证据）三态各自如实；失败态仍保留「已发起」的
+  // 事实陈述（spawn 确实发起了），但不再让调用方把发起误读成成功。
+  const failureNote = receiptFailureEvidence !== undefined
+    ? `；⚠ 失败侦听：回执时刻 wake 日志已见失败证据（${receiptFailureEvidence.slice(0, 160)}）——本轮唤醒大概率失败（engine.jsonl wake-failed 将留痕、投递租约已/将被释放），消息 pull 兜底，请勿按已开工处理`
+    : "";
   return {
     delivered: "wake",
     note:
@@ -3411,6 +3700,7 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
       + wakeFallbackNote(req.env, resolvedCfg)
       + warningNote
       + `；${startConfirmNote(startOutcome, startConfirmThresholdMs)}`
+      + failureNote
       + `；三级指标 wake-spawn-ok/wake-child-alive/wake-consumed（回执面只确认前两级：`
       + `spawn-ok=${startOutcome.confirmed ? "ok+child-alive" : "ok，child-alive 未见"}；`
       + `consumed 由 consumedAt/readAt 回写异步确认，见 engine 事件 wake-consumed）`,
@@ -3419,6 +3709,11 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
     receiptIds: ids,
     nonce: token,
     startConfirmed: startOutcome.confirmed,
+    // v0.9.6（V095-14）：失败第三态的结构化键（回执时刻已见失败证据才带；fast-fail
+    // 场景调用方不必等 engine 事件即可知悉）。
+    ...(receiptFailureEvidence !== undefined
+      ? { wakeFailureSeen: true, failureEvidence: receiptFailureEvidence.slice(0, 300) }
+      : {}),
     wakeTiers: {
       spawnOk: "ok",
       childAlive: startOutcome.confirmed ? "ok" : "no",

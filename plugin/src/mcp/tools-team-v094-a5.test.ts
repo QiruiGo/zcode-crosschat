@@ -194,7 +194,7 @@ describe("v0.9.4 A5：member-add 供给唤醒计入三级（scene=post-provision
     expect(readEngineEvents().filter((e) => e["event"] === WAKE_TIER_EVENT_SPAWN_OK)).toHaveLength(0);
   });
 
-  it("有积压且唤醒成功（对照 A3）：回执写「已发起唤醒（非送达确认）」而非已送达", async () => {
+  it("有积压且唤醒成功（对照 A3）：回执写「已发起唤醒（非送达确认）」而非已送达（v0.9.6 V095-14：措辞统一走 renderDeliveryOutcome）", async () => {
     await bindLead();
     await writeTeam(stateRoot, teamWith([
       { key: "ldr1", sessionId: "sess_ldr1", role: "worker", joinedAt: 1, lastSeen: 1, state: "ready" },
@@ -203,7 +203,10 @@ describe("v0.9.4 A5：member-add 供给唤醒计入三级（scene=post-provision
     await appendMailbox(stateRoot, "default", "m3", createMessage("ldr1", "m3", "积压", {}));
     const res = await memberCore().xc_member_add({ name: "m3" } as never, "conn-lead");
     const text = res.content[0]?.type === "text" ? res.content[0].text : "";
-    expect(text).toContain("backlog 1 message(s) → wake（已发起唤醒，非送达确认）");
+    // v0.9.6（V095-14）：backlog 行措辞与其余路径统一为 renderDeliveryOutcome
+    //（wake → 「已发起唤醒（wake，非送达确认）」；唤醒子未见启动证据时自动升级为
+    // 「已发起唤醒但未见启动证据」——本替身汇报了 pid，故为确认态）。
+    expect(text).toContain("backlog 1 message(s) → 已发起唤醒（wake，非送达确认）");
     expect(text).not.toContain("已送达");
     expect(text).not.toContain("已消费");
   });
