@@ -20,15 +20,15 @@
 
 ### 第 1 步：下载并解包
 
-1. 打开 <https://github.com/QiruiGo/zcode-crosschat/releases>，下载资产 **`zcode-crosschat-0.9.7-prebuilt-slim.tar.gz`**（约 1.7MB；v0.9.4 起生产包已裁掉 node_modules 与测试文件）。**保留原文件名**——随包发布的 `.sha256` 校验和按原名录，改名后校验会失败。
-2. （可选）校验完整性：在文件所在目录执行 `sha256sum -c zcode-crosschat-0.9.7-prebuilt-slim.tar.gz.sha256`（PowerShell 可用 `Get-FileHash` 对照 `.sha256` 文件里的值），期望输出 `OK`。
+1. 打开 <https://github.com/QiruiGo/zcode-crosschat/releases>，下载资产 **`zcode-crosschat-<版本号>-prebuilt-slim.tar.gz`**（Release 页面默认列出最新版本；下文所有 `<版本号>` 都换成页面上显示的那串；约 1.9MB；v0.9.4 起生产包已裁掉 node_modules 与测试文件）。**保留原文件名**——随包发布的 `.sha256` 校验和按原名录，改名后校验会失败。
+2. （可选）校验完整性：在文件所在目录执行 `sha256sum -c zcode-crosschat-<版本号>-prebuilt-slim.tar.gz.sha256`（PowerShell 可用 `Get-FileHash` 对照 `.sha256` 文件里的值），期望输出 `OK`。
 3. 解包（Windows 10+ 自带 tar，PowerShell / Git Bash 均可）：
 
    ```bash
-   tar -xzf zcode-crosschat-0.9.7-prebuilt-slim.tar.gz
+   tar -xzf zcode-crosschat-<版本号>-prebuilt-slim.tar.gz
    ```
 
-   得到目录 `zcode-crosschat-0.9.7/`（下称「解包目录」，其下应有 `marketplace.json`）。
+   得到目录 `zcode-crosschat-<版本号>/`（下称「解包目录」，其下应有 `marketplace.json`）。
 
 ### 第 2 步：安装
 
@@ -43,11 +43,11 @@ zcode 命令行**不在系统 PATH 里**（它是桌面版内置的入口），�
 ```bash
 ZC() { ELECTRON_RUN_AS_NODE=1 "<安装目录>/ZCode.exe" "<安装目录>/resources/<variant>/zcode.cjs" "$@"; }
 
-ZC plugins marketplace add "<解包目录>/zcode-crosschat-0.9.7"
+ZC plugins marketplace add "<解包目录>/zcode-crosschat-<版本号>"
 # 期望：Added marketplace dev-zcode-crosschat (1 plugins)
 
 ZC plugins install zcode-crosschat@dev-zcode-crosschat
-# 期望：Installed plugin zcode-crosschat@dev-zcode-crosschat (0.9.7) [enabled]
+# 期望：Installed plugin zcode-crosschat@dev-zcode-crosschat (<版本号>) [enabled]
 ```
 
 **PowerShell**：
@@ -55,7 +55,7 @@ ZC plugins install zcode-crosschat@dev-zcode-crosschat
 ```powershell
 function ZC { $env:ELECTRON_RUN_AS_NODE = "1"; & "<安装目录>\ZCode.exe" "<安装目录>\resources\<variant>\zcode.cjs" @args }
 
-ZC plugins marketplace add "<解包目录>/zcode-crosschat-0.9.7"
+ZC plugins marketplace add "<解包目录>/zcode-crosschat-<版本号>"
 ZC plugins install zcode-crosschat@dev-zcode-crosschat
 ```
 
@@ -143,7 +143,7 @@ ZC plugins list
 → 回执回到队长邮箱；队长核对证据（读文件）后汇总给你
 ```
 
-配套操作：`/xc-status` 看板（成员状态 / 任务板 / 依赖图 / 停滞标红）、`/xc-team stop <名字> [原因]` 停止成员（默认先留档）、`xc_team({action:"cancel", taskId})` 取消任务；派发时用 `dependsOn` 表达依赖、`priority` 表达优先级（只影响取单顺序，不抢占），上游完成后下游自动收到解除阻塞通知并开工。长任务暂停用 `xc_report(status:"blocked")`（原因必填），解除用 `xc_team({action:"unblock"})`。换会话接手用 `/xc-handoff`（30 秒接手包，≤3 次工具调用进入状态），压缩或交接前先 `/xc-checkpoint` 落检查点。
+配套操作：`/xc-status` 看板（成员状态 / 任务板 / 依赖图 / 停滞标红）、`/xc-team stop <名字> [原因]` 停止成员（默认先留档）、`xc_team({action:"cancel", taskId})` 取消任务；派发时用 `dependsOn` 表达依赖、`priority` 表达优先级（只影响取单顺序，不抢占），上游完成后下游自动收到解除阻塞通知并开工。长任务暂停用 `xc_report(status:"blocked")`（原因必填），解除用 `xc_team({action:"unblock"})`。换会话接手用 `/xc-handoff`（30 秒接手包，≤3 次工具调用进入状态），压缩或交接前先 `/xc-checkpoint` 落检查点。成员回合跑偏、必须立刻纠偏时用 `xc_relay({to:"<成员>", steer:true, msg:"…"})`（硬插队：终止其当前回合并带着纠偏重开新回合，未落盘进度可能丢；催办、软中断、硬插队三档怎么选见内置 `crosschat` 技能 §3）。
 
 ### 长期任务：任务日志与交接（longtask）
 
@@ -175,7 +175,7 @@ ZC plugins list
 | `xc_claim(taskId)` | 原子认领 pending 任务，返回一次性 attemptId 凭证 |
 | `xc_report(taskId, attemptId, status, {result, error, evidence})` | 回报 in_progress / completed（证据=工作区内普通文件 + 现算 sha256 + 可选摘要）/ failed / blocked（原因必填） |
 | `xc_read(scope, {id, field, offset, limit})` | 统一分页读：inbox / mail / task / peer / peer-msg / journal / **handoff**（30 秒接手包，七要素 + 建议下一步；`id`=任务 id 或花名收窄） |
-| `xc_relay(to, msg, {urgent, interrupt, summary, sourceTaskId, sourceAttemptId, withdrawMessageIds, refs})` | 发消息 + 用户介入传导合一；`urgent` 插到所有未读之前并尽力唤醒；`interrupt` 发结构化软中断 INTERRUPT 信封（urgent 置顶不变；收方下一回合安全点消费并回确认，payload 如实回报）；`withdrawMessageIds`（仅队内轴）撤回自己发给该目标且仍未读的消息（整单语义，含已读件整单拒绝并逐条报状态）；`refs`（可选）随消息带工作区内真实文件的 path+sha256（+可选 mime/note），接收面渲染「用 Read 打开该路径」提示——传引用不传内容，不内联、不 base64；非送达回执（dropped/held/…）在 payload `detail` 里附原因与恢复动作 |
+| `xc_relay(to, msg, {urgent, interrupt, steer, summary, sourceTaskId, sourceAttemptId, withdrawMessageIds, refs})` | 发消息 + 用户介入传导合一；`urgent` 插到所有未读之前并尽力唤醒；`interrupt` 发结构化软中断 INTERRUPT 信封（urgent 置顶不变；收方下一回合安全点消费并回确认，payload 如实回报）；`steer`（v0.9.8 起）是硬插队——仅对引擎成员、仅 lead/用户可发：终止对方当前回合（整棵进程树）并带着纠偏重开新回合，回执顶层 `preempted` 如实说明是否真的抢占，交互式会话降级为软中断；`withdrawMessageIds`（仅队内轴）撤回自己发给该目标且仍未读的消息（整单语义，含已读件整单拒绝并逐条报状态）；`refs`（可选）随消息带工作区内真实文件的 path+sha256（+可选 mime/note），接收面渲染「用 Read 打开该路径」提示——传引用不传内容，不内联、不 base64；非送达回执（dropped/held/…）在 payload `detail` 里附原因与恢复动作 |
 | `xc_overview({view, history, offset, limit})` | 全景观测：任务板（team）/ peer 清单（peers）/ 面板（panel：成员+任务+容量+停滞+入站策略）/ 时间线（timeline：engine.jsonl 尾部事件，`limit` 缺省 20、上限 100）/ 紧凑状态（status：任务七态计数+stalled+容量色+离线成员+checkpoint 年龄+未读，一眼瞭望）；capacity 块附唤醒闸状态（阻塞条件/下次重判/本窗 wake-deferred 计数） |
 | `xc_team(action, …)` | 指挥族：init / transfer / release / member-add / member-stop / idle / cancel / unblock / **checkpoint**（服务端落盘一份交接检查点；`note`=写进检查点第 7 章的一句话） |
 | `xc_review({action, axis, ids})` | 入站审阅（队内/跨会话两轴隔离区；`action` 增 approve/deny、`axis` 增 approval 用于转办审批，仅现任 lead 可批） |

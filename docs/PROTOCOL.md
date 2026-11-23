@@ -288,6 +288,42 @@ duplicateKey = (to 成员键, 任务票文本) ∧ 该派发信封未被读过(r
 含已撤）/ `foreign`（不是发送者发的）/ `discarded`（已作废）/ `notice`（withdrawal-notice 帧，
 v0.9.2 起结构性不可撤）。成功响应 `delivered` ∈ `wake|mailbox`（尽力唤醒，同普通消息）。
 
+### 7.2 steer 硬插队（v0.9.8 起）
+
+**请求**：`xc_relay({to, msg, steer:true})` 的可选参数 `steer:true`（0 新增工具）——仅**队内轴**
+（peer 轴显式拒 `steer_peer_axis_unsupported`）、仅以**引擎供给成员**为目标、仅 **lead 或用户**
+（`origin=user` 盖章）可发；成员互发一律拒 `steer_not_authorized`（审计 `steer-rejected`，
+软中断 `interrupt:true` 仍允许）。语义 = 「杀回合再续」而不是向运行中的回合注入：目标有活唤醒
+回合时先优雅终止（`taskkill` 无 `/F`，`XC_STEER_GRACE_MS` 缺省 8s 超时后强杀，v0.9.9 E1 起
+`taskkill /T` 带整棵进程树），随即 `--resume` 起新回合、纠偏正文作新回合首条指令；目标空闲
+→ 不终止，纠偏随本次投递送达、收方下回合生效；**被中止回合一刻没落盘的进度可能丢**（回执与
+人可读行如实披露）。
+
+**回执**：steer 请求时 payload 的 `interrupt` 块改带 **steer 三态**（与普通 interrupt 的
+`{requested,result,reason,envelope}` 形状不同；值为占位）：
+
+```json
+{"requested":true,"result":"preempted","reason":"<为何抢占/为何未抢占>","stopped":{"pid":1234,"graceful":true,"waitedMs":8000,"tree":[1234,5678],"treeSurvivors":[]},"turn":{"nonce":"<nonce>","startConfirmed":true}}
+```
+
+- `result` 三态：`preempted`（已终止并重开）/ `deferred-next-turn`（未执行终止——目标空闲、
+  重复投递、C6/C7 帧禁唤醒、目标无 sessionId、入站 hold 等，纠偏改随投递走下一回合）/
+  `unsupported`（目标是交互式会话等插件无法终止的形态——降级为软中断语义，请人工 Esc）；
+- `stopped`（仅抢占成功时在场）：`{pid, graceful, waitedMs}` + v0.9.9 E1 起的 `tree`
+  （被终止的进程树 pids，根在前）与 `treeSurvivors`（强杀确认后树内残存 pid，空 = 无残留）；
+- `turn`（仅新回合真实发起时在场）：`{nonce, startConfirmed}`——新回合是否见到启动证据；
+- **顶层别名**（v0.9.9 E3）：`preempted`（布尔，`result === "preempted"` 时为 true）与同值的
+  `stopped`/`turn`——v0.9.8 起抢占结果只住在 `interrupt.*` 下，按顶层解析的调用方取不到；
+  别名只在 steer 请求时出现，普通 interrupt/非 interrupt 路径形状不变。
+
+**权限闸先于入站守卫**（v0.9.9 V098-02）：steer 权限闸在入站策略（hold/refuse）**之前**判定——
+入站策略为 hold 时，成员发给成员的 steer 被拒并审计、**一个字节不进隔离区**（此前 hold 会把它
+吞成 `delivered:"held"`、无拒绝无审计）；lead/用户的 steer 被 hold 挡下时回执
+`interrupt:{requested:true, result:"deferred-next-turn", reason}` + 顶层 `preempted:false`，
+明说「消息在隔离区，steer 未执行（无唤醒、无终止）」，`xc_review({action:"accept"})` 放行后
+消息随保留的 steer/interrupt/urgent 元数据进主邮箱、置顶语义仍生效。interrupt/steer 消息的
+注入预算预留与置顶（J1）口径不变。
+
 ## 8. 注入预算公式（防卡死）
 
 磁盘真源永远全文；注入面按**接收方声明**的上下文预算自适应截断（`budget.ts`）：

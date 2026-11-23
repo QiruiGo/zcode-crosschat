@@ -16,8 +16,8 @@
  * 5. crosschat：工具表补 handoff/checkpoint/timeline/status + 「交接与压缩防护」小节；
  * 6. 平台缺口如实声明（README/PROTOCOL/skill 含「无 PreCompact，故用提醒+一键」；
  *    且 PreCompact / 压缩钩子只以否定句式出现——不宣称自动压缩钩子）；
- * 7. 版本号一致性（AC6 的静态面）：四处版本文件 = 0.9.8，第五处文档面（README 安装段 +
- *    CHANGELOG 最新条目）= 0.9.7 待文档 lane 改钉——两半分开钉，见 §8 注。
+ * 7. 版本号一致性（AC6 的静态面）：四处版本文件 = 0.9.10；README 安装段自 v0.9.10 起
+ *    不写死版本号（资产名/目录名/安装回显统一 `<版本号>` 占位），没有「第五处」可钉——见 §8 注。
  */
 import { describe, expect, it } from 'vitest';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
@@ -329,40 +329,38 @@ describe('A5 文档：无 PreCompact，故用提醒+一键（ACCEPT15-1 文档�
 // ---------------------------------------------------------------------------
 // 8. 版本号一致性（AC6 静态面）
 //
-// v0.9.9 注（集成员第 1 轮，2026-11-22）：本轮五组（W/H/M/T/A）并行改码，集成员把**四处版本文件**
-// 改钉 0.9.9（marketplace.json / plugin/.zcode-plugin/plugin.json / plugin/package.json /
-// plugin/src/mcp/server.ts 的 SERVER_VERSION；package-lock.json 两处 version 一并主动改钉）；
-// 文档 lane 本轮未跑，故**第五处**（README 安装段资产名/安装回显 + CHANGELOG 最新条目）仍指向
-// 最后一个已发布版本 0.9.7——v0.9.9 尚未 tag / 发布，这是发布前的正确中间态，不是疏漏。
-//   （v0.9.8 的版本文件改钉由上一轮集成员执行，但上一轮未跑文档 lane、也未在全量单测后改钉本处，
-//     故 v0.9.8 条目从未落进 CHANGELOG/README——第五处至今仍指向 0.9.7，本处按真实现状断言。）
-//   下方两个 it 分别钉这两半。**文档 lane 落笔 v0.9.9 条目（CHANGELOG + README 安装段）时，
-//   把第五处 it 里的 0.9.7 字样连同 it 标题一起改钉 0.9.9**（v0.9.7 那次即由组 B 执行同一步，
-//   见该处旧注）。若只改版本文件不改这里 → 本文件红（v0.9.8 那轮即是如此：a5:334，
-//   expected '0.9.8' to be '0.9.7'；v0.9.9 这轮集成员改钉版本后同处再红一次，本轮已同步）。
+// v0.9.10 起新约定：**只有四处版本文件可钉**（marketplace.json /
+// plugin/.zcode-plugin/plugin.json / plugin/package.json /
+// plugin/src/mcp/server.ts 的 SERVER_VERSION；package-lock.json 两处 version 一并主动改钉）。
+// README 安装段自 v0.9.10 起**不再写死版本号**（资产名 / 解包目录名 / 安装回显统一 `<版本号>`
+// 占位，Release 页面显示什么就填什么）——所以没有「第五处」可钉：下方第二个 it 由「README
+// 指向某个写死版本 + CHANGELOG 最新条目」改钉为「README 不含 zcode-crosschat-0.x.y 形式的
+// 写死资产名 + CHANGELOG 含 v0.9.10/0.9.9/0.9.8/v0.9.7 四条」。
+// 沿革：v0.9.8/v0.9.9 两轮集成员只改了版本文件、文档 lane 未跑，第五处长期停在 0.9.7；
+// v0.9.10 文档 lane 落笔时按新约定一次性收口（见 CHANGELOG v0.9.10 条目）。
 // ---------------------------------------------------------------------------
 
-describe('A5 版本号一致性（四处版本文件 = 0.9.9；第五处文档面 = 0.9.7 待文档 lane 改钉）', () => {
-  it('package.json / plugin.json / marketplace.json / server.ts 四处 = 0.9.9', () => {
-    expect(JSON.parse(readRel('plugin/package.json')).version).toBe('0.9.9');
-    expect(JSON.parse(readRel('plugin/.zcode-plugin/plugin.json')).version).toBe('0.9.9');
-    expect(JSON.parse(readRel('marketplace.json')).plugins[0].version).toBe('0.9.9');
-    expect(readRel('plugin/src/mcp/server.ts')).toContain('const SERVER_VERSION = "0.9.9"');
+describe('A5 版本号一致性（四处版本文件 = 0.9.10；README 自 v0.9.10 起不写死版本，没有第五处可钉）', () => {
+  it('package.json / plugin.json / marketplace.json / server.ts 四处 = 0.9.10', () => {
+    expect(JSON.parse(readRel('plugin/package.json')).version).toBe('0.9.10');
+    expect(JSON.parse(readRel('plugin/.zcode-plugin/plugin.json')).version).toBe('0.9.10');
+    expect(JSON.parse(readRel('marketplace.json')).plugins[0].version).toBe('0.9.10');
+    expect(readRel('plugin/src/mcp/server.ts')).toContain('const SERVER_VERSION = "0.9.10"');
   });
 
-  // 第五处（README 安装段资产名/安装回显 + CHANGELOG 最新条目）仍钉 0.9.7：v0.9.8/v0.9.9 均未 tag
-  // 未发布（v0.9.8 那次集成员只改了版本文件、文档 lane 未落条目），README 指向最后一个已发布资产
-  // 是发布前的正确状态。文档 lane 落笔 v0.9.9 条目后改钉此处。
-  // （v0.9.6 及更早条目仍在 CHANGELOG，按「最新条目 + 三条历史条目」口径只钉最新与既有的三条。）
-  it('README 安装段指向 0.9.7；CHANGELOG 含 v0.9.7/0.9.6/0.9.5/0.9.4 条目（第五处，待文档 lane 改钉）', () => {
+  // README 自 v0.9.10 起不写死版本：安装段资产名/目录名/安装回显全是 `<版本号>` 占位——
+  // 整份 README 不得再出现 zcode-crosschat-<数字>.<数字>.<数字> 形式的写死资产名/目录名
+  // （负例断言；覆盖任意版本号段，不只 0.x.y——将来写回 1.0.0 也该红）。
+  // CHANGELOG 按「最新条目 + 三条历史条目」口径钉 v0.9.10/0.9.9/0.9.8/v0.9.7 四条
+  // （v0.9.8/v0.9.9 条目由 v0.9.10 文档 lane 补录）。
+  it('README 不含写死版本的资产名（/zcode-crosschat-\\d+\\.\\d+\\.\\d+/）；CHANGELOG 含 v0.9.10/0.9.9/0.9.8/v0.9.7 四条', () => {
     const readme = readRel('README.md');
-    expect(readme).toContain('zcode-crosschat-0.9.7-prebuilt-slim.tar.gz');
-    expect(readme).toContain('Installed plugin zcode-crosschat@dev-zcode-crosschat (0.9.7)');
+    expect(readme).not.toMatch(/zcode-crosschat-\d+\.\d+\.\d+/);
     expect(readme).toContain('8 个斜杠命令');
     const changelog = readRel('CHANGELOG.md');
+    expect(changelog).toContain('**v0.9.10**（2026-11-24，只改文档的补丁版');
+    expect(changelog).toContain('**v0.9.9**（2026-11-22，steer 进程树击杀');
+    expect(changelog).toContain('**v0.9.8**（2026-11-22，steer 硬插队');
     expect(changelog).toContain('**v0.9.7**（2026-11-22，v0.9.6 真实复测残留 R1/R2');
-    expect(changelog).toContain('**v0.9.6**（2026-11-22，真实复测缺陷 R1/R2');
-    expect(changelog).toContain('**v0.9.5**（2026-11-21，v0.9.4 对抗轮 4 条 P2');
-    expect(changelog).toContain('**v0.9.4**（2026-11-21，v0.9.3 验收三方对账');
   });
 });
