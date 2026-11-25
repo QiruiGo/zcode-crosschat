@@ -14,11 +14,11 @@
  * @module core/teamstate
  */
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
+import { mkdir, open, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { writeFileAtomic } from './atomic.js';
 import { appendMailbox, createMessage } from './mailbox.js';
-import { inboxDir, inboxFile, snapshotFile, teamBackupFile, teamCorruptFile, teamDir, teamFile } from './paths.js';
+import { engineLogFile, inboxDir, inboxFile, snapshotFile, teamBackupFile, teamCorruptFile, teamDir, teamFile } from './paths.js';
 import { sanitizeKey } from './sanitize.js';
 import {
   OPEN_TASK_STATUSES,
@@ -1203,4 +1203,168 @@ export function sweepStaleProvisioningLocked(
     });
   }
   return swept;
+}
+
+// ---------------------------------------------------------------------------
+// v0.10.0（组 D / G-25）：成员职能声明（duty）的落盘助手。
+//
+// 写入面有两个（xc_identify 的注册/改名/接管 与 xc_team member-add 的供给），
+// 共用本助手保证「读改写 + 持 team 锁」同一纪律（§2.7-4：本模块从不自己持锁的
+// 规矩在这里破例是因为调用方（identify）的注册主体在 identity.ts 的
+// registry→team 组合锁里，无法把 duty 一并带进去——joinTeam 是那边的事实源）。
+// best-effort 语义：写失败只返回 false，调用方在回执里如实披露（注册本身已成功，
+// 不为一句职能声明把整次 identify 判失败）。
+// ---------------------------------------------------------------------------
+
+/** setMemberDuty 的结果（false = 未落盘：调用方披露，不抛）。 */
+export interface MemberDutyWrite {
+  ok: boolean;
+  error?: string;
+}
+
+/**
+ * 把（已清洗的）职能声明写进花名册成员行。`duty === undefined` = 本次未声明 →
+ * 原样保留既有值（「同键重新供给/改名/takeover 不丢」由各路径的成员行 spread
+ * 天然保证，本函数不参与）；成员不在册 → no-op 成功（无行可写不是错误）。
+ */
+export async function setMemberDuty(
+  stateRoot: string,
+  teamId: string,
+  agentKey: string,
+  duty: string | undefined,
+): Promise<MemberDutyWrite> {
+  if (duty === undefined) return { ok: true };
+  try {
+    await withTeamLock(stateRoot, teamId, async () => {
+      const team = await readTeam(stateRoot, teamId);
+      if (team === undefined) return;
+      const idx = team.members.findIndex((m) => m.key === agentKey);
+      if (idx < 0) return;
+      team.members[idx] = { ...team.members[idx]!, duty };
+      await writeTeam(stateRoot, team);
+    });
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// v0.10.0（组 D / R4）：**后台回合进行中**（无头回合在跑）的引擎事件判据。
+//
+// 背景（R4/G-30 + G-25 台账）：成员被唤醒成无头分身跑回合时，桌面会话看不到任何
+// 「后台回合进行中」的迹象，用户以为掉线。监督侧仪器（watch_round.py headless_tag）
+// 的口径移植：**只看引擎事件**（registry 自述活性不可信——G-12/G-24 已实证
+// livenessTs 冻结、member-dead 后仍标 running），判据三条件全满足才标记：
+//   ① 该成员 sid 最近的 `session-running` 晚于最近的 `session-idle`
+//      （当前处于「回合已开始、尚未结束」区间）；
+//   ② 该成员在此之后（即上一次 session-idle 之后）有过 `wake` 事件
+//      （当前这个 running 区间是**被唤醒拉起**的，而非用户手打 prompt 的交互回合）；
+//   ③ 该 wake 不晚于那个 session-running（唤醒 spawn 在前、回合开始钩子在后——
+//      物理次序；只认 running 之前最近的唤醒，防止把交互回合误标）。
+// 只记账不动作：本判据不清理、不终止、不改任何状态，纯观测面输入
+// （xc_overview team/panel/status 三视图 + UserPromptSubmit 钩子提示共用）。
+// ---------------------------------------------------------------------------
+
+/** 一名成员的「后台回合进行中」标记（含判定所依据的两个引擎事件时刻，供对账）。 */
+export interface HeadlessTurnFlag {
+  key: string;
+  sessionId: string;
+  /** 判定依据：spawn 成功的 `wake` 事件时刻（epoch ms）。 */
+  wakeTs: number;
+  /** 判定依据：回合开始的 `session-running` 事件时刻（epoch ms）。 */
+  runningTs: number;
+}
+
+/** 引擎事件尾部窗口（与 core/timeline.ts TAIL_READ_MAX_BYTES / wake 三级计数同口径）。 */
+const HEADLESS_TURN_TAIL_BYTES = 256 * 1024;
+
+/** 引擎事件的一行最小形状（本判据只取 ts/event/sessionId/to 四键）。 */
+interface HeadlessTurnEventLine {
+  ts: number;
+  event: string;
+  sessionId?: string;
+  to?: string;
+}
+
+/** 引擎事件名字面量（与 core/liveness.ts 的冻结事件名一致——本模块不反向依赖 liveness）。 */
+const SESSION_RUNNING_EVENT_NAME = 'session-running';
+const SESSION_IDLE_EVENT_NAME = 'session-idle';
+
+/**
+ * 逐成员判定「后台回合进行中」（Map<成员键, 标记>；空 Map = 无人有后台回合）。
+ *
+ * 读取意外（无 engine.jsonl / 打不开 / 读一半）→ 返回已判得的部分（观测面永不
+ * 因计数失败而崩，同 readWakeTierCounts 纪律）；窗口外更早事件不可见 ⇒ 可能漏判
+ * 「唤醒与回合开始都早于尾窗」的在途回合——失败方向是**漏**（不虚报），与容量
+ * 采样的失败方向一致。
+ */
+export async function headlessTurnMembers(
+  stateRoot: string,
+  team: TeamState,
+): Promise<Map<string, HeadlessTurnFlag>> {
+  const flags = new Map<string, HeadlessTurnFlag>();
+  if (team.members.length === 0) return flags;
+  const lastRunning = new Map<string, number>();
+  const lastIdle = new Map<string, number>();
+  const lastWake = new Map<string, number>();
+  let handle: import('node:fs/promises').FileHandle | undefined;
+  try {
+    handle = await open(engineLogFile(stateRoot), 'r');
+  } catch {
+    return flags; // 无日志/不可开：无人可判（尚未有过任何引擎事件）
+  }
+  try {
+    const size = (await handle.stat()).size;
+    const start = Math.max(0, size - HEADLESS_TURN_TAIL_BYTES);
+    const length = size - start;
+    const buffer = Buffer.alloc(length);
+    await handle.read(buffer, 0, length, start);
+    const lines = buffer.toString('utf8').split('\n');
+    if (start > 0) lines.shift(); // 窗口首行可能是被截断的半行——丢弃（同 wake 三级计数口径）
+    for (const line of lines) {
+      if (line.trim() === '') continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        continue; // 坏行不影响判定（读取面另有审计）
+      }
+      if (typeof parsed !== 'object' || parsed === null) continue;
+      const rec = parsed as Record<string, unknown>;
+      const ts = rec['ts'];
+      if (typeof ts !== 'number' || !Number.isFinite(ts) || ts <= 0) continue;
+      const event = rec['event'];
+      const sessionId = typeof rec['sessionId'] === 'string' ? rec['sessionId'] : undefined;
+      const to = typeof rec['to'] === 'string' ? rec['to'] : undefined;
+      const line1: HeadlessTurnEventLine = { ts, event: typeof event === 'string' ? event : '', ...(sessionId !== undefined ? { sessionId } : {}), ...(to !== undefined ? { to } : {}) };
+      if (line1.event === SESSION_RUNNING_EVENT_NAME && sessionId !== undefined) {
+        const prev = lastRunning.get(sessionId);
+        if (prev === undefined || ts > prev) lastRunning.set(sessionId, ts);
+      } else if (line1.event === SESSION_IDLE_EVENT_NAME && sessionId !== undefined) {
+        const prev = lastIdle.get(sessionId);
+        if (prev === undefined || ts > prev) lastIdle.set(sessionId, ts);
+      } else if (line1.event === 'wake' && to !== undefined) {
+        const prev = lastWake.get(to);
+        if (prev === undefined || ts > prev) lastWake.set(to, ts);
+      }
+    }
+  } catch {
+    /* 读中途失败：用已计得的部分（best-effort 观测面） */
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+  for (const member of team.members) {
+    if (member.sessionId === '') continue; // provisioning 占位：无会话可判
+    const runningTs = lastRunning.get(member.sessionId);
+    if (runningTs === undefined) continue; // 窗口内没有回合开始事件
+    const idleTs = lastIdle.get(member.sessionId) ?? 0;
+    if (runningTs <= idleTs) continue; // ① 最新区间不是 running
+    const wakeTs = lastWake.get(member.key);
+    if (wakeTs === undefined) continue; // ② 从无唤醒：交互会话，不标
+    if (wakeTs <= idleTs) continue; // ② 唤醒发生在上一段 idle 之前：与当前 running 区间无关
+    if (wakeTs > runningTs) continue; // ③ 唤醒晚于回合开始：startup 窗口/双路形态，本判据不认
+    flags.set(member.key, { key: member.key, sessionId: member.sessionId, wakeTs, runningTs });
+  }
+  return flags;
 }

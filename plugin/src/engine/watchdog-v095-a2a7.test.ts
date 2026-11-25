@@ -14,6 +14,11 @@
  *
  * 纪律：真活进程 pid（kill 出真进程死，C8 同款）；合成时刻只走 sweepMembersOnce 的
  * `now` 注入与 timer 面的 Date mock（toFake:['Date']，定时器真实调度）。
+ *
+ * v0.10.0（组 A / R3）口径变化：**连续两个扫描周期都判死才发 member-dead**（二次确认，
+ * 需求书 R3 修法④）。死亡用例在 seed 之后先跑一个 suspect 周期（只记台账 +
+ * suspect-dead 审计），原断言移到第二个周期之后——断言本身逐字不变。补扫轮（resume）
+ * 的「窗外死记录静默认认」路径不受影响（首周期即静默认领，零告警口径原样）。
  */
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { spawn } from "node:child_process";
@@ -136,6 +141,8 @@ describe("v0.9.5 A2/V094-13：新鲜度三源合判（peer 记录之外的死亡
   it("【方案验收锚点】peer 无记录 + witness 90s 内 → member-dead 恰一条（旧实现判存量永久静音）", async () => {
     await seedTeam();
     await seedCrashedMember({ witnessAgeMs: 90_000, lastEventAgeMs: 90_000 });
+    // v0.10.0（组 A / R3）：第一周期只记 suspect（不发 member-dead、不告警）
+    expect((await sweepMembersOnce(deps())).deathSuspects).toEqual(["b"]);
     const summary = await sweepMembersOnce(deps());
     expect(summary.dead).toEqual(["b"]);
     expect(summary.firstSightDead).toEqual(["b"]);
@@ -152,6 +159,8 @@ describe("v0.9.5 A2/V094-13：新鲜度三源合判（peer 记录之外的死亡
   it("registry lastEventTs 90s 内（无证言、无 peer 记录）→ 同样告警（第二证据源独立有效）", async () => {
     await seedTeam();
     await seedCrashedMember({ lastEventAgeMs: 90_000 }); // 不写证言
+    // v0.10.0（组 A / R3）：第一周期 suspect、第二周期认领告警
+    expect((await sweepMembersOnce(deps())).deathSuspects).toEqual(["b"]);
     const summary = await sweepMembersOnce(deps());
     expect(summary.dead).toEqual(["b"]);
     expect(readEngineEvents().filter((e) => e["event"] === "member-dead")).toHaveLength(1);
@@ -165,6 +174,8 @@ describe("v0.9.5 A2/V094-13：新鲜度三源合判（peer 记录之外的死亡
     // 补扫窗（≤7 天）之外（见 watchdog-v096-fixd.test.ts）。
     await seedTeam();
     await seedCrashedMember({ witnessAgeMs: 2 * 3_600_000, lastEventAgeMs: 2 * 3_600_000 });
+    // v0.10.0（组 A / R3）：第一周期 suspect、第二周期认领并告警（首见标注不变）
+    expect((await sweepMembersOnce(deps())).deathSuspects).toEqual(["b"]);
     const summary = await sweepMembersOnce(deps());
     expect(summary.dead).toEqual(["b"]);
     expect(summary.firstSightDead).toEqual(["b"]);
@@ -195,14 +206,18 @@ describe("v0.9.5 A7：休眠恢复补扫（watchdog-resume + 窗口内死亡补�
     // 死亡发生在盲区：witness/lastEventTs 距恢复后首扫 14h（> 10min 新鲜窗，< 14.5h 补扫窗）
     await seedCrashedMember({ witnessAgeMs: 14 * 3_600_000, lastEventAgeMs: 14 * 3_600_000 });
     const gapMs = 14.5 * 3_600_000;
-    const summary = await sweepMembersOnce(deps(), Date.now(), {
-      resume: { gapMs, catchupWindowMs: Math.min(gapMs, 7 * 24 * 3_600_000) },
-    });
+    const resumeOpts = { resume: { gapMs, catchupWindowMs: Math.min(gapMs, 7 * 24 * 3_600_000) } };
+    // v0.10.0（组 A / R3）：恢复后首周期只记 suspect（补扫口径照跑：resume 事件落账）；
+    // 第二个补扫周期仍判死 → 认领 + 补扫口径告警（文案含「补扫」）。
+    const first = await sweepMembersOnce(deps(), Date.now(), resumeOpts);
     // resume 事件恰一条（带 gapMs 与补扫窗）
     const resumes = readEngineEvents().filter((e) => e["event"] === "watchdog-resume");
     expect(resumes).toHaveLength(1);
     expect(resumes[0]!["gapMs"]).toBe(gapMs);
     expect(resumes[0]!["catchupWindowMs"]).toBe(gapMs);
+    expect(first.resume).toEqual({ gapMs, catchupWindowMs: gapMs });
+    expect(first.deathSuspects).toEqual(["b"]);
+    const summary = await sweepMembersOnce(deps(), Date.now(), resumeOpts);
     // 窗口内死亡按补扫告警（不静音）
     expect(summary.resume).toEqual({ gapMs, catchupWindowMs: gapMs });
     expect(summary.dead).toEqual(["b"]);
@@ -237,6 +252,8 @@ describe("v0.9.5 A7：休眠恢复补扫（watchdog-resume + 窗口内死亡补�
     await seedCrashedMember({ witnessAgeMs: 90_000, lastEventAgeMs: 90_000 });
     const now = Date.now();
     const resumeInput = { resume: { gapMs: 14.5 * 3_600_000, catchupWindowMs: 14.5 * 3_600_000 } as const };
+    // v0.10.0（组 A / R3）：第一把记 suspect、第二把认领——死亡认领仍由 watchdog-state
+    // 台账去重（同一次死亡只告警一次），「恰一条 member-dead」的断言不变。
     const first = await sweepMembersOnce(deps(), now, resumeInput);
     const second = await sweepMembersOnce(deps(), now + 1_000, resumeInput); // 1s 后的另一把扫描
     expect(first.resume).toBeDefined();
@@ -244,8 +261,8 @@ describe("v0.9.5 A7：休眠恢复补扫（watchdog-resume + 窗口内死亡补�
     expect(readEngineEvents().filter((e) => e["event"] === "watchdog-resume")).toHaveLength(1);
     // 死亡认领由 watchdog-state 台账去重：同一次死亡只告警一次
     expect(readEngineEvents().filter((e) => e["event"] === "member-dead")).toHaveLength(1);
-    expect(first.dead).toEqual(["b"]);
-    expect(second.dead).toEqual([]);
+    expect(first.deathSuspects).toEqual(["b"]);
+    expect(second.dead).toEqual(["b"]);
   });
 
   it("正常间隔（不传 resume）→ 零补扫事件（验收判据：正常间隔不写）", async () => {

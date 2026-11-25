@@ -17,8 +17,9 @@
 import { z } from "zod";
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
+import { open, stat } from "node:fs/promises";
 import { resolve, sep } from "node:path";
-import { stat } from "node:fs/promises";
 import { checkLinkContainment } from "../core/paths.js";
 import {
   invalidParamsError,
@@ -31,13 +32,15 @@ import {
   renderClaim,
   renderDispatch,
   renderReport,
+  type DispatchDeferredState,
+  type UrgentReportState,
   type WakeReceiptState,
 } from "./render.js";
 import { withTeamLock, withSessionTurnLock, SessionTurnBusyError } from "../core/lock.js";
 import { attemptWake } from "../engine/wake.js";
 import { identityStore } from "./identity.js";
 import { sanitizeKey } from "../core/sanitize.js";
-import { DEFAULT_TEAM_ID, memberState, TERMINAL_TASK_STATUSES, TASK_PRIORITIES } from "../core/types.js";
+import { DEFAULT_TEAM_ID, memberState, TERMINAL_TASK_STATUSES, TASK_PRIORITIES, plausibleLivenessTs } from "../core/types.js";
 import type { EvidenceItem, TeamMessage, TeamState } from "../core/types.js";
 import {
   appendTaskHistory,
@@ -45,6 +48,7 @@ import {
   beginTaskAttempt,
   findActiveDuplicateTask,
   getTask,
+  leadKeyOf,
   makeTask,
   memberOpenTasks,
   newTeamState,
@@ -65,6 +69,8 @@ import {
   staleCompletedReceiptTaskIds,
 } from "../core/mailbox.js";
 import { logEngineEvent } from "../core/log.js";
+import { engineLogFile } from "../core/paths.js";
+import { findInflightWakeNonce, readSession } from "../core/registry.js";
 import { receiverInjectBudget, contextCharsFromEnv, truncateField } from "../core/budget.js";
 import { sha256Of } from "../core/msgstore.js";
 import type { ToolDeps } from "./core.js";
@@ -73,9 +79,11 @@ import { runCore } from "./core.js";
 /** v1 单队固定 default（DESIGN §2.2）。 */
 const TEAM_ID = DEFAULT_TEAM_ID;
 
-/** createMessage 可携带的投递快照字段（与 v0.5.3 一致）。 */
+/** createMessage 可携带的投递快照字段（与 v0.5.3 一致）。
+ * v0.10.0（R8）：白名单再扩含 urgent——插队回单的写入侧新增键（xc_relay 的 urgent
+ * 写入侧同款，v0.6 C1 起 createMessage 即宽容接收），其余行逐字节不动。 */
 type MessageExtras = Partial<
-  Pick<TeamMessage, "taskId" | "attemptId" | "sourceTaskId" | "sourceAttemptId" | "sourceTaskStatus" | "deliveryClaimedAt">
+  Pick<TeamMessage, "taskId" | "attemptId" | "sourceTaskId" | "sourceAttemptId" | "sourceTaskStatus" | "deliveryClaimedAt" | "urgent">
 >;
 
 // ---------------------------------------------------------------------------
@@ -114,6 +122,13 @@ export const ReportShape = {
     )
     .optional()
     .describe("completed 必须至少 1 条；每条必须是工作区内真实存在的普通文件（evidence_not_a_file / evidence_file_missing / evidence_path_outside_workspace），sha256 由工具现算复核"),
+  // v0.10.0（R8，用户点名）：插队回单（"半截回单"）——true 时本条按插队语义投递：
+  // 回执消息带 urgent（排到收件人未读最前）、对任务创建者发起一次 urgent 唤醒尝试
+  // （创建者不是 lead 时 lead 邮箱也落一份不唤醒的通知）、人可读行以【插队回单】开头。
+  // 终态（completed/failed）与中间态（in_progress/blocked）都可带——中间态原本无回执，
+  // urgent 时才建（成员半截把重要发现送出去、然后继续干）。防风暴：同一成员 10 分钟内
+  // 最多 5 次 urgent（XC_URGENT_REPORT_MAX 可调），超出的自动降级为普通回单并在回执写明。
+  urgent: z.boolean().optional().describe("插队回单（v0.10.0 R8）：true 时回执消息 urgent 置顶 + 对任务创建者 urgent 唤醒尝试；创建者非 lead 时 lead 邮箱落一份不唤醒的通知。半截（in_progress/blocked）也可用。防风暴：同一成员 10 分钟内最多 5 次（XC_URGENT_REPORT_MAX 可调），超出自动降级为普通回单"),
 } as const;
 
 export type DispatchArgs = { to: string; title: string; prompt: string; acceptance?: string; dependsOn?: string[]; priority?: (typeof TASK_PRIORITIES)[number]; force?: boolean };
@@ -125,6 +140,8 @@ export type ReportArgs = {
   result?: string;
   error?: string;
   evidence?: Array<{ path: string; note?: string; sha256?: string | null }>;
+  /** v0.10.0（R8）：插队回单开关（可选；缺省/absent = 普通回单，行为与 v0.9.9 逐字节一致）。 */
+  urgent?: boolean;
 };
 
 // ---------------------------------------------------------------------------
@@ -205,6 +222,144 @@ export function assertToolIdWithinLimit(id: string, field: string): void {
 }
 
 // ---------------------------------------------------------------------------
+// v0.10.0（R8）：插队回单的**防风暴闸**（同一成员 10 分钟内 urgent 回单上限）
+//
+// 动机（用户令（R8））：半截回单是一等公民能力，
+// 但「插队」语义（置顶 + 唤醒）被滥用时会反过来轰炸收件人——每次 urgent 回单都可能
+// 唤醒创建者（甚至惊动 lead 邮箱），一个成员狂点 urgent 等于把普通进度升级成噪音。
+// 上限用**环境变量** XC_URGENT_REPORT_MAX 覆盖（可选、带默认值，0 新增必填配置）。
+//
+// 计数真源 = engine.jsonl 的 `report-urgent` 审计事件（回单发生时落的那条），
+// 有界尾读（不全文件读——日志无上界，core/timeline.ts 同款纪律）；读不到/解析失败
+// → 0（fail-open：闸只防风暴，不拦投递，绝不因观测面故障把回单降级）。
+// ---------------------------------------------------------------------------
+
+/** 防风暴计数窗（ms）——同一成员 urgent 回单的滚动窗口。 */
+export const URGENT_REPORT_WINDOW_MS = 10 * 60_000;
+
+/** 窗内 urgent 回单上限缺省值（env XC_URGENT_REPORT_MAX 覆盖）。 */
+export const URGENT_REPORT_MAX_DEFAULT = 5;
+
+/** engine.jsonl 尾读窗口（字节）——覆盖 10min 窗所需的最新事件即止（约数千行）。 */
+const URGENT_REPORT_TAIL_BYTES = 1024 * 1024;
+
+/**
+ * env `XC_URGENT_REPORT_MAX` 解析（正整数；未设/空串/非正/不可解析 → 缺省 5）。
+ * 与 limbo/wake-slow 家族同口径：不接受「关闭用 0」——要停插队语义别传 urgent。
+ */
+export function urgentReportMaxFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.XC_URGENT_REPORT_MAX;
+  if (raw === undefined || raw.trim() === "") return URGENT_REPORT_MAX_DEFAULT;
+  const n = Number(raw);
+  return Number.isSafeInteger(n) && n > 0 ? n : URGENT_REPORT_MAX_DEFAULT;
+}
+
+/**
+ * 统计窗内该成员**已生效**的 urgent 回单数（engine.jsonl 有界尾读；只数
+ * `report-urgent` 且 from 命中、时刻落在窗内的行——降级 Attempt 不落本事件，
+ * 不占额度，见 xc_report 内注释）。
+ *
+ * 纯观测面计数：读失败/坏行一律跳过（返回已数到的部分），绝不因此抛错。
+ */
+export async function countRecentUrgentReports(
+  stateRoot: string,
+  from: string,
+  now: number,
+  windowMs: number = URGENT_REPORT_WINDOW_MS,
+): Promise<number> {
+  let handle: FileHandle | undefined;
+  try {
+    handle = await open(engineLogFile(stateRoot), "r");
+    const size = (await handle.stat()).size;
+    const length = Math.min(size, URGENT_REPORT_TAIL_BYTES);
+    const buffer = Buffer.alloc(length);
+    await handle.read(buffer, 0, length, size - length);
+    let text = buffer.toString("utf8");
+    // 窗口首行可能是被截断的半行（size > length 时才有）——丢弃，防半个 JSON 误解析。
+    if (size > length) {
+      const firstBreak = text.indexOf("\n");
+      text = firstBreak === -1 ? "" : text.slice(firstBreak + 1);
+    }
+    let count = 0;
+    for (const line of text.split("\n")) {
+      if (line.trim() === "") continue;
+      let value: unknown;
+      try {
+        value = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (typeof value !== "object" || value === null) continue;
+      const event = value as Record<string, unknown>;
+      if (event.event !== "report-urgent") continue;
+      if (event.from !== from) continue;
+      const ts = event.ts;
+      if (typeof ts !== "number" || !plausibleLivenessTs(ts, now)) continue;
+      if (now - ts > windowMs) continue;
+      count++;
+    }
+    return count;
+  } catch {
+    // 审计日志不可读（不存在/占用/权限）→ 不挡（fail-open：cap 是防风暴不是投递闸）。
+    return 0;
+  } finally {
+    await handle?.close();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// v0.10.0（R8 补充，用户追加裁决）：紧急回单的**收方回合进行中**闸
+//
+// 裁决原文要义：紧急回单不得把回合正在进行的主控拉成无头分身（R5 同款事故的
+// 回单面复现——17:42 主控正等用户答选项卡时被 urgent 唤醒成无头分身）。该裁决
+// **优先于 R8 原文里「唤醒收方」的字面**：收件人回合进行中时紧急回单不发起唤醒，
+// 消息照常 urgent 落邮箱 + 打待补醒标记，补醒交给看门狗（组 A）在回合结束后做。
+//
+// 判据与派单忙闲闸（B1）同源并多一项：
+// ① 会话记录 liveness='running' ∧ livenessTs 可信（最近的引擎事件是 session-running
+//    且之后没有 session-idle 的落盘投影）；
+// ② **有在途唤醒也算进行中**——registry/wake/ 里有该成员新鲜未消费的 wake nonce
+//    （WAKE_INFLIGHT_MS=15min 窗；spawn 已发起、回合尚未开跑的形态）。
+// 只在有**正向证据**时挡唤醒：读不到证据（ENOENT/读盘失败）按「不在跑」放行
+// （与忙闲闸同方向——闸挡的是「已被证明在跑」的收方，不是「查不到状态」的收方）。
+// ---------------------------------------------------------------------------
+
+/** 待补醒标记的唯一取值（消息 content 的 wakeDeferred 键 / 审计 reason 键共用）。 */
+export const RECIPIENT_TURN_RUNNING = "recipient-turn-running";
+
+/**
+ * 收件人回合是否正在进行（紧急回单唤醒闸的判据；无盘外副作用，读盘失败按不在跑）。
+ *
+ * @param agentKey 收件人成员键（在途唤醒 nonce 按它匹配）
+ * @param sessionId 收件人在花名册上的 sessionId（无 sid → 只查在途唤醒）
+ * @param now 时钟注入（测试用）
+ */
+async function recipientTurnInProgress(
+  stateRoot: string,
+  agentKey: string,
+  sessionId: string | null,
+  now: number,
+): Promise<boolean> {
+  if (sessionId !== null) {
+    try {
+      const record = await readSession(stateRoot, sessionId);
+      if (record?.liveness === "running" && plausibleLivenessTs(record.livenessTs, now)) return true;
+    } catch {
+      // 读盘失败 → 证据不足，按不在跑（见本节注释：只在有正向证据时挡唤醒）
+    }
+  }
+  try {
+    // findInflightWakeNonce 内部已按 isWakeNonceFresh（未用 ∧ 15min 窗）过滤，
+    // 并取 ts 最新的一张；按 agentKey 匹配（票据只可能签发给它的目标成员）。
+    const inflight = await findInflightWakeNonce(stateRoot, agentKey, { teamId: TEAM_ID, now });
+    if (inflight !== undefined) return true;
+  } catch {
+    // 同上：观测面故障不改唤醒决策
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 // 核心实现（SDK 无关；原 tools.ts 平移 + 三处 v0.6 增量）
 // ---------------------------------------------------------------------------
 
@@ -231,8 +386,17 @@ export function dispatchDedupKey(toKey: string, ticket: string): string {
   return `to=${toKey}|ticket=${sha256Of(ticket).slice(0, 16)}`;
 }
 
-/** 回执消息内容：机器可解析 JSON，attempt 关联保留在此（见 xc_report 内注释）。 */
-function receiptText(taskId: string, attemptId: string, status: string, task: TeamState["tasks"][number]): string {
+/** 回执消息内容：机器可解析 JSON，attempt 关联保留在此（见 xc_report 内注释）。
+ * v0.10.0（R8 补充）：`wakeDeferred` 可选键——紧急回单的唤醒被「收方回合进行中」
+ * 挡下时打在回执帧上（待补醒标记；看门狗侧据此认「这条 urgent 回单还欠一次唤醒」）。
+ * 缺省不传 = 与 v0.9.9 逐字节一致（旧帧无该键）。 */
+function receiptText(
+  taskId: string,
+  attemptId: string,
+  status: string,
+  task: TeamState["tasks"][number],
+  wakeDeferred?: string,
+): string {
   return JSON.stringify({
     type: "task-receipt",
     teamId: TEAM_ID,
@@ -242,7 +406,21 @@ function receiptText(taskId: string, attemptId: string, status: string, task: Te
     result: task.result,
     error: task.error,
     evidence: task.evidence,
+    ...(wakeDeferred !== undefined ? { wakeDeferred } : {}),
   });
+}
+
+/**
+ * v0.10.0（R8）：插队回单给 lead 的通知里的**要点摘录**子句（result / error 各截
+ * 300 字符；都缺省 → 空串）。半截报送的价值在「重要发现」本身，只给指针主控还要再
+ * 去读邮箱——摘录让通知自带信息量（仍以回执消息为完整真源）。
+ */
+function pickExcerpt(result: string | undefined, error: string | undefined): string {
+  const r = result?.trim() ?? "";
+  if (r !== "") return `；要点：${r.slice(0, 300)}`;
+  const e = error?.trim() ?? "";
+  if (e !== "") return `；阻塞原因：${e.slice(0, 300)}`;
+  return "";
 }
 
 function requireMember(team: TeamState, agentKey: string): void {
@@ -266,6 +444,9 @@ interface WakeReceipt extends WakeReceiptState {
   wakeLog?: string;
   note?: string;
 }
+
+/** 目标无 sessionId 时的 mailbox 降级 note（wake() 助手与忙闲闸共用，防两处文案漂移）。 */
+const NO_SESSION_NOTE = "target has no sessionId on file";
 
 /**
  * v0.7.2（红队五番战 C8-B3 修复）：派单目标的**生命周期**闸。
@@ -553,13 +734,48 @@ export function createTaskCore(deps: ToolDeps): TaskCore {
             const message = createMessage(me.agentKey, toKey, ticket, extras);
             await appendMailbox(stateRoot, me.teamId, toKey, message);
             await writeTeam(stateRoot, team);
+            // v0.10.0（R2/G-28）：**忙闲闸判据采集**（锁内一次读盘；判据本身在锁外
+            // wake 之前生效，采集放锁内是为了与建单用同一份 team 快照——两次读盘之间
+            // 成员认领了任务会造成「以为不忙 → 还是 spawn 了第二路」的竞态）。
+            //
+            // 忙 = 任一成立：
+            // ① 任务板上有它 **claimed/in_progress** 的任务（blocked 不算——那是
+            //    认领者显式申报的暂停，不是回合在跑；claim 侧 already_has_open_task
+            //    同款口径的收方侧投影）；
+            // ② 注册表里它最近的引擎事件是 session-running 而之后没有 session-idle
+            //    （会话记录 liveness 字段正是该事件流的落盘投影，registry.ts
+            //    applyLivenessTransition/markSessionIdle 维护）——须带可信 livenessTs
+            //    （plausibleLivenessTs：未来值/缺失 = 伪造或损坏，按不忙，core/liveness.ts
+            //    runningTrusted 同口径）。
+            //
+            // R2 建议修法里的第三条备用判据（15min 窗内未消费 wake nonce）**未**纳入：
+            // 需求 B1 的忙定义只含上述两条，且实测中 nonce 已被 SessionStart 钩子
+            // 消费（不能单独依赖，纳入只会误挡）。
+            const toSessionId = team.members.find((m) => m.key === toKey)?.sessionId ?? null;
+            const openTaskIds = team.tasks
+              .filter((t) => t.assignee === toKey && (t.status === "claimed" || t.status === "in_progress"))
+              .map((t) => t.id);
+            let sessionRunning = false;
+            if (toSessionId !== null) {
+              try {
+                const record = await readSession(stateRoot, toSessionId);
+                sessionRunning = record?.liveness === "running" && plausibleLivenessTs(record.livenessTs, now);
+              } catch {
+                // 读盘失败 → 按不忙（fail-open：闸的失败方向是「多唤醒一次」而不是
+                // 「丢单/永不唤醒」，观测面故障不得让派单退化成只落邮箱）。
+                sessionRunning = false;
+              }
+            }
             return {
               kind: "created" as const,
               taskId: task.id,
               status: "pending" as const,
               messageId: message.id,
-              toSessionId: team.members.find((m) => m.key === toKey)?.sessionId ?? null,
+              toSessionId,
               teamResetWarning,
+              busy: openTaskIds.length > 0 || sessionRunning,
+              openTaskIds,
+              sessionRunning,
             };
           });
 
@@ -581,7 +797,29 @@ export function createTaskCore(deps: ToolDeps): TaskCore {
           }
 
           // 锁外投递（§2.5 三重启用条件由 M2 判定；wake 失败=mailbox，不丢消息）。
-          const sent = await wake(toKey, prepared.toSessionId, "dispatch", [prepared.messageId], ticketText(args));
+          // v0.10.0（R2/G-28）：**忙闲闸**——收方在途（在途任务/回合在跑）则跳过 spawn、
+          // 只落邮箱：成员已有在途回合时再唤醒一路无头回合，同一会话两路并发会互相抢
+          // 信箱、重复劳动（今日 17:38/17:44 m8 双路实测，GAP 第十六批）。
+          // 邮箱机制保证不丢单（收方下个 prompt 读未读/可 pull），补醒由看门狗侧负责。
+          // 收方不忙时本闸不生效——wake 调用、审计、回执三面逐字节不变。
+          let sent: WakeReceipt;
+          if (prepared.busy) {
+            // 无 sid 的忙成员沿用 wake() 助手的同款 note（「没有会话」是比「在途」
+            // 更硬的事实，不能因为忙就把这条事实从回执里抹掉）。
+            sent = prepared.toSessionId === null
+              ? { delivered: "mailbox", note: NO_SESSION_NOTE }
+              : { delivered: "mailbox" };
+            await logEngineEvent(stateRoot, {
+              event: "dispatch-deferred-busy",
+              teamId: me.teamId,
+              to: toKey,
+              taskId: prepared.taskId,
+              openTaskIds: prepared.openTaskIds,
+              sessionRunning: prepared.sessionRunning,
+            });
+          } else {
+            sent = await wake(toKey, prepared.toSessionId, "dispatch", [prepared.messageId], ticketText(args));
+          }
           await logEngineEvent(stateRoot, {
             event: "dispatch",
             teamId: me.teamId,
@@ -597,10 +835,16 @@ export function createTaskCore(deps: ToolDeps): TaskCore {
           // v0.9.7（W3/V096-01）：人可读行与 payload 都带三态——两轮唤醒全失败时行内写
           // 失败措辞（不再 "dispatched via wake"），payload 给 startConfirmed/wakeTiers/
           // wakeFailureSeen/failureEvidence 四键。
-          return okResult(renderDispatch(prepared.taskId, toKey, sent.delivered, sent), {
+          // v0.10.0（R2）：忙闲闸降级时行内写「成员在途，已落邮箱，回合结束后补醒」+
+          // payload 给 deferred{reason:"busy", openTaskIds}（不忙时两键均缺席）。
+          const deferred: DispatchDeferredState | undefined = prepared.busy
+            ? { reason: "busy", openTaskIds: prepared.openTaskIds }
+            : undefined;
+          return okResult(renderDispatch(prepared.taskId, toKey, sent.delivered, sent, deferred), {
             taskId: prepared.taskId,
             status: prepared.status,
             delivered: sent.delivered,
+            ...(deferred !== undefined ? { deferred } : {}),
             ...(args.priority !== undefined ? { priority: args.priority } : {}),
             ...(prepared.teamResetWarning !== undefined ? { teamResetWarning: prepared.teamResetWarning } : {}),
             ...(sent.wakeLog ? { wakeLog: sent.wakeLog } : {}),
@@ -848,6 +1092,24 @@ export function createTaskCore(deps: ToolDeps): TaskCore {
             evidence.push({ path: e.path, sha256: computed, note: sanitizeEvidenceNote(e.note) });
           }
 
+          // v0.10.0（R8）：插队回单的**防风暴闸**（team 锁外——engine.jsonl 尾读是慢
+          // I/O；放在证据门之后：被证据门整单拒绝的调用不算一次 urgent 回单，不占额度）。
+          //
+          // 计数真源 = engine.jsonl 的 report-urgent 审计事件（只数已生效的；降级
+          // Attempt 不落该事件、不占额度——否则一次超限会把成员连续锁死 10 分钟）。
+          // 读失败 → 0（fail-open，见 countRecentUrgentReports）。
+          const urgentRequested = args.urgent === true;
+          let urgentHonored = urgentRequested;
+          let urgentDowngradedReason: string | undefined;
+          if (urgentRequested) {
+            const max = urgentReportMaxFromEnv(deps.env);
+            const recent = await countRecentUrgentReports(stateRoot, me.agentKey, Date.now());
+            if (recent >= max) {
+              urgentHonored = false;
+              urgentDowngradedReason = `10 分钟内 urgent 回单已达上限 ${max} 次（XC_URGENT_REPORT_MAX 可调）`;
+            }
+          }
+
           const out = await withTeamLock(stateRoot, me.teamId, async () => {
             const team = await readTeam(stateRoot, me.teamId);
             if (team === undefined) throw new ToolError({ error: "no_team", message: "no team on disk yet" });
@@ -897,30 +1159,89 @@ export function createTaskCore(deps: ToolDeps): TaskCore {
             }, me.agentKey, Date.now());
             await writeTeam(stateRoot, team);
 
-            // 终态 → 给派发方邮箱写回执消息（§2.9-1）。
+            // 回执消息落创建者邮箱（§2.9-1）。
+            // v0.10.0（R8）：回执条件从「仅终态」扩为「终态 ∨ 插队回单生效」——中间态
+            // （in_progress/blocked）普通回报仍**无回执、不唤醒**（硬回归不变），但
+            // urgent 生效时半截也要把重要发现送出去：建一条 urgent 回执（排到创建者
+            // 未读最前）+ 一次 urgent 唤醒尝试。用户令的本体。
             let receipt: { to: string; messageId: string } | null = null;
-            if (TERMINAL_TASK_STATUSES.includes(args.status)) {
+            // v0.10.0（R8 补充）：收方回合进行中 → 不发起唤醒（用户追加裁决，优先于
+            // R8 原文「唤醒收方」）。判据锁内现读（与回执帧上的待补醒标记同一次
+            // 判定——标记与唤醒决策必须同源，不能「标记说不醒、实际却醒了」）。
+            let recipientTurnRunning = false;
+            // v0.10.0（R8）：创建者不是 lead 时，lead 邮箱也落一份**不唤醒**的通知
+            // （插队信息对主控可见，又不把主控强行拉起——R5 同款纪律）。
+            let leadNotified = false;
+            // v0.10.0（R8 补充）：lead 通知同样遵守回合进行中闸——进行中的 lead 不被
+            // 唤醒（通知本来就不唤醒），消息上打同一个待补醒标记。
+            let leadDeferred = false;
+            // 收件人（创建者）在花名册上的 sessionId——回合进行中判据与唤醒目标同源。
+            const toSessionId = team.members.find((m) => m.key === task.createdBy)?.sessionId ?? null;
+            if (TERMINAL_TASK_STATUSES.includes(args.status) || urgentHonored) {
               const to = task.createdBy;
+              if (urgentHonored) {
+                recipientTurnRunning = await recipientTurnInProgress(stateRoot, to, toSessionId, Date.now());
+              }
               const extras: MessageExtras = {
                 taskId: task.id,
                 sourceTaskId: task.id,
                 sourceTaskStatus: args.status,
                 deliveryClaimedAt: Date.now(),
+                ...(urgentHonored ? { urgent: true } : {}),
               };
               const msg = createMessage(
                 me.agentKey,
                 to,
-                receiptText(task.id, args.attemptId, args.status, task),
+                receiptText(
+                  task.id,
+                  args.attemptId,
+                  args.status,
+                  task,
+                  // v0.10.0（R8 补充）：待补醒标记打在回执帧 content 上（Top-level
+                  // 消息字段白名单在 core/types.ts，非本组文件域；content 帧是既有
+                  // 机器可读形态，unblock-notice 同款纪律）。
+                  recipientTurnRunning ? RECIPIENT_TURN_RUNNING : undefined,
+                ),
                 extras,
               );
               await appendMailbox(stateRoot, me.teamId, to, msg);
               receipt = { to, messageId: msg.id };
+              if (urgentHonored) {
+                const leadKey = leadKeyOf(team);
+                if (leadKey !== "" && leadKey !== to) {
+                  // 通知内容 = 指针 + 半截要点摘录（in_progress 的 result / blocked 的
+                  // error，各截 300 字符）——「快速获取重要信息」是 R8 的用户原话，
+                  // 只给一句「有人插队了」对主控没有信息量。
+                  const excerpt = pickExcerpt(args.result, args.error);
+                  const leadSessionId = team.members.find((m) => m.key === leadKey)?.sessionId ?? null;
+                  leadDeferred = await recipientTurnInProgress(stateRoot, leadKey, leadSessionId, Date.now());
+                  await appendMailbox(
+                    stateRoot,
+                    me.teamId,
+                    leadKey,
+                    createMessage(
+                      me.agentKey,
+                      leadKey,
+                      `插队回单（半截报送）：${me.agentKey} 在任务 ${task.id}（${args.status}）中途发出 urgent 回单`
+                        + `${excerpt}；创建者 ${to} 已收到回执消息。本条只作通知，未唤醒 lead。`
+                        // ③：lead 通知同样打待补醒标记（同一标记词汇，便于单一口径识别）。
+                        + (leadDeferred ? ` wakeDeferred:"${RECIPIENT_TURN_RUNNING}"` : ""),
+                      { urgent: true },
+                    ),
+                  );
+                  leadNotified = true;
+                }
+              }
             }
             return {
               taskId: task.id,
               status: args.status,
               reportedAt: Date.now(),
               receipt,
+              recipientTurnRunning,
+              leadNotified,
+              leadDeferred,
+              leadKey: leadDeferred ? leadKeyOf(team) : null,
               toSessionId: receipt
                 ? (team.members.find((m) => m.key === receipt.to)?.sessionId ?? null)
                 : null,
@@ -931,13 +1252,19 @@ export function createTaskCore(deps: ToolDeps): TaskCore {
           let wakeBack: "wake" | "mailbox" = "mailbox";
           // v0.9.7（W3/V096-01）：回执唤醒的三态键（与 dispatch 面同口径；旧实现丢掉）。
           let wakeReceipt: WakeReceiptState | undefined;
-          if (out.receipt !== null) {
+          // v0.10.0（R8 补充）：收方回合进行中 → **不调用 attemptWake**（用户追加裁决：
+          // 不得把在跑的主控拉成无头分身）。回执消息已在邮箱（urgent + 待补醒标记），
+          // 补醒由看门狗（组 A）在回合结束后做。
+          if (out.receipt !== null && !out.recipientTurnRunning) {
             const sent = await wake(
               out.receipt.to,
               out.toSessionId,
               "report",
               [out.receipt.messageId],
               `收到 CrossChat 回执：task ${out.taskId} = ${out.status}`,
+              // v0.10.0（R8）：插队回单 → urgent 唤醒尝试（唤醒 prompt 首位 URGENT
+              // 横幅；闸不豁免——容量闸/交互会话默认不唤醒照旧挡，挡下时回执明说）。
+              urgentHonored,
             );
             wakeBack = sent.delivered;
             wakeReceipt = sent;
@@ -953,14 +1280,82 @@ export function createTaskCore(deps: ToolDeps): TaskCore {
             // v0.9.7（W3/V096-01）：三态键进审计（dispatch 面同口径）。
             ...(wakeReceipt?.startConfirmed !== undefined ? { startConfirmed: wakeReceipt.startConfirmed } : {}),
             ...(wakeReceipt?.wakeFailureSeen === true ? { wakeFailureSeen: true } : {}),
+            // v0.10.0（R8）：urgent 请求事实进常规 report 事件（honored 与否 + 降级原因）
+            // ——降级 Attempt 不落 report-urgent（不占防风暴额度），在此留痕。
+            ...(urgentRequested ? { urgent: urgentHonored } : {}),
+            ...(urgentDowngradedReason !== undefined
+              ? { urgentDowngraded: true, urgentDowngradedReason }
+              : {}),
+            // v0.10.0（R8 补充）：唤醒被「收方回合进行中」挡下（未发起）——与容量闸的
+            // wakeBack=mailbox 同结果不同因，审计面上必须可分辨。
+            ...(out.recipientTurnRunning ? { wakeDeferred: RECIPIENT_TURN_RUNNING } : {}),
           });
+          // v0.10.0（R8）：插队回单生效 → 专项审计 report-urgent{taskId, from, to, woke}
+          // （woke = 本次是否真的发起了唤醒；被闸挡下时 false，原因见 report 事件的
+          // wakeBack/note 与人可读行的「已落邮箱、未唤醒」）。
+          if (urgentHonored) {
+            await logEngineEvent(stateRoot, {
+              event: "report-urgent",
+              teamId: me.teamId,
+              taskId: out.taskId,
+              from: me.agentKey,
+              to: out.receipt?.to ?? null,
+              woke: wakeBack === "wake",
+              status: out.status,
+              // v0.10.0（R8 补充）：收方回合进行中 → reason 写明，woke=false。
+              ...(out.recipientTurnRunning ? { reason: RECIPIENT_TURN_RUNNING } : {}),
+              ...(out.leadNotified === true ? { leadNotified: true } : {}),
+              ...(out.leadDeferred === true ? { leadDeferred: true } : {}),
+              ...(wakeReceipt?.startConfirmed !== undefined ? { startConfirmed: wakeReceipt.startConfirmed } : {}),
+            });
+            // v0.10.0（R8 补充）：**每个被挡下的唤醒目标**各落一条 report-urgent-deferred
+            // （创建者唤醒目标；创建者≠lead 且 lead 回合进行中时，lead 通知目标同样
+            // 落一条 to=lead）——看门狗（组 A）按它认「谁欠一次补醒」。
+            if (out.recipientTurnRunning) {
+              await logEngineEvent(stateRoot, {
+                event: "report-urgent-deferred",
+                teamId: me.teamId,
+                taskId: out.taskId,
+                from: me.agentKey,
+                to: out.receipt?.to ?? null,
+                reason: RECIPIENT_TURN_RUNNING,
+                status: out.status,
+              });
+            }
+            if (out.leadDeferred && out.leadKey !== null) {
+              await logEngineEvent(stateRoot, {
+                event: "report-urgent-deferred",
+                teamId: me.teamId,
+                taskId: out.taskId,
+                from: me.agentKey,
+                to: out.leadKey,
+                reason: RECIPIENT_TURN_RUNNING,
+                status: out.status,
+                target: "lead-notice",
+              });
+            }
+          }
           // v0.9.7（W3/V096-01）：人可读行与 payload 都带三态——两轮唤醒全失败时不再写
           // "wake back via wake"（V096-01 实测形态），改写失败措辞 + 邮箱兜底指引。
-          return okResult(renderReport(out.taskId, out.status, out.receipt?.to ?? null, wakeBack, wakeReceipt), {
+          // v0.10.0（R8）：插队回单人可读行以【插队回单】开头；被防风暴闸降级时行尾
+          // 附降级条款（payload urgentDowngraded/urgentDowngradedReason）；被「收方
+          // 回合进行中」闸挡下时明说「已落邮箱、未唤醒：收方回合进行中，回合结束后送达」。
+          const urgentState: UrgentReportState | undefined = urgentRequested
+            ? {
+                honored: urgentHonored,
+                ...(urgentDowngradedReason !== undefined ? { downgradedReason: urgentDowngradedReason } : {}),
+                ...(out.recipientTurnRunning ? { deferredReason: RECIPIENT_TURN_RUNNING } : {}),
+              }
+            : undefined;
+          return okResult(renderReport(out.taskId, out.status, out.receipt?.to ?? null, wakeBack, wakeReceipt, urgentState), {
             taskId: out.taskId,
             status: out.status,
             reportedAt: out.reportedAt,
             wakeBack,
+            ...(urgentHonored ? { urgent: true } : {}),
+            ...(urgentDowngradedReason !== undefined
+              ? { urgentDowngraded: true, urgentDowngradedReason }
+              : {}),
             ...(wakeReceipt?.startConfirmed !== undefined ? { startConfirmed: wakeReceipt.startConfirmed } : {}),
             ...(wakeReceipt?.wakeTiers !== undefined ? { wakeTiers: wakeReceipt.wakeTiers } : {}),
             ...(wakeReceipt?.wakeFailureSeen === true ? { wakeFailureSeen: true } : {}),
@@ -981,6 +1376,10 @@ export function createTaskCore(deps: ToolDeps): TaskCore {
    * 把 WakeResult 的 startConfirmed/wakeTiers/wakeFailureSeen/failureEvidence 结构性
    * 丢掉（adv-1 F-1 实测：两轮唤醒全失败的回执仍写 "dispatched via wake"，且无任何
    * 失败面结构化键）。现在四键随结果原样转交调用方进回执 payload + 人可读行措辞。
+   *
+   * v0.10.0（R8）：`urgent` 参数——true 时透传 attemptWake 的 urgent 档位（唤醒 prompt
+   * 正文首位插 URGENT 横幅）；不改变三态决策（decideDelivery 三重条件对 urgent 不
+   * 豁免，与 xc_relay urgent 同口径）。缺省 false = v0.9.9 逐字节不变。
    */
   async function wake(
     toAgentKey: string,
@@ -988,9 +1387,10 @@ export function createTaskCore(deps: ToolDeps): TaskCore {
     reason: string,
     receiptIds: readonly string[],
     ticket: string,
+    urgent = false,
   ): Promise<WakeReceipt> {
     if (toSessionId === null) {
-      return { delivered: "mailbox", note: "target has no sessionId on file" };
+      return { delivered: "mailbox", note: NO_SESSION_NOTE };
     }
     const res = await attemptWake({
       stateRoot,
@@ -1002,6 +1402,7 @@ export function createTaskCore(deps: ToolDeps): TaskCore {
       receiptIds,
       ticket,
       env: deps.env,
+      ...(urgent ? { urgent: true } : {}),
     });
     return {
       delivered: res.delivered,
@@ -1060,7 +1461,7 @@ export function registerTaskTools(
   );
   reg(
     "xc_report",
-    "Report task progress/completion/failure/blocked with the current attempt token; completion requires result and >=1 evidence (each entry must be a real regular file inside the workspace; the tool computes its sha256 and rejects a carried evidence[].sha256 that does not match - evidence_checksum_mismatch). status=blocked pauses the task keeping the attempt alive and requires a non-blank error as the blocking reason.",
+    "Report task progress/completion/failure/blocked with the current attempt token; completion requires result and >=1 evidence (each entry must be a real regular file inside the workspace; the tool computes its sha256 and rejects a carried evidence[].sha256 that does not match - evidence_checksum_mismatch). status=blocked pauses the task keeping the attempt alive and requires a non-blank error as the blocking reason. urgent:true (v0.10.0 R8) sends the receipt as a priority report: the receipt message is urgent (jumps to the front of the recipient's unread), one urgent wake attempt is made on the task creator (when the creator is not the lead, the lead's mailbox also gets a non-waking notice), and the summary line starts with 【插队回单】. The wake is skipped when the recipient's session turn is in progress (urgent reports never pull a running lead into a headless clone): the receipt still lands in the mailbox marked for a post-turn re-wake, and the receipt says so. Anti-storm: at most 5 urgent reports per member per 10 minutes (XC_URGENT_REPORT_MAX overrides); extra ones are downgraded to a plain receipt and say so in the receipt.",
     ReportShape,
     async (args, extra) => taskCore.xc_report(args as unknown as ReportArgs, connectionKeyOf(extra)),
   );

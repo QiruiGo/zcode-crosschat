@@ -16,6 +16,11 @@
  * pid 活性用真活进程（spawn node sleeper）——pid-dead 是 C8 唯一进程死硬证据，不能用
  * 假 pid 伪造；唤醒 spawn 不注入（看门狗自己调 attemptWake），测试里用「唤醒闸关闭 /
  * 容量 RED」让它必然不 spawn。
+ *
+ * v0.10.0（组 A / R3）口径变化：**连续两个扫描周期都判死才发 member-dead**
+ * （二次确认，需求书 R3 修法④）。死亡用例因此在 kill 之后跑满两个周期——首周期只记
+ * suspect（suspect-dead 审计 + 台账 liveness=pid-dead），第二个周期认领并告警；
+ * 原有断言（事件数/邮箱数/唤醒数/状态）在第二个周期之后逐字不变。
  */
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { spawn } from "node:child_process";
@@ -183,10 +188,16 @@ describe("v0.9.2 A2：成员看门狗", () => {
     // 50ms——负载下进程回收可能远超 50ms，固定等待会把活 pid 误当已死（g16 同款教训）。
     expect(await until(() => !pidAlive(memberPid), 10_000)).toBe(true);
 
+    // v0.10.0（组 A / R3）：第一周期只记 suspect（不发 member-dead、不回池）
+    const suspect = await sweepMembersOnce(deps());
+    expect(suspect.dead).toEqual([]);
+    expect(suspect.deathSuspects).toEqual(["b"]);
+    expect(eventsOf("member-dead")).toHaveLength(0);
+
+    // 第二周期仍判死 → 认领 + 三件套齐（engine 事件 / lead 邮箱 urgent / 尝试唤醒 lead）
     const second = await sweepMembersOnce(deps());
     expect(second.dead).toEqual(["b"]);
     expect(second.leadDead).toBe(false);
-    // 三件套齐：engine 事件 / lead 邮箱 urgent / 尝试唤醒 lead
     const dead = eventsOf("member-dead");
     expect(dead).toHaveLength(1);
     expect(dead[0]!["member"]).toBe("b");
@@ -201,6 +212,9 @@ describe("v0.9.2 A2：成员看门狗", () => {
     expect(wakes).toHaveLength(1);
     expect(wakes[0]!["to"]).toBe("a");
     expect(wakes[0]!["delivered"]).toBe("mailbox"); // 唤醒闸关闭：如实降级并记事件
+    // 注：注册表活性翻转（member-dead → sessions/<sid>.json liveness=dead）要求该 sid
+    // 有会话记录；本用例只 seed 了 peer 记录（无会话记录），翻转面由
+    // engine/watchdog-v0100a-r3-r6.test.ts 的带记录用例覆盖（R6 双写一致）。
 
     // 第三轮：同一成员仍死 → **不重复**（状态说 dead，无迁移）
     const third = await sweepMembersOnce(deps());
@@ -231,6 +245,9 @@ describe("v0.9.2 A2：成员看门狗", () => {
     // 负载无关：等「OS 已回收该 pid」这一产品判据成立（pidAlive 转 false），不猜固定
     // 50ms——负载下进程回收可能远超 50ms，固定等待会把活 pid 误当已死（g16 同款教训）。
     expect(await until(() => !pidAlive(leadPid), 10_000)).toBe(true);
+
+    // v0.10.0（组 A / R3）：第一周期只记 suspect；第二周期认领并转移通知
+    expect((await sweepMembersOnce(deps())).deathSuspects).toEqual(["a"]);
 
     const second = await sweepMembersOnce(deps());
     expect(second.dead).toEqual(["a"]);
@@ -271,6 +288,8 @@ describe("v0.9.2 A2：成员看门狗", () => {
     // 50ms——负载下进程回收可能远超 50ms，固定等待会把活 pid 误当已死（g16 同款教训）。
     expect(await until(() => !pidAlive(leadPid), 10_000)).toBe(true);
 
+    // v0.10.0（组 A / R3）：第一周期 suspect、第二周期认领（原断言在第二周期后不变）
+    expect((await sweepMembersOnce(deps())).deathSuspects).toEqual(["a"]);
     const second = await sweepMembersOnce(deps());
     expect(second.dead).toEqual(["a"]);
     const skipped = eventsOf("watchdog-notify-skipped");
@@ -290,11 +309,17 @@ describe("v0.9.2 A2：成员看门狗", () => {
     // 50ms——负载下进程回收可能远超 50ms，固定等待会把活 pid 误当已死（g16 同款教训）。
     expect(await until(() => !pidAlive(memberPid), 10_000)).toBe(true);
 
-    // 唤醒闸开启（env 层）+ 容量 RED：attemptWake 在 spawn 前被容量闸挡下
-    const second = await sweepMembersOnce(deps({
-      env: { XC_MESSAGING_DIR: peerRoot, XC_WAKE_ENABLED: "true" },
+    // 唤醒闸开启（env 层）+ 容量 RED：attemptWake 在 spawn 前被容量闸挡下。
+    // v0.10.0（组 A / R5）：member-dead 告警对 lead 默认只写邮箱不唤醒——要验证
+    // 「唤醒走 attemptWake 标准路径」的容量闸透出，需显式 XC_WATCHDOG_WAKE_LEAD=1
+    // 恢复对 lead 的唤醒尝试（R5 的旧行为档）。v0.10.0（组 A / R3）：第一周期
+    // suspect（无告警无唤醒）、第二周期认领后才三件套齐。
+    const wakeLeadDeps = deps({
+      env: { XC_MESSAGING_DIR: peerRoot, XC_WAKE_ENABLED: "true", XC_WATCHDOG_WAKE_LEAD: "1" },
       capacitySample: redSample(),
-    }));
+    });
+    expect((await sweepMembersOnce(wakeLeadDeps)).deathSuspects).toEqual(["b"]);
+    const second = await sweepMembersOnce(wakeLeadDeps);
     expect(second.dead).toEqual(["b"]);
     const wakes = eventsOf("watchdog-wake");
     expect(wakes).toHaveLength(1);

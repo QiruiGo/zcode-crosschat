@@ -207,7 +207,10 @@ describe("v0.9.4 A1：看门狗端到端（kill 宿主 pid → member-dead 恰�
     // ② kill 宿主 pid（会话进程死亡；无 Stop 钩子 → running 自述悬停）
     await killSleeper(memberPid);
 
-    // ③ 下一拍扫描：pid-dead → member-dead 恰一条（+ lead 通知与唤醒尝试照旧发生）
+    // ③ v0.10.0（组 A / R3）：kill 后第一个扫描周期只记 suspect（二次确认：不发
+    //    member-dead、不回池）；第二个周期仍判死 → pid-dead → member-dead 恰一条
+    //    （+ lead 通知与唤醒尝试照旧发生）。
+    expect((await sweepMembersOnce(deps)).deathSuspects).toEqual(["b"]);
     const second = await sweepMembersOnce(deps);
     expect(second.dead).toEqual(["b"]);
     const events = readEngineEvents().filter((e) => e["event"] === "member-dead");

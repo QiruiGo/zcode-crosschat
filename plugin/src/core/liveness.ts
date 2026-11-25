@@ -47,8 +47,15 @@ import { plausibleLivenessTs, type SessionRecord, type SessionWitness, type Sess
 // 既有 import 面（registry.ts / task-edges.ts 从本模块取型）。
 export type { SessionWitness, SessionWitnessKind };
 
-/** 落盘的会话活性两态（registry/sessions/<sid>.json 的 `liveness` 字段）。 */
-export type StoredLiveness = 'running' | 'idle';
+/**
+ * 落盘的会话活性两态（registry/sessions/<sid>.json 的 `liveness` 字段）。
+ *
+ * v0.10.0（组 A / R6/G-24）：新增第三态 `dead`——看门狗判亡（member-dead）后由
+ * core/registry.ts markSessionDead 落盘（与 engine.jsonl 的 member-dead 事件同临界段
+ * 双写）；重新 register（anchorSessionForRegister）或下一回合边界即翻回 running/idle。
+ * 类型与 coerceSessionRecord 的枚举在 core/types.ts 同步放开（两处单一定义点）。
+ */
+export type StoredLiveness = 'running' | 'idle' | 'dead';
 
 /** 观测三态：落盘两态 + dead（C8 pid-dead 派生，不落盘）。 */
 export type SessionLivenessState = StoredLiveness | 'dead';
@@ -56,6 +63,16 @@ export type SessionLivenessState = StoredLiveness | 'dead';
 /** engine.jsonl 活性迁移事件名（PROTOCOL §12.4 冻结示例；family=liveness）。 */
 export const SESSION_RUNNING_EVENT = 'session-running';
 export const SESSION_IDLE_EVENT = 'session-idle';
+/**
+ * v0.10.0（组 A / R6/G-24）：**判亡翻转**的迁移事件名（v0.10.0 新增；既有
+ * session-running / session-idle 的键集与语义逐字节不动）。由 core/registry.ts
+ * markSessionDead / clearSessionDead / anchorSessionForRegister 在活性**迁移**时落
+ * （同态刷新不落）：running/idle → dead（看门狗判亡后注册表翻转）与
+ * dead → running/idle（重新 register / 重新武装）各一条，prev 如实记来源态。
+ * 用途：engine.jsonl 与注册表两处双写一致可逐条对账（member-dead 是告警事件，
+ * session-dead 是注册表翻转事件，一次判亡两条）。
+ */
+export const SESSION_DEAD_EVENT = 'session-dead';
 
 /** 一次活性状态迁移（from=null = 记录此前无活性字段：存量/首标）。 */
 export interface LivenessTransition {
@@ -68,9 +85,18 @@ export interface LivenessTransition {
  *
  * 语义：
  * - `lastEventTs` 恒刷新为 now（凡是触到 registry 的引擎事件都是心跳）；
- * - `to` 与既有 `liveness` 同值 → 只刷新 lastEventTs，不产生迁移（防每个 prompt
- *   都写一条 engine.jsonl 事件）；
- * - 迁移发生 → 记 `livenessTs = now`（状态进入时刻，观测面算 stateAgeMin 用）。
+ * - v0.10.0（组 A / R6）：`livenessTs` **同点刷新**——修掉「livenessTs 冻结而
+ *   lastEventTs 新鲜」的写入路径（监督侧实测：15:55:52 冻结而同日 lastEventTs
+ *   17:58:58 新鲜；G-24 的注册表活性不可信即此形态）。此前同态分支只刷
+ *   lastEventTs，一个跨小时的长回合/长 idle 会让「状态时刻」永久停在进入时刻，
+ *   任何以 livenessTs 为新鲜度佐证的消费面（pid 判据的回合中自述、三视图
+ *   stateAgeMin、待续跑 idleSinceTs）都读到一句几个小时的假话。刷新后语义改为
+ *   「当前状态最近一次被引擎事件确认的时刻」——与 lastEventTs 同源，冻结只发生在
+ *   **真的没有任何引擎事件**时（那也正是该判陈旧的时刻）；
+ * - `to` 与既有 `liveness` 同值 → 同态刷新（不产生迁移，防每个 prompt 都写一条
+ *   engine.jsonl 事件）；
+ * - 迁移发生（含 `dead` → running/idle 的复活迁移）→ 记 `livenessTs = now`
+ *   （状态进入时刻，观测面算 stateAgeMin 用）。
  */
 export function applyLivenessTransition(
   record: SessionRecord,
@@ -79,7 +105,7 @@ export function applyLivenessTransition(
 ): { record: SessionRecord; transition: LivenessTransition | null } {
   const from = record.liveness ?? null;
   if (from === to) {
-    return { record: { ...record, lastEventTs: now }, transition: null };
+    return { record: { ...record, lastEventTs: now, livenessTs: now }, transition: null };
   }
   return {
     record: { ...record, liveness: to, livenessTs: now, lastEventTs: now },
@@ -187,6 +213,8 @@ function ageMin(now: number, ts: number | undefined): number | null {
  * - `dead` 判据复用 C8（offline.memberLiveness 的 pid-dead；scan 缺失 = 扫描面
  *   不可用，退化按记录状态呈现——观测面永不为难，不猜进程死）；
  * - 记录缺失 / 无 liveness 字段（存量记录）→ `idle`（保守：不给清扫豁免）；
+ * - v0.10.0（组 A / R6）：记录自述 `dead`（看门狗判亡后的注册表翻转）∧ 无活证据
+ *   （peer 扫描非 live/heartbeat-stale）→ `dead`（不按 idle 处理，显示面如实）；
  * - v0.9.1（V090-01）：`running` **必须伴随可信的 livenessTs**（产品自写的 running
  *   恒由 applyLivenessTransition 同步落状态时刻）——`running` 而无时刻/时刻在未来
  *   = 伪造或损坏，按 `idle` 呈现与豁免判定（保守：不给清扫豁免）；
@@ -214,10 +242,19 @@ export function memberLivenessView(
         pid: judge.sessionPid.pid,
         alive: judge.sessionPid.alive,
         turnInProgress: record?.liveness === 'running' && plausibleLivenessTs(record.livenessTs, now),
+        // v0.10.0（组 A / R6）：与 deriveSessionPidEvidence 同判据——dead 自述（判亡翻转）
+        // 是 pid 判据的第二来源，注入面不丢它（否则展示面与判死面判据分裂，V094-13 同族）；
+        // 只在真 dead 时在场（非 dead 记录形状不变）。
+        ...(record?.liveness === 'dead' && plausibleLivenessTs(record.livenessTs, now) ? { selfClaimsDead: true } : {}),
       }
     : deriveSessionPidEvidence(record, now, judge.pidAliveProbe ?? pidAlive);
   const liveness = scan !== undefined ? memberLiveness(member, scan, now, { sessionPid }) : null;
-  const dead = liveness === 'pid-dead';
+  // v0.10.0（组 A / R6）：注册表自述 `dead`（看门狗判亡后的落盘翻转，G-24 修法）——
+  // 无活证据时不落进「按 idle 处理」的分支，显示面如实显示 dead。活证据压过陈旧
+  // 自述：peer 扫描说 live/heartbeat-stale（pid 活着）时记录里的 dead 是上一化身的
+  // 残留（register/回合边界本应翻回），按既有口径呈现（endpointLive 并列展示）。
+  const recordClaimsDead = record?.liveness === 'dead';
+  const dead = liveness === 'pid-dead' || (recordClaimsDead && liveness !== 'live' && liveness !== 'heartbeat-stale');
   const endpointLive = liveness === 'live';
   const runningTrusted = record?.liveness === 'running' && plausibleLivenessTs(record.livenessTs, now);
   const state: SessionLivenessState = dead ? 'dead' : runningTrusted ? 'running' : 'idle';

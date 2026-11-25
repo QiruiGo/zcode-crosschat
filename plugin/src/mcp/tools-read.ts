@@ -1094,6 +1094,13 @@ async function readHandoffScope(deps: ToolDeps, args: ReadArgs, connectionKey: s
       key: m.key,
       ...(peerNames.get(m.sessionId) !== undefined ? { peerName: peerNames.get(m.sessionId)! } : {}),
       isLead: m.key === leadKeyOf(team),
+      // v0.10.0（集成员补线；组 D / G-25 的 duty 透传最后一环）：handoff.ts 的
+      // HandoffRosterEntry.duty 与渲染/payload 都已就绪（core/handoff.ts:137/541/759），
+      // 但 roster 条目在本处组装——组 D 的文件域不含 tools-read.ts，故缺这一行注入，
+      // 「handoff 花名册可见职能」的验收口径在集成树上不成立。本行按组 D 结果里写明的
+      // 原样补上：absent = 不声明职能（空 spread，形状与 v0.9.8 逐字一致）；
+      // 空白串同样不落（与 handoff.ts:759 的透传口径一致）。
+      ...(m.duty !== undefined && m.duty.trim() !== '' ? { duty: m.duty } : {}),
     }));
   } catch {
     roster = undefined; // 观测失败不为难接手包

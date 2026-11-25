@@ -26,6 +26,7 @@ import { wakeDir, wakeFile, namesFile, sessionsDir, sessionFile, witnessFile, wi
 import { logEngineEvent } from './log.js';
 import { withRegistryLock } from './lock.js';
 import {
+  SESSION_DEAD_EVENT,
   SESSION_IDLE_EVENT,
   SESSION_RUNNING_EVENT,
   applyLivenessTransition,
@@ -134,7 +135,11 @@ export async function refreshSessionLastSeen(
   await writeSession(stateRoot, record);
   await logLivenessTransition(stateRoot, sessionId, record, applied.transition);
   // v0.9.1 r3（V090-01）：同步写引擎证言（豁免输入与自述记录分路）。
-  if (liveness !== 'none') {
+  // v0.10.0（组 A / R6）：StoredLiveness 放开到含 `dead` 后，证言仍只收
+  // running/idle——证言是「引擎亲见的**活动**」记录，判亡翻转（markSessionDead）
+  // 不是活动，不往证言里写死亡（sweepOwnerGuard 以证言为唯一豁免输入，多一种
+  // 形态就多一条攻击/误判面）。'none' 与 'dead' 都不写证言。
+  if (liveness === 'running' || liveness === 'idle') {
     await writeSessionWitness(stateRoot, sessionId, liveness, now);
   }
   return record;
@@ -186,6 +191,13 @@ export async function writeSessionWitness(
  * 只刷记录、不刷日志。审计行携带 prev/state/name（boundName 兜底）——刻意不用
  * `from`/`to` 键名（它们在时间线 actor 取值链上，状态字符串会被误当行为方）。
  * best-effort：logEngineEvent 自吞 IO 失败（core/log.ts 纪律），本函数不再包 try。
+ *
+ * v0.10.0（组 A / R6）：新增第三迁移目标 **`session-dead`**（v0.10.0 新事件名，
+ * 既有 session-running/session-idle 键集与语义逐字节不动）——running/idle → dead
+ * 的判亡翻转（markSessionDead）与 dead → running/idle 的复活迁移（重新 register /
+ * 重新武装）都落它，prev 如实记来源态。此后 engine.jsonl 里「注册表活性翻过一次」
+ * 可逐条对账（member-dead 是死亡告警事件、session-dead 是注册表翻转事件，一次判亡
+ * 两条、同成员同 sid，双写一致由此可验证）。
  */
 async function logLivenessTransition(
   stateRoot: string,
@@ -199,7 +211,11 @@ async function logLivenessTransition(
   // 不再写 boundName 后，唤醒绑定会话的活性迁移审计仍可命名——安全修复不丢观测面。
   const name = record.boundName ?? record.wakeTicketBound?.name ?? null;
   await logEngineEvent(stateRoot, {
-    event: transition.to === 'running' ? SESSION_RUNNING_EVENT : SESSION_IDLE_EVENT,
+    event: transition.to === 'running'
+      ? SESSION_RUNNING_EVENT
+      : transition.to === 'dead'
+        ? SESSION_DEAD_EVENT
+        : SESSION_IDLE_EVENT,
     sessionId,
     prev: transition.from,
     state: transition.to,
@@ -270,6 +286,114 @@ export async function markSessionHeartbeat(
     },
     { waitMs: options.waitMs ?? 2_000 },
   );
+}
+
+/**
+ * v0.10.0（组 A / R6/G-24）：**判亡后注册表活性翻转**（member-dead 的注册表侧双写）。
+ *
+ * 缺陷形态（G-24，监督侧实测）：看门狗发 member-dead 后 registry 仍标 running
+ * （今日 xingtai、m7 等被判亡多次而 sessions/<sid>.json 的 Running 不翻）——
+ * 「engine 事件说亡、注册表说活」，R3 若要改判据，这个前置不修则换了 pid 来源也未必准。
+ *
+ * 口径（写死）：
+ * - 只把记录从 running/idle 翻成 `dead`（含 livenessTs/lastEventTs 同刻刷新）；
+ *   同态（已 dead / 无记录 / 无 liveness 字段）→ 零写入零事件（不制造翻转噪音）；
+ * - 迁移落 engine.jsonl `session-dead` 事件（与 session-running/session-idle 同族
+ *   的活性迁移审计；best-effort，写失败不影响记录本身）；
+ * - **不写证言**：registry/witness/<sid>.json 是引擎亲见的活动证据，判亡不是活动，
+ *   不往证言里写死亡（证言只由 hooks/工具心跳写，core/liveness.ts sweepOwnerGuard
+ *   以它为唯一豁免输入——写 death 会让豁免面多一种形态）；
+ * - 自带 registry 锁（waitMs 预算同 markSessionIdle）；锁忙即放弃——下一次判亡
+ *   周期会再翻（看门狗每轮对 confirmed 死亡调用，丢失一次无害）。
+ *
+ * 翻回由另外两个写入点保证：重新 register（{@link anchorSessionForRegister}）与
+ * 下一回合边界（{@link refreshSessionLastSeen} 默认 running）——「member-dead 之后
+ * 翻 dead、重新 register 后翻回 running 或 idle」闭环。
+ */
+export async function markSessionDead(
+  stateRoot: string,
+  sessionId: string,
+  options: { now?: number; waitMs?: number } = {},
+): Promise<void> {
+  const now = options.now ?? Date.now();
+  await withRegistryLock(
+    stateRoot,
+    async () => {
+      const existing = await readSession(stateRoot, sessionId);
+      // 无记录 / 已是 dead / 从未标过活性（存量最小记录）→ 无从翻转（不猜、不写）
+      if (existing === undefined) return;
+      if (existing.liveness !== 'running' && existing.liveness !== 'idle') return;
+      const applied = applyLivenessTransition(existing, 'dead', now);
+      await writeSession(stateRoot, applied.record);
+      await logLivenessTransition(stateRoot, sessionId, applied.record, applied.transition);
+    },
+    { waitMs: options.waitMs ?? 2_000 },
+  );
+}
+
+/**
+ * v0.10.0（组 A / R6）：**判亡翻回的清除面**——记录自述 `dead` 时翻回 `idle`。
+ *
+ * 两个调用方：
+ * 1. 看门狗「重新武装」路径（台账 dead→alive 迁移）：成员不再 pid-dead（新 peer
+ *    记录 / 新 pid 写回）而注册表还挂着上一次判亡的 `dead`——清掉，让注册表与
+ *    「已重新武装」的台账一致（选 idle 而非 running：此刻没有回合中的引擎证据，
+ *    下一回合边界会标回 running）；
+ * 2. 记录缺失 / 非 dead → 零写入（含 running/idle 原样保留——不与钩子写入抢写）。
+ */
+export async function clearSessionDead(
+  stateRoot: string,
+  sessionId: string,
+  options: { now?: number; waitMs?: number } = {},
+): Promise<void> {
+  const now = options.now ?? Date.now();
+  await withRegistryLock(
+    stateRoot,
+    async () => {
+      const existing = await readSession(stateRoot, sessionId);
+      if (existing === undefined) return;
+      if (existing.liveness !== 'dead') return;
+      const applied = applyLivenessTransition(existing, 'idle', now);
+      await writeSession(stateRoot, applied.record);
+      await logLivenessTransition(stateRoot, sessionId, applied.record, applied.transition);
+    },
+    { waitMs: options.waitMs ?? 2_000 },
+  );
+}
+
+/**
+ * v0.10.0（组 A / R6）：**wakeToken 注册路径的会话记录锚定**（mcp/identity.ts 专用；
+ * 「服务端代写」的单一写入点）。
+ *
+ * 缺陷形态：旧实现整体 spread 旧记录后只改 sessionId/cwd/startedAt/lastSeen/regToken
+ * （identity.ts 原 :611-619）——上一次化身的陈旧 `liveness`（含判亡翻转的 `dead`、
+ * 或崩溃前悬停的 `running`）被原样带回来，「重新 register 后立即翻回 running 或
+ * idle」不成立（R6 验收口径第二句）。
+ *
+ * 口径（写死）：注册发生在**回合内**（模型刚发起 xc_identify 工具调用）——记录锚定
+ * 的同时把活性翻回 `running`（迁移落 session-running 事件，prev 如实记 dead/idle/
+ * null）；其余字段逐字节保持旧实现形状（cwd 覆盖、startedAt 保留、regToken 缺省
+ * 补铸）。不写证言（与旧实现一致：证言由钩子/心跳路径写，注册本身不伪造活动证据）。
+ */
+export async function anchorSessionForRegister(
+  stateRoot: string,
+  sessionId: string,
+  options: { cwd?: string; now?: number } = {},
+): Promise<SessionRecord> {
+  const now = options.now ?? Date.now();
+  const existing = await readSession(stateRoot, sessionId);
+  const record: SessionRecord = {
+    ...(existing ?? {}),
+    sessionId,
+    cwd: options.cwd ?? existing?.cwd ?? '',
+    startedAt: existing?.startedAt ?? now,
+    lastSeen: now,
+    regToken: existing?.regToken ?? randomUUID(),
+  };
+  const applied = applyLivenessTransition(record, 'running', now);
+  await writeSession(stateRoot, applied.record);
+  await logLivenessTransition(stateRoot, sessionId, applied.record, applied.transition);
+  return applied.record;
 }
 
 // ---------------------------------------------------------------------------

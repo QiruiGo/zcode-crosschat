@@ -125,11 +125,16 @@ export interface HandoffUnread {
  * `key` = 队内花名册键（队内 `xc_relay({to:"<key>"})` 直达，恒在）；
  * `peerName` = 跨会话 peer 花名（absent = 当前无活跃 peer 记录，仅队内可达）。
  * 工具层经 peer-services 的 peerNameBySessionId 解析后注入（本模块无 I/O）。
+ *
+ * v0.10.0（组 D / G-25）：`duty` = 该成员的职能声明（一句话；来自 team.json 成员行）。
+ * absent = 未声明/旧记录——渲染面不出「职能」片段（形状与 v0.9.8 逐字一致）。
+ * 注入面在 mcp/tools-read.ts（别组文件域）：此处只做类型 + 渲染 + payload 透传。
  */
 export interface HandoffRosterEntry {
   key: string;
   peerName?: string;
   isLead?: boolean;
+  duty?: string;
 }
 
 /** 容量（level 由 core/checkpoint.ts 的推导助手产出——三视图同一口径）。 */
@@ -230,10 +235,10 @@ export type HandoffPayload = {
   unreadWithheld?: 'subjects';
   /**
    * v0.9.8（组 O R2）：可寻址队友名单（payload 与第 1 章文本**同帽**裁切——C2-B5）。
-   * 每项 {key, peerName?, isLead?}；key 恒在（队内可达），peerName absent = 仅队内。
-   * absent = 调用方未提供 roster 输入（旧形状兼容）。
+   * 每项 {key, peerName?, isLead?, duty?}；key 恒在（队内可达），peerName absent = 仅队内，
+   * duty absent = 未声明职能（v0.10.0 组 D / G-25）。absent = 调用方未提供 roster 输入。
    */
-  roster?: Array<{ key: string; peerName?: string; isLead?: boolean }>;
+  roster?: Array<{ key: string; peerName?: string; isLead?: boolean; duty?: string }>;
 };
 
 export interface HandoffAssembly {
@@ -528,9 +533,13 @@ function renderBody(input: HandoffInput, level: DegradeLevel, suggestions: reado
   const rosterAll = roster.all;
   const rosterShown = roster.shown;
   if (rosterAll.length > 0) {
+    // v0.10.0（组 D / G-25）：职能声明进花名册行（`职能：<duty>；` 前缀；absent =
+    // 未声明，形状与 v0.9.8 逐字一致）。duty 文本面折叠控制字符（防御纵深，写入侧已洗）。
     const detail = rosterShown
       .map((e) =>
-        `${e.key}${e.isLead === true ? '(lead)' : ''}（队内 ${e.key}`
+        `${e.key}${e.isLead === true ? '(lead)' : ''}（`
+        + `${e.duty !== undefined && e.duty.trim() !== '' ? `职能：${foldLine(e.duty)}；` : ''}`
+        + `队内 ${e.key}`
         + `${e.peerName !== undefined && e.peerName !== '' ? ` / peer ${e.peerName}` : ' / 仅队内'}）`)
       .join('、');
     lines.push(
@@ -740,12 +749,14 @@ export function assembleHandoff(input: HandoffInput): HandoffAssembly {
     suggestions: suggestions.slice(0, suggestionsShown),
     filter: input.filter,
     // v0.9.8（组 O R2）：可寻址队友名单（与第 1 章文本同帽；absent = 调用方未提供）。
+    // v0.10.0（组 D / G-25）：duty 透传（absent = 未声明职能——旧调用方/旧记录无该键）。
     ...(roster.all.length > 0
       ? {
           roster: roster.shown.map((e) => ({
             key: e.key,
             ...(e.peerName !== undefined ? { peerName: e.peerName } : {}),
             ...(e.isLead !== undefined ? { isLead: e.isLead } : {}),
+            ...(e.duty !== undefined && e.duty.trim() !== '' ? { duty: e.duty } : {}),
           })),
         }
       : {}),

@@ -211,7 +211,11 @@ describe("V094-13：同一次 pid-dead 在 看门狗 / xc_overview 三视图 同
     expect(panel.payload.liveness).toEqual({ running: 2, idle: 0, dead: 1 });
     expect(rowOf(panel.payload.members, "charlie1")?.liveness?.state).toBe("dead");
 
-    // ⑤ 看门狗随后扫描：恰一条 member-dead（发射面与展示面指向同一次死亡）
+    // ⑤ 看门狗随后扫描：恰一条 member-dead（发射面与展示面指向同一次死亡）。
+    // v0.10.0（组 A / R3）：二次确认——第一周期 suspect（无事件），第二周期认领。
+    const suspect = await sweepMembersOnce(watchdogDeps());
+    expect(suspect.deathSuspects).toEqual(["charlie1"]);
+    expect(readEngineEvents().filter((e) => e["event"] === "member-dead")).toHaveLength(0);
     const swept = await sweepMembersOnce(watchdogDeps());
     expect(swept.dead).toEqual(["charlie1"]);
     const deadEvents = readEngineEvents().filter((e) => e["event"] === "member-dead");

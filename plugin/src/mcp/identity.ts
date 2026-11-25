@@ -28,7 +28,7 @@
  * tools.ts 的 runCore 统一映射成结构化错误信封。
  */
 
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { invalidParamsError, notRegisteredError, ToolError } from "./protocol.js";
@@ -39,6 +39,11 @@ import {
   ADOPT_ANCHOR_MAX_CLOCK_SKEW_MS,
   ADOPT_ANCHOR_MAX_PREBIRTH_MS,
   adoptByPpidEnabledFromEnv,
+  // v0.10.0（组 A / R6）：wakeToken 注册路径的会话记录锚定改走 registry 的单一写入点
+  // （anchorSessionForRegister）——旧实现整体 spread 旧记录，会把上一次化身的陈旧
+  // liveness（含判亡翻转的 dead、崩溃前悬停的 running）原样带回来，「重新 register
+  // 后立即翻回 running 或 idle」不成立（R6 验收口径第二句）。
+  anchorSessionForRegister,
   bindName,
   consumeWakeNonce,
   probeHostResumeSidSync,
@@ -48,7 +53,6 @@ import {
   readSessionByHostPidSync,
   readWakeNonce,
   unbindName,
-  writeSession,
 } from "../core/registry.js";
 import { peerBaseDir, peerBaseFile, peerRootFromEnv, readPeerBaseRecord, writePeerBaseRecord } from "../core/peerdir.js";
 import { resolveStateRoot, teamFile } from "../core/paths.js";
@@ -590,6 +594,13 @@ export async function xcRegister(
       // v0.5.3（a6）：代写不得抹掉钩子已写的锚定令牌（保留既有 regToken；缺失则
       // 补铸一枚，令牌与后续 SessionStart 的延续逻辑同源）。
       //
+      // v0.10.0（组 A / R6）：代写走 core/registry.ts anchorSessionForRegister（单一
+      // 写入点）——除上述字段形状逐字节保持外，**活性翻回 running**（注册发生在回合内：
+      // 模型刚发起 xc_identify 工具调用）。旧实现整体 spread 旧记录，上一次化身的
+      // 陈旧 liveness（看门狗判亡翻成的 dead / 崩溃前悬停的 running）会被原样带回，
+      // 「member-dead 之后翻 dead、重新 register 后翻回 running 或 idle」不闭环。
+      // 迁移落 session-running 审计事件（prev 如实记 dead/idle/null）。
+      //
       // v0.9.1 r4（V090-04，P2）：**不再写 boundName**（旧实现无条件
       // `boundName: agentKey`）。该字段在 v0.9.1 r3 起是「引擎供给的无头持有者」
       // 判据（core/config.ts engineHolderIsHeadless：行当前 sid 的记录带本名
@@ -604,20 +615,10 @@ export async function xcRegister(
       // 修后 boundName 的**唯一**写入路径 = member-add 供给代写
       // （mcp/tools-team.ts Phase 3，供给即无头会话、攻击者无法让引擎为自己的
       // 交互 sid 代写）；本路径只做「不依赖钩子落盘」的记录锚定，不替代供给链。
-      // 既有记录已带的 boundName 经下方 spread 原样保留（合法成员的记录本就由
-      // member-add 盖过，重写不丢）；记录缺失/无 boundName（交互会话钩子锚定形态）
-      // → 保持缺失，免开关不成立（回落 file/env/默认层，fail-safe）。
-      const existingRecord = await readSession(stateRoot, sessionId);
-      const record: SessionRecord = {
-        ...(existingRecord ?? {}),
-        sessionId,
-        cwd: process.cwd(),
-        startedAt: existingRecord?.startedAt ?? now,
-        lastSeen: now,
-        regToken: existingRecord?.regToken ?? randomUUID(),
-      };
-      await writeSession(stateRoot, record);
-      sess = record;
+      // 既有记录已带的 boundName 经 anchorSessionForRegister 的 spread 原样保留
+      // （合法成员的记录本就由 member-add 盖过，重写不丢）；记录缺失/无 boundName
+      // （交互会话钩子锚定形态）→ 保持缺失，免开关不成立（回落 file/env/默认层，fail-safe）。
+      sess = await anchorSessionForRegister(stateRoot, sessionId, { cwd: process.cwd(), now });
     } else {
       // ---- 路径 1：hook 锚定（§2.3-1/3）----
       via = "hook";

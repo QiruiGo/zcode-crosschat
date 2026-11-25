@@ -117,13 +117,33 @@ describe("applyLivenessTransition（纯状态机）", () => {
     expect(record.lastEventTs).toBe(5_000);
   });
 
-  it("同态刷新：不产生迁移（防每 prompt 刷日志），lastEventTs 仍刷新", () => {
+  it("同态刷新：不产生迁移（防每 prompt 刷日志），lastEventTs/livenessTs 同点刷新", () => {
+    // v0.10.0（组 A / R6）：同态分支从「只刷 lastEventTs」改为**同点刷 livenessTs**——
+    // 修「livenessTs 冻结而 lastEventTs 新鲜」（监督侧实测：15:55:52 冻结而同日
+    // lastEventTs 17:58:58 新鲜，G-24 的注册表活性不可信即此形态）。语义改为「当前
+    // 状态最近一次被引擎事件确认的时刻」；冻结只发生在真的没有任何引擎事件时。
     const running: SessionRecord = { ...base, liveness: "running", livenessTs: 2_000, lastEventTs: 2_000 };
     const { record, transition } = applyLivenessTransition(running, "running", 9_000);
     expect(transition).toBeNull();
     expect(record.liveness).toBe("running");
-    expect(record.livenessTs).toBe(2_000); // 状态进入时刻不变
+    expect(record.livenessTs).toBe(9_000); // 同点刷新（v0.10.0 R6：不再冻结）
     expect(record.lastEventTs).toBe(9_000); // 心跳恒刷新
+  });
+
+  it("v0.10.0（组 A / R6）：dead 三态——running→dead 迁移落 livenessTs；同态 dead 只刷时刻", () => {
+    const running: SessionRecord = { ...base, liveness: "running", livenessTs: 2_000, lastEventTs: 2_000 };
+    const died = applyLivenessTransition(running, "dead", 9_000);
+    expect(died.transition).toEqual({ from: "running", to: "dead" });
+    expect(died.record.liveness).toBe("dead");
+    expect(died.record.livenessTs).toBe(9_000);
+    // 复活迁移：dead → running（重新 register / 重新武装的翻回面）
+    const revived = applyLivenessTransition(died.record, "running", 12_000);
+    expect(revived.transition).toEqual({ from: "dead", to: "running" });
+    expect(revived.record.liveness).toBe("running");
+    // 同态 dead（已是 dead 再标 dead）：无迁移、时刻刷新
+    const again = applyLivenessTransition(died.record, "dead", 15_000);
+    expect(again.transition).toBeNull();
+    expect(again.record.livenessTs).toBe(15_000);
   });
 
   it("running → idle → running 双向迁移（回合边界交替）", () => {

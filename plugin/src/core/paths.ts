@@ -16,7 +16,7 @@
  * @module core/paths
  */
 import { dirname, join, resolve } from 'node:path';
-import { realpathSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { lstat, realpath } from 'node:fs/promises';
 
 /** State directory name under the workspace. Code constant, not userConfig
@@ -24,11 +24,174 @@ import { lstat, realpath } from 'node:fs/promises';
 export const STATE_DIR_NAME = '.crosschat';
 
 /**
+ * v0.10.0（C1 / R1 / G-27）：向上查找既存协作根的**最大层数**（含起点自身那一层）。
+ *
+ * 背景（G-27）：SessionStart 钩子按「会话当前工作目录」裸拼 `<cwd>/.crosschat`，
+ * 会话 cd 进子目录（或 cwd 本身就是 `.crosschat`）后一旦重启，就在子目录里**另起一个
+ * 协作根**——身份/邮箱/任务板裂成两半，幻影根里的 regToken 脱离主根可见范围。
+ * 现在从起点逐级向上找**已存在**的协作根（命中判定见 {@link hasExistingStateRoot}），
+ * 最近的祖先优先；起点自身在某个 `.crosschat` 里时直接解析到那个 `.crosschat`
+ * （{@link StateRootVia} 的 `inside-root`）——绝不产生 `.crosschat\.crosschat` 嵌套根。
+ *
+ * 12 层对「仓库根 → 深层子目录」的真实形态宽裕（实测最深约 5 层），同时把
+ * 单次解析的文件系统往返钉在有界范围（每层最多 1+3 次 existsSync）。
+ */
+export const STATE_ROOT_WALK_UP_MAX_LEVELS = 12;
+
+/**
+ * 既存协作根的判定标记：`<dir>/.crosschat/` 下存在其一即算「既有根」。
+ * （空目录 `.crosschat/` 不算——那通常是半途创建的残留，不是可复用的协作状态。）
+ */
+const STATE_ROOT_MARKERS = ['registry', 'teams', 'logs'] as const;
+
+/** 状态根解析走了哪条路径（C2 漂移审计事件的 `via` 字段）。 */
+export type StateRootVia = 'bare' | 'ancestor' | 'inside-root';
+
+/** {@link resolveStateRootWithDiscovery} 的解析结果（含来源，供漂移审计用）。 */
+export interface StateRootResolution {
+  /** 绝对状态根（`<workspace>/.crosschat`，或向上/向内发现的既存根）。 */
+  root: string;
+  /** 本次解析的路径：`bare` = 保持现状的裸拼；`ancestor` = 向上找到的既存根；`inside-root` = 起点就在某个 `.crosschat` 里。 */
+  via: StateRootVia;
+  /** `resolve()` 归一后的绝对工作区（调用方入参的词法归一，不等于 root 的父目录）。 */
+  workspace: string;
+}
+
+/** `<dir>/.crosschat` 存在且含 registry/teams/logs 之一 → 算既存协作根。 */
+function hasExistingStateRoot(dir: string): boolean {
+  const base = join(dir, STATE_DIR_NAME);
+  if (!existsSync(base)) return false;
+  return STATE_ROOT_MARKERS.some((marker) => existsSync(join(base, marker)));
+}
+
+/**
+ * 绝对路径切分：根前缀（盘符 / UNC / Windows 扩展前缀 / POSIX 根）与其余段。
+ * 段判定必须按段做而不是整串正则——`A\.crosschat\.crosschat\B` 这类嵌套形态下，
+ * 逐段扫才能取到**最近**的那个 `.crosschat`（整串正则会因前一个匹配吃掉分隔符
+ * 而漏掉内层，v0.10.0 组 C 首轮实现即踩此坑）。
+ */
+function splitAbsolutePath(path: string): { prefix: string; segments: string[] } {
+  let prefix = '';
+  let rest = path;
+  const extended = /^(?:\\\\\?\\|\\\\.\\)/.exec(path);
+  if (extended !== null) {
+    const body = path.slice(extended[0].length);
+    const unc = /^UNC\\[^\\/]+[\\/][^\\/]+/i.exec(body);
+    const drive = /^[a-zA-Z]:[\\/]?/.exec(body);
+    prefix = unc !== null
+      ? `${extended[0]}${unc[0]}\\`
+      : drive !== null
+        ? `${extended[0]}${drive[0].replace(/[\\/]$/, '\\')}`
+        : extended[0];
+    rest = path.slice(prefix.length);
+  } else if (/^[a-zA-Z]:[\\/]/.test(path)) {
+    prefix = path.slice(0, 3);
+    rest = path.slice(3);
+  } else if (path.startsWith('\\\\')) {
+    const unc = /^\\\\[^\\/]+[\\/][^\\/]+[\\/]?/.exec(path);
+    prefix = unc !== null ? unc[0] : '\\\\';
+    rest = path.slice(prefix.length);
+  } else if (path.startsWith('/')) {
+    prefix = '/';
+    rest = path.slice(1);
+  }
+  return { prefix, segments: rest.split(/[\\/]+/).filter((segment) => segment !== '') };
+}
+
+/** 段名是否是状态目录名（win32 大小写不敏感）。 */
+function isStateDirSegment(segment: string): boolean {
+  return process.platform === 'win32'
+    ? segment.toLowerCase() === STATE_DIR_NAME
+    : segment === STATE_DIR_NAME;
+}
+
+/** 根前缀对应的分隔符（POSIX 根 `/` → `/`；盘符/UNC/扩展前缀 → `\`）。 */
+function separatorFor(prefix: string): string {
+  if (prefix === '/') return '/';
+  if (prefix === '') return process.platform === 'win32' ? '\\' : '/';
+  return '\\';
+}
+
+/**
+ * 起点自身是否位于某个 `.crosschat` 目录里（或正是它）→ 返回那个 `.crosschat`
+ * （取**最近**的，即路径里最后一个该名字的段；`.crosschat\.crosschat` 嵌套形态下
+ * 解析到内层，不再继续嵌套）。判定是纯词法的（不依赖目录存在）——「绝不产生嵌套
+ * 根」这条不该因为目录尚未落盘而失效。
+ */
+function enclosingStateRoot(abs: string): string | undefined {
+  const { prefix, segments } = splitAbsolutePath(abs);
+  let lastIndex = -1;
+  for (let index = 0; index < segments.length; index += 1) {
+    if (isStateDirSegment(segments[index]!)) lastIndex = index;
+  }
+  if (lastIndex < 0) return undefined;
+  return prefix + segments.slice(0, lastIndex + 1).join(separatorFor(prefix));
+}
+
+/** 从起点逐级向上找既存协作根（最近祖先优先；到盘符/网络根或层数上限止）。 */
+function findAncestorStateRoot(abs: string): string | undefined {
+  let current = abs;
+  for (let level = 0; level < STATE_ROOT_WALK_UP_MAX_LEVELS; level += 1) {
+    if (hasExistingStateRoot(current)) return current;
+    const parent = dirname(current);
+    if (parent === current) return undefined; // 盘符根 / 网络根：到顶
+    current = parent;
+  }
+  return undefined;
+}
+
+/**
+ * 两条绝对路径是否同一个目录（win32 大小写不敏感；两者都应已 resolve/join 归一、
+ * 无尾部分隔符）。用于「命中起点自身那一层」与裸拼结果的等价判定。
+ */
+export function isSameAbsolutePath(a: string, b: string): boolean {
+  return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
+/**
+ * v0.10.0（C1 / R1 / G-27）：解析状态根并回报**走了哪条路**。
+ *
+ * 顺序（先内后外，任一步命中即返回）：
+ * 1. `inside-root`：起点自身在某个 `.crosschat` 里或其子目录里 → 直接解析到那个
+ *    `.crosschat`（G-27 幻影根治口：cwd = `.crosschat` 的会话不再拼出嵌套根）；
+ * 2. `ancestor`：起点目录**真实存在**时，逐级向上（≤12 层）找已存在的协作根，
+ *    命中即以该根的父目录为工作区归属（主修：项目根/任意深度子目录/压缩重启后
+ *    cd 都归并到同一主根）。**命中起点自身那一层**（`<cwd>/.crosschat` 已存在）时
+ *    结果与裸拼逐字节相同 → 记 `bare`（正常路径，C2 据此零审计噪声）；
+ * 3. `bare`：向上找不到 → 保持 v0.9.10 前行为（`<workspace>/.crosschat`，由调用方
+ *    首启创建）。起点目录不存在时同样走这条——不存在的路径没有可发现的盘上状态，
+ *    且旧行为（裸拼后创建）必须保留（paths.test.ts 的既有判据即此形态）。
+ *
+ * 显式传入的工程目录环境变量优先级不变（ZCODE_PROJECT_DIR/CLAUDE_PROJECT_DIR →
+ * stdin cwd → process.cwd() 的选取链在 hooks/shared.ts，本函数只吃选定的工作区）。
+ */
+export function resolveStateRootWithDiscovery(workspace: string): StateRootResolution {
+  const abs = resolve(workspace);
+  const bare = join(abs, STATE_DIR_NAME);
+  const inside = enclosingStateRoot(abs);
+  if (inside !== undefined) {
+    return { root: inside, via: 'inside-root', workspace: abs };
+  }
+  if (existsSync(abs)) {
+    const ancestor = findAncestorStateRoot(abs);
+    if (ancestor !== undefined) {
+      const root = join(ancestor, STATE_DIR_NAME);
+      return { root, via: isSameAbsolutePath(root, bare) ? 'bare' : 'ancestor', workspace: abs };
+    }
+  }
+  return { root: bare, via: 'bare', workspace: abs };
+}
+
+/**
  * Resolve the absolute state root for one workspace.
  * @param workspace the session workspace directory (may be relative).
+ *
+ * v0.10.0（C1 / R1 / G-27）：不再裸拼——改为 {@link resolveStateRootWithDiscovery}
+ * 的既存根发现（向上 ≤12 层 / 向内归一）；向上找不到时才退回裸拼。返回其中的
+ * `root`；需要 `via` 做漂移审计的调用方（hooks/shared.ts）用带 provenance 的版本。
  */
 export function resolveStateRoot(workspace: string): string {
-  return resolve(workspace, STATE_DIR_NAME);
+  return resolveStateRootWithDiscovery(workspace).root;
 }
 
 /**

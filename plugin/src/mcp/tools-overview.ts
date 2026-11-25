@@ -50,7 +50,7 @@ import { engineLogFile, inboxFile, isValidTeamId } from "../core/paths.js";
 // v0.9.3（A2）：唤醒三级指标（判据与取数的单一真源在 engine/wake.ts）。
 import { readWakeTierCounts, wakeTierCountsLine } from "../engine/wake.js";
 import { readTeam } from "../core/teamstate.js";
-import { sortTasksForBoard } from "../core/teamstate.js";
+import { headlessTurnMembers, sortTasksForBoard, type HeadlessTurnFlag } from "../core/teamstate.js";
 import { orphanTaskIds, readMailbox, staleCompletedReceiptTaskIds } from "../core/mailbox.js";
 import { logEngineEvent } from "../core/log.js";
 import { receiverInjectBudget, contextCharsFromEnv, batchWindowCount, truncateField } from "../core/budget.js";
@@ -189,6 +189,11 @@ async function capacityMount(deps: ToolDeps): Promise<CapacityMount | null> {
         headlessTurnMaxRssBytes: sample.headlessTurnMaxRssBytes,
         degraded: sample.degraded,
         ...(sample.categoryCounts !== undefined ? { categoryCounts: sample.categoryCounts } : {}),
+        // v0.10.0（组 D / R7）：无头进程树记账（按唤醒生命周期账本的 pid 汇总工作集）。
+        // 采样失败时该字段缺席并如实标注（memberTreesError）——绝不让记账失败拖垮
+        // 整个容量采样（观测面永不为难任务板）。
+        ...(sample.memberTrees !== undefined ? { memberTrees: sample.memberTrees } : {}),
+        ...(sample.memberTreesError !== undefined ? { memberTreesError: sample.memberTreesError } : {}),
         red: verdict.red,
         violated: verdict.violated,
         detail: verdict.detail,
@@ -378,6 +383,21 @@ async function scanPeersSafe(deps: ToolDeps, now: number): Promise<PeerScanResul
 /** 紧凑活性文本行（team/panel 文本面统一格式；status 文本行序冻结，活性只在 payload）。 */
 function livenessTextLine(counts: LivenessMount["counts"]): string {
   return `liveness: running ${counts.running} / idle ${counts.idle} / dead ${counts.dead}`;
+}
+
+/**
+ * v0.10.0（组 D / G-25）：职能声明的**文本面**折叠（控制字符清成空格 + trim）——
+ * payload 给清洗后的入库原值（写入侧 sanitizeDuty 已洗），文本行再折一次是防御
+ * 纵深（外部手改 team.json 的可能），与 handoff/checkpoint 的 foldLine 同口径。
+ */
+function foldForLine(text: string): string {
+  return text.replace(/[\u0000-\u001f\u007f]+/g, ' ').trim();
+}
+
+/** v0.10.0（组 D / R4）：后台回合进行中的紧凑文本行（team/panel 文本面统一格式）。 */
+function headlessTextLine(headless: Map<string, HeadlessTurnFlag>): string {
+  return `headless: ${[...headless.keys()].join("、")} 后台回合进行中`
+    + '（引擎事件：wake 后 session-running、其后未见 session-idle）';
 }
 
 // ---------------------------------------------------------------------------
@@ -584,6 +604,18 @@ export function createTeamOverviewCore(deps: ToolDeps): TeamOverviewCore {
         const liveness = team !== undefined ? await livenessMount(deps, team, now, peerScan) : null;
         // v0.9.3（A2）：唤醒三级指标计数（engine.jsonl 尾部窗口；无唤醒不挂载）。
         const wakeTiers = await wakeTierMount(deps);
+        // v0.10.0（组 D / R4）：**后台回合进行中**（引擎事件判据：session-running
+        // 晚于 session-idle 且其间有过 wake——注册表自述活性不可信，不参与本判据）。
+        // 与 liveness/wakeTiers 同纪律：读取意外 → 空 Map（不虚报、不崩观测面）。
+        const headless: Map<string, HeadlessTurnFlag> = team !== undefined
+          ? await headlessTurnMembers(deps.stateRoot, team)
+          : new Map();
+        // v0.10.0（组 D / G-25）：职能声明清单（payload 机器可读面；文本行另行折叠）。
+        const dutyEntries = team !== undefined
+          ? team.members
+              .filter((m) => m.duty !== undefined && m.duty.trim() !== '')
+              .map((m) => ({ key: m.key, duty: m.duty! }))
+          : [];
         // v0.9.1 r4（V090-01 观测，V090-GUIDANCE-R4）：清扫豁免连续 defer 的**累计期数**
         // （「豁免 N×阈值」）——与 sweepOwnerGuard 同一证言读取路径（livenessMount.witness），
         // lead 在任务板可见异常长豁免（自述 running 但证言缺失/陈旧另在豁免审计留痕）。
@@ -645,19 +677,33 @@ export function createTeamOverviewCore(deps: ToolDeps): TeamOverviewCore {
               }
             : {}),
           members: team !== undefined
-            ? snapshot.members.map((m) => ({
-                ...m,
+            ? team.members.map((m) => ({
+                // 与 snapshot.members 同基字段（key/sessionId/role/lastSeen）——直接映射
+                // 花名册而非快照，只为把 duty/headlessTurn 两个新观测面带上（snapshot.ts
+                // 的 StatusSnapshotMember 属别组文件域，不动）。
+                key: m.key,
+                sessionId: m.sessionId,
+                role: m.role,
+                lastSeen: m.lastSeen,
                 isLead: m.key === leadKeyOf(team),
+                // v0.10.0（组 D / G-25）：职能声明（absent = 未声明/旧记录）。
+                ...(m.duty !== undefined && m.duty.trim() !== '' ? { duty: m.duty } : {}),
                 // v0.9（G-9）：成员行暴露活性（三视图统一口径 {state, stateAgeMin, lastEventAgeMin}）。
                 ...(liveness?.views.get(m.key) !== undefined ? { liveness: liveness.views.get(m.key) } : {}),
                 // v0.9.8（组 O R2）：成员行补**可寻址名**——跨会话 peer 花名（ absent =
                 // 当前无活跃 peer 记录，仅队内 key 可达）。队内 key 恒在 `key` 列；
                 // 解析与 panel agents() 同一函数（peerNameBySessionId），两面一致。
                 ...(peerNames.get(m.sessionId) !== undefined ? { peerName: peerNames.get(m.sessionId)! } : {}),
+                // v0.10.0（组 D / R4）：后台回合进行中标记（引擎事件判据；三视图同形）。
+                ...(headless.get(m.key) !== undefined ? { headlessTurn: headless.get(m.key)! } : {}),
               }))
             : snapshot.members,
           // v0.9（G-9）挂载点：liveness 三态计数（成员行已逐个带 liveness 细节）。
           ...(liveness !== null ? { liveness: { ...liveness.counts } } : {}),
+          // v0.10.0（组 D / G-25）挂载点：职能声明清单（无声明 = 不出键）。
+          ...(dutyEntries.length > 0 ? { duties: dutyEntries } : {}),
+          // v0.10.0（组 D / R4）挂载点：后台回合进行中清单（含判定依据的两个事件时刻）。
+          ...(headless.size > 0 ? { headlessTurns: [...headless.values()] } : {}),
           // C5 挂载点：stalled / 建议行 / 阈值钳制 WARNING / v0.8.1（C4-F2）非法回落披露。
           ...(stalled.length > 0 || stallClamped || stallFellBack
             ? {
@@ -731,6 +777,12 @@ export function createTeamOverviewCore(deps: ToolDeps): TeamOverviewCore {
             : "")
           // v0.9（G-9）：活性计数行（成员细节在 payload members[].liveness）。
           + (liveness !== null ? `\n${livenessTextLine(liveness.counts)}` : "")
+          // v0.10.0（组 D / G-25）：职能声明行（成员细节在 payload members[].duty）。
+          + (dutyEntries.length > 0
+            ? `\nduty: ${dutyEntries.map((e) => `${e.key}=${foldForLine(e.duty)}`).join(", ")}`
+            : "")
+          // v0.10.0（组 D / R4）：后台回合进行中行（判定依据=引擎事件，见 headlessTurnMembers）。
+          + (headless.size > 0 ? `\n${headlessTextLine(headless)}` : "")
           // v0.9.3（A2）：唤醒三级指标计数行（spawn-ok / child-alive / consumed）。
           + (wakeTiers !== null ? `\n${wakeTiers.line}` : "")
           // r4（V090-01 观测）：豁免期数文本行（任务板对人可见「豁免 N×阈值」）。
@@ -844,12 +896,22 @@ export async function overviewPanel(deps: ToolDeps): Promise<ToolResult> {
     : "stalled: (none)";
   // v0.9（G-9）：panel 成员行同样暴露活性（与 team 视图同一 livenessMount 口径；
   // dead 判据不可用时降级为记录状态呈现——观测面永不崩）。
+  // v0.10.0（组 D）：成员行补 duty（G-25）与 headlessTurn（R4）——与 team 视图同判据
+  // 同形状（duty 取本函数开头读的同一份 team；headless 走同一 headlessTurnMembers）。
+  const headless: Map<string, HeadlessTurnFlag> = team !== undefined
+    ? await headlessTurnMembers(deps.stateRoot, team)
+    : new Map();
   const panelWithLiveness = {
     ...panel,
-    members: panel.members.map((m) => ({
-      ...m,
-      ...(liveness?.views.get(m.key) !== undefined ? { liveness: liveness.views.get(m.key) } : {}),
-    })),
+    members: panel.members.map((m) => {
+      const rosterMember = team?.members.find((tm) => tm.key === m.key);
+      return {
+        ...m,
+        ...(liveness?.views.get(m.key) !== undefined ? { liveness: liveness.views.get(m.key) } : {}),
+        ...(rosterMember?.duty !== undefined && rosterMember.duty.trim() !== '' ? { duty: rosterMember.duty } : {}),
+        ...(headless.get(m.key) !== undefined ? { headlessTurn: headless.get(m.key)! } : {}),
+      };
+    }),
   };
   // C3 挂载（M6）：panel 同样携带 capacity 块（采样失败只丢观测块）。
   const capacity = await capacityMount(deps);
@@ -858,6 +920,10 @@ export async function overviewPanel(deps: ToolDeps): Promise<ToolResult> {
   // v0.9.2（C4）：任务计数文本与 payload **同源**——同一份 `panel.tasks` 七态计数渲染，
   // 不再有「文本三桶 / payload 七态」两套口径（与 status 视图 tasks 行同格式，可对账）。
   const tasksLine = `tasks: ${TASK_STATUSES.map((s) => `${s} ${panel.tasks[s] ?? 0}`).join(' / ')}`;
+  // v0.10.0（组 D / G-25）：职能声明（payload 与文本行同源同形，避免「拼字符串再拆回来」）。
+  const dutyRows = (team?.members ?? [])
+    .filter((m) => m.duty !== undefined && m.duty.trim() !== '')
+    .map((m) => ({ key: m.key, duty: m.duty! }));
   const panelLines = [
     panel.self !== undefined ? `self: ${panel.self.name} (${panel.self.status ?? "unknown"})` : "self: 未注册",
     `peers: ${panel.peers.length}${peersTruncated ? `（本页列 ${shownPeers}，其余用 xc_overview({view:"peers", offset:${shownPeers}}) 续读）` : ""}`,
@@ -866,6 +932,10 @@ export async function overviewPanel(deps: ToolDeps): Promise<ToolResult> {
     stalledLine,
     // v0.9（G-9）：活性计数行（成员细节在 payload members[].liveness）。
     ...(liveness !== null ? [livenessTextLine(liveness.counts)] : []),
+    // v0.10.0（组 D / G-25）：职能声明行（无人声明则不占行）。
+    ...(dutyRows.length > 0 ? [`duty: ${dutyRows.map((e) => `${e.key}=${foldForLine(e.duty)}`).join(", ")}`] : []),
+    // v0.10.0（组 D / R4）：后台回合进行中行（无人有后台回合则不占行）。
+    ...(headless.size > 0 ? [headlessTextLine(headless)] : []),
     // v0.9.3（A2）：唤醒三级指标计数行（spawn-ok / child-alive / consumed）。
     ...(wakeTiers !== null ? [wakeTiers.line] : []),
     panel.inboundPolicy !== undefined
@@ -885,6 +955,10 @@ export async function overviewPanel(deps: ToolDeps): Promise<ToolResult> {
       ...windowed,
       members: panelWithLiveness.members,
       ...(liveness !== null ? { liveness: { ...liveness.counts } } : {}),
+      // v0.10.0（组 D / G-25）：职能声明清单（payload 与文本行同源）。
+      ...(dutyRows.length > 0 ? { duties: dutyRows } : {}),
+      // v0.10.0（组 D / R4）：后台回合进行中清单（与 team 视图同形）。
+      ...(headless.size > 0 ? { headlessTurns: [...headless.values()] } : {}),
       ...(wakeTiers !== null ? wakeTiers.payload : {}),
       ...(stalled.length > 0 ? { stalled: stalled.map((flag) => ({ ...flag, suggestion: stallSuggestion(flag.kind, flag.status) })) } : {}),
       ...(peersTruncated
@@ -1122,6 +1196,8 @@ export async function statusView(deps: ToolDeps, connectionKey: string): Promise
         taskCounts: { pending: 0, claimed: 0, in_progress: 0, blocked: 0, completed: 0, failed: 0, cancelled: 0 },
         members: { total: 0, offline: null },
         liveness: { running: 0, idle: 0, dead: 0, byMember: {} },
+        // v0.10.0（组 D / R4）：无团队 → 空清单（键集与有团队时一致，形状稳定）。
+        headlessTurns: [],
         stalled: 0,
         capacity: null,
         checkpoints: {},
@@ -1154,6 +1230,9 @@ export async function statusView(deps: ToolDeps, connectionKey: string): Promise
     const offlineMount = await offlineMembersMount(deps, team, now, peerScan);
     const offlineCount = offlineMount === null ? null : offlineMount.members.length;
     const liveness = await livenessMount(deps, team, now, peerScan);
+    // v0.10.0（组 D / R4）：后台回合进行中（引擎事件判据；status 给一行汇总，
+    // payload 给清单——与 team/panel 同一函数同一形状，三视图不矛盾）。
+    const headless = await headlessTurnMembers(deps.stateRoot, team);
     // v0.9.3（A2）：唤醒三级指标计数。status 的文本行序归 render.ts（本组只碰统计行），
     // 故此处**只进 payload**（team/panel 两视图的文本行已挂，三视图 payload 同源同形）。
     const wakeTiers = await wakeTierMount(deps);
@@ -1264,6 +1343,11 @@ export async function statusView(deps: ToolDeps, connectionKey: string): Promise
     }
     // v0.8.1（C4-O1 修复）：容量水位预警线越界的回落披露（与 capacityMount 同句）。
     if (watermarkFellBack) extraWarnings.push(MEM_WATERMARK_FALLBACK_WARNING);
+    // v0.10.0（组 D / R4）：后台回合进行中汇总行（有人才出；空 = 无人跑无头回合）。
+    // 放在固定降级序列之后、context 提醒行之前——后台回合可见性（R4）优先于上下文建议。
+    if (headless.size > 0) {
+      final.text = `${final.text}\nheadless: ${headless.size} 个成员后台回合进行中（${[...headless.keys()].join("、")}；引擎事件判定）`;
+    }
     if (extraWarnings.length > 0) final.text = `${final.text}\n${extraWarnings.join("\n")}`;
 
     // v0.9.8（组 O C1）：上下文体积提醒行——**只在超阈值且未设 XC_CONTEXT_NUDGE=0 时**
@@ -1290,6 +1374,9 @@ export async function statusView(deps: ToolDeps, connectionKey: string): Promise
         ...liveness.counts,
         byMember: Object.fromEntries(liveness.views),
       },
+      // v0.10.0（组 D / R4）：后台回合进行中清单（恒在键——空数组 = 无人跑无头回合；
+      // 与 team/panel 的 headlessTurns 同形状，三视图可对账）。
+      headlessTurns: [...headless.values()],
       taskCounts: counts,
       stalled: stalled.length,
       // v0.9.8（组 O C1）：上下文体积估算块（**事实恒在**——与 env 开关无关；
@@ -1341,11 +1428,11 @@ export function registerOverviewTools(
   registry: PrimaryRegistry,
 ): void {
   const description =
-    "Observation snapshot (task board / members / peers / capacity / stall in one tool). view=team (default): members with isLead + session liveness (running/idle/dead + livenessSources 四判据来源, PROTOCOL §12.4), priority-ordered task board (budget-windowed with boardTruncated pointer), unread counts, orphan/stale-receipt warnings, stalled flags (C5); " +
+    "Observation snapshot (task board / members / peers / capacity / stall in one tool). view=team (default): members with isLead + session liveness (running/idle/dead + livenessSources 四判据来源, PROTOCOL §12.4) + duty (v0.10.0, 职能声明, absent=未声明) + headlessTurn (v0.10.0, 后台回合进行中——引擎事件判据：session-running 晚于 session-idle 且其间有过 wake), priority-ordered task board (budget-windowed with boardTruncated pointer), unread counts, orphan/stale-receipt warnings, stalled flags (C5); " +
     "history:true appends leadHistory; view=peers: addressable cross-session peers (self/member/session rows, rowsTruncated pointer); " +
-    "view=panel: self + peers + members (+ liveness per member row, 含 livenessSources) + task counts + inbound policy; " +
+    "view=panel: self + peers + members (+ liveness / duty / headlessTurn per member row, 含 livenessSources) + task counts + inbound policy; " +
     "view=timeline: engine.jsonl timeline ordered by ts descending (limit defaults 20, max 100 with limitClamped disclosure; offset is a positional cursor skipping back N from the newest event — drifts under live appends; budget window with truncated pointer; skippedEvents counts unnormalizable lines; olderEventsOmitted disclosed on every page when the tail window truncates the file); " +
-    "view=status: compact status block (task counts by status / stalled / capacity level + watermark / offline members / member liveness in payload liveness block / checkpoint ages / unread counts / context-size estimate (per-member mailbox bytes+messages, overThreshold facts + one advisory line when over threshold — suggests checkpoint then compress/new session, never auto-compresses, XC_CONTEXT_NUDGE=0 disables) — the no-statusline substitute). Does not require registration; writes snapshot.json (always the full board) only for view=team.";
+    "view=status: compact status block (task counts by status / stalled / capacity level + watermark (+ memberTrees per-headless-process-tree bytes when the wake-lifecycle ledger is readable, R7) / offline members / member liveness in payload liveness block / headless-turn summary line + headlessTurns list (v0.10.0) / checkpoint ages / unread counts / context-size estimate (per-member mailbox bytes+messages, overThreshold facts + one advisory line when over threshold — suggests checkpoint then compress/new session, never auto-compresses, XC_CONTEXT_NUDGE=0 disables) — the no-statusline substitute). Does not require registration; writes snapshot.json (always the full board) only for view=team.";
   const handler = async (args: Record<string, unknown>, extra: unknown): Promise<ToolResult> =>
     handleOverview(deps, args as unknown as OverviewArgs, connectionKeyOf(extra));
   server.tool("xc_overview", description, OverviewShape, handler);

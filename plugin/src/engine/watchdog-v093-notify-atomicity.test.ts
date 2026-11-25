@@ -173,6 +173,8 @@ describe("V093-04：看门狗告知两段式（常量与台账形状）", () => 
     await seedPeerRecord("sess_a", process.pid, Date.now()); // lead 活着（本进程）
     await seedDeadPeer("sess_b", Date.now());
 
+    // v0.10.0（组 A / R3）：第一周期 suspect（不发 member-dead、不通知）；第二周期认领
+    expect((await sweepMembersOnce(deps())).deathSuspects).toEqual(["b"]);
     const first = await sweepMembersOnce(deps());
     expect(first.dead).toEqual(["b"]);
     expect(eventsOf("member-dead")).toHaveLength(1);
@@ -295,7 +297,8 @@ describe("V093-04①：认领了但通知未落地 → 下一轮重发（不再�
     await seedPeerRecord("sess_a", process.pid, Date.now());
     await seedDeadPeer("sess_b", Date.now());
 
-    // 第一轮：b 首见即死（peer 心跳新鲜）⇒ 认领 + 当轮通知一条
+    // 第一轮：b 首见 suspect（v0.10.0 组 A / R3 二次确认）；第二轮认领 + 当轮通知一条
+    expect((await sweepMembersOnce(deps())).deathSuspects).toEqual(["b"]);
     const first = await sweepMembersOnce(deps());
     expect(first.dead).toEqual(["b"]);
     expect(first.renotified).toEqual([]); // 宽限内不重发
@@ -395,6 +398,8 @@ describe("V093-04②：台账无历史时的首见即死（新鲜死亡告警 / 
     // 台账文件缺失（fresh state root / lost file）
     expect(existsSync(join(root, "capacity", "watchdog-state.json"))).toBe(false);
 
+    // v0.10.0（组 A / R3）：第一周期 suspect、第二周期认领告警（firstSightDead + 三件套）
+    expect((await sweepMembersOnce(deps())).deathSuspects).toEqual(["b"]);
     const summary = await sweepMembersOnce(deps());
     expect(summary.dead).toEqual(["b"]);
     expect(summary.firstSightDead).toEqual(["b"]);
@@ -425,6 +430,8 @@ describe("V093-04②：台账无历史时的首见即死（新鲜死亡告警 / 
     // b 20 分钟前就亡了（超出 10min 新鲜窗）——启动期/台账丢失后的存量死记录形态
     await seedDeadPeer("sess_b", now - 20 * 60_000);
 
+    // v0.10.0（组 A / R3）：第一周期 suspect、第二周期认领并默认告警（首见标注不变）
+    expect((await sweepMembersOnce(deps())).deathSuspects).toEqual(["b"]);
     const summary = await sweepMembersOnce(deps());
     expect(summary.dead).toEqual(["b"]);
     expect(summary.firstSightDead).toEqual(["b"]);

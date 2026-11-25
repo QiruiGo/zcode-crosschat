@@ -16,7 +16,7 @@
  * 5. crosschat：工具表补 handoff/checkpoint/timeline/status + 「交接与压缩防护」小节；
  * 6. 平台缺口如实声明（README/PROTOCOL/skill 含「无 PreCompact，故用提醒+一键」；
  *    且 PreCompact / 压缩钩子只以否定句式出现——不宣称自动压缩钩子）；
- * 7. 版本号一致性（AC6 的静态面）：四处版本文件 = 0.9.10；README 安装段自 v0.9.10 起
+ * 7. 版本号一致性（AC6 的静态面）：四处版本文件 = 0.10.0；README 安装段自 v0.9.10 起
  *    不写死版本号（资产名/目录名/安装回显统一 `<版本号>` 占位），没有「第五处」可钉——见 §8 注。
  */
 import { describe, expect, it } from 'vitest';
@@ -335,29 +335,35 @@ describe('A5 文档：无 PreCompact，故用提醒+一键（ACCEPT15-1 文档�
 // README 安装段自 v0.9.10 起**不再写死版本号**（资产名 / 解包目录名 / 安装回显统一 `<版本号>`
 // 占位，Release 页面显示什么就填什么）——所以没有「第五处」可钉：下方第二个 it 由「README
 // 指向某个写死版本 + CHANGELOG 最新条目」改钉为「README 不含 zcode-crosschat-0.x.y 形式的
-// 写死资产名 + CHANGELOG 含 v0.9.10/0.9.9/0.9.8/v0.9.7 四条」。
+// 写死资产名 + CHANGELOG 含 v0.10.0/v0.9.10/v0.9.9/v0.9.8/v0.9.7 五条」。
 // 沿革：v0.9.8/v0.9.9 两轮集成员只改了版本文件、文档 lane 未跑，第五处长期停在 0.9.7；
 // v0.9.10 文档 lane 落笔时按新约定一次性收口（见 CHANGELOG v0.9.10 条目）。
+// v0.10.0（集成员第 1 轮）：四处版本断言由 0.9.10 改钉 **0.10.0**；CHANGELOG 断言加
+// **v0.10.0** 一条（该条目本轮只放「标题 + 一行占位」，正文归文档 lane 写——占位条目
+// 的存在本身由本 it 守着，文档 lane 落笔前它不许消失）。
 // ---------------------------------------------------------------------------
 
-describe('A5 版本号一致性（四处版本文件 = 0.9.10；README 自 v0.9.10 起不写死版本，没有第五处可钉）', () => {
-  it('package.json / plugin.json / marketplace.json / server.ts 四处 = 0.9.10', () => {
-    expect(JSON.parse(readRel('plugin/package.json')).version).toBe('0.9.10');
-    expect(JSON.parse(readRel('plugin/.zcode-plugin/plugin.json')).version).toBe('0.9.10');
-    expect(JSON.parse(readRel('marketplace.json')).plugins[0].version).toBe('0.9.10');
-    expect(readRel('plugin/src/mcp/server.ts')).toContain('const SERVER_VERSION = "0.9.10"');
+describe('A5 版本号一致性（四处版本文件 = 0.10.0；README 自 v0.9.10 起不写死版本，没有第五处可钉）', () => {
+  it('package.json / plugin.json / marketplace.json / server.ts 四处 = 0.10.0', () => {
+    expect(JSON.parse(readRel('plugin/package.json')).version).toBe('0.10.0');
+    expect(JSON.parse(readRel('plugin/.zcode-plugin/plugin.json')).version).toBe('0.10.0');
+    expect(JSON.parse(readRel('marketplace.json')).plugins[0].version).toBe('0.10.0');
+    expect(readRel('plugin/src/mcp/server.ts')).toContain('const SERVER_VERSION = "0.10.0"');
   });
 
   // README 自 v0.9.10 起不写死版本：安装段资产名/目录名/安装回显全是 `<版本号>` 占位——
   // 整份 README 不得再出现 zcode-crosschat-<数字>.<数字>.<数字> 形式的写死资产名/目录名
   // （负例断言；覆盖任意版本号段，不只 0.x.y——将来写回 1.0.0 也该红）。
-  // CHANGELOG 按「最新条目 + 三条历史条目」口径钉 v0.9.10/0.9.9/0.9.8/v0.9.7 四条
-  // （v0.9.8/v0.9.9 条目由 v0.9.10 文档 lane 补录）。
-  it('README 不含写死版本的资产名（/zcode-crosschat-\\d+\\.\\d+\\.\\d+/）；CHANGELOG 含 v0.9.10/0.9.9/0.9.8/v0.9.7 四条', () => {
+  // CHANGELOG 按「最新条目 + 四条历史条目」口径钉 v0.10.0/v0.9.10/v0.9.9/v0.9.8/v0.9.7 五条
+  // （v0.9.8/v0.9.9 条目由 v0.9.10 文档 lane 补录；v0.10.0 条目由 v0.10.0 文档 lane 补写）。
+  // v0.10.0 只钉 `**v0.10.0**` 这个条目头（不钉日期/摘要）——正文归文档 lane，
+  // 它写什么摘要都不该把本 it 打红；但条目消失（版本文件改了、CHANGELOG 没条目）必须红。
+  it('README 不含写死版本的资产名（/zcode-crosschat-\\d+\\.\\d+\\.\\d+/）；CHANGELOG 含 v0.10.0/v0.9.10/v0.9.9/v0.9.8/v0.9.7 五条', () => {
     const readme = readRel('README.md');
     expect(readme).not.toMatch(/zcode-crosschat-\d+\.\d+\.\d+/);
     expect(readme).toContain('8 个斜杠命令');
     const changelog = readRel('CHANGELOG.md');
+    expect(changelog).toContain('**v0.10.0**');
     expect(changelog).toContain('**v0.9.10**（2026-11-24，只改文档的补丁版');
     expect(changelog).toContain('**v0.9.9**（2026-11-22，steer 进程树击杀');
     expect(changelog).toContain('**v0.9.8**（2026-11-22，steer 硬插队');

@@ -143,7 +143,7 @@ ZC plugins list
 → 回执回到队长邮箱；队长核对证据（读文件）后汇总给你
 ```
 
-配套操作：`/xc-status` 看板（成员状态 / 任务板 / 依赖图 / 停滞标红）、`/xc-team stop <名字> [原因]` 停止成员（默认先留档）、`xc_team({action:"cancel", taskId})` 取消任务；派发时用 `dependsOn` 表达依赖、`priority` 表达优先级（只影响取单顺序，不抢占），上游完成后下游自动收到解除阻塞通知并开工。长任务暂停用 `xc_report(status:"blocked")`（原因必填），解除用 `xc_team({action:"unblock"})`。换会话接手用 `/xc-handoff`（30 秒接手包，≤3 次工具调用进入状态），压缩或交接前先 `/xc-checkpoint` 落检查点。成员回合跑偏、必须立刻纠偏时用 `xc_relay({to:"<成员>", steer:true, msg:"…"})`（硬插队：终止其当前回合并带着纠偏重开新回合，未落盘进度可能丢；催办、软中断、硬插队三档怎么选见内置 `crosschat` 技能 §3）。
+配套操作：`/xc-status` 看板（成员状态 / 任务板 / 依赖图 / 停滞标红）、`/xc-team stop <名字> [原因]` 停止成员（默认先留档）、`xc_team({action:"cancel", taskId})` 取消任务；派发时用 `dependsOn` 表达依赖、`priority` 表达优先级（只影响取单顺序，不抢占），上游完成后下游自动收到解除阻塞通知并开工。长任务暂停用 `xc_report(status:"blocked")`（原因必填），解除用 `xc_team({action:"unblock"})`。换会话接手用 `/xc-handoff`（30 秒接手包，≤3 次工具调用进入状态），压缩或交接前先 `/xc-checkpoint` 落检查点。成员回合跑偏、必须立刻纠偏时用 `xc_relay({to:"<成员>", steer:true, msg:"…"})`（硬插队：终止其当前回合并带着纠偏重开新回合，未落盘进度可能丢；催办、软中断、硬插队三档怎么选见内置 `crosschat` 技能 §3）。给在途成员（名下有在途任务，或会话回合在跑）再派单会被忙闲闸挡下——不重复 spawn、只落邮箱，回执带 `deferred{reason:"busy", openTaskIds}`，成员回合一结束由看门狗补醒（冷却 120s，`XC_DISPATCH_RESUME_COOLDOWN_MS` 可调；同一成员 10 分钟窗内最多 5 次真唤醒补醒，超出只落邮箱不唤醒，`XC_RESUME_WAKE_MAX` 可调）；重要发现半截就报走 `xc_report({urgent:true})` 插队回单（同一成员 10 分钟内最多 5 次，`XC_URGENT_REPORT_MAX` 可调）。
 
 ### 长期任务：任务日志与交接（longtask）
 
@@ -170,10 +170,10 @@ ZC plugins list
 
 | 工具 | 作用 |
 |---|---|
-| `xc_identify(name, sessionId, …)` | 注册/重绑/改名/接管（队内 + 跨会话两轴合一；`sessionId` 取钩子注入值；`takeover:true` 显式接管崩溃成员；peer 轴附 `kind`/`modeClass`/`contextChars`） |
+| `xc_identify(name, sessionId, …)` | 注册/重绑/改名/接管（队内 + 跨会话两轴合一；`sessionId` 取钩子注入值；`takeover:true` 显式接管崩溃成员；peer 轴附 `kind`/`modeClass`/`contextChars`；可选 `duty` = 一句话职能声明，≤120 字符，落 `team.json` 成员行、改名/接管不丢，`xc_overview` 与 handoff 花名册可见） |
 | `xc_dispatch(to, title, prompt, {acceptance, dependsOn, priority})` | 派发可检验任务；`priority`（high/normal/low）只影响取单顺序；同一张票重复派发幂等（见下） |
 | `xc_claim(taskId)` | 原子认领 pending 任务，返回一次性 attemptId 凭证 |
-| `xc_report(taskId, attemptId, status, {result, error, evidence})` | 回报 in_progress / completed（证据=工作区内普通文件 + 现算 sha256 + 可选摘要）/ failed / blocked（原因必填） |
+| `xc_report(taskId, attemptId, status, {result, error, evidence, urgent})` | 回报 in_progress / completed（证据=工作区内普通文件 + 现算 sha256 + 可选摘要）/ failed / blocked（原因必填）；`urgent:true` = 插队回单（重要发现半截就报：回执 urgent 置顶 + 对创建者一次 urgent 唤醒尝试，收方回合进行中则只落邮箱、不打断、回合一结束补醒；同一成员 10 分钟内最多 5 次，`XC_URGENT_REPORT_MAX` 可调） |
 | `xc_read(scope, {id, field, offset, limit})` | 统一分页读：inbox / mail / task / peer / peer-msg / journal / **handoff**（30 秒接手包，七要素 + 建议下一步；`id`=任务 id 或花名收窄） |
 | `xc_relay(to, msg, {urgent, interrupt, steer, summary, sourceTaskId, sourceAttemptId, withdrawMessageIds, refs})` | 发消息 + 用户介入传导合一；`urgent` 插到所有未读之前并尽力唤醒；`interrupt` 发结构化软中断 INTERRUPT 信封（urgent 置顶不变；收方下一回合安全点消费并回确认，payload 如实回报）；`steer`（v0.9.8 起）是硬插队——仅对引擎成员、仅 lead/用户可发：终止对方当前回合（整棵进程树）并带着纠偏重开新回合，回执顶层 `preempted` 如实说明是否真的抢占，交互式会话降级为软中断；`withdrawMessageIds`（仅队内轴）撤回自己发给该目标且仍未读的消息（整单语义，含已读件整单拒绝并逐条报状态）；`refs`（可选）随消息带工作区内真实文件的 path+sha256（+可选 mime/note），接收面渲染「用 Read 打开该路径」提示——传引用不传内容，不内联、不 base64；非送达回执（dropped/held/…）在 payload `detail` 里附原因与恢复动作 |
 | `xc_overview({view, history, offset, limit})` | 全景观测：任务板（team）/ peer 清单（peers）/ 面板（panel：成员+任务+容量+停滞+入站策略）/ 时间线（timeline：engine.jsonl 尾部事件，`limit` 缺省 20、上限 100）/ 紧凑状态（status：任务七态计数+stalled+容量色+离线成员+checkpoint 年龄+未读，一眼瞭望）；capacity 块附唤醒闸状态（阻塞条件/下次重判/本窗 wake-deferred 计数） |
@@ -210,7 +210,7 @@ ZC plugins list
 
 ## 已知限制与威胁模型
 
-26 条已知限制（平台缺口、威胁模型边界与「不修行为」的如实声明；v0.9.6 起含 25/26 两条行为边界）与 v0.6 口径威胁模型见 [docs/LIMITATIONS.md](docs/LIMITATIONS.md)（v0.9.4 B3 自 README 搬家：README 正文 ≤220 行预算，内容零丢失、逐条可比对）。
+31 条已知限制（平台缺口、威胁模型边界与「不修行为」的如实声明；v0.9.6 起含 25/26 两条行为边界，v0.10.0 起含 27–31 五条边界）与 v0.6 口径威胁模型见 [docs/LIMITATIONS.md](docs/LIMITATIONS.md)（v0.9.4 B3 自 README 搬家：README 正文 ≤220 行预算，内容零丢失、逐条可比对）。
 
 ## 版本记录
 

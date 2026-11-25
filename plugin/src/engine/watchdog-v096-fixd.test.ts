@@ -14,6 +14,10 @@
  *
  * 纪律（与 watchdog-v095-a2a7.test.ts 同款）：真活进程 pid（kill 出真进程死）；合成时刻
  * 只走 sweepMembersOnce 的 `now` 注入与 timer 面的 Date mock（toFake:['Date']，定时器真实调度）。
+ *
+ * v0.10.0（组 A / R3）口径变化：**连续两个扫描周期都判死才发 member-dead**（二次确认）。
+ * 死亡用例在 seed 之后先跑一个 suspect 周期，原断言移到第二个周期之后——断言本身逐字
+ * 不变。补扫轮（resume）的「窗外死记录静默认认」路径不受影响（首周期即静默认领）。
  */
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { spawn } from "node:child_process";
@@ -173,8 +177,10 @@ function leadMail(): string {
 describe("v0.9.6 A2/V095-06：台账复合键 (成员,会话)——重供给后的新化身死亡照常告警", () => {
   it("【方案验收锚点】重供给（换新 sid）→ 新化身死在首个扫描节拍内 → member-dead 恰 1 条（不再被旧化身的 dead 条目吞掉）", async () => {
     await seedTeam("sess_b1");
-    // 第 1 化身（sess_b1）崩溃并被扫描认领：恰 1 条告警，台账记 `b|sess_b1`
+    // 第 1 化身（sess_b1）崩溃并被扫描认领：恰 1 条告警，台账记 `b|sess_b1`。
+    // v0.10.0（组 A / R3）：kill 后先 suspect 一个周期，第二周期认领。
     await seedCrashedMember("sess_b1", { lastEventAgeMs: 90_000 });
+    expect((await sweepMembersOnce(deps())).deathSuspects).toEqual(["b"]);
     const first = await sweepMembersOnce(deps());
     expect(first.dead).toEqual(["b"]);
     expect(deadEvents()).toHaveLength(1);
@@ -188,6 +194,8 @@ describe("v0.9.6 A2/V095-06：台账复合键 (成员,会话)——重供给后�
     await reprovisionMember("sess_b2");
     await seedCrashedMember("sess_b2", { lastEventAgeMs: 90_000 });
 
+    // v0.10.0（组 A / R3）：新化身同样先 suspect 一个周期，第二周期认领。
+    expect((await sweepMembersOnce(deps())).deathSuspects).toEqual(["b"]);
     const second = await sweepMembersOnce(deps());
     expect(second.dead).toEqual(["b"]);
     expect(second.firstSightDead).toEqual(["b"]);
@@ -208,6 +216,8 @@ describe("v0.9.6 A2/V095-06：台账复合键 (成员,会话)——重供给后�
   it("死亡文案不再自荐误导：附「待回池 + requeueAtMs」口径与重供给独立记账说明（A8 四面之一的文案面）", async () => {
     await seedTeam("sess_b1");
     await seedCrashedMember("sess_b1", { lastEventAgeMs: 90_000 });
+    // v0.10.0（组 A / R3）：先 suspect 一个周期，第二周期认领后文案才落邮箱
+    expect((await sweepMembersOnce(deps())).deathSuspects).toEqual(["b"]);
     await sweepMembersOnce(deps());
     const mail = leadMail();
     // 旧文案「名下任务请用 xc_overview 核对后用 xc_dispatch 重派，或用 … 幂等重供给」：
@@ -234,6 +244,8 @@ describe("v0.9.6 A2/V095-06：台账复合键 (成员,会话)——重供给后�
     // 当前化身（sess_b2，可能是重供给后的新化身）已死且证据过期
     await seedCrashedMember("sess_b2", { witnessAgeMs: 2 * 3_600_000, lastEventAgeMs: 2 * 3_600_000 });
 
+    // v0.10.0（组 A / R3）：旧格式条目清除后按复合键先 suspect 一个周期，第二周期首见告警
+    expect((await sweepMembersOnce(deps())).deathSuspects).toEqual(["b"]);
     const summary = await sweepMembersOnce(deps());
     // 静音 = V095-06 残留；修复方向「宁误报一次」：旧格式清除后按复合键首见告警
     expect(summary.dead).toEqual(["b"]);
@@ -280,7 +292,11 @@ describe("v0.9.6 A4/V095-10：补扫窗取 max(gap, 常规新鲜窗) 钳 7 天�
     // 死亡证据年龄 130s（V095-10 实测：恰落旧公式窗缘 → 静默）
     await seedCrashedMember("sess_b1", { witnessAgeMs: 130_000, lastEventAgeMs: 130_000 });
     const gapMs = 130_000;
-    // 按旧公式传窗（min(gap,7d)=gap）——复现 V095-10 的缺陷输入；sweep 面钳到 ≥10min
+    // 按旧公式传窗（min(gap,7d)=gap）——复现 V095-10 的缺陷输入；sweep 面钳到 ≥10min。
+    // v0.10.0（组 A / R3）：第一周期 suspect、第二周期认领（补扫口径的文案与窗口不变）。
+    expect((await sweepMembersOnce(deps(), Date.now(), {
+      resume: { gapMs, catchupWindowMs: Math.min(gapMs, WATCHDOG_RESUME_CATCHUP_MAX_MS) },
+    })).deathSuspects).toEqual(["b"]);
     const summary = await sweepMembersOnce(deps(), Date.now(), {
       resume: { gapMs, catchupWindowMs: Math.min(gapMs, WATCHDOG_RESUME_CATCHUP_MAX_MS) },
     });
@@ -312,6 +328,10 @@ describe("v0.9.6 A4/V095-13：恢复判据 60s 下界钳制——事件循环秒
   it("sweep 面：以旧公式形态传入 3.5s 微窗（V095-13 的静音根因）→ 生效窗钳到常规 10min，窗内死亡照告", async () => {
     await seedTeam("sess_b1");
     await seedCrashedMember("sess_b1", { witnessAgeMs: 3_500, lastEventAgeMs: 3_500 });
+    // v0.10.0（组 A / R3）：第一周期 suspect、第二周期认领（窗口钳制断言不变）
+    expect((await sweepMembersOnce(deps(), Date.now(), {
+      resume: { gapMs: 3_500, catchupWindowMs: 3_500 },
+    })).deathSuspects).toEqual(["b"]);
     const summary = await sweepMembersOnce(deps(), Date.now(), {
       resume: { gapMs: 3_500, catchupWindowMs: 3_500 },
     });

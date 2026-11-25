@@ -67,6 +67,7 @@ import {
   OPEN_TASK_STATUSES,
   TERMINAL_TASK_STATUSES,
   memberState,
+  sanitizeDuty,
 } from "../core/types.js";
 import type { LeadHistoryEntry, MemberState, TeamMember, TeamMessage, TeamState } from "../core/types.js";
 import { revokeAttempt } from "../core/graph.js";
@@ -110,6 +111,11 @@ export const TeamShape = {
   note: z.string().optional().describe("action=member-add：备注（仅审计）；action=checkpoint：写进检查点第 7 章的一句话"),
   contextChars: z.number().int().positive().optional().describe("action=member-add：该成员上下文字符数声明（预算刻度，R-18；缺省 XC_CONTEXT_CHARS/200k）"),
   reason: z.string().optional().describe("action=transfer/member-stop：原因（入审计）"),
+  // v0.10.0（组 D / G-25）：供给时一并声明该成员的职能（与 xc_identify 的 duty 同字段
+  // 同口径：一句话、≤120 字符、控制字符清洗；缺省=不声明，重供给时保留既有声明）。
+  duty: z.string().max(2000).optional().describe(
+    "action=member-add：该成员的职能声明（一句话说明它负责什么；最长 120 字符，控制字符清掉；缺省=不声明/保留既有声明。写入 team.json 成员行，xc_overview 与 handoff 花名册可见）",
+  ),
   taskId: z.string().min(1).optional().describe("action=cancel/unblock：任务 id"),
   summary: z.string().min(1).optional().describe("action=idle：空闲摘要（守则 v2 第 3 条）"),
   idleReason: z.enum(IDLE_REASONS).optional().describe("action=idle：缺省 no-claimable-task"),
@@ -299,8 +305,11 @@ interface MemberAddPlan {
   swept: string[];
 }
 
-async function memberAdd(deps: ToolDeps, args: { name: string; model?: string; reasoningLevel?: string; note?: string; contextChars?: number }, me: BoundIdentity): Promise<ToolResult> {
+async function memberAdd(deps: ToolDeps, args: { name: string; model?: string; reasoningLevel?: string; note?: string; contextChars?: number; duty?: string }, me: BoundIdentity): Promise<ToolResult> {
   const { stateRoot, workspace, env } = deps;
+  // v0.10.0（组 D / G-25）：职能声明清洗（与 xc_identify 同一纯函数；控制字符清掉、
+  // ≤120 字符；声明为空 = 不声明）。锁外快洗，零副作用。
+  const duty = sanitizeDuty(args.duty);
   // v0.6.1（红队四番战 安全对-2/安全对-5 修复）：与 xc_identify 同一道花名闸
   // （validateMemberName：严格文法 + 保留名两轴一致）。此前这里只 sanitizeKey +
   // RESERVED_MEMBER_KEYS，全角/同形等碰撞写法可入册（"Ａｌｉｃｅ" → 键 alice，
@@ -387,6 +396,9 @@ async function memberAdd(deps: ToolDeps, args: { name: string; model?: string; r
           error: undefined,
           stopReason: undefined,
           ...(args.contextChars !== undefined ? { contextChars: args.contextChars } : {}),
+          // v0.10.0（组 D / G-25）：重供给时可（重）声明职能；未声明则 spread 保留
+          // 既有 duty——「同键重新供给不丢」（G-25 设计建议 3）。
+          ...(duty !== undefined ? { duty } : {}),
         }
       : {
           key,
@@ -399,6 +411,7 @@ async function memberAdd(deps: ToolDeps, args: { name: string; model?: string; r
           joinedAt: now,
           lastSeen: now,
           ...(args.contextChars === undefined ? {} : { contextChars: args.contextChars }),
+          ...(duty === undefined ? {} : { duty }),
         };
     if (existing === undefined) team.members.push(record);
     else team.members[team.members.indexOf(existing)] = record;
@@ -558,6 +571,9 @@ async function memberAdd(deps: ToolDeps, args: { name: string; model?: string; r
         sessionId: result.sessionId,
         state: "ready",
         identity: "engine",
+        // v0.10.0（组 D / G-25）：本次（重）声明的职能回显（缺省 = 未声明；
+        // 未声明时既有 duty 仍在成员行里，重供给不丢）。
+        ...(duty !== undefined ? { duty } : {}),
         // v0.9.6（R2）：model 块与 reasoningFallback 都带**实际生效**档位（缺省配置
         // 首试即成功；降级路径如实披露 from→to，不再虚报所配档位）。
         model: { providerId: result.providerId, modelId: result.modelId, reasoningLevel: result.reasoningLevel },
@@ -991,7 +1007,7 @@ async function memberStop(deps: ToolDeps, args: { name: string; reason?: string;
 
 /** 队内成员工具核心（原 member-tools.ts 的 registerMemberTools 两个 handler 主体）。 */
 export interface MemberToolCore {
-  xc_member_add(args: { name: string; model?: string; reasoningLevel?: string; note?: string; contextChars?: number }, connectionKey: string): Promise<ToolResult>;
+  xc_member_add(args: { name: string; model?: string; reasoningLevel?: string; note?: string; contextChars?: number; duty?: string }, connectionKey: string): Promise<ToolResult>;
   xc_member_stop(args: { name: string; reason?: string; archive?: boolean }, connectionKey: string): Promise<ToolResult>;
 }
 
@@ -1594,6 +1610,8 @@ export type TeamActionArgs = {
   reasoningLevel?: string;
   note?: string;
   contextChars?: number;
+  // v0.10.0（组 D / G-25）：action=member-add 的职能声明（可选；同 xc_identify duty）。
+  duty?: string;
   reason?: string;
   taskId?: string;
   summary?: string;
@@ -1931,6 +1949,8 @@ export async function handleTeam(deps: ToolDeps, args: TeamActionArgs, connectio
         ...(args.reasoningLevel !== undefined ? { reasoningLevel: args.reasoningLevel } : {}),
         ...(args.note !== undefined ? { note: args.note } : {}),
         ...(args.contextChars !== undefined ? { contextChars: args.contextChars } : {}),
+        // v0.10.0（组 D / G-25）：供给时一并声明职能（可选；与 xc_identify duty 同字段）。
+        ...(args.duty !== undefined ? { duty: args.duty } : {}),
       }, connectionKey);
     case "member-stop":
       if (args.name === undefined) throw new ToolError({ error: "invalid_params", message: "action=member-stop requires \"name\"" });
@@ -1979,7 +1999,7 @@ export function registerTeamTools(
   const description =
     "Command family in one tool (actions: init/transfer/release/member-add/member-stop/idle/cancel/unblock/checkpoint). " +
     "action=init becomes lead (takeover:true ONLY on explicit user instruction); transfer/release move/drop the metadata lead role; " +
-    "member-add provisions an engine member (lead only); member-stop removes a member, requeues its open tasks and returns its unclaimed dispatches (pending tasks reserved via `to`) to the shared pending pool — both with creator receipts — and (default archive:true) writes .crosschat/archive/<name>/ first (C4); " +
+    "member-add provisions an engine member (lead only; duty (optional, v0.10.0) declares what the member is responsible for — one line, <=120 chars, kept on the team.json member row and shown on xc_overview member rows / the xc_read handoff roster); member-stop removes a member, requeues its open tasks and returns its unclaimed dispatches (pending tasks reserved via `to`) to the shared pending pool — both with creator receipts — and (default archive:true) writes .crosschat/archive/<name>/ first (C4); " +
     "idle reports idleness to the lead; cancel cancels a task (lead or creator); unblock releases a blocked task back to its preBlocked status (lead/creator/claimant) with an unblock-notice to the claimant; " +
     "checkpoint writes a 7-section handoff checkpoint to .crosschat/checkpoints/<you>/<ISO>.md server-side (keeps the newest 20 per member; note goes into section 7); " +
     "there is no PreCompact hook on this platform, so use it before accepting compression or handing over.";

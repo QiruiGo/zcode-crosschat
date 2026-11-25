@@ -17,6 +17,7 @@ import { createToolCore, type ToolDeps } from "./core.js";
 import { createTeamOverviewCore } from "./tools-overview.js";
 import { sweepMembersOnce, type WatchdogDeps } from "../engine/watchdog.js";
 import { writeSession, refreshSessionLastSeen } from "../core/registry.js";
+import { readTeam, writeTeam } from "../core/teamstate.js";
 import { readFileSync, existsSync } from "node:fs";
 import { payloadOf, type ToolResult } from "./protocol.js";
 
@@ -103,7 +104,17 @@ describe("v0.9.6 A8/V095-21：死亡成员任务的四面一致（板面行 / Of
     // Offline 文本行带「待回池 @ISO」
     expect(text).toContain(`待回池 ${taskId}@${new Date(row.requeueAtMs!).toISOString()}`);
 
-    // 面④：看门狗死亡告警文案同口径（待回池 + requeueAtMs 指针）
+    // 面④：看门狗死亡告警文案同口径（待回池 + requeueAtMs 指针）。
+    // v0.10.0（组 A / R3）两处口径变化：① **在途即活**——任务还在 in_progress 时判亡校验
+    //    命中（open-tasks），不发 member-dead（G-29 修法③）；先在测试里把在途单收尾
+    //    （生产里由回单/stale 清扫完成），② 豁免解除后 pid-dead 证据已连续两个周期在场
+    //    （豁免轮 + 本轮）⇒ 直接认领并告警（二次确认的台账计数不受豁免轮影响）。
+    const exempt = await sweepMembersOnce({ stateRoot, workspace: workDir, env: deps.env } as WatchdogDeps);
+    expect(exempt.deathExempt).toEqual([{ key: "m1", reasons: ["open-tasks"] }]);
+    expect(existsSync(join(stateRoot, "teams", "default", "inbox", "a.jsonl"))).toBe(false);
+    const teamBefore = (await readTeam(stateRoot, "default"))!;
+    teamBefore.tasks = teamBefore.tasks.map((t) => (t.id === taskId ? { ...t, status: "completed" as const } : t));
+    await writeTeam(stateRoot, teamBefore);
     const watchdog = await sweepMembersOnce({ stateRoot, workspace: workDir, env: deps.env } as WatchdogDeps);
     expect(watchdog.dead).toEqual(["m1"]);
     const mailFile = join(stateRoot, "teams", "default", "inbox", "a.jsonl");

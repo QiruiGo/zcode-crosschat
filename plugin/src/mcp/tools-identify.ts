@@ -38,9 +38,9 @@ import { appendMailbox, createMessage, readMailbox } from "../core/mailbox.js";
 import { logEngineEvent } from "../core/log.js";
 import { readNames, readSession, unbindName, bindName, findInflightWakeNonce, WAKE_INFLIGHT_MS } from "../core/registry.js";
 import { sanitizeKey, validateMemberName } from "../core/sanitize.js";
-import { DEFAULT_TEAM_ID, TERMINAL_TASK_STATUSES } from "../core/types.js";
+import { DEFAULT_TEAM_ID, TERMINAL_TASK_STATUSES, sanitizeDuty } from "../core/types.js";
 import type { MemberRole } from "../core/types.js";
-import { memberOpenTasks, readTeam, writeTeam } from "../core/teamstate.js";
+import { memberOpenTasks, readTeam, setMemberDuty, writeTeam } from "../core/teamstate.js";
 import { revokeAttempt } from "../core/graph.js";
 import { peerRootFromEnv } from "../core/peerdir.js";
 // v0.9.8（组 O D7 / V097-21）：未读判据收敛到 core/checkpoint.ts 单一真源
@@ -79,6 +79,11 @@ export const IdentifyShape = {
   kind: z.enum(["interactive", "bg"]).optional().describe("会话类别；缺省 interactive"),
   modeClass: z.enum(["bypass", "prompting"]).optional().describe("权限档类兜底；仅钩子基记录无档类时生效"),
   contextChars: z.number().int().positive().optional().describe("上下文字符数声明（注入预算刻度，R-18；缺省 XC_CONTEXT_CHARS/200k）"),
+  // v0.10.0（组 D / G-25）：会话职能声明（一句话：这个会话负责什么；≤120 字符，
+  // 控制字符入库前清洗；缺省 = 不声明，旧花名册无该字段时一切照常）。
+  duty: z.string().max(2000).optional().describe(
+    "会话职能声明（一句话说明这个会话负责什么；最长 120 字符，控制字符清掉；缺省=不声明。写入 team.json 成员行，改名/takeover/重新供给不丢；xc_overview 与 handoff 花名册可见）",
+  ),
 } as const;
 
 export type IdentifyArgs = {
@@ -91,6 +96,7 @@ export type IdentifyArgs = {
   kind?: "interactive" | "bg";
   modeClass?: "bypass" | "prompting";
   contextChars?: number;
+  duty?: string;
 };
 
 export interface IdentifyCore {
@@ -389,12 +395,28 @@ async function takeoverRevokeTasks(
 }
 
 /**
+ * v0.10.0（组 D / G-25）：职能声明落盘（best-effort）。
+ *
+ * 注册主体（joinTeam）在 identity.ts 的 registry→team 组合锁里，duty 无法随它
+ * 一并写入，故成功后由本助手补写（core/teamstate.ts setMemberDuty 同一把 team 锁）。
+ * 失败只产出一条 warning 进回执——注册本身已成功，不为一句职能声明把整次
+ * identify 判失败（调用方重试即补上）。
+ */
+async function applyDuty(stateRoot: string, agentKey: string, duty: string | undefined): Promise<string[]> {
+  if (duty === undefined) return [];
+  const applied = await setMemberDuty(stateRoot, TEAM_ID, agentKey, duty);
+  return applied.ok ? [] : [`duty declaration could not be persisted: ${applied.error ?? "unknown"}`];
+}
+
+/**
  * xc_identify 主处理器（注册器由 registerIdentifyTools 挂进 server + dispatcher）。
  */
 export async function handleIdentify(deps: ToolDeps, rawArgs: IdentifyArgs, connectionKey: string): Promise<ToolResult> {
   return runCore(deps.stateRoot, async () => {
     const services = getPeerServices(deps);
     const now = Date.now();
+    // v0.10.0（组 D / G-25）：职能声明清洗一次，四条路径（wake/改名/接管/常规注册）共用。
+    const duty = sanitizeDuty(rawArgs.duty);
     const existing = identityStore.get(connectionKey);
     const newKey = sanitizeKey(rawArgs.name);
     if (newKey === "") {
@@ -424,6 +446,8 @@ export async function handleIdentify(deps: ToolDeps, rawArgs: IdentifyArgs, conn
         role: rawArgs.role,
         wakeToken: rawArgs.wakeToken,
       }, connectionKey, { peerRoot: peerRootFromEnv(deps.env) });
+      // v0.10.0（组 D / G-25）：职能声明随本次注册落盘（无头回合自带说明时）。
+      const dutyWarnings = await applyDuty(deps.stateRoot, newKey, duty);
       return okResult(
         renderRegister(newKey, rawArgs.sessionId, outcome.teamId, outcome.roster, outcome.warnings),
         {
@@ -433,6 +457,7 @@ export async function handleIdentify(deps: ToolDeps, rawArgs: IdentifyArgs, conn
           protocolDigest: outcome.protocolDigest,
           via: outcome.via,
           ...(outcome.warnings.length ? { warnings: outcome.warnings } : {}),
+          ...(dutyWarnings.length ? { warnings: [...outcome.warnings, ...dutyWarnings] } : {}),
           takeoverApplied: [],
         },
       );
@@ -577,7 +602,14 @@ export async function handleIdentify(deps: ToolDeps, rawArgs: IdentifyArgs, conn
           if (team !== undefined) {
             const idx = team.members.findIndex((m) => m.key === existing.agentKey);
             if (idx >= 0) {
-              team.members[idx] = { ...team.members[idx]!, key: newKey, lastSeen: now };
+              // v0.10.0（组 D / G-25）：duty 随成员行换键保留（spread 即保留）；
+              // 本次调用显式带了 duty 时以新声明覆盖（改名 = 重新声明职能的时机）。
+              team.members[idx] = {
+                ...team.members[idx]!,
+                key: newKey,
+                lastSeen: now,
+                ...(duty !== undefined ? { duty } : {}),
+              };
               // 边界-1 修复（P1）：lead/founder 花名随动——成员 key 换绑而
               // leadKey/founderKey 不随动会悬空，把现任 lead 锁死在
               // transfer/release/init 之外（not_lead / lead_exists），且 idle
@@ -758,6 +790,9 @@ export async function handleIdentify(deps: ToolDeps, rawArgs: IdentifyArgs, conn
         sessionId: rawArgs.sessionId,
         role: rawArgs.role,
       }, connectionKey, { peerRoot: peerRootFromEnv(deps.env) });
+      // v0.10.0（组 D / G-25）：接管可同时（重）声明职能；未声明则既有 duty 随
+      // 成员行原样保留（joinTeam 的 upsert spread）——「换代不丢知识」。
+      const dutyWarnings = await applyDuty(deps.stateRoot, newKey, duty);
       await logEngineEvent(deps.stateRoot, {
         event: "member-takeover",
         teamId: TEAM_ID,
@@ -776,7 +811,9 @@ export async function handleIdentify(deps: ToolDeps, rawArgs: IdentifyArgs, conn
           roster: outcome.roster,
           protocolDigest: outcome.protocolDigest,
           via: outcome.via,
-          ...(outcome.warnings.length ? { warnings: outcome.warnings } : {}),
+          ...(outcome.warnings.length || dutyWarnings.length
+            ? { warnings: [...outcome.warnings, ...dutyWarnings] }
+            : {}),
           takeover: true,
           takeoverApplied: ["team"],
           revokedTasks: revoked,
@@ -848,6 +885,8 @@ export async function handleIdentify(deps: ToolDeps, rawArgs: IdentifyArgs, conn
       }
     }
     // peer 轴注册成功：两轴身份都在场（catch 分支已在上面抛错，走到这里即成功路径）。
+    // v0.10.0（组 D / G-25）：职能声明在两轴都成功后落盘（与注册同一成败面）。
+    const dutyWarnings = await applyDuty(deps.stateRoot, newKey, duty);
     return okResult(
       renderRegister(newKey, rawArgs.sessionId, teamOutcome.teamId, teamOutcome.roster, teamOutcome.warnings) +
         ` Peer axis registered: ${peerOutcome!.name} (pid=${peerOutcome!.pid}, endpoint=${peerOutcome!.socketPath}).`,
@@ -857,7 +896,9 @@ export async function handleIdentify(deps: ToolDeps, rawArgs: IdentifyArgs, conn
         roster: teamOutcome.roster,
         protocolDigest: teamOutcome.protocolDigest,
         via: teamOutcome.via,
-        ...(teamOutcome.warnings.length ? { warnings: teamOutcome.warnings } : {}),
+        ...(teamOutcome.warnings.length || dutyWarnings.length
+          ? { warnings: [...teamOutcome.warnings, ...dutyWarnings] }
+          : {}),
         peer: peerOutcome,
         takeoverApplied: [],
       },
@@ -887,6 +928,7 @@ export function registerIdentifyTools(
     "Names must already be in canonical key form (letters/digits/single dashes, ≤48 chars); silently-normalizing spellings (fullwidth, homoglyphs, path/control characters, spaces, underscores) are refused - same strict grammar as the peer axis. " +
     "Both-axis atomicity: if the peer axis fails (register or rename), the team axis is rolled back and the error receipt reports teamAxis.rolledBack - a failed call leaves no half-applied identity, so you can retry directly; a rename blocked by the team-axis board guard (open task references / a non-empty mailbox) is refused on BOTH axes (team_rename_blocked) instead of renaming only the peer axis. " +
     "takeover:true (explicit) rebinds a dead holder's name and requeues its open tasks with receipts; it refuses while an in-flight wake round exists or the old holder is still live (takeover_live_holder). " +
+    "duty (optional, v0.10.0): a one-line statement of what this session is responsible for (<=120 chars, control characters cleaned) - persisted on the team.json member row, kept across rename/takeover/re-supply, and shown on xc_overview member rows and the xc_read handoff roster. " +
     "Soft validation only: name_taken on live conflicts, session_id_in_use on live sid clashes, idempotent exact-pair rebind. No regToken (removed in v0.6).";
   const handler = async (args: Record<string, unknown>, extra: unknown): Promise<ToolResult> =>
     handleIdentify(deps, args as unknown as IdentifyArgs, connectionKeyOf(extra));

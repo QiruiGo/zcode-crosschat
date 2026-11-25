@@ -45,10 +45,12 @@
  * @module core/capacity
  */
 import { spawn, type SpawnOptions } from 'node:child_process';
-import { mkdir, readFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir } from 'node:fs/promises';
 import os from 'node:os';
 import { dirname, join } from 'node:path';
 import { writeFileAtomic } from './atomic.js';
+// v0.10.0（组 D / R7）：唤醒生命周期账本的目录（logs/wake-lifecycle-<member>-<ts>.jsonl）。
+import { logsDir } from './paths.js';
 // v0.9.2（C1）：唤醒子命令行标记 = 唤醒 prompt 的冻结回执前缀（单一真源，不另抄字面量）。
 import { RECEIPT_PREFIX } from './mailbox.js';
 // v0.9.3（B1）：capacity 分层配置的 file 层解析（core/config.ts 只依赖 M1 paths/types，
@@ -590,6 +592,170 @@ export interface CapacitySample {
   degraded: 'cim-unavailable' | null;
   /** 诊断附加：分类计数（仅 count>0 的类）；CIM 失败时 absent。 */
   categoryCounts?: Record<string, number>;
+  /**
+   * v0.10.0（组 D / R7）：**每棵无头进程树**的记账（成员键 + 根 pid + 工作集字节 +
+   * 空闲分钟数）。按唤醒生命周期账本（logs/wake-lifecycle-<member>-<ts>.jsonl）里
+   * helper 汇报的唤醒子 pid 找进程及其子孙，汇总工作集。
+   *
+   * 纪律（写死）：
+   * - **只记账，不做任何清理或终止**——本字段不参与 judgeCapacity 的任何判定，
+   *   未来清扫器要动树须自行叠加「任务在途状态」等判据（R7 建议修法的后半段，
+   *   本版明确不做）；
+   * - 采样失败时**缺席**并如实标注：CIM 失败 → 与 degraded:'cim-unavailable' 同帧
+   *   （进程类数据整体不可信）；生命周期账本读失败 → {@link memberTreesError}
+   *   带原因。绝不让记账失败拖垮整个容量采样；
+   * - 缓存命中时取缓存值（与 headlessTurnCount 等进程类字段同纪律——缓存只省
+   *   CIM 成本，窗口 ≤ XC_MEM_SAMPLE_MIN_MS 缺省 60s，sampledAt 标注真采样时刻）；
+   * - absent = 旧样本（v0.9.10 之前落盘）/ CIM 不可用 / 账本不可读 / 无在册唤醒树。
+   */
+  memberTrees?: MemberTreeSample[];
+  /** memberTrees 缺席的原因（账本读取意外；CIM 失败走 degraded，不走本键）。 */
+  memberTreesError?: string;
+}
+
+/**
+ * v0.10.0（组 D / R7）：一棵无头进程树的记账条目。
+ *
+ * `idleMin` 的口径与诚实边界（写死）：**距该唤醒树最近一条生命周期账**
+ * （spawn 头行 / 启动确认 / 消费确认 / 退出观察）的分钟数。账本只在生命周期事件
+ * 落行，因此对正在跑回合的树它≈「回合已进行分钟数」——它不是「任务空闲」的判据
+ * （任务在途看任务板），只是树上最后一次引擎侧观察至今的时长；未来清扫器要判
+ * 「空闲树」必须再叠加任务板在途状态（R7 原文的「无在途任务、idle 超 N 分钟」），
+ * 本字段不承担该判定。
+ */
+export interface MemberTreeSample {
+  /** 成员键（花名册键；= 账本行里的 `to`）。 */
+  member: string;
+  /** 唤醒子根 pid（helper 汇报的启动证据；账本 `wake-child-start-confirmed` 行）。 */
+  rootPid: number;
+  /** 进程树工作集合计（字节；根进程 + 采样集内全部子孙，见 {@link memberTreesFromLedger}）。 */
+  bytes: number;
+  /** 距本棵唤醒树最近一条生命周期账的分钟数（口径见上方接口注释）。 */
+  idleMin: number;
+}
+
+/** capacity 文本面列出占用最大的几棵（R7「看门狗或清扫器可按阈值处理」的前置观测）。 */
+export const MEMBER_TREES_TOP_N = 3;
+
+/** 一条生命周期账文件提炼出的「候选树」（已排除已观察到退出的账）。 */
+export interface WakeTreeLedgerEntry {
+  /** 成员键（账本行 `to`；缺失时回落文件名分组）。 */
+  member: string;
+  /** helper 汇报的唤醒子 pid（启动确认行）。 */
+  rootPid: number;
+  /** 该账本全部行的最大 ts（idleMin 的基准）。 */
+  lastTs: number;
+}
+
+/**
+ * v0.10.0（组 D / R7）：扫 logs/ 下的唤醒生命周期账本，提炼候选进程树。
+ *
+ * 形状与 engine/wake.ts readDeliveryAttemptLedger 的反解同源（贪婪分组 + 锚定
+ * 数字尾段，成员键含连字符/数字也不误判）：
+ * - 只收**带启动确认 pid**（`wake-child-start-confirmed` 行的 `pid`）且**没有**
+ *   `wake-child-exit` 行的账——前者是「哪棵树」的唯一机器可分辨证据，后者表示
+ *   引擎已观察到唤醒子消失（进程已亡，无从汇总工作集）；
+ * - `lastTs` = 账本内最大 ts（坏行跳过；文件不可读按无此账）。
+ * 任何目录级读取意外向上抛（调用方 takeFreshSample 转成 memberTreesError）。
+ */
+export async function readWakeTreeLedger(stateRoot: string): Promise<WakeTreeLedgerEntry[]> {
+  const dir = logsDir(stateRoot);
+  const entries: WakeTreeLedgerEntry[] = [];
+  const pattern = /^wake-lifecycle-(.+)-(\d+)\.jsonl$/;
+  for (const file of await readdir(dir)) {
+    const matched = pattern.exec(file);
+    if (matched === null) continue;
+    let text: string;
+    try {
+      text = await readFile(join(dir, file), 'utf8');
+    } catch {
+      continue; // 单本账读失败不影响其余账（观测面尽力而为）
+    }
+    let member: string | undefined;
+    let rootPid: number | undefined;
+    let rootPidTs = -1;
+    let lastTs = 0;
+    let exited = false;
+    for (const raw of text.split(/\r?\n/)) {
+      if (raw.trim() === '') continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        continue; // 坏行不影响判据
+      }
+      if (typeof parsed !== 'object' || parsed === null) continue;
+      const rec = parsed as Record<string, unknown>;
+      const ts = rec['ts'];
+      if (typeof ts === 'number' && Number.isFinite(ts) && ts > lastTs) lastTs = ts;
+      const to = rec['to'];
+      if (member === undefined && typeof to === 'string' && to.trim() !== '') member = to;
+      const event = rec['event'];
+      if (event === 'wake-child-exit') {
+        exited = true;
+        continue;
+      }
+      if (event === 'wake-child-start-confirmed') {
+        const pid = rec['pid'];
+        const tsOk = typeof ts === 'number' && Number.isFinite(ts) ? ts : 0;
+        if (typeof pid === 'number' && Number.isSafeInteger(pid) && pid > 0 && tsOk >= rootPidTs) {
+          rootPid = pid;
+          rootPidTs = tsOk;
+        }
+      }
+    }
+    if (exited || rootPid === undefined) continue; // 已退出/无启动证据：不计树
+    entries.push({ member: member ?? matched[1]!, rootPid, lastTs });
+  }
+  return entries;
+}
+
+/**
+ * v0.10.0（组 D / R7）：候选树 + CIM 进程行 → 每棵树的工作集合计（纯函数）。
+ *
+ * 汇总口径：根进程 + 采样集内**全部子孙**（按 ppid 图 BFS；自环防御 + 访问集合防
+ * 环）。根 pid 不在采样集（进程已亡 / 非 ZCode 宿主形态 / CIM 漏采）→ 该树不计
+ * （不虚报 0 字节的树——「0」会被读成「这棵树没占内存」的断言）。结果按字节降序
+ * （占用最大的在前，供文本面 Top-N 与 payload 同序）。
+ */
+export function memberTreesFromLedger(
+  rows: readonly ProcRow[],
+  entries: readonly WakeTreeLedgerEntry[],
+  now: number,
+): MemberTreeSample[] {
+  const byPid = new Map<number, ProcRow>();
+  const children = new Map<number, number[]>();
+  for (const row of rows) {
+    byPid.set(row.pid, row);
+    if (row.ppid === row.pid) continue; // 自环防御
+    const list = children.get(row.ppid);
+    if (list === undefined) children.set(row.ppid, [row.pid]);
+    else list.push(row.pid);
+  }
+  const out: MemberTreeSample[] = [];
+  for (const entry of entries) {
+    if (!byPid.has(entry.rootPid)) continue; // 根进程不在采样集：不计（不虚报）
+    let bytes = 0;
+    const seen = new Set<number>();
+    const queue: number[] = [entry.rootPid];
+    while (queue.length > 0) {
+      const pid = queue.shift()!;
+      if (seen.has(pid)) continue;
+      seen.add(pid);
+      const row = byPid.get(pid);
+      if (row !== undefined) bytes += row.wsBytes;
+      for (const child of children.get(pid) ?? []) {
+        if (!seen.has(child)) queue.push(child);
+      }
+    }
+    out.push({
+      member: entry.member,
+      rootPid: entry.rootPid,
+      bytes,
+      idleMin: Math.max(0, Math.floor((now - entry.lastTs) / 60_000)),
+    });
+  }
+  return out.sort((a, b) => b.bytes - a.bytes);
 }
 
 export type CapacityViolatedRule = 'watermark' | 'session-limit' | 'turn-concurrency';
@@ -690,6 +856,20 @@ export function formatCapacityLines(s: CapacitySample, verdict: CapacityVerdict)
       + (s.degraded === null ? '' : ` | degraded=${s.degraded}`),
   ];
   for (const d of verdict.detail) lines.push(`  - ${d}`);
+  // v0.10.0（组 D / R7）：每棵无头进程树的记账（占用最大的前 MEMBER_TREES_TOP_N 棵）。
+  // 只在采样成功且账本可读时出现（memberTrees 在场）；absent = 不占行（旧样本 /
+  // CIM 失败 / 账本不可读——后者由 payload 的 memberTreesError 带原因）。
+  if (s.memberTrees !== undefined && s.memberTrees.length > 0) {
+    // 防御性排序：memberTreesFromLedger 产出恒降序，但缓存/外部写入不保证——
+    // 「Top N」的语义必须由展示层自己成立（拷贝排序，不改调用方数组）。
+    const sorted = [...s.memberTrees].sort((a, b) => b.bytes - a.bytes);
+    const top = sorted.slice(0, MEMBER_TREES_TOP_N);
+    const detail = top
+      .map((t) => `${t.member}=${formatBytes(t.bytes)}(pid ${t.rootPid}, idle ${t.idleMin}min)`)
+      .join(", ");
+    const more = s.memberTrees.length > top.length ? ` 等 ${s.memberTrees.length} 棵` : '';
+    lines.push(`  - 回合树 Top${top.length}: ${detail}${more}（按唤醒生命周期账本 pid 汇总；只记账不清理）`);
+  }
   // C9（DESIGN-V0.7.md §5）：标红才给压缩建议行——绿样本不噪声化面板。
   if (verdict.red) lines.push(COMPRESS_ADVICE_LINE);
   return lines;
@@ -723,9 +903,21 @@ function watermarkOf(totalBytes: number, freeBytes: number): number {
   return totalBytes > 0 ? freeBytes / totalBytes : 1;
 }
 
-/** 惰性采样入口（DESIGN §3.3）：窗口期内回缓存，否则真采样并尽力写缓存。 */
+/** 惰性采样入口（DESIGN §3.3）：窗口期内回缓存，否则真采样并尽力写缓存。
+ *
+ * v0.10.0（组 D / R7）：stateRoot 从 cacheFile 反解（`<stateRoot>/capacity/sample.json`）
+ * 传给真采样——进程树记账要读 `<stateRoot>/logs/` 下的唤醒生命周期账本。反解不出
+ * （异常 cacheFile 形状）→ 不传（memberTrees 缺席，其余字段行为不变）。
+ */
 export async function sampleCapacity(env: NodeJS.ProcessEnv, cacheFile: string, now: number): Promise<CapacitySample> {
-  return sampleCapacityWithSampler(env, cacheFile, now, () => takeFreshSample(now));
+  return sampleCapacityWithSampler(env, cacheFile, now, () => takeFreshSample(now, stateRootFromCacheFile(cacheFile)));
+}
+
+/** cacheFile（`<stateRoot>/capacity/sample.json`）→ stateRoot；形状异常返回 undefined（不猜）。 */
+function stateRootFromCacheFile(cacheFile: string): string | undefined {
+  const dir = dirname(cacheFile); // <stateRoot>/capacity
+  const root = dirname(dir); // <stateRoot>
+  return root === dir ? undefined : root;
 }
 
 /**
@@ -760,8 +952,14 @@ export async function sampleCapacityWithSampler(
   return fresh;
 }
 
-/** 一次真采样（os 水位 + CIM 分类；now 注入保持纯度）。 */
-export async function takeFreshSample(now: number = Date.now()): Promise<CapacitySample> {
+/** 一次真采样（os 水位 + CIM 分类 + v0.10.0 组 D：无头进程树记账；now 注入保持纯度）。
+ *
+ * `stateRoot` 可选：给出时才读唤醒生命周期账本算 memberTrees（测试与旧调用点不传 =
+ * 行为逐字节不变）。账本读取意外只让 memberTrees 缺席并带 {@link CapacitySample.memberTreesError}，
+ * **绝不**让记账失败拖垮 os 水位/CIM 分类这些主字段（R7 验收：采样失败时该字段缺席
+ * 并如实标注，不让采样整体失败）。
+ */
+export async function takeFreshSample(now: number = Date.now(), stateRoot?: string): Promise<CapacitySample> {
   const { totalBytes, freeBytes } = readOsWatermark();
   const watermark = watermarkOf(totalBytes, freeBytes);
   const rows = await sampleZcodeTree();
@@ -782,6 +980,17 @@ export async function takeFreshSample(now: number = Date.now()): Promise<Capacit
   for (const [kind, bucket] of Object.entries(tree.categories)) {
     if (bucket.count > 0) categoryCounts[kind] = bucket.count;
   }
+  // v0.10.0（组 D / R7）：进程树记账（best-effort；失败只缺席该字段 + 标注原因）。
+  let memberTrees: MemberTreeSample[] | undefined;
+  let memberTreesError: string | undefined;
+  if (stateRoot !== undefined) {
+    try {
+      const entries = await readWakeTreeLedger(stateRoot);
+      memberTrees = memberTreesFromLedger(rows, entries, now);
+    } catch (error) {
+      memberTreesError = error instanceof Error ? error.message : String(error);
+    }
+  }
   return {
     sampledAt: now,
     totalBytes,
@@ -792,6 +1001,8 @@ export async function takeFreshSample(now: number = Date.now()): Promise<Capacit
     headlessTurnMaxRssBytes: tree.headlessTurnMaxRssBytes,
     degraded: null,
     categoryCounts,
+    ...(memberTrees !== undefined ? { memberTrees } : {}),
+    ...(memberTreesError !== undefined ? { memberTreesError } : {}),
   };
 }
 
@@ -819,6 +1030,10 @@ async function readSampleCache(cacheFile: string, now: number, minMs: number): P
               .map(([k, v]) => [k, Number(v)]),
           )
         : undefined;
+    // v0.10.0（组 D / R7）：进程树记账宽容读取——逐条形状校验（member 非空串 /
+    // rootPid 正整数 / bytes ≥0 / idleMin 非负整数），坏条目丢弃不拒整块；
+    // 键缺席（旧样本）= absent。与 steadyTreeBytes 等同为进程类缓存字段。
+    const memberTrees = coerceMemberTrees(rec['memberTrees']);
     return {
       sampledAt,
       totalBytes,
@@ -829,10 +1044,34 @@ async function readSampleCache(cacheFile: string, now: number, minMs: number): P
       headlessTurnMaxRssBytes: rec['headlessTurnMaxRssBytes'] === null ? null : Number.isFinite(maxRss) && maxRss >= 0 ? maxRss : null,
       degraded: rec['degraded'] === 'cim-unavailable' ? 'cim-unavailable' : null,
       ...(categoryCounts !== undefined && Object.keys(categoryCounts).length > 0 ? { categoryCounts } : {}),
+      ...(memberTrees !== undefined ? { memberTrees } : {}),
+      ...(typeof rec['memberTreesError'] === 'string' && rec['memberTreesError'].trim() !== ''
+        ? { memberTreesError: rec['memberTreesError'] }
+        : {}),
     };
   } catch {
     return null; // 缺文件/损坏 JSON → 重采样
   }
+}
+
+/** v0.10.0（组 D / R7）：sample.json 里 memberTrees 的宽容解析（坏条目丢弃；非数组 → undefined）。 */
+function coerceMemberTrees(value: unknown): MemberTreeSample[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const out: MemberTreeSample[] = [];
+  for (const raw of value) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) continue;
+    const rec = raw as Record<string, unknown>;
+    const member = rec['member'];
+    const rootPid = rec['rootPid'];
+    const bytes = rec['bytes'];
+    const idleMin = rec['idleMin'];
+    if (typeof member !== 'string' || member.trim() === '') continue;
+    if (typeof rootPid !== 'number' || !Number.isSafeInteger(rootPid) || rootPid <= 0) continue;
+    if (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes < 0) continue;
+    if (typeof idleMin !== 'number' || !Number.isSafeInteger(idleMin) || idleMin < 0) continue;
+    out.push({ member, rootPid, bytes, idleMin });
+  }
+  return out;
 }
 
 async function writeSampleCache(cacheFile: string, sample: CapacitySample): Promise<void> {

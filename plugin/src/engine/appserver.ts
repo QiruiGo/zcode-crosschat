@@ -311,9 +311,16 @@ export class AppServerKeeper {
       );
     }
     const spawnImpl = options.spawnImpl ?? spawn;
+    // v0.10.0（C3，防御性对齐）：与插件其余 9 处进程创建点（wake direct/helper 跳板、
+    // 唤醒子 ZCode.exe、zcode-locate 探测、capacity/registry CIM、session-start 宿主
+    // 枚举、steer taskkill、进程树枚举）逐点对齐补 windowsHide——本处（AppServerKeeper
+    // .start，唯一调用方 provision.ts 成员供给）此前是唯一漏点。今天无害（ZCode.exe
+    // PE subsystem=2=WINDOWS_GUI，GUI 子系统子进程本就不分配控制台），但若换用
+    // console 子系统的启动器即闪窗（GAP 第十四批记录项一的防御缺口）。
     const child = spawnImpl(cfg.zcodeExe, [cfg.zcodeCjs, "app-server"], {
       env: { ...(options.env ?? process.env), ELECTRON_RUN_AS_NODE: "1" },
       stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
     });
     return new AppServerKeeper(child, options);
   }

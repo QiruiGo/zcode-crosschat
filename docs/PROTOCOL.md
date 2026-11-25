@@ -363,7 +363,7 @@ total = clamp(16000 × scale, 4000, 64000)，且 total ≥ item  # 批次基准�
 | `XC_INJECT_TOTAL_CHARS` | `inject_total_chars` | 空 | 批次预算覆盖（0/非法=自动） |
 | `XC_USERVOICE_TTL_MS` | `uservoice_ttl_ms` | `600000`（10min） | 盖章链匹配窗口；每条原话 ≤3 次 |
 
-仅代码读取、无用户设置项的演练 env：`XC_STALL_MINUTES`（停滞阈值，缺省 120；小于 `XC_STALE_TASK_MINUTES` 时按 stale 钳制并附 WARNING + payload `stalledThresholdClamped`；v0.8.1 起 0/负数/非数字同样**不静默**——回落内置缺省 120min 并附 WARNING + payload `stalledThresholdFallback:true`，见 §5）、`XC_MEM_WARN_WATERMARK`（缺省 0.15；合法域 (0,1)，v0.8.1 起越界值（0/负数/≥1/非数字）不再静默——回落内置缺省并附 WARNING + capacity payload `memWarnWatermarkFallback:true`，见 §5）、`XC_MEM_SESSION_LIMIT_BYTES`（缺省 800MB）、`XC_TURN_ESTIMATE_BYTES`（并发 headless 回合单回合瞬时占用预估，缺省 1.5GB=1610612736 字节；>0 合法，非法/未设回落缺省——见 §5 预警规则 3；v0.9.1 起同时是 spawn 前容量闸的**边际预估**判据，见 §15.2）、`XC_MEM_SAMPLE_MIN_MS`（缺省 60000）、`XC_MEM_WAKE_COOLDOWN_MS`（v0.9.1 G-12-b 容量闸冷却窗，缺省 120000=120s；>=0 合法，0=每次投递都重新判定，非法/未设回落缺省——见 §15.2）、`XC_MEM_WAKE_GATE`（v0.9.1 G-12-b 容量闸开关；`off`=关闸回到「只警不拦」，其余值/未设=开启——见 §15.2）、`XC_LIMBO_TIMEOUT_MS`（v0.9.1 G-12v3 消费确认超时，缺省 600000=10min；盖章后无 `consumedAt` 回写即自动降级回 unread，见 §15.3）、`XC_WAKE_SLOW_MS`（v0.9.1 G-12v3 wake-slow 阈值，缺省 300000=5min；spawn 后无 session-start 即告知 lead，见 §15.3）、`XC_TOOL_REQUEST_TTL_MS`（v0.7 C6 转办请求缺省有效期，缺省 3600000=1h，硬上限 86400000=24h）、`XC_OFFLINE_MINUTES`（v0.7 C8 离线判定空闲阈值，缺省 240min；低于 `XC_STALE_TASK_MINUTES` 时按 stale 钳制并附 WARNING；v0.7.2 起 0/负数/非数字同样**不静默**——回落内置缺省 240min 并附 WARNING + payload `offlineThresholdFallback:true`，见 §12）、`XC_CHECKPOINT_NUDGE`（v0.8 检查点提醒开关；**`0` = 关闭 UserPromptSubmit 的检查点提醒**，其余值/未设 = 默认开启。判据五态与 30min 阈值/节流见 §14.2；阈值本身不做 env 化）、`XC_START_CONFIRM_MS`（v0.9.2 A1 同步启动确认窗口，缺省 5000ms；正整数，0/负/非整数/不可解析 → 回落缺省，回落不静默（回执仍按「已发起但未见启动证据」如实措辞）——见 §15.5）、`XC_WATCHDOG_MS`（v0.9.2 A2 成员看门狗轮询间隔，缺省 60000=60s；0=关（不启动定时器），非数字/负数 → 回落缺省——见 §15.5）、`XC_DEFERRED_ALERT_N`（v0.9.3 B3 wake-deferred 累积告警阈值，缺省 5；正整数，0=关该告警，非正整数/不可解析 → 回落缺省——见 §15.7）、`XC_DEFERRED_ALERT_WINDOW_MS`（v0.9.3 B3 累积窗，缺省 600000=10min；正整数，0=关该告警，非正整数/不可解析 → 回落缺省——见 §15.7）、`XC_WAKE_OFF_ALERT_MS`（v0.9.3 B3 唤醒开关持续关闭告警阈值，缺省 1800000=30min；正整数，0=关该告警，非正整数/不可解析 → 回落缺省——见 §15.7）。均为高级 env，不进插件设置面。
+仅代码读取、无用户设置项的演练 env：`XC_STALL_MINUTES`（停滞阈值，缺省 120；小于 `XC_STALE_TASK_MINUTES` 时按 stale 钳制并附 WARNING + payload `stalledThresholdClamped`；v0.8.1 起 0/负数/非数字同样**不静默**——回落内置缺省 120min 并附 WARNING + payload `stalledThresholdFallback:true`，见 §5）、`XC_MEM_WARN_WATERMARK`（缺省 0.15；合法域 (0,1)，v0.8.1 起越界值（0/负数/≥1/非数字）不再静默——回落内置缺省并附 WARNING + capacity payload `memWarnWatermarkFallback:true`，见 §5）、`XC_MEM_SESSION_LIMIT_BYTES`（缺省 800MB）、`XC_TURN_ESTIMATE_BYTES`（并发 headless 回合单回合瞬时占用预估，缺省 1.5GB=1610612736 字节；>0 合法，非法/未设回落缺省——见 §5 预警规则 3；v0.9.1 起同时是 spawn 前容量闸的**边际预估**判据，见 §15.2）、`XC_MEM_SAMPLE_MIN_MS`（缺省 60000）、`XC_MEM_WAKE_COOLDOWN_MS`（v0.9.1 G-12-b 容量闸冷却窗，缺省 120000=120s；>=0 合法，0=每次投递都重新判定，非法/未设回落缺省——见 §15.2）、`XC_MEM_WAKE_GATE`（v0.9.1 G-12-b 容量闸开关；`off`=关闸回到「只警不拦」，其余值/未设=开启——见 §15.2）、`XC_LIMBO_TIMEOUT_MS`（v0.9.1 G-12v3 消费确认超时，缺省 600000=10min；盖章后无 `consumedAt` 回写即自动降级回 unread，见 §15.3）、`XC_WAKE_SLOW_MS`（v0.9.1 G-12v3 wake-slow 阈值，缺省 300000=5min；spawn 后无 session-start 即告知 lead，见 §15.3）、`XC_TOOL_REQUEST_TTL_MS`（v0.7 C6 转办请求缺省有效期，缺省 3600000=1h，硬上限 86400000=24h）、`XC_OFFLINE_MINUTES`（v0.7 C8 离线判定空闲阈值，缺省 240min；低于 `XC_STALE_TASK_MINUTES` 时按 stale 钳制并附 WARNING；v0.7.2 起 0/负数/非数字同样**不静默**——回落内置缺省 240min 并附 WARNING + payload `offlineThresholdFallback:true`，见 §12）、`XC_CHECKPOINT_NUDGE`（v0.8 检查点提醒开关；**`0` = 关闭 UserPromptSubmit 的检查点提醒**，其余值/未设 = 默认开启。判据五态与 30min 阈值/节流见 §14.2；阈值本身不做 env 化）、`XC_START_CONFIRM_MS`（v0.9.2 A1 同步启动确认窗口，缺省 5000ms；正整数，0/负/非整数/不可解析 → 回落缺省，回落不静默（回执仍按「已发起但未见启动证据」如实措辞）——见 §15.5）、`XC_WATCHDOG_MS`（v0.9.2 A2 成员看门狗轮询间隔，缺省 60000=60s；0=关（不启动定时器），非数字/负数 → 回落缺省——见 §15.5）、`XC_DEFERRED_ALERT_N`（v0.9.3 B3 wake-deferred 累积告警阈值，缺省 5；正整数，0=关该告警，非正整数/不可解析 → 回落缺省——见 §15.7）、`XC_DEFERRED_ALERT_WINDOW_MS`（v0.9.3 B3 累积窗，缺省 600000=10min；正整数，0=关该告警，非正整数/不可解析 → 回落缺省——见 §15.7）、`XC_WAKE_OFF_ALERT_MS`（v0.9.3 B3 唤醒开关持续关闭告警阈值，缺省 1800000=30min；正整数，0=关该告警，非正整数/不可解析 → 回落缺省——见 §15.7）、`XC_WATCHDOG_WAKE_LEAD`（v0.10.0 R5：看门狗 urgent 告警（member-dead 等）是否尝试唤醒 lead；**只认字面量 `"1"`**，未设/空串/`0`/`true` 全按「不唤醒、只写 urgent 邮箱」——见 §16.4）、`XC_DISPATCH_RESUME_COOLDOWN_MS`（v0.10.0 A4：看门狗补醒冷却窗，缺省 120000=120s；`0`=不冷却，负/非数字回落缺省——两类未读（未读派单 / 未读紧急回执）共用一窗，见 §16.3）、`XC_URGENT_REPORT_MAX`（v0.10.0 R8：插队回单限速，同一成员 10 分钟窗内最多 N 次 urgent 回单；正整数，未设/空串/非正/不可解析 → 缺省 5，见 §16.2）、`XC_RESUME_WAKE_MAX`（v0.10.0 第 5 轮：补醒防风暴闸，同一成员 10 分钟窗内最多 N 次**真唤醒**补醒——只数 `dispatch-resume`/`report-resume` ∧ `delivered !== "mailbox"` 的行，被闸挡下只落邮箱的不占额度；正整数，未设/空串/非正/不可解析 → 缺省 5，**不接受「`0` = 关闭」**，达标只落 `resume-wake-deferred` 审计、不调 attemptWake，见 §16.3）。均为高级 env，不进插件设置面。
 
 ## 10. 身份与安全底线（v0.6 口径）
 
@@ -530,6 +530,8 @@ crosschat 的 MCP server 是宿主外独立 stdio 进程，不持有其他 MCP �
 | 记录 `reason:'lastSeen-stale'`（pid 活、心跳过期；心跳 15s） | 进程活着但空闲/长回合 | `liveness='heartbeat-stale'`——**不是死** |
 | 无记录（回合间隙 / 从未 peer 注册；优雅退出也会摘记录） | 未知 | `liveness='no-record'`——按空闲处理，**不可检出为离线** |
 | `lastSeen` 新鲜 | 上次工具调用时刻 | `liveness='live'` |
+
+**v0.10.0 第 5 轮增补（真实复测 mustFix #1）**：`pid-dead` 判定前多一道「注册表活 pid 一票否决」——peer 扫描落在 dead 分区、但注册表会话记录的 pid 活着（`sessionPid.alive === true`）时判 `heartbeat-stale` 而非 `pid-dead`（活证据优先：dead 分区记录可能是会话重启换 pid 不换 sid 的旧化身残留；判 `heartbeat-stale` 而非 `live` = 只证明进程没死、没有心跳证据，宁可不判进程死也不错判）。无该证据或 `alive=false` 时维持 `pid-dead` 不变。该判据同时进 `member-dead` 与 `xc_overview` 三视图成员行（`livenessSources` 展示面）——详见 §16.4。
 
 `offlineVerdict(task, member, liveness, now, thresholdMs)`：
 
@@ -1252,7 +1254,11 @@ degraded 样本只评 watermark——不虚报）；
 （同一成员同一次死亡只发一次，状态真源 `capacity/watchdog-state.json`；跨进程认领锁保证
 同一次事故只有一个通告者）；发 = engine 事件 + lead 邮箱 urgent + **尝试唤醒 lead**
 （受 §15.2 容量闸约束，冷却/延迟按该节口径）。lead 自己死 → 通知其余在册成员并唤醒
-（复用 C6-BUG-4「不通知崩溃者自己的邮箱」口径：已判 pid-dead 的成员一律不收）。
+（复用 C6-BUG-4「不通知崩溃者自己的邮箱」口径：**判死的成员一律不收**——v0.10.0 第 7 轮
+起判死口径 = `memberLivenessView` 的 `state==='dead'`，即活性 pid-dead **或**注册表记录
+自述 dead 且无 live/heartbeat-stale 活证据；含本轮刚死与往轮已死。给死会话写邮箱/唤醒死
+sid 必然 sessionNotFound，只会制造 wake-failed + wake-retry-failed 双事件与双 urgent 噪音；
+pid 被回收复用也不会让已判亡成员回到收件人名单，见 §16.4）。
 看门狗全部随进程死亡时，由 UserPromptSubmit 的**回合开始事故摘要**（自上次回合
 `lastTurnTs`：N 个成员死亡 / M 条 limbo 降级 / K 次唤醒失败）兜底。
 
@@ -1275,6 +1281,8 @@ degraded 样本只评 watermark——不虚报）；
 ```json
 {"event":"watchdog-wake","teamId":"default","to":"b","delivered":"wake"}
 ```
+
+`note` 是自由文本原因行（可选键，仅在有值时在场）；v0.10.0 起已知取值域：容量闸 deferral 的原因与重试窗口（§15.2）、lead 默认档「未尝试唤醒」（§16.4）、**告警收件人回合进行中而未唤醒**（第 6 轮忙闲闸挡下，§16.8）——第三种不改变键集，只给既有的 `note` 可选键新增一种取值。
 
 **engine 事件 `watchdog-notify-skipped`**（无人可通知：lead 死且无其他活成员 / 全员
 不可寻址 → 只落审计，不抛、不回退；键集冻结，行级 `ts` 除外）：
@@ -1447,3 +1455,164 @@ server 最坏各发一条（方向是罕见重复而非漏报），engine.jsonl 
 env 口径（不在本版文件域），未设 capacity 段时各面行为与 v0.9.2 完全一致；
 ④ 告警文案里的开启/关闭指引与既有口径一致（config.json 一行开启、`XC_MEM_WAKE_GATE=off`
 关闸均不静默）。
+
+## 16. v0.10.0 增量：派单忙闲闸 / 插队回单 / 看门狗判亡四道校验 / 协作根归并 / 职能声明与后台回合可见性
+
+本节只**追加**新事件名、新回执字段与新判据，不改动 §3/§7/§7.1/§15.2/§15.3/§15.5 的任何冻结示例与既有键集（protocol-frozen-contract 系列测试按 marker 取块对拍，本节位于其全部 marker 之后，不参与既有取块）。
+
+### 16.1 派单忙闲闸（R2/G-28）：`dispatch-deferred-busy` 与回执 `deferred` 块
+
+`xc_dispatch` 在调用 `wake` **之前**加忙闲闸（锁内判据一次现读）：收方满足任一即判忙——① 任务板上存在它 `claimed`/`in_progress` 的在途任务；② 注册表会话记录 `liveness=running` 且 `livenessTs` 可信（`session-running` 之后无 `session-idle` 的落盘投影）。收方忙时**跳过 spawn、只落邮箱**（`delivered=mailbox`），不产生第二个无头回合（G-28：同一会话两路并发互相抢信箱）。收方不忙时 `wake` 调用、审计（`dispatch` 事件）、回执三面逐字节不变；同票去重、幂等、生命周期闸原样。
+
+**engine 事件 `dispatch-deferred-busy`**（键集冻结，行级 `ts` 除外）：
+
+```json
+{"event":"dispatch-deferred-busy","teamId":"default","to":"b","taskId":"t-112","openTaskIds":["t-111"],"sessionRunning":true}
+```
+
+`openTaskIds` = 收方在途任务 id（仅会话回合在跑而任务板无在途单时为空数组）；`sessionRunning` = 判据②是否命中。
+
+**回执新增字段**（`xc_dispatch` payload，仅忙路径在场；缺省不出键）：
+
+```json
+{"deferred":{"reason":"busy","openTaskIds":["t-111"]}}
+```
+
+人可读行同形携带「成员在途，已落邮箱，回合结束后补醒」。消息已在邮箱，pull 兜底不丢单；补醒由看门狗负责（§16.3）。
+
+**忙的定义不含 `blocked`**（v0.10.0 口径，写死）：`blocked` 是认领者显式申报的暂停、不是回合在跑，不计入上面两条判据（与 claim 侧 `already_has_open_task` 的收方侧投影对齐）——成员 blocked 中再派单照旧尝试唤醒。
+
+### 16.2 插队回单（R8）：`xc_report` 的 `urgent`、`report-urgent` 与限速
+
+`xc_report` 新增**可选参数** `urgent`（布尔；工具面仍恰 10，0 新增必填配置）。`urgent:true` = 插队回单：回执消息 `urgent` 置顶 + 对任务创建者一次 `urgent:true` 唤醒尝试；创建者非 lead 时 lead 邮箱落一份**不唤醒**的通知（含要点摘录）；人可读行以【插队回单】开头。半截（`in_progress`/`blocked`）回单同样可用——不必等任务 `completed`。
+
+**防风暴**：同一成员 10 分钟内最多 5 次 urgent 回单（常量 `URGENT_REPORT_WINDOW_MS = 600000`、`URGENT_REPORT_MAX_DEFAULT = 5`，env `XC_URGENT_REPORT_MAX` 覆盖；未设/空串/非正/不可解析 → 缺省 5）。计数真源 = engine.jsonl 的 `report-urgent` 审计事件（有界尾读）。超出的**自动降级**为普通回单并在回执写明原因；降级 Attempt 不落 `report-urgent`（不占额度），只在常规 `report` 事件留 `urgentDowngraded` 与 `urgentDowngradedReason`。
+
+**engine 事件 `report-urgent`**（键集冻结，行级 `ts` 除外；`reason`/`leadNotified`/`leadDeferred`/`startConfirmed` 为可选键，仅命中时在场）：
+
+```json
+{"event":"report-urgent","teamId":"default","taskId":"t-121","from":"b","to":"lead","woke":true,"status":"in_progress"}
+```
+
+`woke` = 本次是否真的发起了唤醒（被任何闸挡下时 `false`，原因见常规 `report` 事件的 `wakeBack`/`note` 与人可读行的「已落邮箱、未唤醒」）。
+
+**收件人回合进行中时不唤醒**（用户追加裁决）：判据 = 注册表 `liveness=running` ∧ `livenessTs` 可信 ∨ 有 15min 窗内新鲜未消费的在途 wake nonce（与 §15.2 的在途判据同源）。命中即**不调用 attemptWake**：回执消息照常 urgent 落邮箱排未读最前，content 的 task-receipt 帧打待补醒标记 `wakeDeferred:"recipient-turn-running"`，人可读行明说「已落邮箱、未唤醒：收方回合进行中，回合结束后送达」。
+
+**engine 事件 `report-urgent-deferred`**（键集冻结，行级 `ts` 除外；`target` 仅 lead 通知被挡下时在场）：
+
+```json
+{"event":"report-urgent-deferred","teamId":"default","taskId":"t-121","from":"b","to":"lead","reason":"recipient-turn-running","status":"in_progress"}
+```
+
+创建者≠lead 且 lead 回合进行中时，lead 通知目标同样落一条（`to=lead`、`target:"lead-notice"`）。该事件是「谁欠一次补醒」的耐久真源（看门狗按邮箱标记补醒，见 §16.3）。
+
+### 16.3 看门狗补醒：`dispatch-resume` 与 `report-resume`
+
+看门狗扫描到「成员空闲 ∧ 无在途唤醒 ∧ 收件箱有两类未读之一」时补一次唤醒（不新增状态文件，证据取 wake 生命周期账与邮箱）：
+
+- 未读**派单**（task-assignment）→ scene `dispatch-resume`（不 urgent）；
+- 未读**紧急回执**（task-receipt ∧ `urgent===true` ∨ 帧上 `wakeDeferred==="recipient-turn-running"`）→ scene `report-resume` 且 `urgent:true`。
+
+非紧急 task-receipt（stale 清扫回执等）**不**触发补醒。两类共用同一冷却窗（缺省 120s，env `XC_DISPATCH_RESUME_COOLDOWN_MS` 覆盖；`0` = 不冷却），照常经过容量闸与在途 nonce 闸（紧急不豁免）。收件人回合进行中（活性视图非 idle / 引擎证言非 idle / 有在途 nonce）**绝不补醒**。
+
+**补醒防风暴闸（第 5 轮，对抗 ADV-02）**：同一成员 **10 分钟窗内最多 5 次真唤醒补醒**（常量 `RESUME_WAKE_WINDOW_MS = 600000`、`RESUME_WAKE_MAX_DEFAULT = 5`，env `XC_RESUME_WAKE_MAX` 覆盖；正整数，未设/空串/非正/不可解析 → 缺省 5，**不接受「`0` = 关闭」**——把配错当成关了会让风暴重现，要停补醒语义请把冷却设成正数的大值或关看门狗）。计数真源 = engine.jsonl 的 `dispatch-resume`/`report-resume` 事件 ∧ `to` 命中 ∧ `delivered !== "mailbox"` ∧ 时刻落窗内（有界尾读；被任何闸挡下只落邮箱的行不占额度）。达标后**不调 attemptWake、不动邮箱**（零 nonce、零生命周期账），消息仍留邮箱未读、pull 兜底不丢，只落审计（事件键集见下面两个冻结块）：
+
+**engine 事件 `dispatch-resume` / `report-resume`**（键集冻结，行级 `ts` 除外；`wakeDeferred`/`retryAfterMs` 仅补醒被容量闸挡下时在场）：
+
+```json
+{"event":"dispatch-resume","teamId":"default","to":"b","sessionId":"sess-b","taskIds":["t-112"],"messageIds":["m-1"],"delivered":"wake","cooldownMs":120000,"note":"<判据与降级说明>"}
+```
+
+**engine 事件 `resume-wake-deferred`**（键集冻结，行级 `ts` 除外；`reason` 唯一取值 `resume-wake-cap` = 补醒防风暴闸挡下）：
+
+```json
+{"event":"resume-wake-deferred","teamId":"default","to":"b","sessionId":"sess-b","scene":"dispatch-resume","reason":"resume-wake-cap","taskIds":["t-112"],"messageIds":["m-1"],"resumeWakeMax":5,"note":"<一句话说明>"}
+```
+
+不复用 §15.2 的 `wake-deferred`：那组键集冻结为容量闸专属（watermark/freeBytes/detail/… 恒在），同名落这 9 键会破坏冻结面——按「新事件用新名」的既定纪律起新名；运维可一条事件看出「本轮想补但被防风暴闸挡下」与「补了但被容量闸挡下」（后者仍是 `dispatch-resume`/`report-resume` 的 `delivered:"mailbox"` + `wake-deferred` 原因行）的区别。
+
+### 16.4 看门狗判亡四道校验（R3/G-29）与 `suspect-dead` / `session-dead`
+
+判 `member-dead`（pid-dead/process-dead）**之前**先过四道校验，前三道为纯判据（`core/offline.ts` `sessionDeathGuard`），第四道为跨周期二次确认：
+
+1. **在途唤醒**：有未消费 nonce、或生命周期账有 start 无 exit 且落在 15min 在途窗内、或 spawn 落在启动窗内而此后尚无 `session-running`、或唤醒子 pid 仍活着；
+2. **在途任务**：名下存在 `claimed`/`in_progress` 任务（在途即活）；
+3. **更新的 pid**：注册表已有比记录 pid 更新的活 pid（认领前的 TOCTOU 重读）；
+4. **二次确认**：首次判死只记 suspect（台账 state 仍 alive），连续第二个扫描周期仍判死才发 `member-dead` 并回池。
+
+被前三道豁免的成员不发 `member-dead`、不回池、不告警，只落审计（豁免本身必须可见，否则豁免成了新的静默区）。
+
+**二次确认的代价（如实声明）**：真正掉线的检出比单周期晚一个扫描周期（`XC_WATCHDOG_MS` 缺省 60s，即最坏约两个轮询间隔才发 `member-dead` 并回池）——这是用「晚一个周期检出」换 R3 当日 21 次误判归零的自觉取舍，见 [docs/LIMITATIONS.md](LIMITATIONS.md) 第 28 条。
+
+**engine 事件 `suspect-dead`**（键集冻结，行级 `ts` 除外；`reasons` 取值域 `inflight-wake`/`open-tasks`/`newer-pid`，首次判死时为空数组）：
+
+```json
+{"event":"suspect-dead","teamId":"default","member":"b","sessionId":"sess-b","liveness":"pid-dead","evidence":"process-dead","reasons":["inflight-wake"],"via":"watchdog","note":"<一句话说明>"}
+```
+
+**engine 事件 `session-dead`**（R6/G-24 注册表活性双写；`core/registry.ts` `markSessionDead`）：`member-dead` 是**告警**事件，`session-dead` 是**注册表活性翻转**事件，一次判亡两条（同成员同 sid，可逐条对账）。`running`/`idle` → `dead` 落它；重新 register（`anchorSessionForRegister`）或下一回合边界（`refreshSessionLastSeen`）翻回 `running`/`idle` 同样落它（`prev` 如实记来源态）。判亡翻转**不写证言**（`registry/witness/<sid>.json` 只记引擎亲见的活动）。
+
+```json
+{"event":"session-dead","sessionId":"sess-b","prev":"running","state":"dead","name":"b"}
+```
+
+**lead 不被死亡告警拉起**（R5，用户点 2）：member-dead 及其它看门狗 urgent 告警对 lead 类收件人**只写 urgent 邮箱、不调用 attemptWake**——主控在自己回合即可看到告警，不被强行拉起成无头分身。env `XC_WATCHDOG_WAKE_LEAD=1` 显式恢复旧行为（只认字面量 `"1"`）。「是否尝试过唤醒」由 `watchdog-wake` 事件如实记录（`delivered=mailbox` + note 注明未尝试唤醒）。队友收件人（lead 已死时的转移通知）与派单/回执/普通唤醒路径不受影响。
+
+**memberLiveness 的「注册表活 pid 一票否决」（第 5 轮，真实复测 mustFix #1）**：`core/offline.ts` 的 dead 分区分支新增一票否决——peer 扫描落在 dead 分区、但注册表会话记录的 pid 活着（`sessionPid.alive === true`，SessionStart 钩子写的宿主进程 pid）时，判 `heartbeat-stale` 而非 `pid-dead`：dead 分区记录可能是**旧化身残留**（会话重启换 pid 不换 sid；曾 `xc_identify` 的会话当前回合不刷新 peer 端点时，扫描只剩过期端点记录、其 pid 已亡），peer 证据与注册表 pid 证据冲突时**活证据优先**。判 `heartbeat-stale` 而非 `live`：没有心跳证据证明它在协作面上活着，只证明进程没死（宁可不判进程死，也不错判）。无 `sessionPid` 证据或 `alive=false` 时维持 `pid-dead`（不放松既有判死）。该判据同时进 `memberLivenessView`（`core/liveness.ts`）的展示面：成员行不再因陈旧 peer 记录翻 `dead`，`livenessSources` 按其余判据如实列（全静默时仍是空列表 + 保守 idle，不冒充活跃）；`member-dead` 判据同源（看门狗 phase 1 与三视图注入同一 pid 证据，`engine/watchdog.ts` 与 `mcp/tools-overview.ts` 的 `sessionPidFor`），不会一个报 dead 一个报 running。
+
+**判死/收件人/重新武装共用视图的 dead（第 7 轮，真实加测 R3 §6.1）**：第 7 轮起，看门狗里三处原先各自用「活性字符串 === 'pid-dead'」的判据（判死候选、告警收件人过滤、台账 dead→alive 的重新武装）统一改为 `memberLivenessView` 的 `state === 'dead'`——后者 = 活性为 `pid-dead` **或**注册表记录自述 `dead` 且没有 live/heartbeat-stale 这类活证据（记录自述 dead 由 `markSessionDead` 落盘）。**重新武装因此需要正向复活证据**：注册表记录不再自述 `dead`（该会话自己的钩子写过 `running`/`idle`），或有 live/heartbeat-stale 证据；**记录仍自述 dead 时，即使存储的 pid 已被系统回收复用**（`alive(storedPid)` 为真令 pid 证据支整支失效、活性退成 `no-record`，旧字符串判据下死人不再是 pid-dead）**也按死人处理**——不重新武装、不进告警收件人名单、不被唤醒。修的是「僵尸回路」：死成员被重新拉活 → 进收件人名单被 `watchdog-wake` 拉起一回合 → 再死，member-dead 反复（真实加测 R3 §6.1 实证：m2 于 04:50:33 被重新武装、04:51:35 被拉起）。存量形态（台账 dead ∧ 记录不自述 dead）行为逐字节不变——视图的 dead 在记录不自述 dead 时就等于「活性 === 'pid-dead'」。报告建议的「pid + 进程启动时间双要素」未做（要改 peer 注册记录格式，超出本版范围）；取舍声明见 [docs/LIMITATIONS.md](LIMITATIONS.md) 第 28 条。
+
+### 16.5 协作状态根向上归并（R1/G-27）：`state-root-resolved` 与 `state-root-drift`
+
+`resolveStateRoot` 不再裸拼 `<cwd>/.crosschat`：改为 `resolveStateRootWithDiscovery`——从起点目录**向上 ≤12 层**找既存根（判据 = 该目录含 `.crosschat` 且其下有 `registry`/`teams`/`logs` 之一），命中最近祖先即用它；起点本身在 `.crosschat` 内时向内归一（绝不产生嵌套根）；向上找不到才裸拼（起点目录不存在时同样直接裸拼，保持既有测试口径）。全插件唯一构造点，MCP/hooks/peer 面同一规则。
+
+**engine 事件 `state-root-resolved`**（键集冻结；仅解析结果**不是**裸拼时落，`via` 取值域 `ancestor`/`inside-root`，`sessionId` 仅钩子面可得时在场）：
+
+```json
+{"event":"state-root-resolved","via":"ancestor","root":"D:/work/proj/.crosschat","sessionId":"sess-1"}
+```
+
+**engine 事件 `state-root-drift`**（键集冻结；同一会话解析出的根与其注册表记录 cwd 经同一规则算出的根不一致时落——幻影根/换项目导致的根漂移由此显式化；只读审计不改记录，漂移持续期间每次 SessionStart 复读，幻影根被清除后自愈停止）：
+
+```json
+{"event":"state-root-drift","registered":"D:/work/proj/.crosschat/.crosschat","resolved":"D:/work/proj/.crosschat","sessionId":"sess-1"}
+```
+
+**既存根的判据与两条后果（用户可感知，如实声明）**：上面「既存根」的判据是**该目录含 `.crosschat` 且其下有 `registry`/`teams`/`logs` 之一**——三者有其一即可（只有 `config.json` 不算）。据此有两条后果，插件**不自动处理**，写进 [docs/LIMITATIONS.md](LIMITATIONS.md) 第 30 条：
+
+1. **升级前已经在子目录里生成的 `.crosschat` 自己就是既存根**：它带 registry/teams/logs 之一，向上查找命中它自己而非主根——在这些子目录里启动的会话仍落在旧的子目录根里（身份、邮箱、任务板与主根隔离）。要并回去，须停掉相关会话后删除或迁移这些子目录里的 `.crosschat`（删除前确认其中没有要保留的状态；迁移属运维动作）。
+2. **只有 `config.json` 的工作区不算既存根**：该工作区启动时会继续向上找，12 层内若上层目录已有协作根就并入上层根，它自己的 `config.json` 不生效；想让它独立成根，先在其中建好 `registry`/`teams`/`logs` 之一，或确保上层没有根。
+
+两种情形的根漂移都有审计（`state-root-resolved` 记实际走的路：`ancestor`/`inside-root`/`bare`；`state-root-drift` 记注册根与解析根不一致），但**归并/迁移动作不由插件代做**——状态文件的删除与迁移属用户侧运维（同已知限制 12）。
+
+### 16.6 职能声明 `duty`（G-25）与后台回合可见性（R4/G-30）
+
+`xc_identify` 与 `xc_team action=member-add` 各新增**可选参数** `duty`（一句话说明这个会话负责什么；最长 120 字符，控制字符清掉，缺省 = 不声明）。写入 `team.json` 成员行，与 boundName 同生命周期维护（改名/takeover/重新供给不丢）。`xc_overview` team/panel 成员行带 `duty`、`duties` 块与文本 `duty:` 行；`xc_read({scope:"handoff"})` 花名册条目带 `duty`（文本面「职能：<duty>；」前缀）。
+
+**成员行新增键**（`xc_overview` payload `members[]`，仅在场时出；旧花名册无该键）：
+
+```json
+{"key":"b","duty":"看门狗与活性","headlessTurn":{"key":"b","sessionId":"sess-b","wakeTs":1764000000000,"runningTs":1764000001000}}
+```
+
+`headlessTurn` = 后台回合进行中标识（R4：桌面看不到无头回合的动静）。判据**只看引擎事件**（`core/teamstate.ts` `headlessTurnMembers`）：该 sid 晚于最近一次 `session-idle` 有 `wake`（spawn 成功）、且不晚于该 `session-running`——注册表自述 running 但无 wake 不标记（宁漏不误报）。三视图同形，另在 UserPromptSubmit 注入一行提示。
+
+### 16.7 进程树记账（R7）：capacity `memberTrees`
+
+`capacity/sample.json` 新增可选键 `memberTrees`（`core/capacity.ts`）：按唤醒生命周期账本（`logs/wake-lifecycle-<member>-<ts>.jsonl`）取候选树，经 CIM 进程行汇总根 + 子孙工作集。**只记账不清理**（R7 建议修法的后半段——按阈值处理空闲无头树——本版明确不做）。
+
+**采样条目形状**（`memberTrees[]`，仅采样成功且账本可读时在场；账本读取意外 → `memberTreesError`，主字段照常）：
+
+```json
+{"member":"b","rootPid":19016,"bytes":1717986918,"idleMin":12}
+```
+
+`idleMin` 的口径 = **距该唤醒树最近一条生命周期账的分钟数**（不是任务空闲判据）：对在跑回合它≈回合已进行分钟数。未来清扫器若要按「空闲无头树」处理，须自行叠加任务板在途状态。文本面列出占用最大的前 3 棵（`MEMBER_TREES_TOP_N = 3`）。
+
+### 16.8 看门狗告警的忙闲闸（第 6 轮）：告警不拉进行中的成员
+
+§15.5 的告警面（`notifyAndWake`）对**非 lead 收件人**（以及 `XC_WATCHDOG_WAKE_LEAD=1` 时的 lead）先过一道忙闲闸，判据与派单忙闲闸（§16.1）**同源**：① 任务板上有该收件人 `claimed`/`in_progress` 的任务（`blocked` 不算）；② 注册表会话记录 `liveness==='running'` 且 `livenessTs` 可信（`plausibleLivenessTs`）。15min 未消费 wake nonce 的备用判据同样不纳入（与 §16.1 同口径：实测已被 SessionStart 钩子消费，纳入只会误挡）。
+
+任务板**现读一次**（通知路径在锁外执行，扫描开始时的快照可能已旧；现读失败回退快照——fail-open：闸的失败方向是「多唤醒一次」，不是「丢告警」）。命中即**不调 attemptWake**：urgent 告警本身已落邮箱（邮箱帧先落盘、再走唤醒路径，这一层不变），落一条 `delivered:"mailbox"` 的 `watchdog-wake`，`note` 写明「告警收件人 "X" 回合进行中（在途任务 … / 会话 liveness=running 且时刻可信）——不发起唤醒……urgent 告警已落邮箱，成员自己回合即可看到，pull 兜底不丢」——`note` 取值域新增的这一种见 §15.5，**不新增任何键**（§15.5 冻结的可选键枚举不动）。
+
+顺序：先 lead 分支（默认只写邮箱，`note` 是 §16.4 那条、逐字节不变），再忙闲闸。收件人空闲时行为逐字节不变（wake 调用 / 审计 / 回执三面不变）。取舍声明（宁可不唤醒，也不错杀双回合）见 [docs/LIMITATIONS.md](LIMITATIONS.md) 第 31 条。

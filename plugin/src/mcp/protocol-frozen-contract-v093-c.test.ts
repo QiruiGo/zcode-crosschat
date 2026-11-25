@@ -323,10 +323,16 @@ describe("v0.9.3 契约：PROTOCOL §15.5 冻结块 ↔ 实跑 engine 事件键�
     expect(await until(() => !pidAlive(memberPid), 10_000)).toBe(true);
 
     // 唤醒闸开启（env 层）+ 容量 RED：attemptWake 在 spawn 前被容量闸挡下（deferral 透出）。
-    await sweepMembersOnce(deps({
-      env: { XC_MESSAGING_DIR: peerRoot, XC_WAKE_ENABLED: "true" },
+    // v0.10.0（组 A / R5）：member-dead 告警对 lead 默认只写邮箱不唤醒——本对拍要的是
+    // 「唤醒走 attemptWake 标准路径」的容量闸透出，显式 XC_WATCHDOG_WAKE_LEAD=1 恢复
+    // 对 lead 的唤醒尝试（R5 的旧行为档；键集不变，note 仍属 §15.5 声明可选键）。
+    // v0.10.0（组 A / R3）：二次确认——第一周期 suspect（零事件零唤醒），第二周期认领。
+    const wakeLeadDeps = deps({
+      env: { XC_MESSAGING_DIR: peerRoot, XC_WAKE_ENABLED: "true", XC_WATCHDOG_WAKE_LEAD: "1" },
       capacitySample: redSample(),
-    }));
+    });
+    expect((await sweepMembersOnce(wakeLeadDeps)).deathSuspects).toEqual(["b"]);
+    await sweepMembersOnce(wakeLeadDeps);
     const dead = eventsOf("member-dead")[0]!;
     expectFrozenKeys(dead, frozenDead!, "member-dead");
     expect(dead["liveness"]).toBe("pid-dead");
@@ -357,6 +363,8 @@ describe("v0.9.3 契约：PROTOCOL §15.5 冻结块 ↔ 实跑 engine 事件键�
     killSyncPid(leadPid);
     expect(await until(() => !pidAlive(leadPid), 10_000)).toBe(true);
 
+    // v0.10.0（组 A / R3）：二次确认——第一周期 suspect（零告警），第二周期认领（无人可通知）。
+    expect((await sweepMembersOnce(deps())).deathSuspects).toEqual(["a"]);
     await sweepMembersOnce(deps());
     const skipped = eventsOf("watchdog-notify-skipped")[0]!;
     expectFrozenKeys(skipped, frozen!, "watchdog-notify-skipped");

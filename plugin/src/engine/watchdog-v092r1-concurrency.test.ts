@@ -25,6 +25,11 @@
  * 依赖隔离：peer 注册表写临时目录（env XC_MESSAGING_DIR），pid 活性用真活进程（spawn node
  * sleeper——pid-dead 是 C8 唯一进程死硬证据，不能用假 pid 伪造）；唤醒不注入 spawn，靠
  * 「唤醒闸关闭」让 attemptWake 如实降级 mailbox 并留痕。
+ *
+ * v0.10.0（组 A / R3）口径变化：**连续两个扫描周期都判死才发 member-dead**（二次确认）。
+ * 死亡用例在 kill 之后先跑一个 suspect 周期，原断言（告警套数/收件人面/零失败风暴）移到
+ * 第二个周期之后——断言本身逐字不变。并发用例的「恰一套告警」性质不受影响：锁把多个
+ * 扫描串行化，第一个写 suspect、第二个认领，最终仍恰一条 member-dead。
  */
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
@@ -336,7 +341,8 @@ describe("v0.9.2 打回 V092-01：看门狗认领的跨进程互斥", () => {
       rmSync(lockPath, { force: true });
     }
 
-    // 锁释放后恢复认领
+    // 锁释放后恢复认领（v0.10.0 组 A / R3：先 suspect 一个周期，第二周期认领）
+    expect((await sweepMembersOnce(deps())).deathSuspects).toEqual(["b"]);
     const after = await sweepMembersOnce(deps());
     expect(after.skipped).toBeUndefined();
     expect(after.dead).toEqual(["b"]);
@@ -365,6 +371,8 @@ describe("v0.9.2 打回 V092-02：已判 pid-dead 的成员一律不作收件人
     await killAndForget(aPid);
     await killAndForget(bPid);
 
+    // v0.10.0（组 A / R3）：第一周期双 suspect、第二周期双认领（收件人面断言不变）
+    expect((await sweepMembersOnce(deps())).deathSuspects.sort()).toEqual(["a", "b"]);
     const summary = await sweepMembersOnce(deps());
     expect(summary.dead.sort()).toEqual(["a", "b"]);
     expect(summary.leadCurrentlyDead).toBe(true);
@@ -389,9 +397,11 @@ describe("v0.9.2 打回 V092-02：已判 pid-dead 的成员一律不作收件人
     await seedLivePeer("sess_c");
     await sweepMembersOnce(deps());
 
-    // 第 1 轮：lead 死 → 通知 b/c（原 C6-BUG-4 行为保持）
+    // 第 1 轮：lead 死 → 通知 b/c（原 C6-BUG-4 行为保持）。
+    // v0.10.0（组 A / R3）：kill 后先 suspect 一个周期，第二周期才认领并通知。
     const aPid = await pidOf("sess_a");
     await killAndForget(aPid);
+    expect((await sweepMembersOnce(deps())).deathSuspects).toEqual(["a"]);
     const first = await sweepMembersOnce(deps());
     expect(first.dead).toEqual(["a"]);
     expect(first.wakes.map((w) => w.to).sort()).toEqual(["b", "c"]);
@@ -399,8 +409,10 @@ describe("v0.9.2 打回 V092-02：已判 pid-dead 的成员一律不作收件人
 
     // 第 2 轮：b 也死了 —— 出事成员不是 lead，但 lead 已死 ⇒ 必须改投活成员 c，
     // 不能把通知/唤醒打到已死 lead 上（原缺陷：wake-failed + wake-retry-failed + 死邮箱堆积）。
+    // v0.10.0（组 A / R3）：同样先 suspect 一个周期再认领。
     const bPid = await pidOf("sess_b");
     await killAndForget(bPid);
+    expect((await sweepMembersOnce(deps())).deathSuspects).toEqual(["b"]);
     const second = await sweepMembersOnce(deps());
     expect(second.dead).toEqual(["b"]);
     expect(second.leadCurrentlyDead).toBe(true);
@@ -421,6 +433,8 @@ describe("v0.9.2 打回 V092-02：已判 pid-dead 的成员一律不作收件人
     await killAndForget(aPid);
     await killAndForget(bPid);
 
+    // v0.10.0（组 A / R3）：第一周期双 suspect、第二周期双认领（无人可通知的断言不变）
+    expect((await sweepMembersOnce(deps())).deathSuspects.sort()).toEqual(["a", "b"]);
     const summary = await sweepMembersOnce(deps());
     expect(summary.dead.sort()).toEqual(["a", "b"]);
     expect(summary.wakes).toEqual([]);
@@ -441,6 +455,8 @@ describe("v0.9.2 打回 V092-02：已判 pid-dead 的成员一律不作收件人
     const bPid = await pidOf("sess_b");
     await killAndForget(bPid);
 
+    // v0.10.0（组 A / R3）：第一周期 suspect、第二周期认领（lead 收件人面断言不变）
+    expect((await sweepMembersOnce(deps())).deathSuspects).toEqual(["b"]);
     const summary = await sweepMembersOnce(deps());
     expect(summary.dead).toEqual(["b"]);
     expect(summary.leadCurrentlyDead).toBe(false);

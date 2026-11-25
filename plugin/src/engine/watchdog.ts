@@ -44,7 +44,7 @@
  *
  * @module engine/watchdog
  */
-import { mkdir, readFile } from 'node:fs/promises';
+import { mkdir, open, readdir, readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { writeFileAtomic } from '../core/atomic.js';
@@ -57,7 +57,15 @@ import {
   type TeamState,
 } from '../core/types.js';
 import { memberUnclaimedTasks, readTeam, repoolUnclaimedTasksForFailedMember } from '../core/teamstate.js';
-import { deriveSessionPidEvidence, memberLiveness, type MemberLiveness } from '../core/offline.js';
+// v0.10.0（组 A / R3）：sessionDeathGuard——判亡前四道校验之前三道的纯判据（第④道
+// 二次确认的跨周期账在本模块的 watchdog-state 台账）。
+import {
+  DEATH_GUARD_LIFECYCLE_INFLIGHT_MS,
+  deriveSessionPidEvidence,
+  memberLiveness,
+  sessionDeathGuard,
+  type MemberLiveness,
+} from '../core/offline.js';
 import { scanPeers, type PeerRecord, type PeerScanResult } from '../core/peerregistry.js';
 import { peerRootFromEnv } from '../core/peerdir.js';
 import { logEngineEvent } from '../core/log.js';
@@ -76,11 +84,32 @@ import {
   sweepLimboDeliveriesLocked,
 } from '../core/mailbox.js';
 // v0.9.5（A2）：readSessionWitness——首见死亡的新鲜度三源合判补引擎证言（V094-13）。
-import { findInflightWakeNonce, readSession, readSessionWitness } from '../core/registry.js';
+// v0.10.0（组 A / R6）：clearSessionDead / markSessionDead——判亡后注册表活性翻转与
+// 重新武装时的翻回清除（member-dead 的注册表侧双写，G-24 修法）。
+import {
+  clearSessionDead,
+  findInflightWakeNonce,
+  markSessionDead,
+  readSession,
+  readSessionWitness,
+} from '../core/registry.js';
 import { memberLivenessView, type SessionLivenessView } from '../core/liveness.js';
 import type { SessionRecord } from '../core/types.js';
-import { wakeLifecycleFile } from '../core/paths.js';
-import { attemptWake, deliveryAttemptVerdict, limboTimeoutFromEnv, readDeliveryAttemptLedger, wakeNonceDigest } from './wake.js';
+import { engineLogFile, logsDir, wakeLifecycleFile } from '../core/paths.js';
+// v0.10.0（组 A / R2 后半）：未读判据收敛到 checkpoint 的单一真源（与 overview/panel/
+// status/改名守卫同判据——「未读派单」不另立一套）。
+import { currentUnreadMessages } from '../core/checkpoint.js';
+// v0.10.0（组 A / R3）：findLiveInflightWakeNonce——在途唤醒的活体证据判据（R1 同款），
+// 判亡路径与 limbo 候选路径从此共用同一份「在途」定义。
+import {
+  attemptWake,
+  deliveryAttemptVerdict,
+  findLiveInflightWakeNonce,
+  limboTimeoutFromEnv,
+  readDeliveryAttemptLedger,
+  wakeNonceDigest,
+  type WakeRequest,
+} from './wake.js';
 import type { CapacitySample } from '../core/capacity.js';
 import {
   limboAlertAlreadySent,
@@ -143,7 +172,9 @@ export const WATCHDOG_NOTIFY_MAX_ATTEMPTS = 3;
  * v0.9.3 打回第 1 轮（V093-04）：**首见即死**的「新鲜死亡」窗（ms）。
  *
  * 台账无历史（全新状态根 / 状态文件损坏被删）时，「首见只记录不告警」会把**首扫前就已死**
- * 的成员永久静音（重新武装还要 liveness≠pid-dead，崩溃进程永不满足）。本常量给出判别：
+ * 的成员永久静音（重新武装还要正向复活证据——记录不再自述 dead 或有 live/heartbeat-stale，
+ * 崩溃进程永不满足；v0.10.0 集成员·第 7 轮起用视图的 dead 判，见下方重新武装处注释）。
+ * 本常量给出判别：
  * peer 注册记录的心跳 lastSeen 落在窗内 ⇒ 这是**刚发生**的死亡（引擎只是没有它的历史），
  * 照常告警；窗外 ⇒ 存量死记录（启动期噪声），只记录不告警（v0.9.2 A2 原口径保留）。
  * 心跳形态见 core/peerregistry.ts PEER_STALE_MS（60s）：活成员 lastSeen 最多几十秒前。
@@ -259,6 +290,153 @@ export function watchdogIntervalMsFromEnv(env: NodeJS.ProcessEnv = process.env):
   return n;
 }
 
+/**
+ * v0.10.0（组 A / R5）：member-dead（及其它看门狗 urgent 告警）是否**尝试唤醒 lead**
+ * 的 env 开关：`XC_WATCHDOG_WAKE_LEAD`。
+ *
+ * 缺陷（R5，用户点 2）：看门狗每次 member-dead 给主控写 urgent 邮箱并**立即唤醒
+ * 主控**，主控被拉成无头分身（今日 5 次 urgent=true 唤醒各紧随一条 member-dead；
+ * 17:42:12 那次打断了「正在等用户答的选项卡」）。修法（方案 C）：对 lead 类收件人
+ * **只写 urgent 邮箱、不调用 attemptWake**——主控仍在自己回合看到告警，只是不被
+ * 强行拉起；真正掉线的检测与任务回池不受影响。
+ *
+ * 口径（与 adoptByPpidEnabledFromEnv 同族）：只认字面量 `"1"`（显式恢复旧行为），
+ * 其余一切取值（未设/空串/0/true/on）都按**不唤醒**处理——开关方向是「少拉一次
+ * 无头分身」，误开比误关烦人，取最保守解析。队友收件人（lead 已死时的转移通知）
+ * 与派单/回执/普通唤醒路径一律不受本开关影响。
+ */
+export const WATCHDOG_WAKE_LEAD_ENV = 'XC_WATCHDOG_WAKE_LEAD';
+
+export function watchdogWakeLeadFromEnv(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env[WATCHDOG_WAKE_LEAD_ENV] === '1';
+}
+
+/**
+ * v0.10.0（组 A / R2 后半）：dispatch-resume **补醒冷却窗**缺省值（ms，120s）——与
+ * 容量闸的分域冷却同窗长（engine/wake.ts WAKE_CAPACITY_COOLDOWN_MS_DEFAULT），
+ * 「同一成员一个冷却窗内最多补醒一次」。env `XC_DISPATCH_RESUME_COOLDOWN_MS` 覆盖
+ * （可选、带默认值，0 新增必填配置）：未设/空串 → 缺省；负数/非有限/不可解析 →
+ * 回落缺省（不静默关闸——把「配错了」当成「关了」会让补醒每分钟重试）；`0` = 不冷却
+ * （每个扫描周期都可补醒，运维显式选择）。
+ */
+export const DISPATCH_RESUME_COOLDOWN_DEFAULT_MS = 120_000;
+
+export function dispatchResumeCooldownMsFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env['XC_DISPATCH_RESUME_COOLDOWN_MS'];
+  if (raw === undefined || raw.trim() === '') return DISPATCH_RESUME_COOLDOWN_DEFAULT_MS;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) return DISPATCH_RESUME_COOLDOWN_DEFAULT_MS;
+  return n;
+}
+
+// ---------------------------------------------------------------------------
+// v0.10.0（集成员·第 5 轮 / 对抗 ADV-02）：补醒**防风暴总次数上限**
+//
+// 缺口（裁决维持 P1）：冷却窗只防「一个窗内重复补醒」，不防「每个窗都补一次」——成员
+// 空闲、无在途唤醒、收件箱有未读派单/未读紧急回执而**始终不认领**时，看门狗每过一个
+// 120s 冷却窗就补醒一次，无总次数上限（实测 t0 / t0+121s / t0+242s 三次真唤醒）。
+// 每次补醒 = 一整棵无头进程树（集成口径约 1GB/棵），收方零动作的生产形态已实证
+// （实测 4/4 limbo）⇒ 构成慢速唤醒风暴。
+//
+// 修法（仿 mcp/tools-tasks.ts 的 urgent 回单防风暴上限，同族同纪律）：
+// - 计数真源 = engine.jsonl 有界尾读里 `event ∈ {dispatch-resume, report-resume}`
+//   ∧ `to` = 该成员 ∧ `delivered !== 'mailbox'`（真起进程树的行；被容量闸/唤醒闸挡下
+//   只落邮箱的行不占额度）∧ 时刻落在 10min 窗内；
+// - 读失败/坏行 → 0（**fail-open**：闸只防风暴、不拦投递，绝不因观测面故障把消息打死）；
+// - 命中上限 → 本轮不进 dispatchResumeCandidates（判据落在 phase 1 冷却判据之后），
+//   只落 `resume-wake-deferred` 审计；**邮箱消息不动**（pull 兜底不变）。
+//
+// 事件名为什么不是 `wake-deferred`：§15.2 把 `wake-deferred` 的键集冻结为容量闸专属
+// （watermark / freeBytes / detail / cooldownMs / retryAfterMs / cooldownActive /
+// wakeGateEnabled / gateEnv / urgent 恒在，且 tools-relay-v091.test.ts 按 Object.keys
+// 与实跑事件对拍）。用同名落一个 5 键子集会破坏该冻结面（任务书同一句也要求
+// 「事件名与键集先与冻结面核对、不越界」）⇒ 按 §16「新事件用新名、不动冻结键集」的
+// 既定纪律起新名 `resume-wake-deferred`（键集：teamId/to/sessionId/scene/reason/
+// taskIds/messageIds/resumeWakeMax/note）。
+// ---------------------------------------------------------------------------
+
+/** 防风暴计数窗（ms）——同一成员补醒的滚动窗口（与 urgent 回单上限同窗长）。 */
+export const RESUME_WAKE_WINDOW_MS = 10 * 60_000;
+
+/** 窗内真唤醒补醒上限缺省值（env XC_RESUME_WAKE_MAX 覆盖）。 */
+export const RESUME_WAKE_MAX_DEFAULT = 5;
+
+/** engine.jsonl 尾读窗口（字节）——覆盖 10min 窗所需的最新事件即止（约数千行）。 */
+const RESUME_WAKE_TAIL_BYTES = 1024 * 1024;
+
+/** 补醒被防风暴闸挡下的审计事件名（新事件名；§15.2 的 wake-deferred 键集不动）。 */
+export const RESUME_WAKE_DEFERRED_EVENT = 'resume-wake-deferred';
+
+/** 防风暴闸挡下的原因值（审计 reason 键的唯一取值）。 */
+export const RESUME_WAKE_CAP_REASON = 'resume-wake-cap';
+
+/**
+ * env `XC_RESUME_WAKE_MAX` 解析（正整数；未设/空串/非正/不可解析 → 缺省 5）。
+ * 与 urgentReportMaxFromEnv 逐字同口径：**不接受「关闭用 0」**——要停补醒语义
+ * 应把冷却设成正数的大值或关看门狗，把「配错了」当成「关了」会让风暴重新出现。
+ */
+export function resumeWakeMaxFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env['XC_RESUME_WAKE_MAX'];
+  if (raw === undefined || raw.trim() === '') return RESUME_WAKE_MAX_DEFAULT;
+  const n = Number(raw);
+  return Number.isSafeInteger(n) && n > 0 ? n : RESUME_WAKE_MAX_DEFAULT;
+}
+
+/**
+ * 统计窗内该成员**已生效**的补醒次数（engine.jsonl 有界尾读；只数
+ * `dispatch-resume` / `report-resume` ∧ `to` 命中 ∧ `delivered !== 'mailbox'`
+ * ∧ 时刻落窗内的行——被闸挡下只落邮箱的行不占额度）。
+ *
+ * 纯观测面计数：读失败/坏行一律跳过（返回已数到的部分），绝不因此抛错（fail-open）。
+ */
+export async function countRecentResumeWakes(
+  stateRoot: string,
+  to: string,
+  now: number,
+  windowMs: number = RESUME_WAKE_WINDOW_MS,
+): Promise<number> {
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(engineLogFile(stateRoot), 'r');
+    const size = (await handle.stat()).size;
+    const length = Math.min(size, RESUME_WAKE_TAIL_BYTES);
+    const buffer = Buffer.alloc(length);
+    await handle.read(buffer, 0, length, size - length);
+    let text = buffer.toString('utf8');
+    // 窗口首行可能是被截断的半行（size > length 时才有）——丢弃，防半个 JSON 误解析。
+    if (size > length) {
+      const firstBreak = text.indexOf('\n');
+      text = firstBreak === -1 ? '' : text.slice(firstBreak + 1);
+    }
+    let count = 0;
+    for (const line of text.split('\n')) {
+      if (line.trim() === '') continue;
+      let value: unknown;
+      try {
+        value = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (typeof value !== 'object' || value === null) continue;
+      const event = value as Record<string, unknown>;
+      if (event['event'] !== RESUME_SCENE_DISPATCH && event['event'] !== RESUME_SCENE_REPORT) continue;
+      if (event['to'] !== to) continue;
+      // 「真起进程树」= delivered 非 mailbox（容量闸/唤醒闸挡下只落邮箱的行不占额度）。
+      if (event['delivered'] === 'mailbox') continue;
+      const ts = event['ts'];
+      if (typeof ts !== 'number' || !plausibleLivenessTs(ts, now)) continue;
+      if (now - ts > windowMs) continue;
+      count++;
+    }
+    return count;
+  } catch {
+    // 审计日志不可读（不存在/占用/权限）→ 不挡（fail-open：闸只防风暴，不拦投递）。
+    return 0;
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
 /** 看门狗依赖（与 ToolDeps 结构兼容；不 import mcp 面——M2 不依赖 M3）。 */
 export interface WatchdogDeps {
   stateRoot: string;
@@ -270,6 +448,13 @@ export interface WatchdogDeps {
    * 只把它透给 attemptWake（容量闸的唯一判据在 core/capacity.ts）。
    */
   capacitySample?: CapacitySample;
+  /**
+   * v0.10.0（集成员·第 5 轮 / 对抗 ADV-02）测试注入：spawn 实现（缺省=attemptWake 真 spawn
+   * `spawnResume`）——与 `capacitySample` 同一注入纪律：注入即信任，生产路径永不传。
+   * 只透给**补醒路径**（§4.7 的 attemptWake，本轮防风暴闸的被测面：需要「真唤醒」才能让
+   * 引擎事件带 delivered≠mailbox，计数闸才看得到它）；其余 attemptWake 调用点形状不变。
+   */
+  spawn?: WakeRequest['spawn'];
 }
 
 /** 一轮扫描的结算（审计/测试用）。 */
@@ -305,8 +490,40 @@ export interface WatchdogSweepSummary {
    * （创建者已收到 task-receipt、审计 `member-unclaimed-repooled`）。修复前这些单
    * 不在任何回池域（stale 清扫只含 claimed/in_progress）而永久搁浅。空 = 本轮无此类
    * 回池（无 pid-dead 成员 / 无未认领单 / 回池失败——失败落 `watchdog-repool-failed`）。
+   *
+   * v0.10.0（组 A / R3）：回池随**二次确认**后移——首次判死的成员本轮只记 suspect
+   * （见 {@link deathSuspects}），不回池；连续第二个扫描周期仍判死才认领死亡并回池。
+   * 已被往轮认领的死者（台账 state='dead'）仍每轮自愈回池（停机后新派给死者的单）。
    */
   unclaimedRepooled: Array<{ key: string; taskIds: string[] }>;
+  /**
+   * v0.10.0（组 A / R3/G-29）：本轮判 pid-dead 但被**判亡前四道校验**豁免的成员
+   * （不发 member-dead、不回池、不告警；落 `suspect-dead` 审计）。reasons = 命中的
+   * 校验名：inflight-wake（在途唤醒/启动窗/唤醒子 pid 活着）、open-tasks（名下
+   * claimed/in_progress 在途任务）、newer-pid（注册表已有更新的活 pid）。
+   */
+  deathExempt: Array<{ key: string; reasons: Array<'inflight-wake' | 'open-tasks' | 'newer-pid'> }>;
+  /**
+   * v0.10.0（组 A / R3）：本轮**首次**判死（四道校验全过）而进入二次确认等待的成员
+   * ——台账记 suspect（state 仍 alive、liveness=pid-dead），连续第二个扫描周期仍判死
+   * 才发 member-dead 并回池。落 `suspect-dead` 审计（reasons 为空版）。
+   */
+  deathSuspects: string[];
+  /**
+   * v0.10.0（组 A / R2 后半；补充·R8 联动）：本轮**补醒**的未读消息（scene 二选一）——
+   * 成员空闲 ∧ 无在途唤醒 ∧ 收件箱有两类未读之一时按对应场景补一次唤醒：未读派单
+   * （task-assignment）→ scene `dispatch-resume`；未读紧急回执（task-receipt ∧ urgent/
+   * 待补醒标记）→ scene `report-resume` 且 urgent:true。两类都照常经过容量闸（紧急不豁免），
+   * 同一成员一个冷却窗内最多一次。落与 scene 同名的审计事件。
+   */
+  dispatchResumed: Array<{ key: string; scene: string; messageIds: string[]; delivered: string; note?: string }>;
+  /**
+   * v0.10.0（集成员·第 5 轮 / 对抗 ADV-02）：本轮因**防风暴总次数上限**而未补醒的成员
+   * （冷却窗已过、其余判据全中，但同一成员 10min 窗内真唤醒补醒已达
+   * {@link RESUME_WAKE_MAX_DEFAULT} / `XC_RESUME_WAKE_MAX`）——不调 attemptWake、不动邮箱，
+   * 只落 `resume-wake-deferred` 审计。空 = 本轮无此类挡下。
+   */
+  resumeWakeDeferred: Array<{ key: string; scene: string; messageIds: string[]; reason: string }>;
   /** 本轮新发现的在途 nonce 孤儿（不可反查摘要）。 */
   orphanNonces: string[];
   /** 本轮尝试过的唤醒（含降级）。 */
@@ -487,6 +704,180 @@ async function wakeChildExited(lifecycleFile: string): Promise<boolean> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// v0.10.0（组 A / R3 + R2 后半）：wake 生命周期账的**判亡/补醒两用读取面**
+//
+// 为什么看门狗要读这份账：G-29 的根因是「看门狗握有在途唤醒数据却只用于 limbo 候选
+// 判定，没用在判死路径上」。生命周期账（logs/wake-lifecycle-<to>-<ts>.jsonl，命名真源
+// core/paths.ts）记有每次 attemptWake 的 spawn 头行（scene/sid/nonce 摘要）、启动确认
+// 行（唤醒子 pid）与 exit 尾行——判亡前的「在途唤醒」校验与补醒的「冷却窗」都从它取
+// 证据，不新增任何状态文件（跨进程共享：每个 MCP server 的扫描看到同一份账）。
+// ---------------------------------------------------------------------------
+
+/** 一名成员的最近唤醒证据（判亡校验注入 core/offline.ts sessionDeathGuard 的输入）。 */
+interface WakeLifecycleEvidence {
+  /** 最近一次 spawn 的头行时刻（epoch ms；undefined = 从未唤醒过）。 */
+  lastSpawnTs?: number;
+  /** 最近一次 spawn 有 start 头行且无 exit 尾行（唤醒子可能仍在跑）。 */
+  startNoExit: boolean;
+  /** 启动确认行汇报的唤醒子 pid 是否活着（「以唤醒子进程的 pid 为准」）。 */
+  wakeChildPidAlive: boolean;
+  /**
+   * 最近一次**补醒** spawn 的时刻（epoch ms；undefined = 无）——scene 为
+   * {@link RESUME_SCENE_DISPATCH} 或 {@link RESUME_SCENE_REPORT}（v0.10.0 补充：两类
+   * 未读的补醒共用同一个冷却窗，任一场景的最近 spawn 都算冷却源）。
+   */
+  lastResumeTs?: number;
+}
+
+/**
+ * 读一名成员在**时间窗内**的唤醒生命周期账证据（窗 = `windowMs`；读失败/无账 → 空证据，不猜）。
+ *
+ * 为什么要窗而不是「最新 N 份」：生命周期文件长期累积（无 prune），「最新 3 份」在别的
+ * 场景连发唤醒时会把窗内的 dispatch-resume 挤出视野（冷却漏判 → 窗内重复补醒）。按窗过滤
+ * （文件名里的 ts 就是 spawn 时刻，readdir 即可判，不必读文件）既精确又便宜。两个调用面
+ * 各传自己的窗：判亡校验传在途窗（{@link DEATH_GUARD_LIFECYCLE_INFLIGHT_MS} 15min），
+ * 补醒冷却传冷却窗（120s 量级）。
+ */
+async function readWakeLifecycleEvidence(
+  stateRoot: string,
+  agentKey: string,
+  windowMs: number,
+  now: number = Date.now(),
+  pidAliveProbe: (pid: number) => boolean = pidAlive,
+): Promise<WakeLifecycleEvidence> {
+  const empty: WakeLifecycleEvidence = { startNoExit: false, wakeChildPidAlive: false };
+  let entries: string[];
+  try {
+    entries = await readdir(logsDir(stateRoot));
+  } catch {
+    return empty; // 无 logs 目录：无唤醒证据
+  }
+  // 同一形状反解（贪婪分组 + 锚定数字尾段，agentKey 含连字符/数字也不误判；与
+  // engine/wake.ts readDeliveryAttemptLedger 的同名反解同口径）。
+  const pattern = new RegExp(`^wake-lifecycle-(.+)-(\\d+)\\.jsonl$`);
+  const files: Array<{ ts: number; path: string }> = [];
+  for (const entry of entries) {
+    const matched = pattern.exec(entry);
+    if (matched === null || matched[1] !== agentKey) continue;
+    const ts = Number(matched[2]);
+    if (!Number.isFinite(ts)) continue;
+    if (ts < now - windowMs) continue; // 窗外：与判据无关（不读、不猜）
+    files.push({ ts, path: join(logsDir(stateRoot), entry) });
+  }
+  if (files.length === 0) return empty;
+  files.sort((a, b) => b.ts - a.ts); // 最新 spawn 优先
+  const evidence: WakeLifecycleEvidence = { startNoExit: false, wakeChildPidAlive: false };
+  for (const file of files) {
+    let text: string;
+    try {
+      text = await readFile(file.path, 'utf8');
+    } catch {
+      continue; // 读不了这一份：跳过（不猜）
+    }
+    const lines = text.split(/\r?\n/).flatMap((line) => {
+      if (line.trim() === '') return [];
+      try {
+        const parsed: unknown = JSON.parse(line);
+        return typeof parsed === 'object' && parsed !== null ? [parsed as Record<string, unknown>] : [];
+      } catch {
+        return []; // 坏行跳过
+      }
+    });
+    if (lines.length === 0) continue;
+    const hasStart = lines.some((line) => line['event'] === 'wake-child-start');
+    const hasExit = lines.some((line) => line['event'] === 'wake-child-exit');
+    const scene = lines.find((line) => typeof line['scene'] === 'string')?.['scene'];
+    if (evidence.lastSpawnTs === undefined && hasStart) {
+      evidence.lastSpawnTs = file.ts;
+      evidence.startNoExit = !hasExit;
+    }
+    if ((scene === RESUME_SCENE_DISPATCH || scene === RESUME_SCENE_REPORT)
+      && (evidence.lastResumeTs === undefined || file.ts > evidence.lastResumeTs)) {
+      evidence.lastResumeTs = file.ts;
+    }
+    // 唤醒子 pid：启动确认行（confirmed/unconfirmed 都可能带 pid）里最后出现的那个。
+    const pidLines = lines.filter((line) => typeof line['pid'] === 'number' && Number.isSafeInteger(line['pid']));
+    const lastPid = pidLines.length > 0 ? pidLines[pidLines.length - 1]!['pid'] as number : undefined;
+    if (lastPid !== undefined && pidAliveProbe(lastPid)) {
+      evidence.wakeChildPidAlive = true;
+    }
+  }
+  return evidence;
+}
+
+/**
+ * v0.10.0（组 A / G-25）：member-dead 告警文案里的**职能摘要**——读成员行上的
+ * `duty`（组 D 的职能声明字段，v0.10.0 起 team.json 可选带；absent = 不带）。
+ * 清洗口径：控制字符清成空格、trim、最长 60 字符（超长截断加 …）；清洗后为空 →
+ * undefined（文案里不带职能段，逐字节回到不带 duty 的旧形态）。
+ */
+const DUTY_SNIPPET_MAX_CHARS = 60;
+
+export function dutySnippet(member: TeamMember | { duty?: string }): string | undefined {
+  const raw = (member as { duty?: string }).duty;
+  if (typeof raw !== 'string') return undefined;
+  const cleaned = raw.replace(/[\u0000-\u001f\u007f]+/g, ' ').trim();
+  if (cleaned === '') return undefined;
+  return cleaned.length <= DUTY_SNIPPET_MAX_CHARS ? cleaned : `${cleaned.slice(0, DUTY_SNIPPET_MAX_CHARS - 1)}…`;
+}
+
+// ---------------------------------------------------------------------------
+// v0.10.0（组 A 补充·R2/R8 联动）：补醒判据的**两类未读**——派单与紧急回执
+//
+// 用户追加裁决：组 B 把「收件人回合进行中时，紧急回单只落邮箱不唤醒，并打上
+// 待补醒标记」；本组 A4 的补醒判据随之从「未读的派单」扩为两类未读：
+//   ① 未读**派单**（task-assignment）：带 taskId 且正文不是 task-receipt 信封；
+//   ② 未读**紧急回执**（task-receipt ∧ 插队/待补醒标记）：正文 JSON `type==='task-receipt'`
+//      且 `urgent===true`（组 B R8 写入侧）**或** 帧上带待补醒标记
+//      `wakeDeferred==='recipient-turn-running'`（组 B 「补充」一节正式约定：标记位于
+//      **content 的 task-receipt 帧里**，不在消息 top-level——白名单会拷掉它）。
+// 命中紧急回执 → 补醒用 urgent:true、scene=report-resume；仅派单 → scene=dispatch-resume。
+// 非紧急的 task-receipt（stale 清扫回执等进度/审计邮件）**不**触发补醒——两类未读的口径
+// 写死，不把任何未读邮件都变成唤醒理由。
+// ---------------------------------------------------------------------------
+
+/**
+ * 组 B 紧急回执「待补醒」标记的唯一取值（fix-b.md「补充」节正式约定，与其
+ * tools-tasks.ts:327 `RECIPIENT_TURN_RUNNING` 同值）：**位于回执 content 的 task-receipt
+ * JSON 帧里**（`wakeDeferred` 键）——不在 TeamMessage top-level（那里的 normalizeMessage
+ * 白名单会拷掉未声明字段），故本组只从帧里读。
+ */
+export const URGENT_RECEIPT_WAKE_DEFERRED = 'recipient-turn-running';
+
+/** 两条补醒场景（scene 值；进 engine.jsonl 与唤醒 prompt）。 */
+export const RESUME_SCENE_DISPATCH = 'dispatch-resume';
+export const RESUME_SCENE_REPORT = 'report-resume';
+
+/** task-receipt 帧（正文 JSON 且 `type==='task-receipt'`；非 JSON/异型 → undefined）。 */
+function taskReceiptFrame(message: { content: string }): Record<string, unknown> | undefined {
+  try {
+    const parsed = JSON.parse(message.content) as unknown;
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined;
+    const frame = parsed as Record<string, unknown>;
+    return frame['type'] === 'task-receipt' ? frame : undefined;
+  } catch {
+    return undefined; // 派单票面等自由文本：不是回执
+  }
+}
+
+/** 正文是否是 task-receipt 信封。 */
+export function isTaskReceiptMessage(message: { content: string }): boolean {
+  return taskReceiptFrame(message) !== undefined;
+}
+
+/** 是否「待补醒的紧急回执」：task-receipt ∧（urgent 旗标 ∨ 帧上待补醒标记）。 */
+export function isUrgentReceiptMessage(message: { content: string; urgent?: boolean }): boolean {
+  const frame = taskReceiptFrame(message);
+  if (frame === undefined) return false;
+  return message.urgent === true || frame['wakeDeferred'] === URGENT_RECEIPT_WAKE_DEFERRED;
+}
+
+/** 未读派单（task-assignment）：带 taskId 且不是 task-receipt 信封。 */
+export function isUnreadDispatchMessage(message: { content: string; taskId?: string }): boolean {
+  return message.taskId !== undefined && !isTaskReceiptMessage(message);
+}
+
 /**
  * v0.9.3 打回第 1 轮（V093-04）：**近期存活证据**（纯函数）——台账无历史时判别「这是刚发生
  * 的死亡」还是「启动期存量死记录」。
@@ -554,6 +945,10 @@ function recentLifeEvidence(
  * （V098-07 修法）。非空时尾段如实写「未认领派单已回池至共享待领池（创建者已收到回执）」，
  * 在途单保持「冻结待回池 + requeueAtMs」口径——未认领单本就不在 stale 清扫域、板面无
  * requeueAtMs，旧文案对它们是过度承诺；空时尾段逐字节保持 v0.9.6 口径（在途单冻结）。
+ *
+ * v0.10.0（组 A / G-25）：`duty` = 成员职能声明的一句话摘要（组 D 的 duty 字段；
+ * absent = 不带，文案逐字节回到旧形态）。收件人无需记忆即可判断该成员之死的业务影响
+ * （boundName 本身不透明——G-25 的实证代价）。
  */
 function renderMemberDeadText(
   key: string,
@@ -563,17 +958,20 @@ function renderMemberDeadText(
   catchUp = false,
   freshEvidence = true,
   repooledUnclaimed?: string[],
+  duty?: string,
 ): string {
+  // 职能段：紧缀成员名之后（三种 head 形态同一插入点）；absent = 零字符。
+  const dutyClause = duty !== undefined ? `（职能：${duty}）` : '';
   const head = firstSight
     ? (catchUp
-      ? `成员 "${key}" 进程已亡（pid-dead，sid ${sessionId}；休眠/扫描中断后补扫——死亡落在本轮补扫窗口内，按补扫口径告警不静音）`
+      ? `成员 "${key}"${dutyClause} 进程已亡（pid-dead，sid ${sessionId}；休眠/扫描中断后补扫——死亡落在本轮补扫窗口内，按补扫口径告警不静音）`
       : freshEvidence
-        ? `成员 "${key}" 进程已亡（pid-dead，sid ${sessionId}；看门狗台账无该成员历史，按近期存活证据判为新鲜死亡）`
-        : `成员 "${key}" 进程已亡（pid-dead，sid ${sessionId}；【首见】看门狗台账无该成员历史且未采到近期存活证据——`
+        ? `成员 "${key}"${dutyClause} 进程已亡（pid-dead，sid ${sessionId}；看门狗台账无该成员历史，按近期存活证据判为新鲜死亡）`
+        : `成员 "${key}"${dutyClause} 进程已亡（pid-dead，sid ${sessionId}；【首见】看门狗台账无该成员历史且未采到近期存活证据——`
           + `按首见死亡宁误报一次告警；若属启动期存量死记录/长期离队形态可安全忽略本条）`)
     : isLead
-      ? `lead "${key}" 进程已亡（pid-dead）`
-      : `成员 "${key}" 进程已亡（pid-dead，sid ${sessionId}）`;
+      ? `lead "${key}"${dutyClause} 进程已亡（pid-dead）`
+      : `成员 "${key}"${dutyClause} 进程已亡（pid-dead，sid ${sessionId}）`;
   // v0.9.9（V098-07）：未认领单的真实措辞（已回池 ↔ 创建者回执）；在途单的「冻结待
   // 回池 + requeueAtMs」口径只在有未认领单时把「名下任务」收窄为「在途任务」——
   // 两者并列时不出现「已回池」与「冻结」互相矛盾。
@@ -613,11 +1011,74 @@ function renderRenotifyText(keys: readonly string[], leadKey: string, leadCurren
 }
 
 /**
+ * v0.10.0（集成员·第 6 轮）：**告警收件人回合是否在进行中**（与派单忙闲闸 B1 同款判据）。
+ *
+ * 缺口（真实复测第 0.1 节第 2 条）：`notifyAndWake` 对非 lead 收件人直接 attemptWake，
+ * 不看对方是否在途——成员死亡告警发给正跑到一半的队友时，会给同一个会话再拉一路无头
+ * 回合，正是 R2 忙闲闸要消的双回合形态（两路抢信箱、重复劳动，m8 双路实测同族）。
+ *
+ * 判据（逐字沿用 mcp/tools-tasks.ts 的忙闲闸；blocked 不算忙——认领者显式申报的暂停
+ * 不是回合在跑；15min 未消费 wake nonce 的备用判据同样不纳入：实测已被 SessionStart
+ * 钩子消费，纳入只会误挡）：
+ * ① 任务板上有它 **claimed/in_progress** 的任务；
+ * ② 注册表会话记录 `liveness === 'running'` ∧ `livenessTs` 可信
+ *    （plausibleLivenessTs：未来值/缺失 = 伪造或损坏，按不忙；core/liveness.ts
+ *    runningTrusted 同口径）。
+ *
+ * 任务板**现读一次**（锁外通知路径拿的是扫描开始时的快照，认领可能发生在那之后；
+ * 读失败回退快照——fail-open：闸的失败方向是「多唤醒一次」而不是「丢告警」）。
+ */
+async function recipientTurnBusy(
+  stateRoot: string,
+  teamId: string,
+  teamSnapshot: TeamState,
+  agentKey: string,
+  sessionId: string | null,
+  now: number,
+): Promise<{ busy: boolean; openTaskIds: string[]; sessionRunning: boolean }> {
+  let team = teamSnapshot;
+  try {
+    const fresh = await readTeam(stateRoot, teamId);
+    if (fresh !== undefined) team = fresh;
+  } catch {
+    /* 现读失败：用扫描快照（fail-open 方向） */
+  }
+  const openTaskIds = team.tasks
+    .filter((t) => t.assignee === agentKey && (t.status === 'claimed' || t.status === 'in_progress'))
+    .map((t) => t.id);
+  let sessionRunning = false;
+  if (sessionId !== null && sessionId !== '') {
+    try {
+      const record = await readSession(stateRoot, sessionId);
+      sessionRunning = record?.liveness === 'running' && plausibleLivenessTs(record.livenessTs, now);
+    } catch {
+      // 读盘失败 → 按不忙（fail-open：观测面故障不得让告警退化成只落邮箱）。
+      sessionRunning = false;
+    }
+  }
+  return { busy: openTaskIds.length > 0 || sessionRunning, openTaskIds, sessionRunning };
+}
+
+/**
  * 通知 + 尽力唤醒（锁外执行——attemptWake 必须持无团队锁，§2.7-4）。
  *
  * 邮箱帧先落盘（O_APPEND 原子追加，与 engine 信号的 notifyLeadUrgent 同纪律），再对每个
  * 有 sessionId 的收件人走标准唤醒路径。唤醒被任何一道闸挡下（分层闸/在途 nonce/容量闸/
  * 成员状态）都如实记 `watchdog-wake` 事件——「尝试唤醒」与「唤醒成功」是两件事，回执不混写。
+ *
+ * v0.10.0（组 A / R5）：**lead 类收件人只写 urgent 邮箱、不调用 attemptWake**（除非
+ * `XC_WATCHDOG_WAKE_LEAD=1` 显式恢复旧行为）。缺陷：看门狗 urgent「成员已亡」告警把
+ * 主控拉成无头分身（今日 5 次 urgent 唤醒各紧随一条 member-dead，17:42:12 那次打断了
+ * 正在等用户答的选项卡——用户点 2）。邮箱帧本身照写（主控在自己回合看得到告警），
+ * 「不唤醒」这一事实如实落 `watchdog-wake`（delivered=mailbox + note 注明未尝试唤醒，
+ * 键集不越 PROTOCOL §15.5 冻结面）。队友收件人（lead 已死时的转移通知）与派单/回执/
+ * 普通唤醒路径不受影响——那些不走本函数。
+ *
+ * v0.10.0（集成员·第 6 轮）：**其余收件人（含 wakeLead=1 时的 lead）先过忙闲闸**——
+ * 回合进行中（在途任务 ∨ 注册表 running 自述可信）则不发起唤醒，urgent 告警照落邮箱，
+ * 并落一条 delivered=mailbox 的 `watchdog-wake`（note 写明是因为成员回合进行中而未唤醒，
+ * 不新增任何键——§15.5 的可选键枚举不动）。判据与理由见 {@link recipientTurnBusy}；
+ * 收件人空闲时本闸不生效——wake 调用、审计、回执三面逐字节不变。
  */
 async function notifyAndWake(
   deps: WatchdogDeps,
@@ -626,6 +1087,7 @@ async function notifyAndWake(
   text: string,
   scene: string,
   summary: WatchdogSweepSummary,
+  opts: { leadKey: string; wakeLead: boolean; team: TeamState },
 ): Promise<void> {
   const { stateRoot, workspace, env } = deps;
   const now = Date.now();
@@ -639,6 +1101,42 @@ async function notifyAndWake(
     if (recipient.sessionId === null || recipient.sessionId === '') continue; // 无 sid：邮箱兜底
     const messageId = messageIds[index];
     if (messageId === undefined) continue;
+    // v0.10.0（组 A / R5）：lead 告警不拉无头分身（只写邮箱）——「是否尝试过唤醒」如实记账。
+    if (recipient.key === opts.leadKey && !opts.wakeLead) {
+      const note = `member-dead 告警对 lead 只写 urgent 邮箱、未尝试唤醒（XC_WATCHDOG_WAKE_LEAD 未设为 "1"；`
+        + '恢复旧行为可设该 env）——主控在自己回合即可看到本告警，不被强行拉起成无头分身';
+      summary.wakes.push({ to: recipient.key, delivered: 'mailbox', note });
+      await logEngineEvent(stateRoot, {
+        event: 'watchdog-wake',
+        teamId,
+        to: recipient.key,
+        delivered: 'mailbox',
+        note,
+      });
+      continue;
+    }
+    // v0.10.0（集成员·第 6 轮）：**忙闲闸**（R2 同款判据）——回合进行中的收件人不发起
+    // 唤醒：死亡告警发给正跑到一半的队友时，再拉一路无头回合同样是 G-28 的双回合形态。
+    // urgent 告警已落邮箱（上面第一段），成员自己回合即可看到；本闸只挡 spawn。
+    const busy = await recipientTurnBusy(stateRoot, teamId, opts.team, recipient.key, recipient.sessionId, now);
+    if (busy.busy) {
+      const reasons = [
+        ...(busy.openTaskIds.length > 0 ? [`在途任务 ${busy.openTaskIds.join(', ')}`] : []),
+        ...(busy.sessionRunning ? ['会话 liveness=running 且时刻可信'] : []),
+      ];
+      const note = `告警收件人 "${recipient.key}" 回合进行中（${reasons.join('；')}）——不发起唤醒`
+        + '（同一会话两路并发 = G-28 双回合格局：两路抢信箱、重复劳动）；urgent 告警已落邮箱，'
+        + '成员自己回合即可看到，pull 兜底不丢';
+      summary.wakes.push({ to: recipient.key, delivered: 'mailbox', note });
+      await logEngineEvent(stateRoot, {
+        event: 'watchdog-wake',
+        teamId,
+        to: recipient.key,
+        delivered: 'mailbox',
+        note,
+      });
+      continue;
+    }
     const sent = await attemptWake({
       stateRoot,
       teamId,
@@ -651,6 +1149,10 @@ async function notifyAndWake(
       urgent: true,
       env,
       ...(deps.capacitySample !== undefined ? { capacitySample: deps.capacitySample } : {}),
+      // v0.10.0（集成员·第 6 轮）：测试注入的 spawn（缺省 = 真 spawnResume）——与
+      // capacitySample / §4.7 补醒路径同纪律：注入即信任，生产路径永不传。透到告警路径，
+      // 是为了让「忙闲闸挡下 ⇒ 零 attemptWake」可被 fake spawn 的调用计数直接观测。
+      ...(deps.spawn !== undefined ? { spawn: deps.spawn } : {}),
     });
     summary.wakes.push({
       to: recipient.key,
@@ -700,34 +1202,43 @@ function renderRoundIncidents(
  * 收件人规划（v0.9.2 打回第 1 轮 V092-02 修正；锁外调用，纯函数）。
  *
  * 规则（写死）：
- * 1. **已判 pid-dead 的成员一律不收**——含本轮刚死的、也含往轮已死的。给一个已崩会话写
+ * 1. **已判死的成员一律不收**——含本轮刚死的、也含往轮已死的。给一个已崩会话写
  *    邮箱没有接收意义，attemptWake 一个死 sid 必然 sessionNotFound → wake-failed +
  *    wake-retry-failed 双事件 + 双 urgent，且 notifyLeadUrgent 还会把第二份 urgent 写进
  *    那个死邮箱（adv-1 TC-2 C/C2 部分实测）。这与 C6-BUG-4「不通知崩溃者自己的邮箱」
  *    是同一条口径——原实现只排除了 leadKey 一个键，同轮/往轮已死的其他成员漏排；
- * 2. 出事成员不是 lead ∧ lead 可寻址（在册 ∧ 有 sid ∧ 非 pid-dead）→ 通知 lead（原口径）；
+ * 2. 出事成员不是 lead ∧ lead 可寻址（在册 ∧ 有 sid ∧ 非死）→ 通知 lead（原口径）；
  * 3. 否则（出事的是 lead，或 lead 已死/不可寻址）→ 通知**其余可寻址的活成员**；
  * 4. 无 sid 的成员不收（邮箱兜底可以写，但唤醒无处可打——与原实现一致只走邮箱的实现
  *    在这里统一为「不收」，避免「只写邮箱不唤醒」的半套件）；
  * 5. 一个都找不到 → 调用方只落 `watchdog-notify-skipped`（不抛、不回退）。
+ *
+ * v0.10.0（集成员·第 7 轮）：判死由「活性字符串 === 'pid-dead'」改为**视图的 dead**
+ * （{@link memberLivenessView} 的 state==='dead'）——后者 = 活性为 pid-dead **或**
+ * 注册表记录自述 dead 且没有 live/heartbeat-stale 这类活证据。修「死人被重新武装后
+ * 进收件人名单并被唤醒」：pid 被系统回收复用时 `alive(storedPid)` 为真，pid 证据支
+ * 整支失效、活性退成 no-record，字符串判据下死人不再是 pid-dead ⇒ 重新武装 + 进名单
+ * + 被唤醒（真实加测 R3 §6.1 实证）。记录仍自述 dead 时无论 pid 现在是否活着都按死人。
  */
 function planRecipients(input: {
   team: TeamState;
   leadKey: string;
-  livenessByKey: ReadonlyMap<string, MemberLiveness>;
+  /** 判死视图（state==='dead'）——判死/收件人/重新武装共用的单一口径。 */
+  viewsByKey: ReadonlyMap<string, SessionLivenessView>;
   leadCurrentlyDead: boolean;
 }): Array<{ key: string; sessionId: string }> {
-  // 可寻址的**活**成员（型收窄后必有 sid，唤醒才有的打；pid-dead 一律排除——V092-02）
+  const isDead = (key: string): boolean => input.viewsByKey.get(key)?.state === 'dead';
+  // 可寻址的**活**成员（型收窄后必有 sid，唤醒才有的打；已判死的一律排除——V092-02）
   const liveMembers = input.team.members.filter(
     (m): m is TeamMember & { sessionId: string } =>
       m.key !== input.leadKey
       && typeof m.sessionId === 'string' && m.sessionId !== ''
-      && input.livenessByKey.get(m.key) !== 'pid-dead',
+      && !isDead(m.key),
   );
   if (!input.leadCurrentlyDead) {
     const lead = input.team.members.find((m) => m.key === input.leadKey);
     if (lead !== undefined && typeof lead.sessionId === 'string' && lead.sessionId !== ''
-      && input.livenessByKey.get(lead.key) !== 'pid-dead') {
+      && !isDead(lead.key)) {
       return [{ key: lead.key, sessionId: lead.sessionId }];
     }
   }
@@ -811,6 +1322,10 @@ export async function sweepMembersOnce(
     leaseExpired: [],
     needsContinuation: [],
     unclaimedRepooled: [],
+    deathExempt: [],
+    deathSuspects: [],
+    dispatchResumed: [],
+    resumeWakeDeferred: [],
     orphanNonces: [],
     wakes: [],
   };
@@ -866,10 +1381,17 @@ export async function sweepMembersOnce(
 
     // ── 1. 无锁预计算：活性表 + 四类认领候选（都是只读投影，不碰状态文件）──
     const livenessByKey = new Map<string, MemberLiveness>();
-    const deathCandidates: Array<{ key: string; sessionId: string; recentLife: boolean }> = [];
+    // v0.10.0（组 A / R3/G-29）：判亡候选 = pid-dead ∧ **四道校验前三道全过**（第④道
+    // 二次确认在状态锁内按台账连判两周期）。被前三道豁免的成员进 guardedDead——
+    // 不发 member-dead、不回池、不进告警，只落 suspect-dead 审计（「判据被豁免」
+    // 这件事本身要可见，否则豁免成了新的静默区）。
+    const deathCandidates: Array<{ key: string; sessionId: string; recentLife: boolean; duty?: string }> = [];
+    const guardedDead: Array<{ key: string; sessionId: string; reasons: Array<'inflight-wake' | 'open-tasks' | 'newer-pid'> }> = [];
     // v0.9.4（A1）：会话记录一次读取、两个循环复用（死亡判定的 pid 证据 + 待续跑判据）
-    // ——不新增每成员的盘读次数。
+    // ——不新增每成员的盘读次数。v0.10.0（组 A / R2 后半）：活性视图同样一次计算、
+    // 待续跑与补醒两个判据共用（省掉每成员一次 pidAlive 系统调用）。
     const sessionRecords = new Map<string, SessionRecord | undefined>();
+    const viewsByKey = new Map<string, SessionLivenessView>();
     for (const member of team.members) {
       if (memberState(member) === 'removed') continue; // 显式终态不是「死亡」
       const sessionId = typeof member.sessionId === 'string' && member.sessionId !== '' ? member.sessionId : null;
@@ -882,6 +1404,7 @@ export async function sweepMembersOnce(
         record = undefined; // 读失败 = 无记录（保守 idle，不崩观测面）
       }
       sessionRecords.set(member.key, record);
+      viewsByKey.set(member.key, memberLivenessView(member, record, scan, now));
       // v0.9.4（A1）：pid 证据（记录 pid + 存活探测 + 回合中自述）——peer 注册表没有
       // 该 sid 记录时（引擎成员从未 identify），会话记录 pid 是进程死的第二硬证据。
       // v0.9.4 打回第 1 轮（V094-13）：派生走 core/offline.ts 的**单一派生点**——
@@ -890,33 +1413,73 @@ export async function sweepMembersOnce(
       const pidEvidence = deriveSessionPidEvidence(record, now, pidAlive);
       const liveness = memberLiveness(member, scan, now, { sessionPid: pidEvidence });
       livenessByKey.set(member.key, liveness);
-      if (liveness === 'pid-dead') {
-        // v0.9.5（A2/V094-13）：新鲜度**三源合判**——peer 记录心跳之外，补 registry
-        // 会话记录 lastEventTs（hooks 回合边界 + 工具心跳）与引擎证言 ts。V094-13
-        // 实测形态：引擎成员从未 peer 注册（每次工具调用的 server 短命、干净注销），
-        // 旧判据只扫 peer 记录 → 90 秒前还活着的成员被当存量死记录永久静音。
-        // v0.9.6（A4/V095-10）：补扫轮的新鲜窗 = 生效补扫窗（max(gap,常规 10min) 钳 7 天
-        // 上界，见入口的 catchupWindowMs）——窗口内死亡按补扫告警（不静音）；正常轮维持
-        // WATCHDOG_FRESH_DEATH_MS。
-        let witnessTs: number | undefined;
-        try {
-          witnessTs = (await readSessionWitness(stateRoot, sessionId))?.ts;
-        } catch {
-          witnessTs = undefined; // 证言读失败 = 该源无声（不猜）
-        }
-        const freshWindowMs = catchupWindowMs;
-        const recentLife = recentLifeEvidence(
-          scan,
-          sessionId,
-          now,
-          { lastEventTs: record?.lastEventTs, ...(witnessTs !== undefined ? { witnessTs } : {}) },
-          freshWindowMs,
-        );
-        deathCandidates.push({ key: member.key, sessionId, recentLife });
+      if (liveness !== 'pid-dead') continue;
+      // v0.9.5（A2/V094-13）：新鲜度**三源合判**——peer 记录心跳之外，补 registry
+      // 会话记录 lastEventTs（hooks 回合边界 + 工具心跳）与引擎证言 ts。V094-13
+      // 实测形态：引擎成员从未 peer 注册（每次工具调用的 server 短命、干净注销），
+      // 旧判据只扫 peer 记录 → 90 秒前还活着的成员被当存量死记录永久静音。
+      // v0.9.6（A4/V095-10）：补扫轮的新鲜窗 = 生效补扫窗（max(gap,常规 10min) 钳 7 天
+      // 上界，见入口的 catchupWindowMs）——窗口内死亡按补扫告警（不静音）；正常轮维持
+      // WATCHDOG_FRESH_DEATH_MS。
+      let witnessTs: number | undefined;
+      let witnessKind: string | undefined;
+      try {
+        const witness = await readSessionWitness(stateRoot, sessionId);
+        witnessTs = witness?.ts;
+        witnessKind = witness?.kind;
+      } catch {
+        witnessTs = undefined; // 证言读失败 = 该源无声（不猜）
       }
+      const freshWindowMs = catchupWindowMs;
+      const recentLife = recentLifeEvidence(
+        scan,
+        sessionId,
+        now,
+        { lastEventTs: record?.lastEventTs, ...(witnessTs !== undefined ? { witnessTs } : {}) },
+        freshWindowMs,
+      );
+      // v0.10.0（组 A / R3）：判亡前四道校验之前三道——纯判据 core/offline.ts
+      // sessionDeathGuard，证据在本循环内一次读齐（唤醒生命周期账 + 在途 nonce +
+      // 证言 + 任务板快照）。任一命中即不判亡（方向保守：误判亡会撤回在途派单）。
+      // 判亡校验的在途窗 = DEATH_GUARD_LIFECYCLE_INFLIGHT_MS（15min，与 deliveryAttemptVerdict
+      // 的在途面同窗——强杀唤醒子可能不留 exit 尾行，窗后不再无限豁免）。
+      const wakeEvidence = await readWakeLifecycleEvidence(stateRoot, member.key, DEATH_GUARD_LIFECYCLE_INFLIGHT_MS, now);
+      const sessionRunningSinceSpawn = witnessKind === 'running'
+        && wakeEvidence.lastSpawnTs !== undefined
+        && witnessTs !== undefined
+        && witnessTs >= wakeEvidence.lastSpawnTs;
+      const inflightNonce = (await findLiveInflightWakeNonce(stateRoot, member.key, { teamId, sid: sessionId, now })) !== undefined;
+      const openTaskCount = team.tasks.filter(
+        (task) => task.assignee === member.key && (task.status === 'claimed' || task.status === 'in_progress'),
+      ).length;
+      const guard = sessionDeathGuard({
+        wake: {
+          inflightNonce,
+          lifecycleStartNoExit: wakeEvidence.startNoExit,
+          lastSpawnTs: wakeEvidence.lastSpawnTs,
+          sessionRunningSinceSpawn,
+          wakeChildPidAlive: wakeEvidence.wakeChildPidAlive,
+        },
+        openTaskCount,
+        // `newer-pid`（③ 记录 pid 亡但注册表已有更新的活 pid）在 phase 1 无第二来源：
+        // peer 注册表里同 sid 的活记录会让 memberLiveness 直接判 live（到不了 pid-dead），
+        // 剩下的来源只有「SessionStart 钩子刚把新 pid 写回记录」——那由状态锁内认领前的
+        // TOCTOU 重读覆盖（见下方认领分支）。此处不重复计（同一事实不记两个理由）。
+        newerPidAlive: false,
+        now,
+      });
+      if (guard.exempt) {
+        guardedDead.push({ key: member.key, sessionId, reasons: guard.reasons });
+        continue;
+      }
+      deathCandidates.push({ key: member.key, sessionId, recentLife, duty: dutySnippet(member) });
     }
-    summary.leadCurrentlyDead = livenessByKey.get(leadKey) === 'pid-dead';
-    // v0.9.3（A4）待续跑候选（in_progress ∧ idle）：会话记录 + 三视图活性判据，锁外预读。
+    // v0.10.0（集成员·第 7 轮）：lead 是否已死改用**视图的 dead**（而非活性字符串
+    // ==='pid-dead'）——pid 被回收复用时字符串会退成 no-record，lead 会被误判成活
+    // （「通知改投队友」的规则随之失效）；记录自述 dead 时无论 pid 是否活着都按死。
+    summary.leadCurrentlyDead = viewsByKey.get(leadKey)?.state === 'dead';
+    // v0.9.3（A4）待续跑候选（in_progress ∧ idle）：会话记录 + 三视图活性判据，锁外预读
+    // （视图已在上面循环算好，此处不重复派生）。
     const continuationCandidates: Array<{ key: string; sessionId: string; taskId: string; idleSinceTs: number | undefined }> = [];
     for (const member of team.members) {
       if (memberState(member) === 'removed') continue;
@@ -924,7 +1487,7 @@ export async function sweepMembersOnce(
       if (sessionId === null) continue;
       // v0.9.4（A1）：复用上方循环已读的会话记录（不重复读盘）。
       const record = sessionRecords.get(member.key);
-      const view = memberLivenessView(member, record, scan, now);
+      const view = viewsByKey.get(member.key)!;
       const candidate = continuationCandidateOf(member, view, record, team.tasks, now);
       if (candidate !== undefined) {
         continuationCandidates.push({
@@ -938,12 +1501,28 @@ export async function sweepMembersOnce(
     // v0.9.3（A1）claimed-未投递候选（claimed ∧ ¬delivered ∧ ¬consumed ∧ 超时）+ limbo 候选：
     // 两个判据都吃同一份邮箱快照，故合并为**一次**锁外预读（每成员一封邮件箱读一遍，
     // 判据各自纯函数过滤——与 sweepLimboDeliveriesLocked 内部的判据同源，不漂移）。
+    // v0.10.0（组 A / R2 后半；补充·R8 联动）：同一份快照顺带算**补醒候选**（两类未读：
+    // 未读派单 + 未读紧急回执）——判据依次叠昂贵程度排列：邮箱快照已在手 → 活性视图已算
+    // → 证言/在途 nonce/生命周期账按需读。
     const deliveryLeaseMs = deliveryLeaseMsFromEnv(env);
     const limboTimeoutMs = limboTimeoutFromEnv(env);
+    const resumeCooldownMs = dispatchResumeCooldownMsFromEnv(env);
+    // v0.10.0（集成员·第 5 轮 / 对抗 ADV-02）：补醒防风暴总次数上限的生效值（每轮取一次）。
+    const resumeWakeMax = resumeWakeMaxFromEnv(env);
     const claimCandidates = new Map<string, TeamMessage[]>();
     const limboCandidates = new Map<string, Map<string, number | undefined>>();
+    const dispatchResumeCandidates: Array<{
+      key: string; sessionId: string; messageIds: string[]; taskIds: string[];
+      scene: string; urgent: boolean;
+    }> = [];
+    // v0.10.0（集成员·第 5 轮 / 对抗 ADV-02）：被防风暴闸挡下的补醒（phase 1 只收候选，
+    // 审计事件在 §4.7 与 dispatch-resume/report-resume 同处落——engine 事件的写入点集中）。
+    const resumeWakeDeferredCandidates: Array<{
+      key: string; sessionId: string; scene: string; messageIds: string[]; taskIds: string[];
+    }> = [];
     for (const member of team.members) {
       if (memberState(member) === 'removed') continue;
+      const sessionId = typeof member.sessionId === 'string' && member.sessionId !== '' ? member.sessionId : null;
       let messages: TeamMessage[];
       try {
         messages = await readMailbox(stateRoot, teamId, member.key);
@@ -954,6 +1533,68 @@ export async function sweepMembersOnce(
       if (expired.length > 0) claimCandidates.set(member.key, expired);
       const limbo = limboCandidateMessages(messages, team, now, limboTimeoutMs);
       if (limbo.length > 0) limboCandidates.set(member.key, new Map(limbo.map((m) => [m.id, m.deliveredAt])));
+      // ── v0.10.0（组 A / R2 后半；补充·R8 联动）：补醒候选筛选 ──
+      // 判据（需求 A4 + 追加裁决）：① 成员空闲——最后一个引擎事件是 session-idle（引擎
+      //   证言 kind='idle'）且没有在途回合（活性视图非 running；dead 由上一步排除）；
+      //   **收件人回合还在进行中时绝不补醒**；
+      //   ② 没有在途唤醒（在途 nonce 有活体证据）；
+      //   ③ 收件箱里有**两类未读**之一：未读派单（task-assignment）或未读紧急回执
+      //   （task-receipt ∧ urgent/wakeDeferred 标记；判据见 isUrgentReceiptMessage 一族，
+      //   未读真源与 overview/改名守卫同一）；
+      //   ④ 冷却窗内不重复补醒（生命周期账里任一补醒 scene 的最近 spawn；两类未读共用一窗）。
+      // 方向保守：宁可不补醒（下轮/邮箱 pull 兜底），不把在途成员拉起第二路（G-28）。
+      if (sessionId === null) continue;
+      // v0.10.0（集成员·第 7 轮）：死者不补醒改用**视图的 dead**——pid 被回收复用时
+      // 活性字符串退成 no-record，字符串判据下死人会被补醒（重新拉起一回合）。
+      if (viewsByKey.get(member.key)?.state === 'dead') continue; // 死者不补醒（member-dead 通道负责）
+      if (viewsByKey.get(member.key)?.state !== 'idle') continue; // running 不补醒；无记录按非 idle 处理
+      const unread = currentUnreadMessages(team, messages);
+      const unreadUrgentReceipts = unread.filter((m) => isUrgentReceiptMessage(m));
+      const unreadDispatch = unread.filter((m) => isUnreadDispatchMessage(m));
+      if (unreadDispatch.length === 0 && unreadUrgentReceipts.length === 0) continue;
+      // 命中紧急回执 → scene=report-resume + urgent:true；仅派单 → dispatch-resume（不 urgent）
+      const resumeScene = unreadUrgentReceipts.length > 0 ? RESUME_SCENE_REPORT : RESUME_SCENE_DISPATCH;
+      const resumeIds = [...unreadDispatch, ...unreadUrgentReceipts];
+      let witnessKind: string | undefined;
+      try {
+        witnessKind = (await readSessionWitness(stateRoot, sessionId))?.kind;
+      } catch {
+        witnessKind = undefined; // 证言读失败：无从证明「最后一个事件是 session-idle」→ 不补醒
+      }
+      if (witnessKind !== 'idle') continue;
+      if ((await findLiveInflightWakeNonce(stateRoot, member.key, { teamId, sid: sessionId, now })) !== undefined) continue;
+      // 冷却源按**冷却窗**读生命周期账（窗精确：文件名 ts 即 spawn 时刻；两类补醒 scene
+      // 共用一窗）；冷却为 0 时完全不读（显式不冷却）。
+      if (resumeCooldownMs > 0) {
+        const wakeEvidence = await readWakeLifecycleEvidence(stateRoot, member.key, resumeCooldownMs, now);
+        if (wakeEvidence.lastResumeTs !== undefined
+          && now - wakeEvidence.lastResumeTs < resumeCooldownMs) {
+          continue; // 冷却窗内不重复补醒
+        }
+      }
+      // ⑤ v0.10.0（集成员·第 5 轮 / 对抗 ADV-02）：**防风暴总次数闸**——冷却只管一个窗内
+      //    不重复，不管窗窗都补：收方零动作时每 120s 一次真唤醒 = 慢速唤醒风暴（每次一整棵
+      //    无头进程树）。同一成员 10min 窗内真唤醒补醒已达上限 → 本轮不补醒（不进候选），
+      //    只落 resume-wake-deferred 审计；**邮箱消息不动**（pull 兜底不丢）。
+      //    计数读失败/坏行 → 0（fail-open：闸只防风暴，不因观测面故障把消息打死）。
+      if (await countRecentResumeWakes(stateRoot, member.key, now) >= resumeWakeMax) {
+        resumeWakeDeferredCandidates.push({
+          key: member.key,
+          sessionId,
+          scene: resumeScene,
+          messageIds: resumeIds.map((m) => m.id!),
+          taskIds: resumeIds.flatMap((m) => (m.taskId !== undefined ? [m.taskId] : [])),
+        });
+        continue;
+      }
+      dispatchResumeCandidates.push({
+        key: member.key,
+        sessionId,
+        messageIds: resumeIds.map((m) => m.id!),
+        taskIds: resumeIds.flatMap((m) => (m.taskId !== undefined ? [m.taskId] : [])),
+        scene: resumeScene,
+        urgent: unreadUrgentReceipts.length > 0,
+      });
     }
     // v0.9.3 打回第 1 轮（V093-02/V093-03）：A1 释放前的**跨源门槛**。「这个租约真对应一次
     // attemptWake 尝试」与「该尝试可能仍在途」都不是邮箱行条件（要读 registry/wake 的 nonce
@@ -984,48 +1625,21 @@ export async function sweepMembersOnce(
       });
     }
 
-    // ── 1.5 v0.9.9（V098-07）：pid-dead 成员的**未认领单**回池（团队锁内）──
-    // 缺陷形态（51-v098 验收 adv-3 i=1）：判死路径只告警不回池——派给死者的未认领单
-    // （pending ∧ assignee 空 ∧ to 命中）不在 stale 清扫域（SWEEPABLE 只含
-    // claimed/in_progress）、他人 claim 得 not_assignee、死者无法认领 ⇒ 永久搁浅，
-    // 创建者零回执；且死亡告警「名下任务已冻结待回池（板面 requeueAtMs）」对未认领单
-    // 属过度承诺（板面 requeueAtMs 只覆盖 assignee 命中单，pending 单永远等不到清扫）。
-    // 修法 = 死亡路径调用回池原语（core/teamstate.ts
-    // repoolUnclaimedTasksForFailedMember：删 to 回共享待领池 + 创建者 task-receipt +
-    // 审计 member-unclaimed-repooled），与供给失败面（provision.ts catch）同款。
-    // 位置在状态锁认领**之前**：锁序恒为「先团队锁（回池/limbo 降级）→ 再状态锁
-    // （认领）」（见 WATCHDOG_STATE_LOCK_NAME 注释），不成环；且回池结果可进本轮告警
-    // 文案（未认领单如实写「已回池」而非「冻结待回池」）。
-    // 判据 = liveness pid-dead（进程死硬证据，与告警同源）∧ 名下有未认领单（phase 1
-    // 快照预筛，省掉无谓的锁竞争）；每轮对命中成员回池一次——幂等（to 清后不再命中），
-    // 停机后**新派给死者**的单下一轮自愈（dispatch 面只拒 removed/failed，不拒
-    // pid-dead-but-roster-ready）。removed 成员的未认领单不在此域：停机面（member-stop，
-    // V098-06）已在同一临界段回池。
-    const unclaimedRepooledByKey = new Map<string, string[]>();
-    for (const member of team.members) {
-      if (livenessByKey.get(member.key) !== 'pid-dead') continue;
-      if (memberUnclaimedTasks(team.tasks, member.key).length === 0) continue;
-      try {
-        const released = await repoolUnclaimedTasksForFailedMember(stateRoot, teamId, member.key, {
-          reason: 'member-dead',
-          detail: 'watchdog: member process is dead (pid-dead); unclaimed dispatch returned to the shared pending pool',
-        });
-        if (released.length === 0) continue; // 锁内重判后已无可回池（并发已处理）——零审计零披露
-        const taskIds = released.map((entry) => entry.taskId);
-        unclaimedRepooledByKey.set(member.key, taskIds);
-        summary.unclaimedRepooled.push({ key: member.key, taskIds });
-      } catch (error) {
-        // 回池是判死路径的尽力清理：失败不掩盖死亡告警本身（成员照常告警；判据不销，
-        // 下一轮自愈）。落审计让「未认领单没回池」在观测面可见；**不回写告警文案**
-        // （不把没回池的单说成已回池——不变式 5）。
-        await logEngineEvent(stateRoot, {
-          event: 'watchdog-repool-failed',
-          teamId,
-          member: member.key,
-          error: error instanceof Error ? error.message : String(error),
-        }).catch(() => undefined);
-      }
-    }
+    // ── 1.5 v0.9.9（V098-07）回池面：v0.10.0（组 A / R3）起**后移**到状态锁认领之后 ──
+    // （见下方 2.7 节）。缺陷形态（51-v098 验收 adv-3 i=1）：判死路径只告警不回池——
+    // 派给死者的未认领单（pending ∧ assignee 空 ∧ to 命中）不在 stale 清扫域
+    // （SWEEPABLE 只含 claimed/in_progress）、他人 claim 得 not_assignee、死者无法认领
+    // ⇒ 永久搁浅，创建者零回执。修法 = 死亡路径调用回池原语
+    // （core/teamstate.ts repoolUnclaimedTasksForFailedMember：删 to 回共享待领池 +
+    // 创建者 task-receipt + 审计 member-unclaimed-repooled），与供给失败面
+    // （provision.ts catch）同款。
+    // v0.10.0（组 A / R3）后移的原因：R3 验收要求「连续两个扫描周期都判死才发
+    // member-dead **并执行回池**（二次确认）」——回池若留在认领之前，首次判死的成员
+    // 当轮就被回池，二次确认形同虚设。新位置 = 状态锁认领之后（锁序：状态锁 → 团队锁，
+    // 两把锁从不嵌套，不成环；与 3 节 limbo 降级同序）；已被往轮认领的死者（台账
+    // state='dead'）仍每轮自愈回池（停机后新派给死者的单——dispatch 面只拒
+    // removed/failed，不拒 pid-dead-but-roster-ready）。removed 成员的未认领单不在此域：
+    // 停机面（member-stop，V098-06）已在同一临界段回池。
 
     const incidents: RoundIncident[] = [];
 
@@ -1041,6 +1655,18 @@ export async function sweepMembersOnce(
     // 死亡补炸」的旧注释随两段式告知作废——权威见 watchdog-state.ts 同名字段文档与
     // watchdog-v093-notify-atomicity.test.ts 的旧格式例）。
     const renotifyPending: Array<{ key: string; sessionId: string; ledgerKey: string; at: number; evidence: string }> = [];
+    /**
+     * v0.10.0（组 A / R3）：本轮**认领的死亡**（锁内判定、锁外善后）——member-dead
+     * 事件、注册表翻转（markSessionDead）、未认领取回池与告警文案都在锁外按本清单做
+     * （回池要拿团队锁，与状态锁不嵌套；事件后移的缺口由 V093-04 的重发/补发队列兜底
+     * ——进程崩在认领与善后之间时，下一轮见 notify:'pending' 会补发，事件由
+     * backfillMemberDeadEvents 条件式补落）。
+     */
+    const confirmedDeaths: Array<{
+      key: string; sessionId: string; firstSight: boolean; recentLife: boolean; duty?: string; silent: boolean;
+    }> = [];
+    /** 本轮「重新武装」（台账 dead→alive）的成员——锁外翻回注册表的 dead 自述。 */
+    const rearmedKeys: Array<{ key: string; sessionId: string }> = [];
     let state: WatchdogState;
     try {
       state = await withWatchdogStateLock(stateRoot, async () => {
@@ -1073,44 +1699,116 @@ export async function sweepMembersOnce(
           // 静音：t2 实测形态（引擎成员未 peer 注册 + 无工具回合 + 台账无历史，长回合中
           // 进程死）三源全过期，静默认领零审计零告警——正是「宁误报一次」要堵的形态。
           if (previous === undefined && !hit.recentLife && summary.resume !== undefined) {
+            // 补扫轮的远古死记录：静默认领（不告警）——回池与注册表翻转照做（善后进
+            // confirmedDeaths.silent），「同一次死亡只认领一次」的口径不变。
             locked.members[ledgerKey] = {
               state: 'dead', at: now, liveness: 'pid-dead', evidence: 'process-dead', notify: 'sent',
             };
+            confirmedDeaths.push({
+              key: hit.key, sessionId: hit.sessionId, firstSight: true, recentLife: hit.recentLife,
+              ...(hit.duty !== undefined ? { duty: hit.duty } : {}), silent: true,
+            });
             continue;
           }
-          const firstSight = previous === undefined;
+          // v0.10.0（组 A / R3 修法④）：**二次确认**——连续两个扫描周期都判死才发
+          // member-dead 并回池。首个周期只记 suspect（state 仍 alive、liveness=pid-dead、
+          // at=首见时刻），落 `suspect-dead` 审计（「判据命中但待复核」可见，不静默）。
+          // 判据用台账上一周期的 liveness 快照：非 pid-dead（含首见/刚恢复）= 第一周期。
+          if (previous === undefined || previous.liveness !== 'pid-dead') {
+            locked.members[ledgerKey] = { state: 'alive', at: now, liveness: 'pid-dead' };
+            summary.deathSuspects.push(hit.key);
+            await logEngineEvent(stateRoot, {
+              event: 'suspect-dead',
+              teamId,
+              member: hit.key,
+              sessionId: hit.sessionId,
+              liveness: 'pid-dead',
+              evidence: 'process-dead',
+              reasons: [],
+              via: 'watchdog',
+              note: '首次判死（判亡前四道校验全过）——按二次确认口径等下一个扫描周期复核；'
+                + '连续两个扫描周期仍判死才发 member-dead 并执行回池',
+            });
+            continue;
+          }
+          // 第二周期仍判死 → 认领前的 **TOCTOU 复核**（第四道校验的账本外半）：记录 pid
+          // 可能已被 SessionStart 钩子改写成更新的活 pid（G-29 启动窗：新 pid 已写回而
+          // phase 1 读到的还是旧 pid）——锁内重读一次，变了且活着就不判亡（退回 suspect）。
+          let recordNow: SessionRecord | undefined;
+          try {
+            recordNow = await readSession(stateRoot, hit.sessionId);
+          } catch {
+            recordNow = undefined; // 读失败 = 无从复核：按已判证据走（下轮自愈）
+          }
+          const previousPid = sessionRecords.get(hit.key)?.pid;
+          if (recordNow?.pid !== undefined && recordNow.pid !== previousPid && pidAlive(recordNow.pid)) {
+            locked.members[ledgerKey] = { state: 'alive', at: now, liveness: 'pid-dead' };
+            summary.deathExempt.push({ key: hit.key, reasons: ['newer-pid'] });
+            await logEngineEvent(stateRoot, {
+              event: 'suspect-dead',
+              teamId,
+              member: hit.key,
+              sessionId: hit.sessionId,
+              liveness: 'pid-dead',
+              evidence: 'process-dead',
+              reasons: ['newer-pid'],
+              via: 'watchdog',
+              note: '记录 pid 亡但注册表已有更新的活 pid（认领前重读复核：SessionStart 钩子已写回新 pid）——不算死',
+            });
+            continue;
+          }
+          // 认领：firstSight = suspect 记于上一周期（首见即死形态的文案标注由此保留）
+          const firstSight = now - previous.at <= WATCHDOG_NOTIFY_RETRY_MS;
           locked.members[ledgerKey] = {
             state: 'dead', at: now, liveness: 'pid-dead', evidence: 'process-dead', notify: 'pending',
           };
           summary.dead.push(hit.key);
           if (firstSight) summary.firstSightDead.push(hit.key);
           if (hit.key === leadKey) summary.leadDead = true;
-          await logEngineEvent(stateRoot, {
-            event: 'member-dead',
-            teamId,
-            member: hit.key,
-            sessionId: hit.sessionId,
-            liveness: 'pid-dead',
-            evidence: 'process-dead',
-            via: 'watchdog',
+          confirmedDeaths.push({
+            key: hit.key, sessionId: hit.sessionId, firstSight, recentLife: hit.recentLife,
+            ...(hit.duty !== undefined ? { duty: hit.duty } : {}), silent: false,
           });
-          incidents.push({
-            kind: 'member-dead',
-            text: renderMemberDeadText(
-              hit.key,
-              hit.sessionId,
-              hit.key === leadKey,
-              firstSight,
-              summary.resume !== undefined,
-              hit.recentLife,
-              // v0.9.9（V098-07）：本轮已回池的未认领单（若有）——文案对它们写「已回池」
-              // 而不是「冻结待回池」（后者对 pending 单是过度承诺）。
-              unclaimedRepooledByKey.get(hit.key),
-            ),
-          });
+        }
+        // v0.10.0（组 A / R3）：被四道校验豁免的 pid-dead 成员——suspect 记账（state 仍
+        // alive、liveness=pid-dead）＋ 状态**转换时**落一条 suspect-dead 审计（同一豁免
+        // 形态持续多轮不重复落——审计是「状态变了」的信号，不是心跳）。往轮已认领死亡
+        // 的条目不动（那次死亡已告过警）。
+        for (const hit of guardedDead) {
+          const ledgerKey = watchdogLedgerKey(hit.key, hit.sessionId);
+          const previous = locked.members[ledgerKey];
+          summary.deathExempt.push({ key: hit.key, reasons: hit.reasons });
+          if (previous?.state === 'dead') continue; // 已认领过：豁免不改变已发生的事实
+          const alreadySuspect = previous !== undefined && previous.liveness === 'pid-dead';
+          if (!alreadySuspect) {
+            locked.members[ledgerKey] = { state: 'alive', at: now, liveness: 'pid-dead' };
+            await logEngineEvent(stateRoot, {
+              event: 'suspect-dead',
+              teamId,
+              member: hit.key,
+              sessionId: hit.sessionId,
+              liveness: 'pid-dead',
+              evidence: 'process-dead',
+              reasons: hit.reasons,
+              via: 'watchdog',
+              note: `判 pid-dead 但被判亡前校验豁免（${hit.reasons.join('/')}）——不发 member-dead、不回池、不告警`,
+            });
+          }
         }
         // 非迁移成员刷新快照（复合键，V095-06）：活过来即重新武装；往轮已死者保持 dead
         // （不因一次扫描抖动重新武装）。同一成员换 sid（重供给/重绑）= 新化身独立记账。
+        // v0.10.0（组 A / R3）：alive 条目的 liveness 快照**随轮刷新**——二次确认要求
+        // 「连续两个周期」，上一周期不是 pid-dead（中间活过）就必须重新数两周期。
+        // v0.10.0（集成员·第 7 轮）：重新武装的「活过来」判据从「活性字符串 !== 'pid-dead'」
+        // 改为**视图的 dead 为假**（{@link memberLivenessView}：pid-dead ∨ 记录自述 dead 且
+        // 无 live/heartbeat-stale 活证据）。修「死人被重新武装」：pid 被系统回收复用时
+        // `alive(storedPid)` 为真 ⇒ pid 证据支整支失效 ⇒ 活性字符串退成 no-record，旧判据
+        // 下死人被重新武装（台账翻 alive + clearSessionDead 把注册表清成 idle，engine 里出现
+        // session-idle{prev:'dead'}），随后进告警收件人名单并被唤醒——真实加测 R3 §6.1 实证
+        // （m2 于 04:50:33 被重新武装、04:51:35 被 watchdog-wake 拉起一回合）。
+        // 新判据要求**正向复活证据**：记录不再自述 dead（该会话自己的钩子写过 running/idle）
+        // 或有 live/heartbeat-stale 证据。存量（台账 dead ∧ 记录不自述 dead）行为逐字节不变
+        // ——视图的 dead 在记录不自述 dead 时就等于「活性 === pid-dead」。
         for (const member of team.members) {
           if (memberState(member) === 'removed') continue;
           const refreshSid = typeof member.sessionId === 'string' && member.sessionId !== '' ? member.sessionId : null;
@@ -1123,7 +1821,12 @@ export async function sweepMembersOnce(
             locked.members[ledgerKey] = { state: liveness === 'pid-dead' ? 'dead' : 'alive', at: now, liveness };
             continue;
           }
-          if (previous.state === 'dead' && liveness !== 'pid-dead') {
+          if (previous.state === 'dead' && viewsByKey.get(member.key)?.state !== 'dead') {
+            locked.members[ledgerKey] = { state: 'alive', at: now, liveness };
+            rearmedKeys.push({ key: member.key, sessionId: refreshSid });
+            continue;
+          }
+          if (previous.state === 'alive' && previous.liveness !== liveness) {
             locked.members[ledgerKey] = { state: 'alive', at: now, liveness };
           }
         }
@@ -1179,6 +1882,113 @@ export async function sweepMembersOnce(
         return summary;
       }
       throw error;
+    }
+
+    // ── 2.7 v0.10.0（组 A / R3+R6）：死亡善后（锁外；锁序 = 状态锁 → 团队锁 → registry 锁，
+    //    两把从不嵌套）──
+    // ① **注册表翻转**（R6/G-24）：member-dead 之后 sessions/<sid>.json 的 liveness 立即
+    //    翻成 dead 并落盘——与 engine.jsonl 的 member-dead 事件双写一致。对本轮认领的
+    //    死者与往轮已认领的死者都做（后者是自愈：翻转失败/丢锁的下一轮补上）；
+    // ② **未认领取回池**（V098-07，v0.10.0 起随二次确认后移）：只对台账已认领死亡
+    //    （state='dead'）且当前仍 pid-dead 的成员做——首次判死的 suspect 成员不在域内
+    //    （连续两周期才回池）；每轮幂等，停机后新派给死者的单下一轮自愈；
+    // ③ **member-dead 事件 + 告警文案**：回池结果进文案（未认领单如实写「已回池」），
+    //    事件与注册表翻转同一段完成（两处一致）。
+    {
+      const deathIncidents: RoundIncident[] = [];
+      // 认领集合：本轮 confirmedDeaths + 往轮已 dead 且当前**视图仍判死**的成员（自愈回池面）。
+      // v0.10.0（集成员·第 7 轮）：第二个集合的判据从「活性字符串 === 'pid-dead'」改为视图的
+      // dead——pid 被回收复用时字符串退成 no-record，往轮死者的自愈回池会静默停摆
+      // （未认领单永久搁浅）；记录自述 dead 时无论 pid 是否活着都算仍死。
+      const aftermath = new Map<string, { key: string; sessionId: string; silent: boolean; firstSight: boolean; recentLife: boolean; duty?: string }>();
+      for (const death of confirmedDeaths) {
+        aftermath.set(death.key, {
+          key: death.key, sessionId: death.sessionId, silent: death.silent,
+          firstSight: death.firstSight, recentLife: death.recentLife,
+          ...(death.duty !== undefined ? { duty: death.duty } : {}),
+        });
+      }
+      for (const member of team.members) {
+        if (aftermath.has(member.key)) continue;
+        if (viewsByKey.get(member.key)?.state !== 'dead') continue;
+        const sid = typeof member.sessionId === 'string' && member.sessionId !== '' ? member.sessionId : null;
+        if (sid === null) continue;
+        if (state.members[watchdogLedgerKey(member.key, sid)]?.state !== 'dead') continue; // 未认领（suspect）不回池
+        aftermath.set(member.key, { key: member.key, sessionId: sid, silent: true, firstSight: false, recentLife: false });
+      }
+      for (const member of team.members) {
+        const entry = aftermath.get(member.key);
+        if (entry === undefined) continue;
+        // ① 注册表翻转（R6）：member-dead 与注册表 liveness=dead 双写一致。
+        try {
+          await markSessionDead(stateRoot, entry.sessionId, { now });
+        } catch {
+          /* best-effort：翻转失败不掩盖死亡告警本身（下一轮自愈） */
+        }
+        // ② 未认领单回池（V098-07 + 二次确认后移）。
+        let repooled: string[] | undefined;
+        if (memberUnclaimedTasks(team.tasks, entry.key).length > 0) {
+          try {
+            const released = await repoolUnclaimedTasksForFailedMember(stateRoot, teamId, entry.key, {
+              reason: 'member-dead',
+              detail: 'watchdog: member process is dead (pid-dead); unclaimed dispatch returned to the shared pending pool',
+            });
+            if (released.length === 0) {
+              repooled = undefined; // 锁内重判后已无可回池（并发已处理）——零审计零披露
+            } else {
+              repooled = released.map((r) => r.taskId);
+              summary.unclaimedRepooled.push({ key: entry.key, taskIds: repooled });
+            }
+          } catch (error) {
+            // 回池是判死路径的尽力清理：失败不掩盖死亡告警本身（成员照常告警；判据不销，
+            // 下一轮自愈）。落审计让「未认领单没回池」在观测面可见；**不回写告警文案**
+            // （不把没回池的单说成已回池——不变式 5）。
+            await logEngineEvent(stateRoot, {
+              event: 'watchdog-repool-failed',
+              teamId,
+              member: entry.key,
+              error: error instanceof Error ? error.message : String(error),
+            }).catch(() => undefined);
+          }
+        }
+        if (entry.silent) continue; // 往轮已认领/补扫静默认领：无事件无告警（只做上面的善后）
+        // ③ member-dead 事件（与注册表翻转同段完成）+ 告警文案。
+        await logEngineEvent(stateRoot, {
+          event: 'member-dead',
+          teamId,
+          member: entry.key,
+          sessionId: entry.sessionId,
+          liveness: 'pid-dead',
+          evidence: 'process-dead',
+          via: 'watchdog',
+        });
+        deathIncidents.push({
+          kind: 'member-dead',
+          text: renderMemberDeadText(
+            entry.key,
+            entry.sessionId,
+            entry.key === leadKey,
+            entry.firstSight,
+            summary.resume !== undefined,
+            entry.recentLife,
+            // v0.9.9（V098-07）：本轮已回池的未认领单（若有）——文案对它们写「已回池」
+            // 而不是「冻结待回池」（后者对 pending 单是过度承诺）。
+            repooled,
+            entry.duty,
+          ),
+        });
+      }
+      // 成员死亡告警排在本轮事故最前（与 v0.9.9 及以前的文案次序一致：先死后其它）。
+      incidents.unshift(...deathIncidents);
+      // 重新武装的成员：注册表里上一轮判亡翻成的 dead 自述清回 idle（R6 的翻回面；
+      // running 由下一回合边界标——此刻没有回合中的引擎证据，取保守 idle）。
+      for (const rearmed of rearmedKeys) {
+        try {
+          await clearSessionDead(stateRoot, rearmed.sessionId, { now });
+        } catch {
+          /* best-effort：清失败下一轮再清 */
+        }
+      }
     }
 
     // ── 2.5 v0.9.3（A4）needs-continuation 认领：读台账 → 判「idle 持续 ≥T 且本 episode
@@ -1366,9 +2176,100 @@ export async function sweepMembersOnce(
       }
     }
 
+    // ── 4.7 v0.10.0（组 A / R2 后半；补充·R8 联动）：**补醒**（锁外；attemptWake 必须
+    //    持无团队锁，§2.7-4）──
+    // 两类未读各一个场景：
+    // - 派单被忙闲闸挡下（delivered=mailbox，事件 dispatch-deferred-busy——组 B 的 R2
+    //   前半）→ scene=dispatch-resume：成员回合结束后无人驱动它去读邮箱/认领，看门狗按
+    //   **普通派单场景**补一次唤醒（不设 urgent——紧急不豁免的口径不变）；
+    // - 紧急回执被「收件人回合进行中只落邮箱不唤醒」挡下（组 B R8 + 追加裁决的待补醒
+    //   标记）→ scene=report-resume 且 **urgent:true**（插队信息要排到未读最前）。
+    // 两类都照常经过容量闸与在途 nonce 闸，消息不丢的兜底（邮箱 pull）不变，同一成员一个
+    // 冷却窗内最多一次（判据在 phase 1 的邮箱循环里，见 dispatchResumeCandidates）。
+    // v0.10.0（集成员·第 5 轮 / 对抗 ADV-02）：被**防风暴总次数闸**挡下的补醒先落审计
+    // （零 attemptWake、零 nonce、零生命周期账、邮箱消息不动）——审计与真补醒同处落盘，
+    // 运维可一条事件看出「本轮想补但没补」与「补了但被容量闸挡下」的区别。
+    for (const deferred of resumeWakeDeferredCandidates) {
+      summary.resumeWakeDeferred.push({
+        key: deferred.key,
+        scene: deferred.scene,
+        messageIds: deferred.messageIds,
+        reason: RESUME_WAKE_CAP_REASON,
+      });
+      await logEngineEvent(stateRoot, {
+        event: RESUME_WAKE_DEFERRED_EVENT,
+        teamId,
+        to: deferred.key,
+        sessionId: deferred.sessionId,
+        scene: deferred.scene,
+        reason: RESUME_WAKE_CAP_REASON,
+        taskIds: deferred.taskIds,
+        messageIds: deferred.messageIds,
+        resumeWakeMax,
+        note: `成员空闲、无在途唤醒、收件箱有未读消息，但 10min 窗内真唤醒补醒已达上限 ${resumeWakeMax}`
+          + `（XC_RESUME_WAKE_MAX）——本轮不补醒（防唤醒风暴：每次补醒一整棵无头进程树）；`
+          + '消息仍留邮箱未读，pull 兜底不丢，成员自己回合随时可读',
+      });
+    }
+    for (const candidate of dispatchResumeCandidates) {
+      const taskIds = candidate.taskIds;
+      const isReportResume = candidate.scene === RESUME_SCENE_REPORT;
+      const ticket = isReportResume
+        ? `[zcode-crosschat 看门狗·补醒] 成员 "${candidate.key}" 回合已结束而收件箱有未读紧急回执`
+          + `（${candidate.messageIds.length} 条${taskIds.length > 0 ? `，任务 ${taskIds.join(', ')}` : ''}）——`
+          + '按紧急回执场景补一次唤醒（scene=report-resume；urgent，容量闸照常判定、紧急不豁免）。'
+          + '请 xc_read({scope:"inbox"}) 优先消费该回执。'
+        : `[zcode-crosschat 看门狗·补醒] 成员 "${candidate.key}" 回合已结束而收件箱有未读派单`
+          + `（${candidate.messageIds.length} 条${taskIds.length > 0 ? `，任务 ${taskIds.join(', ')}` : ''}）——`
+          + '按普通派单场景补一次唤醒（scene=dispatch-resume；容量闸照常判定，紧急不豁免）。'
+          + '请 xc_read({scope:"inbox"}) 消费未读派单并按需 xc_claim 认领。';
+      const sent = await attemptWake({
+        stateRoot,
+        teamId,
+        toAgentKey: candidate.key,
+        toSessionId: candidate.sessionId,
+        workspace: deps.workspace,
+        reason: candidate.scene,
+        receiptIds: candidate.messageIds,
+        ticket,
+        ...(candidate.urgent ? { urgent: true } : {}),
+        env,
+        ...(deps.capacitySample !== undefined ? { capacitySample: deps.capacitySample } : {}),
+        // v0.10.0（集成员·第 5 轮 / 对抗 ADV-02）：测试注入的 spawn（缺省 = 真 spawnResume）。
+        ...(deps.spawn !== undefined ? { spawn: deps.spawn } : {}),
+      });
+      summary.dispatchResumed.push({
+        key: candidate.key,
+        scene: candidate.scene,
+        messageIds: candidate.messageIds,
+        delivered: sent.delivered,
+        ...(sent.note !== undefined ? { note: sent.note } : {}),
+      });
+      await logEngineEvent(stateRoot, {
+        event: candidate.scene,
+        teamId,
+        to: candidate.key,
+        sessionId: candidate.sessionId,
+        taskIds,
+        messageIds: candidate.messageIds,
+        delivered: sent.delivered,
+        cooldownMs: resumeCooldownMs,
+        note: (isReportResume
+          ? '成员空闲（最近引擎事件 session-idle、无在途回合）且收件箱有未读紧急回执（task-receipt ∧ urgent/待补醒标记）——按紧急回执场景补一次唤醒（urgent）'
+          : '成员空闲（最近引擎事件 session-idle、无在途回合）且收件箱有未读派单——看门狗按普通派单场景补一次唤醒')
+          + (sent.note !== undefined ? `；${sent.note}` : ''),
+        ...(sent.wakeDeferred !== undefined
+          ? { wakeDeferred: true, retryAfterMs: sent.wakeDeferred.retryAfterMs }
+          : {}),
+      });
+    }
+
     // ── 5. 锁外通知 + 唤醒（attemptWake 必须持无团队锁，§2.7-4）──
+    // v0.10.0（组 A / R5）：lead 类收件人只写 urgent 邮箱、不唤醒（XC_WATCHDOG_WAKE_LEAD
+    // 未设时）——不把主控拉成无头分身；「是否尝试过唤醒」由 watchdog-wake 事件如实记录。
+    const wakeLead = watchdogWakeLeadFromEnv(env);
     if (incidents.length > 0) {
-      const recipients = planRecipients({ team, leadKey, livenessByKey, leadCurrentlyDead: summary.leadCurrentlyDead });
+      const recipients = planRecipients({ team, leadKey, viewsByKey, leadCurrentlyDead: summary.leadCurrentlyDead });
       const text = renderRoundIncidents(incidents, {
         leadKey,
         leadCurrentlyDead: summary.leadCurrentlyDead,
@@ -1388,7 +2289,7 @@ export async function sweepMembersOnce(
             deadThisRound: summary.dead,
           });
         } else {
-          await notifyAndWake(deps, teamId, recipients, text, 'message', summary);
+          await notifyAndWake(deps, teamId, recipients, text, 'message', summary, { leadKey, wakeLead, team });
           // v0.9.3 打回第 1 轮（V093-04）：通知已发出 → 台账改 'sent'（best-effort；写失败
           // 的代价是下一轮重发一条，方向是「宁可重发，不永久静音」）。
           // v0.9.6（A2/V095-06）：按台账复合键定位（summary.dead 是成员名）。
@@ -1414,14 +2315,14 @@ export async function sweepMembersOnce(
     if (renotifyPending.length > 0) {
       const keys = renotifyPending.map((entry) => entry.key);
       await backfillMemberDeadEvents(stateRoot, teamId, renotifyPending);
-      const recipients = planRecipients({ team, leadKey, livenessByKey, leadCurrentlyDead: summary.leadCurrentlyDead });
+      const recipients = planRecipients({ team, leadKey, viewsByKey, leadCurrentlyDead: summary.leadCurrentlyDead });
       let delivered = false;
       if (recipients.length === 0) {
         // 仍无人可通知：delivered 保持 false ⇒ 计入一次尝试（有上限，不会无限重试），
         // 也不重复刷 watchdog-notify-skipped 审计（主路径已刷过）。
       } else {
         try {
-          await notifyAndWake(deps, teamId, recipients, renderRenotifyText(keys, leadKey, summary.leadCurrentlyDead), 'message', summary);
+          await notifyAndWake(deps, teamId, recipients, renderRenotifyText(keys, leadKey, summary.leadCurrentlyDead), 'message', summary, { leadKey, wakeLead, team });
           delivered = true;
         } catch {
           /* 通知通道失败：计入一次尝试，下轮再试 */

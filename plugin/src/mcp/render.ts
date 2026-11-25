@@ -37,19 +37,44 @@ export function renderRegister(agentKey: string, sessionId: string, teamId: stri
 }
 
 /**
+ * v0.10.0（R2/G-28）：派单**忙闲闸**的降级块——收方在途时 xc_dispatch 跳过 spawn、
+ * 只落邮箱，回执 payload `deferred` 与人可读行同形携带（判据采集在
+ * tools-tasks.ts 的团队锁内：在途任务 id + 会话回合在跑）。
+ *
+ * 与容量闸的 `wakeDeferred{reason:"capacity-red"}`（engine/wake.ts，spawn 前采样）
+ * 是两道不同的闸：本闸在**工具面**、锁内判据，回答「收方有没有在途活」；容量闸在
+ * 引擎面回答「机器有没有余量」。两者都只挡唤醒不拦投递（消息已在邮箱，pull 兜底）。
+ */
+export interface DispatchDeferredState {
+  reason: "busy";
+  /** 收方在途任务 id（claimed/in_progress；仅会话回合在跑时为空数组）。 */
+  openTaskIds: readonly string[];
+}
+
+/**
  * xc_dispatch 的一行摘要。
  *
  * v0.9.7（W3/V096-01）：wake 态补**三态**参数——失败态（两轮唤醒全失败，回执时刻
  * 已见失败证据）不再写 "via wake"（那会把失败读成成功），改写失败措辞 + 邮箱兜底
  * 指引；未见启动证据态追加「已发起但未见启动证据（非送达确认）」。缺省（不传 wake）
  * 输出与 v0.9.6 逐字节一致（旧调用方零行为变化）。
+ *
+ * v0.10.0（R2/G-28）：补第五个可选参 `deferred`——忙闲闸降级（收方在途，已落邮箱，
+ * 回合结束后补醒）时改写人可读行；缺省（undefined）输出与 v0.9.9 逐字节一致。
  */
 export function renderDispatch(
   taskId: string,
   to: string,
   delivered: string,
   wake?: WakeReceiptState,
+  deferred?: DispatchDeferredState,
 ): string {
+  if (deferred?.reason === "busy" && delivered === "mailbox") {
+    const open = deferred.openTaskIds.length > 0
+      ? `（在途任务 ${deferred.openTaskIds.join(", ")}）`
+      : "（会话回合进行中）";
+    return `Task ${taskId} dispatched to ${to} via mailbox：成员在途，已落邮箱，回合结束后补醒${open}.`;
+  }
   if (delivered === "wake") {
     const failure = wakeReceiptFailurePhrase(wake);
     if (failure !== undefined) return `Task ${taskId} dispatched to ${to}: ${failure}.`;
@@ -75,11 +100,40 @@ export function renderClaim(taskId: string, attempt: number, attemptId: string):
 }
 
 /**
+ * v0.10.0（R8，用户点名）：**插队回单**的回执状态——`xc_report({urgent:true})` 的
+ * 人可读行分流输入。
+ *
+ * - `honored:true`：插队语义生效（回执消息带 urgent 排到未读最前 + 对创建者发起
+ *   urgent 唤醒尝试）——人可读行以「【插队回单】」开头；唤醒被任何闸挡下时明说
+ *   「已落邮箱、未唤醒」及原因（不把 delivered:mailbox 读成已送达）；
+ * - `honored:false`：被防风暴闸（同一成员 10 分钟内 urgent 回单上限，
+ *   XC_URGENT_REPORT_MAX 可调）降级为**普通回单**——不写【插队回单】前缀（前缀的
+ *   语义是「本条真是插队回单」），但在行尾附降级条款明说。
+ *
+ * v0.10.0（R8 补充，用户追加裁决）：`deferredReason`——紧急回单的唤醒被
+ * **收方回合进行中**闸挡下（未调用 attemptWake，防把在跑的主控拉成无头分身）：
+ * 人可读行改写为「已落邮箱、未唤醒：收方回合进行中，回合结束后送达」，与容量闸/
+ * 分层闸挡下的「已落邮箱、未唤醒（<note>）」分流（后者有 attemptWake 的 note 原文，
+ * 前者根本没有发起唤醒、故无 note）。
+ */
+export interface UrgentReportState {
+  honored: boolean;
+  /** 降级原因（honored=false 时；进人可读行与 payload）。 */
+  downgradedReason?: string;
+  /** 唤醒被「收方回合进行中」挡下的原因标记（honored=true 时；当前唯一取值
+   *  {@link RECIPIENT_TURN_RUNNING}）。 */
+  deferredReason?: string;
+}
+
+/**
  * xc_report 的一行摘要。
  *
  * v0.9.7（W3/V096-01）：wake 态补**三态**参数——两轮唤醒全失败时不再写
  * "wake back via wake"（V096-01 实测该形态），改写失败措辞 + 邮箱兜底指引；
  * 未见启动证据态追加「已发起但未见启动证据」。缺省输出与 v0.9.6 逐字节一致。
+ *
+ * v0.10.0（R8）：补第六个可选参 `urgent`（{@link UrgentReportState}）——插队回单
+ * 前缀/未唤醒明说/降级条款三态分流；缺省（undefined）输出与 v0.9.9 逐字节一致。
  */
 export function renderReport(
   taskId: string,
@@ -87,16 +141,42 @@ export function renderReport(
   receiptTo: string | null,
   wakeBack: string,
   wake?: WakeReceiptState,
+  urgent?: UrgentReportState,
 ): string {
   const to = receiptTo ? `receipt sent to ${receiptTo}` : "no receipt (non-terminal)";
-  if (wakeBack === "wake") {
+  const honored = urgent?.honored === true;
+  const prefix = honored ? "【插队回单】" : "";
+  let line: string;
+  if (honored && urgent?.deferredReason !== undefined) {
+    // v0.10.0（R8 补充）：收方回合进行中——没有发起唤醒（无 note 可引），明说
+    // 「已落邮箱、未唤醒：收方回合进行中，回合结束后送达」（补醒由看门狗侧负责）。
+    line = `${prefix}Task ${taskId} ${status}; ${to}; 已落邮箱、未唤醒：收方回合进行中，回合结束后送达.`;
+  } else if (honored && wakeBack === "mailbox") {
+    // v0.10.0（R8）：插队回单的唤醒被任何闸挡下（容量闸 / 交互会话默认不唤醒 /
+    // 无 sid / 在途 nonce…）——回执必须明说「已落邮箱、未唤醒」及原因（note 原文），
+    // 不得让 delivered:"mailbox" 被读成「已送达」（A3 同款纪律的插队面）。
+    const reason = wake?.note !== undefined && wake.note.trim() !== "" ? `（${wake.note.trim()}）` : "";
+    line = `${prefix}Task ${taskId} ${status}; ${to}; 已落邮箱、未唤醒${reason}.`;
+  } else if (wakeBack === "wake") {
     const failure = wakeReceiptFailurePhrase(wake);
-    if (failure !== undefined) return `Task ${taskId} ${status}; ${to}; 回执${failure}.`;
-    if (wake?.startConfirmed === false) {
-      return `Task ${taskId} ${status}; ${to}; wake back via wake（已发起但未见启动证据，非送达确认）.`;
+    if (failure !== undefined) line = `${prefix}Task ${taskId} ${status}; ${to}; 回执${failure}.`;
+    else if (wake?.startConfirmed === false) {
+      line = `${prefix}Task ${taskId} ${status}; ${to}; wake back via wake（已发起但未见启动证据，非送达确认）.`;
+    } else {
+      line = `${prefix}Task ${taskId} ${status}; ${to}; wake back via wake.`;
     }
+  } else {
+    line = `${prefix}Task ${taskId} ${status}; ${to}; wake back via ${wakeBack}.`;
   }
-  return `Task ${taskId} ${status}; ${to}; wake back via ${wakeBack}.`;
+  // 降级条款附在行尾（不顶替失败措辞/未唤醒措辞）：防风暴闸挡下时调用方必须看得见
+  // 「这条 urgent 请求没有插队」。
+  if (urgent !== undefined && !honored) {
+    const reason = urgent.downgradedReason !== undefined && urgent.downgradedReason.trim() !== ""
+      ? `：${urgent.downgradedReason.trim()}`
+      : "";
+    line = `${line}（插队回单请求已降级为普通回单${reason}）`;
+  }
+  return line;
 }
 
 /**
@@ -136,6 +216,12 @@ export interface WakeReceiptState {
   wakeFailureSeen?: boolean;
   failureEvidence?: string;
   wakeTiers?: { spawnOk: "ok"; childAlive: "ok" | "no"; consumed: "pending" };
+  /**
+   * v0.10.0（R8）：attemptWake 的降级说明（WakeResult.note 同名字段）——mailbox
+   * 降级时承载「为什么没唤醒」的原因行（mailboxOnlyNote 族）。插队回单被闸挡下时
+   * 人可读行原样引用它明说原因；其余调用方不传（缺省 = 旧行为逐字节不变）。
+   */
+  note?: string;
 }
 
 /**

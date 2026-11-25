@@ -21,20 +21,21 @@ description: 跨独立 zcode 会话的团队协作协议：队长（lead）拆�
 - 交互会话的正常路径：SessionStart / UserPromptSubmit 钩子已把你的 sessionId 写入注册表并注入上下文。注册用 `xc_identify({ "name": "<花名>", "sessionId": "<注入给你的 sid>" })`。**sessionId 取钩子注入值，不要编造**。
 - 花名用短小写英文（如 `a`、`b`、`builder`）；**`lead` 和 `default` 是保留名，不可使用**；同名或同 sid 已被绑定会被拒绝（`name_taken`），换一个名字重试即可。
 - 被 `--resume` 无头唤醒的回合：唤醒 prompt 里会**显式给出你的 sid 与一次性 wakeToken**，注册时一并带上 `wakeToken`（每个被驱动的回合都要重新注册——这是正常现象，不是故障）。
+- **职能声明 `duty`**（v0.10.0 起，可选）：注册时用 `duty:"<一句话：这个会话负责什么>"` 说清自己的职能（≤120 字符，控制字符清掉；缺省 = 不声明，一切照常）。它落进 `team.json` 成员行，改名/takeover/重新供给都不丢，`xc_overview` 成员行与 `xc_read({scope:"handoff"})` 花名册可见——换主控时，新主控看花名册即可知道谁负责什么（lead 换代或记忆丢失，团队「谁负责什么」的知识不清零）。lead 建员时同样可给（`xc_team({action:"member-add", duty:"…"})`）。
 - `xc_overview` / `xc_doctor` 无需注册即可调用（只读观测）。
 
 ## 2. 工具一览（10 个，v0.6.0 起）
 
 | 工具 | 关键参数 | 说明 |
 |---|---|---|
-| `xc_identify` | `name*`, `sessionId*`, `role?`(peer/worker), `takeover?`, `wakeToken?`, `displayName?`, `kind?`, `modeClass?`, `contextChars?` | 绑定协作身份（队内 + 跨会话两轴合一，含改名）；`takeover:true` 显式接管崩溃成员（换绑并回池其未完任务） |
+| `xc_identify` | `name*`, `sessionId*`, `role?`(peer/worker), `takeover?`, `wakeToken?`, `displayName?`, `kind?`, `modeClass?`, `contextChars?`, `duty?` | 绑定协作身份（队内 + 跨会话两轴合一，含改名）；`takeover:true` 显式接管崩溃成员（换绑并回池其未完任务）；`duty?` = 一句话职能声明（本会话负责什么，≤120 字符，控制字符清掉；缺省=不声明——改名/takeover/重新供给都不丢） |
 | `xc_dispatch` | `to*`, `title*`, `prompt*`, `acceptance?`, `dependsOn?`, `priority?`(high/normal/low) | 派发新任务；priority 只影响取单/展示顺序，不抢占 |
 | `xc_claim` | `taskId*` | 原子认领 pending 任务，返回 attemptId（能力令牌） |
-| `xc_report` | `taskId*`, `attemptId*`, `status*`(in_progress/completed/failed/blocked), `result?`, `error?`, `evidence?[]` | 汇报进展/结果；completed 必带 result + evidence≥1；blocked 的 `error`=阻塞原因（必填） |
+| `xc_report` | `taskId*`, `attemptId*`, `status*`(in_progress/completed/failed/blocked), `result?`, `error?`, `evidence?[]`, `urgent?` | 汇报进展/结果；completed 必带 result + evidence≥1；blocked 的 `error`=阻塞原因（必填）；`urgent:true` = 插队回单（半截就报；回执 urgent 置顶 + 对创建者一次 urgent 唤醒尝试，同一成员 10 分钟内最多 5 次、超出自动降级为普通回单；收方回合进行中则只落邮箱不打断） |
 | `xc_read` | `scope*`(inbox/mail/task/peer/peer-msg/journal/handoff), `id?`, `field?`, `offset?`, `limit?` | 统一分页读：inbox=读并消费本队邮箱；mail/task/peer-msg=单件分页；peer=拉取跨会话消息（消费）；journal=任务/留档日志；handoff=30 秒接手包（七要素；`id`=任务 id 或花名收窄） |
 | `xc_relay` | `to*`, `msg*`, `urgent?`, `interrupt?`, `steer?`, `summary?`, `sourceTaskId?`, `sourceAttemptId?`, `withdrawMessageIds?`, `refs?` | 发消息 + 用户介入传导合一（队内成员与跨会话 peer 同一工具；同名用 `名字[team]`/`名字[peer]` 消歧）。v0.7 起 `msg` 亦可携带 C6/C7 帧：`{"type":"tool_request"…}` / `{"type":"tool_result"…}`（仅队内轴）——见 §7.6。v0.9：`interrupt:true` 发结构化软中断信封（见 §6.4）；v0.9.8 起 `steer:true` 硬插队（催办、软中断、硬插队三档怎么选见 §3 第 8 条）；`withdrawMessageIds` 撤回自己发给该目标且**仍未读**的消息（仅队内轴；整单语义——含已读/非本人/不存在件时整单拒绝并逐条报状态；撤回模式下 `msg`/`urgent`/`interrupt`/`steer` 等一律不传）；`refs` 随消息带工作区内真实文件的 path+sha256（传引用不传内容，由接收方自己打开读） |
 | `xc_overview` | `view?`(team/peers/panel/timeline/status), `history?`, `offset?`, `limit?` | 全景观测：任务板 / peer 清单 / 面板（成员+任务+容量水位+停滞+入站策略）/ 时间线（engine.jsonl 尾部事件，`limit` 缺省 20、上限 100）/ 紧凑状态（一眼瞭望，替代状态栏） |
-| `xc_team` | `action*`(init/transfer/release/member-add/member-stop/idle/cancel/unblock/checkpoint), `note?`, 其余按 action | 指挥族合一；idle 上报空闲（`action:"idle"`）；checkpoint 写一份交接检查点（服务端直接落盘，`note`=写进检查点第 7 章的一句话） |
+| `xc_team` | `action*`(init/transfer/release/member-add/member-stop/idle/cancel/unblock/checkpoint), `note?`, `duty?`(member-add), 其余按 action | 指挥族合一；idle 上报空闲（`action:"idle"`）；checkpoint 写一份交接检查点（服务端直接落盘，`note`=写进检查点第 7 章的一句话）；`member-add` 可用 `duty?` 一并声明该成员的职能（一句话，≤120 字符；与 `xc_identify` 的 `duty` 同一字段，重供给时可重声明） |
 | `xc_review` | `action?`(list/accept/discard/**approve/deny**), `axis?`(team/peer/**approval**/all), `ids?`, `ttlMs?`, `note?` | 两轴入站审阅 + v0.7 C7 转办审批：`axis:"approval"` 列待批 tool_request；`approve`/`deny` 带 `id:<requestId>` 写审批文件（**approve 仅现任 lead**，且请求方/执行方不能自批；deny 任意成员可代拒） |
 | `xc_doctor` | — | 只读体检：版本/运行时/zcode 路径探测线索（免注册） |
 
@@ -44,8 +45,8 @@ description: 跨独立 zcode 会话的团队协作协议：队长（lead）拆�
 2. **L2 先盘点**：接到目标后先 `xc_overview` 看现有成员/任务，能续用就不新建——不重复别人已在做的花名与工作。
 3. **L3 拆解**：把目标拆成最小可用任务 DAG——每任务 `title` 一句话、`prompt` 写清做什么/写到哪/以什么形式、`acceptance` 必须可检验（如「`result-m1.txt` 存在且内容为 `391`」，没有验收标准不许派发）；有先后关系写 `dependsOn`；用户表达紧迫度时写 `priority`；可并行的任务不制造假依赖。
 4. **L4 建员**：缺哪个角色补哪个（`xc_team({action:"member-add"})`），受成员上限；不加人也能干的就派给现有成员。
-5. **L5 派发**：`xc_dispatch` 可并行多单在同一个回合内连续派发；派发后结束回合等待回执唤醒，**不要 busy-poll**。`delivered=wake` 已推送唤醒；`mailbox` 已落盘等对方拉取；`duplicate` 同一张票（收方+票面）在效期内已存在——三种都是正常态。重复派发的去重键**不含发送方**：别人已经把同一张票派给同一收方时，你也会拿到 `duplicate`（payload 带 `duplicateKey` 与 `originalCreatedBy`），此时不要另派一单，去认领/跟进那一单即可。
-6. **L6 核收回执**：回执唤醒到达后 `xc_read({scope:"inbox"})` → 按 `acceptance` **独立复核证据**（回执里带 evidence 的 sha256——工具对文件现算的值；用自己的文件工具读文件、复算 sha256 比对）→ 未完成继续等；成员 idle 且 `xc_overview` 显示任务全部终态 → 汇总上报用户。回执没核对前不要宣称任务完成。
+5. **L5 派发**：`xc_dispatch` 可并行多单在同一个回合内连续派发；派发后结束回合等待回执唤醒，**不要 busy-poll**。`delivered=wake` 已推送唤醒；`mailbox` 已落盘等对方拉取；`duplicate` 同一张票（收方+票面）在效期内已存在——三种都是正常态。重复派发的去重键**不含发送方**：别人已经把同一张票派给同一收方时，你也会拿到 `duplicate`（payload 带 `duplicateKey` 与 `originalCreatedBy`），此时不要另派一单，去认领/跟进那一单即可。给在途成员（名下有 claimed/in_progress 任务，或会话回合在跑）再派单会被**忙闲闸**挡下：不 spawn、只落邮箱，回执带 `deferred{reason:"busy", openTaskIds}`——**不必重派**，消息照常落邮箱不丢单，成员回合一结束由看门狗补醒（补醒冷却 120s，env `XC_DISPATCH_RESUME_COOLDOWN_MS` 可调，0=不冷却；防风暴上限 = 同一成员 10 分钟窗内最多 5 次真唤醒补醒，env `XC_RESUME_WAKE_MAX` 可调——正整数、不接受 0 关闭，超出只落邮箱不补醒）。
+6. **L6 核收回执**：回执唤醒到达后 `xc_read({scope:"inbox"})` → 按 `acceptance` **独立复核证据**（回执里带 evidence 的 sha256——工具对文件现算的值；用自己的文件工具读文件、复算 sha256 比对）→ 未完成继续等；成员 idle 且 `xc_overview` 显示任务全部终态 → 汇总上报用户。回执没核对前不要宣称任务完成。成员可用 `xc_report({urgent:true})` 发**插队回单**（半截就报，见成员守则第 10 条）：你（主控）回合进行中时它只落邮箱、不打断你，回合一结束就送达（看门狗补醒）；你空闲时才立即 urgent 唤醒。
 7. **L7 异常**：`failed` 回执 → 阅读错误决定重派（建新任务，或修复后重派）；收到 `stale-swept` 回执说明成员回合丢失，按需重派。成员长期无心跳的任务会被引擎清扫回池并给你发 failed 回执——重派即可，不必追究。blocked 任务不在清扫域（合法暂停），需要时 `xc_team({action:"unblock"})` 解除。
 8. **用户介入（三档，按紧急程度选）**：① 催办、提醒、补充信息 → `xc_relay({to:"<目标>", msg:"…", urgent:true})`——排到目标所有未读之前并尽力唤醒，**不打断**对方当前回合；② 要对方在安全点停下调整 → `interrupt:true`（**软中断**：结构化 INTERRUPT 信封，收方下一次读收件箱时按 §6.4 处理——对方在长回合里不读收件箱就还看不到）；③ 对方正在跑偏、必须**立刻**纠偏 → `steer:true`（**硬插队**，v0.9.8 起）：仅对引擎成员、仅 lead 或用户可发；目标空闲（无活唤醒回合）时**不终止**、退化成普通唤醒（纠偏随消息送达、对方下回合生效），有活回合才终止对方当前回合（整棵进程树）并立即重开新回合，`msg` 就是新回合的首条指令。看回执判断有没有真的抢占：顶层 `preempted:true` 才是已终止并重开（`stopped.tree` 是被终止的进程树，`stopped.treeSurvivors` 应为空，`turn.startConfirmed` 说明新回合是否见到了启动证据）；`preempted:false` 表示没执行或已降级，原因在 `interrupt.reason`——**不要当成已经纠偏**。发之前如实告诉用户：被中止回合一刻没落盘的进度可能丢。纠偏内容要短：写清「停止做什么、改做什么、从哪个文件或任务接着做」，细节给指针不给全文。已知边界（v0.9.8 披露的 P3，v0.9.9 验收仍顺延）：抢占重开的新回合不能重新 claim 回任务——续跑入口必须写进纠偏正文。目标是交互式会话时降级为软中断（只有用户能在那个窗口里按 Esc）。已发消息想撤回用 `withdrawMessageIds`（§6.5）——已读件撤不回。
 
@@ -64,6 +65,7 @@ description: 跨独立 zcode 会话的团队协作协议：队长（lead）拆�
 7. **收到 shutdown-request 帧** → 不再领取新任务，把手头单报告（或直接 failed）后结束回合。
 8. **状态只经工具读写**：一切协作状态只通过 `xc_*` 工具读写；`.crosschat/` 状态目录是只读诊断面，不要手工改动它。
 9. **长任务留痕（longtask）**：进展写入 `.crosschat/tasks/<任务id>/journal.md`（一行摘要 + 产物指针）；被压缩或交接前先落 journal——最坏情况信息有落盘副本。
+10. **重要发现半截就报**（v0.10.0 起）：任务干到半截有了重要结论/风险/阻塞信号，用 `xc_report({..., urgent:true})` 发**插队回单**——回执消息 urgent 置顶 + 对任务创建者一次 urgent 唤醒尝试；创建者回合进行中则只落邮箱、不打断，回合一结束由看门狗补醒。限速：同一成员 10 分钟内最多 5 次（env `XC_URGENT_REPORT_MAX` 可调，正整数），超出的自动降级为普通回单。**普通进度不要带 `urgent`**（≤10 分钟一次的心跳照旧用不带 urgent 的 `in_progress`）。
 
 ## 5. 执行纪律（补充成员守则）
 

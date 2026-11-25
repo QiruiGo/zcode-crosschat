@@ -47,11 +47,21 @@ export type MemberLiveness = 'live' | 'pid-dead' | 'heartbeat-stale' | 'no-recor
  * 回合结束（Stop 钩子 → idle）后宿主进程正常退出，旧 pid 已亡是**正常形态**；只有
  * 「回合还在跑（自述 running）而进程没了」才是崩溃的硬证据。这同时保住桌面会话：
  * 回合间隙（idle）不因旧 pid 误报，进程死由 peer 注册记录路径照常检出。
+ *
+ * v0.10.0（组 A / R6）：`selfClaimsDead`——记录自述 `dead`（看门狗判亡后
+ * markSessionDead 的落盘翻转）且 pid 仍亡。没有它，翻转本身会**熄灭** pid 判据：
+ * 记录从 running 变 dead 后 turnInProgress 不再成立，无 peer 记录的引擎成员在后续
+ * 扫描里从 pid-dead 退化成 no-record——往轮已认领死亡者的自愈回池（V098-07：停机后
+ * 新派给死者的单下一轮回池）随之失效。带上它，同一 pid 的死亡证据跨轮稳定。
+ * `liveness` 取值域随 SessionRecord 放开到含 `dead`（本结构型入参同步收，否则
+ * SessionRecord 无法直接传入）。
  */
 export interface SessionPidEvidence {
   pid: number;
   alive: boolean;
   turnInProgress: boolean;
+  /** v0.10.0（组 A / R6）：记录自述 dead（判亡翻转）且时刻可信——pid 判据的第二来源。 */
+  selfClaimsDead?: boolean;
 }
 
 /**
@@ -67,7 +77,7 @@ export interface SessionPidEvidence {
  * 才让 pid-dead 参与判定——回合间隙（idle）零进程是成员正常形态。
  */
 export function deriveSessionPidEvidence(
-  record: { pid?: number; liveness?: 'running' | 'idle'; livenessTs?: number } | undefined,
+  record: { pid?: number; liveness?: 'running' | 'idle' | 'dead'; livenessTs?: number } | undefined,
   now: number,
   alive: (pid: number) => boolean,
 ): SessionPidEvidence | undefined {
@@ -77,6 +87,11 @@ export function deriveSessionPidEvidence(
     pid,
     alive: alive(pid),
     turnInProgress: record?.liveness === 'running' && plausibleLivenessTs(record.livenessTs, now),
+    // v0.10.0（组 A / R6）：判亡翻转的自述（dead + 可信时刻）——pid 判据的第二来源，
+    // 使「member-dead 后注册表翻 dead」不熄灭同一 pid 的死亡证据（自愈回池的前置）。
+    // 只在真dead时在场（conditional spread）：非 dead 记录的对象形状逐字节不变
+    // （V094-13 的纯判据对拍测试锚定 {pid,alive,turnInProgress} 三键）。
+    ...(record?.liveness === 'dead' && plausibleLivenessTs(record.livenessTs, now) ? { selfClaimsDead: true } : {}),
   };
 }
 
@@ -141,7 +156,9 @@ export const DEFAULT_OFFLINE_MINUTES = 240;
  * 1. `active` 里有同 sid 记录 → `live`（调用方 now 晚于扫描时刻、心跳又过期时降级
  *    为 `heartbeat-stale`——扫描分区是扫描时刻的快照，判定时刻才是真时刻）；
  * 2. `dead` 里有同 sid 记录：任一条**不是** pid-dead（pid 仍活着，只是心跳过期；
- *    或 reason 缺失＝没有硬证据）→ `heartbeat-stale`；全部 pid-dead → `pid-dead`；
+ *    或 reason 缺失＝没有硬证据）→ `heartbeat-stale`；全部 pid-dead → **先看注册表
+ *    会话 pid**：`opts.sessionPid.alive === true`（活证据一票否决，dead 分区记录是旧
+ *    化身残留）→ `heartbeat-stale`，否则才 `pid-dead`；
  * 3. 无任何记录（回合间隙 / 从未 peer 注册 / 优雅退出已摘记录）→ `no-record`。
  *
  * v0.9.4（A1）增量：第 3 类补**会话记录 pid 判据**——peer 注册表没有该 sid 的记录
@@ -150,6 +167,17 @@ export const DEFAULT_OFFLINE_MINUTES = 240;
  * `turnInProgress ∧ ¬alive` → `pid-dead`。判据只补第 3 类空档：active 分区有记录
  * （有进程活着且在心跳）或 dead 分区有 lastSeen-stale 记录（有进程活着只是沉默）
  * 时都不改判——保守方向不变，peer 证据与 pid 证据冲突时活证据优先。
+ * v0.10.0（集成员·第 5 轮 / 真实复测 mustFix #1）增量：上句「冲突时活证据优先」补到
+ * **第 2 类的 dead 分区分支**——此前该分支在全 pid-dead 时直接 return，注册表里活着的
+ * 新 pid 从不被咨询（pid 证据只在无任何 peer 记录时才被咨询），与自述原则自相矛盾。
+ * 现在 dead 分区全部 pid-dead ∧ `opts.sessionPid.alive === true` → `heartbeat-stale`
+ * （活 pid 一票否决）；无证据 / alive=false 仍 `pid-dead`（不放松既有判死）。
+ *
+ * v0.10.0（组 A / R6）增量：pid 判据的第二来源补 `selfClaimsDead`——记录自述
+ * `dead`（看门狗判亡翻转，markSessionDead 落盘）且 pid 仍亡 ⇒ 同样 `pid-dead`。
+ * 修「翻转熄灭判据」：不补它，member-dead 之后记录从 running 变 dead，
+ * turnInProgress 不再成立，无 peer 记录的引擎成员在后续扫描里退化成 no-record，
+ * 往轮已死者的自愈回池（V098-07）随之失效。
  */
 export function memberLiveness(
   member: TeamMember,
@@ -165,14 +193,104 @@ export function memberLiveness(
   const dead = scan.dead.filter((row) => row.record.sessionId === member.sessionId);
   if (dead.length === 0) {
     // v0.9.4（A1）：无 peer 记录时，会话记录 pid + running 自述 = 进程死硬证据。
+    // v0.10.0（组 A / R6）：追加 `dead` 自述（看门狗判亡翻转的落盘值）——同一 pid 的
+    // 死亡证据不因翻转熄灭，往轮已认领死者的自愈回池（V098-07）照常工作。
     const pidEvidence = opts.sessionPid;
-    if (pidEvidence !== undefined && pidEvidence.turnInProgress && !pidEvidence.alive) {
+    if (pidEvidence !== undefined && !pidEvidence.alive
+      && (pidEvidence.turnInProgress || pidEvidence.selfClaimsDead === true)) {
       return 'pid-dead';
     }
     return 'no-record';
   }
   if (dead.some((row) => row.reason !== 'pid-dead')) return 'heartbeat-stale';
+  // v0.10.0（集成员·第 5 轮 / 真实复测 mustFix #1）：**注册表活 pid 一票否决**——dead 分区
+  // 里同 sid 的记录可能是**旧化身残留**（会话重启换 pid 不换 sid；曾 xc_identify 的会话
+  // 当前回合不刷新 peer 端点时，扫描只剩 60s 后失效的旧端点记录、其 pid 已亡）。注册表
+  // 会话记录的 pid 活着（SessionStart 钩子写的宿主进程 pid）= 硬活证据：peer 证据与 pid
+  // 证据冲突时**活证据优先**（:155-167 的自述原则，v0.9.4 起只在「无任何 peer 记录」的
+  // 第 3 类空档里落实，dead 分区分支漏了——生产实测主控保活进程全程存活仍于 02:11:39 被
+  // 判 pid-dead 并连锁唤醒 m1/m2，即此形态）。
+  // 判 `heartbeat-stale` 而非 `live`：没有心跳证据证明它在协作面上活着，只证明进程没死
+  // （宁可不判进程死，也不错判——:155 的保守方向不变）。无 sessionPid 证据或 alive=false
+  // 时维持 `pid-dead` 不变（不放松既有判死）。
+  if (opts.sessionPid?.alive === true) return 'heartbeat-stale';
   return 'pid-dead';
+}
+
+/**
+ * v0.10.0（组 A / R3/G-29）：**判亡前的四道校验之前三道**（纯函数；第④道二次确认的
+ * 跨周期账在看门狗台账，见 engine/watchdog.ts）。
+ *
+ * 缺陷形态（生产实测，21 次 member-dead 全部 pid-dead/process-dead）：
+ * 唤醒子启动窗内旧 pid 已亡、新 pid 未写回注册表（或唤醒 child 退出后回合仍在跑），
+ * 看门狗以注册表存储的旧 pid 判 `member-dead` → V098-07 无人认领回池 → 撤回派单回执
+ * （"revoked: member became unavailable (member-dead)"）。看门狗**已经握有**在途唤醒
+ * 数据（nonce 账本 / wake 生命周期账）却只用于 limbo 候选判定，没用在判死路径上。
+ *
+ * 判据（任一命中即**不判亡**——方向保守：漏报一次死亡有 stale 清扫与下一轮兜底，
+ * 误判亡会撤回在途派单、惊动 lead）：
+ * 1. **在途唤醒**（`wake` 块）：fresh 未消费 nonce（§2.5-3 在途标记）∨ 生命周期账
+ *    start 头行无 exit 尾行且未过 15min 窗 ∨ spawn 后 60s 内还没见到 session-running
+ *    ∨ 唤醒子 pid 活着——此时以唤醒子进程的 pid 或最新注册的 pid 为准，记录里的旧
+ *    pid 亡不算死（G-29 修法①②）；
+ * 2. **在途任务**（`openTaskCount`）：成员名下 claimed/in_progress 任务 > 0——
+ *    在途即活（17:42:11 误判实例：t111 正在跑却被判亡，R3 修法③）；
+ * 3. **更新的 pid**（`newerPidAlive`）：记录 pid 亡但注册表里已有更新的活 pid
+ *    （SessionStart 钩子已写回新 pid / 唤醒子 pid 活着）——不算死（R3 修法③）。
+ *
+ * 输入全部由调用方读盘后注入（本模块无 I/O 纪律不变）；`now` 注入保持纯度。
+ */
+export interface DeathGuardInput {
+  /** 在途唤醒证据（调用方读 registry/wake nonce 账 + logs 生命周期账 + 证言后注入）。 */
+  wake: {
+    /** 存在 fresh（未消费 ∧ 15min 窗内）的有活体证据 nonce（§2.5-3 在途标记）。 */
+    inflightNonce: boolean;
+    /** 生命周期账里最近一次 spawn 有 start 头行且无 exit 尾行（唤醒子可能仍在跑）。 */
+    lifecycleStartNoExit: boolean;
+    /** 该 start 头行的 spawn 时刻（epoch ms；undefined = 无 spawn 证据）。 */
+    lastSpawnTs?: number;
+    /** spawn 之后是否已见到 session-running（引擎证言 kind='running' 且 ts ≥ spawn）。 */
+    sessionRunningSinceSpawn: boolean;
+    /** 唤醒子 pid（生命周期账 start-confirmed 行汇报的 pid）是否活着。 */
+    wakeChildPidAlive: boolean;
+  };
+  /** 成员名下 claimed/in_progress 任务数（任务板快照）。 */
+  openTaskCount: number;
+  /** 注册表里是否有比记录 pid 更新且活着的 pid（新 pid 已写回 / 唤醒子 pid 活着）。 */
+  newerPidAlive: boolean;
+  /** 判定时刻（注入）。 */
+  now: number;
+  /** 唤醒启动窗（ms）：spawn 后这么久内没见到 session-running 即豁免（R3 修法②）。 */
+  wakeStartWindowMs?: number;
+}
+
+/** 判亡校验裁决：`exempt` = 不判亡（任一校验命中）；`reasons` = 命中的校验名（审计用）。 */
+export interface DeathGuardVerdict {
+  exempt: boolean;
+  reasons: Array<'inflight-wake' | 'open-tasks' | 'newer-pid'>;
+}
+
+/** 唤醒启动窗缺省值（ms）：spawn 后 60s 内没见到 session-running 不判亡（R3 修法②）。 */
+export const DEATH_GUARD_WAKE_START_WINDOW_MS = 60_000;
+
+/** 生命周期账「start 无 exit」的在途窗（ms）——与 engine/wake.ts WAKE_INFLIGHT_MS 同值
+ *  （15min；强杀唤醒子可能不留 exit 尾行，窗后不再无限豁免）。 */
+export const DEATH_GUARD_LIFECYCLE_INFLIGHT_MS = 15 * 60_000;
+
+export function sessionDeathGuard(input: DeathGuardInput): DeathGuardVerdict {
+  const reasons: DeathGuardVerdict['reasons'] = [];
+  const wakeStartWindowMs = input.wakeStartWindowMs ?? DEATH_GUARD_WAKE_START_WINDOW_MS;
+  const spawnAgeMs = input.wake.lastSpawnTs === undefined
+    ? undefined
+    : input.now - input.wake.lastSpawnTs;
+  const inflightWake = input.wake.inflightNonce
+    || (input.wake.lifecycleStartNoExit && spawnAgeMs !== undefined && spawnAgeMs < DEATH_GUARD_LIFECYCLE_INFLIGHT_MS)
+    || (spawnAgeMs !== undefined && spawnAgeMs < wakeStartWindowMs && !input.wake.sessionRunningSinceSpawn)
+    || input.wake.wakeChildPidAlive;
+  if (inflightWake) reasons.push('inflight-wake');
+  if (input.openTaskCount > 0) reasons.push('open-tasks');
+  if (input.newerPidAlive) reasons.push('newer-pid');
+  return { exempt: reasons.length > 0, reasons };
 }
 
 /**

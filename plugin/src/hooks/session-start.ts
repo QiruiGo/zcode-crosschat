@@ -50,12 +50,20 @@
  * 归属不可判定，采纳回落票据兜底）。server 侧护栏 6b（mcp/identity.ts）独立复核
  * 同一宿主事实，双向闭合。
  *
+ * v0.10.0 增量（C2 / R1 / G-27）：**状态根解析的漂移审计**——resolveHookContext 的
+ * 状态根改走既存根发现（core/paths.ts resolveStateRootWithDiscovery：向上 ≤12 层找
+ * 既存协作根、起点在 `.crosschat` 里时向内归一，不再按 cwd 裸拼）之后，本钩子在
+ * 会话记录刷新**之前**调用 shared.ts 的 auditStateRootResolution：解析结果不是裸拼
+ * 时落 `state-root-resolved{root, via}`，与注册表记录里的根不一致时再落
+ * `state-root-drift{registered, resolved}`（正常路径零新增日志）。
+ *
  * 降级规则不变：无 sessionId → 不锚定（静默 exit 0）；任何异常 → engine.jsonl 审计 → exit 0。
  *
  * Build entry: dist/hooks/session-start.mjs (scripts/build.mjs).
  */
 import {
   auditHookFailure,
+  auditStateRootResolution,
   boundNamesForSession,
   emitAdditionalContext,
   HOOK_LOCK_WAIT_MS,
@@ -598,6 +606,12 @@ export async function runSessionStartHook(): Promise<void> {
   const ctx = resolveHookContext('SessionStart', stdin);
 
   if (ctx.sessionId === undefined) return;
+
+  // v0.10.0（C2 / R1 / G-27）：状态根解析漂移审计——**必须排在下面的会话记录刷新
+  // 之前**读：刷新路径（refreshSessionLastSeen）会在记录缺 cwd 时把它补成本回合
+  // workspace，之后再读就再也观察不到「上一回合注册在哪个根」这个事实。审计本身
+  // 只读、尽力而为（shared.ts auditStateRootResolution 的纪律见其注释）。
+  await auditStateRootResolution(ctx);
 
   // v0.9.4（A1）：宿主进程 pid（钩子父进程；钩子自身短命不能当会话进程证据）。
   const pid = hookSessionPid();

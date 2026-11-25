@@ -27,6 +27,11 @@
  * 的最后保险（只要还有人开回合就看得见）。无事故零注入；计数真源与文案属主
  * core/incidents.ts。
  *
+ * v0.10.0 增量（组 D / R4）：**后台回合进行中**提示——有成员正被无头唤醒跑回合时
+ * （引擎事件判据，core/teamstate.ts headlessTurnMembers，与 xc_overview 三视图同源），
+ * 在回合开始提示里加一句「后台回合进行中：<名字列表>」。只列其他成员；无人有后台
+ * 回合则零注入。
+ *
  * Build entry: dist/hooks/prompt-submit.mjs (scripts/build.mjs).
  */
 import {
@@ -63,7 +68,7 @@ import { isInterruptOrSteer } from '../core/mailbox.js';
 // v0.9.1（G-14）：回合开始强提醒的「已完成未接力」判据（纯函数属主 core/teamstate.ts，M1）
 // 与任务板读取——M4 → M1 纪律不变（不碰 engine/MCP）。
 import { DEFAULT_TEAM_ID } from '../core/types.js';
-import { readTeam, unrelayedCompletedTasks } from '../core/teamstate.js';
+import { headlessTurnMembers, readTeam, unrelayedCompletedTasks } from '../core/teamstate.js';
 // v0.8.0（A1，DESIGN-V0.8.md §3.5）：检查点提醒（判据/取数/文案属主 core/checkpoint.ts）。
 // v0.9.8（组 O C1）：同族增「上下文体积提醒」三件套（判据四态/取数/文案，
 // 与 checkpoint 提醒共用 .nudge 节流标记——30min 合计最多一条）。
@@ -437,6 +442,37 @@ async function main(): Promise<void> {
       }
     } catch (error) {
       await auditHookFailure(ctx.stateRoot, 'prompt-submit-incident-summary', error);
+    }
+  }
+
+  // --- v0.10.0（组 D / R4）：**后台回合进行中**提示（桌面看得见谁在被无头唤醒跑回合）---
+  // 判据与 xc_overview team/panel/status 三视图同一函数（core/teamstate.ts
+  // headlessTurnMembers）：只看引擎事件（session-running 晚于 session-idle 且其间
+  // 有过 wake），注册表自述活性不参与（G-12/G-24 已实证不可信）。
+  // 只加一句提示：列**其他**成员（本会话自己的后台回合不进列表——钩子就跑在该回合里），
+  // 无人有后台回合则零注入（数据即收口条件，同 A3/G-14 口径）。
+  // 任何异常只审计不阻断（钩子永不失败会话）。
+  if (names.length > 0) {
+    try {
+      const team = await readTeam(ctx.stateRoot, DEFAULT_TEAM_ID);
+      if (team !== undefined) {
+        const headless = await headlessTurnMembers(ctx.stateRoot, team);
+        const others = [...headless.keys()].filter((key) => key !== names[0]);
+        if (others.length > 0) {
+          blocks.push(
+            `[zcode-crosschat] 后台回合进行中：${others.join('、')}`
+            + '（这些成员正被无头唤醒跑回合——引擎事件判定；给他们派单/发消息前先看 xc_overview 看板，避免双路并发）',
+          );
+          await logHookEvent(ctx.stateRoot, {
+            event: 'hook-prompt-submit-headless-turn',
+            sessionId: ctx.sessionId,
+            name: names[0],
+            headlessMembers: others,
+          });
+        }
+      }
+    } catch (error) {
+      await auditHookFailure(ctx.stateRoot, 'prompt-submit-headless-turn', error);
     }
   }
 

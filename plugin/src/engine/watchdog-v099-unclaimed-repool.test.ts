@@ -185,9 +185,10 @@ describe("v0.9.9 V098-07：看门狗判死路径回池未认领单 + 死亡告�
   it("【锚点】pid-dead 成员未认领单 → 判死即回池 + 创建者回执 + 审计 + summary；在途单不动（清扫职责）", async () => {
     await seedTeam();
     const unclaimed = await addTask({ title: "派给死者的单", to: "b", createdBy: "a" });
-    const inflight = await addTask({ title: "死者的在途单", to: "b", createdBy: "a", status: "in_progress", assignee: "b" });
     await seedCrashedMember("sess_b", { lastEventAgeMs: 90_000 });
 
+    // v0.10.0（组 A / R3）：二次确认——第一周期 suspect（不回池），第二周期认领 + 回池。
+    expect((await sweepMembersOnce(deps())).deathSuspects).toEqual(["b"]);
     const summary = await sweepMembersOnce(deps());
     expect(summary.dead).toEqual(["b"]);
 
@@ -199,9 +200,17 @@ describe("v0.9.9 V098-07：看门狗判死路径回池未认领单 + 死亡告�
     expect(repooled.assignee).toBeNull();
     expect(repooled.attempt).toBe(0);
     expect(repooled.history.at(-1)).toMatchObject({ event: "released-member-unavailable" });
+
     // ② 在途单**不**被看门狗回池——stale 清扫（XC_STALE_TASK_MINUTES 缺省 30min）的职责；
     //    告警文案对在途单保持 requeueAtMs 口径（板面该字段只覆盖 assignee 命中单）。
-    const stillInflight = team.tasks.find((t) => t.id === inflight.id)!;
+    //    v0.10.0（组 A / R3）叠一层：成员已判死之后**新出现**的在途单同样不回池（自愈面只
+    //    认未认领单），且此时 open-tasks 校验如实记豁免（deathExempt）——判据可见。
+    const inflight = await addTask({ title: "死者的在途单", to: "b", createdBy: "a", status: "in_progress", assignee: "b" });
+    const after = await sweepMembersOnce(deps());
+    expect(after.dead).toEqual([]); // 同一次死亡不重复告警
+    expect(after.deathExempt).toEqual([{ key: "b", reasons: ["open-tasks"] }]);
+    expect(after.unclaimedRepooled).toEqual([]); // 在途单不在判死回池域
+    const stillInflight = (await readTeam(root, "default"))!.tasks.find((t) => t.id === inflight.id)!;
     expect(stillInflight.status).toBe("in_progress");
     expect(stillInflight.assignee).toBe("b");
 
@@ -239,9 +248,10 @@ describe("v0.9.9 V098-07：看门狗判死路径回池未认领单 + 死亡告�
 
   it("无未认领单 → 零回池零审计；死亡告警保持 v0.9.6 A8 原文案（名下任务已冻结待回池）", async () => {
     await seedTeam();
-    await addTask({ title: "只有一死在途单", to: "b", createdBy: "a", status: "in_progress", assignee: "b" });
     await seedCrashedMember("sess_b", { lastEventAgeMs: 90_000 });
 
+    // v0.10.0（组 A / R3）：二次确认——suspect → 认领（此时名下无任何单）。
+    expect((await sweepMembersOnce(deps())).deathSuspects).toEqual(["b"]);
     const summary = await sweepMembersOnce(deps());
     expect(summary.dead).toEqual(["b"]);
     expect(summary.unclaimedRepooled).toEqual([]);
@@ -252,7 +262,10 @@ describe("v0.9.9 V098-07：看门狗判死路径回池未认领单 + 死亡告�
     expect(mail).toContain("名下任务已冻结待回池");
     expect(mail).toContain("requeueAtMs");
     expect(mail).not.toContain("已回池至共享待领池");
-    // 在途单仍挂死者名下（清扫职责，不看门狗）。
+    // 判死之后新出现的死在途单：仍挂死者名下（清扫职责，不看门狗），且不被回池。
+    await addTask({ title: "只有一死在途单", to: "b", createdBy: "a", status: "in_progress", assignee: "b" });
+    const after = await sweepMembersOnce(deps());
+    expect(after.unclaimedRepooled).toEqual([]);
     const team = (await readTeam(root, "default"))!;
     expect(team.tasks[0]!.assignee).toBe("b");
     expect(team.tasks[0]!.status).toBe("in_progress");
@@ -261,6 +274,9 @@ describe("v0.9.9 V098-07：看门狗判死路径回池未认领单 + 死亡告�
   it("自愈：往轮已死成员（不再告警）新收到的未认领单 → 下一轮回池，且不重复死亡告警", async () => {
     await seedTeam();
     await seedCrashedMember("sess_b", { lastEventAgeMs: 90_000 });
+
+    // 第 0 轮：suspect（v0.10.0 组 A / R3 二次确认的第一周期，无回池无告警）。
+    expect((await sweepMembersOnce(deps())).deathSuspects).toEqual(["b"]);
 
     // 第 1 轮：判死 + 告警（此时名下无任何单）。
     const first = await sweepMembersOnce(deps());
@@ -312,6 +328,8 @@ describe("v0.9.9 V098-07：看门狗判死路径回池未认领单 + 死亡告�
     const cTask = await addTask({ title: "c 的派单", to: "c", createdBy: "a" });
     await seedCrashedMember("sess_b", { lastEventAgeMs: 90_000 });
 
+    // v0.10.0（组 A / R3）：第一周期 suspect、第二周期认领并回池（回池域断言不变）
+    expect((await sweepMembersOnce(deps())).deathSuspects).toEqual(["b"]);
     const summary = await sweepMembersOnce(deps());
     expect(summary.dead).toEqual(["b"]);
     expect(summary.unclaimedRepooled).toEqual([{ key: "b", taskIds: [bTask.id] }]);

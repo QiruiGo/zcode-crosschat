@@ -265,6 +265,22 @@ export interface TeamMember {
   error?: string;
   /** v0.5（R-18）：声明的上下文字符数（预算刻度；absent = env/200k 缺省）。声明值，非探测值（V-1）。 */
   contextChars?: number;
+  /**
+   * v0.10.0（组 D / G-25）：**会话职能声明**（一句话说明这个会话负责什么）。
+   *
+   * 背景（G-25）：插件数据模型此前没有任何一处记录「这个会话是
+   * 干什么的」——职能知识只存在于 lead 的持久记忆与手写交接卡里，lead 换代/记忆丢失
+   * 即团队职能知识清零（主控换人当天实证）。本字段把职能声明落进
+   * team.json 成员记录，与 boundName 同生命周期维护（改名/takeover/同键重新供给
+   * 都不丢——那些路径全部按既有成员行 spread 保留）。
+   *
+   * 口径（写死）：
+   * - 写入前经 {@link sanitizeDuty} 清洗：控制字符清成空格、trim、最长
+   *   {@link DUTY_MAX_CHARS} 字符（超长截断加 …）；清洗后为空串 → absent（不落空字段）；
+   * - 读取侧宽容增量（§11.1 纪律）：非空串才收，非法值整字段丢弃，绝不整文件拒绝；
+   * - absent = 旧 team.json（v0.9.10 之前落盘）或从未声明——一切照常，无兼容分支。
+   */
+  duty?: string;
 }
 
 /**
@@ -404,8 +420,17 @@ export interface SessionRecord {
    * UserPromptSubmit/SessionStart 起）/ `idle`（Stop 钩子止）；`dead` 是 C8 pid-dead
    * 的派生态，不落盘（core/liveness.ts）。absent = v0.8 存量记录 → 读作 idle
    * （保守：不给清扫豁免）。
+   *
+   * v0.10.0（组 A / R6/G-24）：新增第三态 **`dead`**——看门狗判亡（member-dead）后
+   * **注册表即时翻转**并落盘（engine/watchdog.ts 判死路径调 core/registry.ts
+   * markSessionDead 与 member-dead 事件同临界段双写）。修掉 G-24 的形态：
+   * 「member-dead 后 registry 仍标 running」（监督侧实测 xingtai/m7 等
+   * 多次被判亡而 sessions/<sid>.json 的 Running 不翻）。翻转由引擎自写，属
+   * 同机信任域内的状态真源（README 已知限制 12 同族）；重新 register
+   * （xc_identify wakeToken 路径经 anchorSessionForRegister）或下一回合边界
+   * （refreshSessionLastSeen）即翻回 running/idle。旧记录不受影响（缺省照读）。
    */
-  liveness?: 'running' | 'idle';
+  liveness?: 'running' | 'idle' | 'dead';
   /** v0.9（G-9）：进入当前 liveness 态的时刻（epoch ms）；观测面算 stateAgeMin 用。 */
   livenessTs?: number;
   /**
@@ -816,6 +841,27 @@ function coerceTask(value: unknown, now: number = Date.now()): Task | undefined 
   };
 }
 
+/**
+ * v0.10.0（组 D / G-25）：职能声明长度上限（字符）——「一句话」纪律，超长截断加 …。
+ */
+export const DUTY_MAX_CHARS = 120;
+
+/**
+ * v0.10.0（组 D / G-25）：职能声明清洗（纯函数；写入侧唯一入口）。
+ *
+ * 口径（与 evidence note / checkpoint note 同族）：
+ * - 控制字符（`[\u0000-\u001f\u007f]`）清成空格后 trim；
+ * - 超长按 {@link DUTY_MAX_CHARS} 截断（末位 …）；
+ * - 非字符串 / 清洗后为空串 → `undefined`（absent：不落空字段，也不报错——
+ *   duty 是可选声明，「没说」与「说空了」在数据模型里同一态）。
+ */
+export function sanitizeDuty(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const cleaned = raw.replace(/[\u0000-\u001f\u007f]+/g, ' ').trim();
+  if (cleaned === '') return undefined;
+  return cleaned.length <= DUTY_MAX_CHARS ? cleaned : `${cleaned.slice(0, DUTY_MAX_CHARS - 1)}…`;
+}
+
 // ---------------------------------------------------------------------------
 // Member + whole-team validation (port of state.js:675-700/1023-1073, our schema)
 // ---------------------------------------------------------------------------
@@ -852,6 +898,10 @@ function coerceMember(value: unknown): TeamMember | undefined {
     && contextCharsRaw > 0
     ? contextCharsRaw
     : undefined;
+  // v0.10.0（组 D / G-25）：duty 宽容增量——非空串才收（非法值整字段丢弃，
+  // 不整文件拒绝）；**不在读盘侧重新清洗**（清洗属写入侧 sanitizeDuty 的职责，
+  // 与 contextChars/stopReason 同款宽容语义）。旧 team.json 无该字段 → absent。
+  const duty = optionalString(value['duty']);
   return {
     key,
     sessionId,
@@ -865,6 +915,7 @@ function coerceMember(value: unknown): TeamMember | undefined {
     ...(stopReason === undefined ? {} : { stopReason }),
     ...(error === undefined ? {} : { error }),
     ...(contextChars === undefined ? {} : { contextChars }),
+    ...(duty === undefined || duty.trim() === '' ? {} : { duty }),
   };
 }
 
@@ -1044,6 +1095,8 @@ export function coerceSessionRecord(value: unknown, expectedSessionId: string, n
   const regToken = optionalString(value['regToken']);
   // v0.9（G-9）：活性三字段宽容增量（§11.1 纪律）——旧记录缺省照读；在场时取值
   // 非法（liveness 枚举外 / 时间戳非有限数）整字段丢弃，绝不整文件拒绝。
+  // v0.10.0（组 A / R6）：枚举收 `dead`——看门狗判亡后注册表翻转的落盘值
+  // （SessionRecord.liveness 注释）；旧记录无此值照常缺省，零兼容分支。
   // v0.9.1（V090-01）：livenessTs/lastEventTs/lastTurnTs 加**未来值校验**
   // （plausibleLivenessTs）——未来时刻在物理上不可能是产品自写的值，durable
   // boundary 直接丢弃（absent = 无心跳/无状态时刻，下游按保守口径处理：running
@@ -1060,7 +1113,7 @@ export function coerceSessionRecord(value: unknown, expectedSessionId: string, n
   //   记录 + OS pid 复用 → steer 把旁观进程当活回合宿主强杀）正是这一类，丢弃时刻
   //   （liveness 字段保留，下游异常面据「running ∧ 无可信时刻」如实记账）。
   const livenessRaw = optionalString(value['liveness']);
-  const liveness = livenessRaw === 'running' || livenessRaw === 'idle' ? livenessRaw : undefined;
+  const liveness = livenessRaw === 'running' || livenessRaw === 'idle' || livenessRaw === 'dead' ? livenessRaw : undefined;
   const lastEventTs = plausibleLivenessTs(value['lastEventTs'], now) ? value['lastEventTs'] as number : undefined;
   const livenessTs = plausibleLivenessTs(
     value['livenessTs'],

@@ -30,7 +30,7 @@
  * @module hooks/shared
  */
 import { readFileSync } from 'node:fs';
-import { resolveStateRoot, workspaceFromEnv } from '../core/paths.js';
+import { isSameAbsolutePath, resolveStateRootWithDiscovery, workspaceFromEnv, type StateRootVia } from '../core/paths.js';
 import { readNames, namesBoundToSession, readSession, refreshSessionLastSeen } from '../core/registry.js';
 import { readUnreadMailbox, urgentFirst, markMailboxConsumed } from '../core/mailbox.js';
 import { withRegistryLock, withTeamLock, LockBusyError } from '../core/lock.js';
@@ -71,6 +71,12 @@ export interface HookContext {
   workspace: string;
   /** Absolute `<workspace>/.crosschat`. */
   stateRoot: string;
+  /**
+   * v0.10.0（C1 / R1 / G-27）：本回合状态根解析走了哪条路（undefined = 旧构造面
+   * 或测试替手，读作 `'bare'`）。{@link auditStateRootResolution} 据此决定是否落
+   * `state-root-resolved` 审计——正常路径（裸拼且无漂移）零新增日志。
+   */
+  stateRootVia?: StateRootVia;
   /** Session id from CLAUDE_SESSION_ID env or stdin; undefined when absent. */
   sessionId: string | undefined;
   /** Hook event name (diagnostics only). */
@@ -111,6 +117,14 @@ export function readStdinPayload(): HookStdin | undefined {
 /**
  * Resolve the hook context: workspace + state root + session id.
  * Env first (the documented hook variables), stdin as fallback.
+ *
+ * v0.10.0（C1 / R1 / G-27）：状态根解析不再裸拼——工作区选定链不变（显式传入的
+ * 工程目录环境变量优先级原样保留：ZCODE_PROJECT_DIR/CLAUDE_PROJECT_DIR → stdin
+ * cwd → process.cwd()），但 `<workspace>/.crosschat` 改经
+ * {@link resolveStateRootWithDiscovery}：向上 ≤12 层找既存协作根（最近祖先优先）、
+ * 起点在 `.crosschat` 里时向内归一，找不到才裸拼（首启）。`workspace` 仍记当轮
+ * 来源目录本身（会话记录 cwd / peer 基记录 cwd 的既有口径不动），只有 stateRoot
+ * 归并到主根。
  */
 export function resolveHookContext(event: string, stdin: HookStdin | undefined): HookContext {
   const env = process.env;
@@ -119,7 +133,61 @@ export function resolveHookContext(event: string, stdin: HookStdin | undefined):
     ? envWorkspace
     : stdin?.str('cwd', 'cwd') ?? workspaceFromEnv(env);
   const sessionId = env['CLAUDE_SESSION_ID']?.trim() || stdin?.str('session_id', 'sessionId');
-  return { workspace, stateRoot: resolveStateRoot(workspace), sessionId, event };
+  const resolution = resolveStateRootWithDiscovery(workspace);
+  return {
+    workspace,
+    stateRoot: resolution.root,
+    stateRootVia: resolution.via,
+    sessionId,
+    event,
+  };
+}
+
+/**
+ * v0.10.0（C2 / R1 / G-27）：状态根解析的**漂移可观测**——钩子回合边界落审计事件，
+ * 让「某会话跑去别处起了根」在主根 engine.jsonl 里看得见（G-27 影响面第 3 条）。
+ *
+ * 两条事件（R1 建议修法 4）：
+ * 1. `state-root-resolved{root, via}`：解析结果**不是**裸拼的 `<cwd>/.crosschat`
+ *    时落（via = `ancestor` | `inside-root`）——记录本次归并到了哪个主根、怎么归并的；
+ * 2. `state-root-drift{registered, resolved}`：同一会话解析出的根与它**注册表记录
+ *    里的根**（会话记录 cwd 经同一解析规则算出的根）不一致时再落——幻影根/换项目
+ *    导致的根漂移由此显式化，而不是静默裂成两个根。漂移**持续期间每次 SessionStart
+ *    复读**（只读审计不改记录）；另一端（幻影根）被清除后，记录 cwd 经同一规则
+ *    归并回主根，事件自愈停止。
+ *
+ * 纪律：
+ * - 正常路径（裸拼且无漂移）**零新增日志**；
+ * - 只读（不写注册表、不改任何状态）——刷新路径会在记录缺 cwd 时补写本回合
+ *   workspace，故漂移审计必须排在会话记录刷新**之前**读旧值（调用方 session-start.ts
+ *   已按此排序）；
+ * - 尽力而为：任何 IO/解析失败只吞掉（观测面增强不许把钩子拖失败）。
+ */
+export async function auditStateRootResolution(ctx: HookContext): Promise<void> {
+  try {
+    const via = ctx.stateRootVia ?? 'bare';
+    if (via !== 'bare') {
+      await logEngineEvent(ctx.stateRoot, {
+        event: 'state-root-resolved',
+        via,
+        root: ctx.stateRoot,
+        ...(ctx.sessionId !== undefined ? { sessionId: ctx.sessionId } : {}),
+      });
+    }
+    if (ctx.sessionId === undefined) return;
+    const record = await readSession(ctx.stateRoot, ctx.sessionId).catch(() => undefined);
+    if (record === undefined || typeof record.cwd !== 'string' || record.cwd.trim() === '') return;
+    const registered = resolveStateRootWithDiscovery(record.cwd).root;
+    if (isSameAbsolutePath(registered, ctx.stateRoot)) return;
+    await logEngineEvent(ctx.stateRoot, {
+      event: 'state-root-drift',
+      registered,
+      resolved: ctx.stateRoot,
+      sessionId: ctx.sessionId,
+    });
+  } catch {
+    // 漂移审计是观测面增强：失败静默（正常路径本来就不该有日志）。
+  }
 }
 
 /** Emit the hook's context injection: exactly one strict-schema key. */
