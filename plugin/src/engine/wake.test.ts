@@ -345,6 +345,89 @@ describe("attemptWake", () => {
     expect(wake!["to"]).toBe("b");
   });
 
+  it("【G-26】成员行 compactInProgressAt 新鲜（评审 F1：时间戳标记）→ 只入箱不唤醒（wake-skipped member-compacting；不 spawn、消息照常落邮箱）", async () => {
+    const message = await seedMailbox();
+    const team = newTeamState({ teamId: "default", name: "default", founderKey: "a", now: 0 });
+    team.members.push({
+      key: "b", sessionId: "sess_b", role: "worker", identity: "engine",
+      joinedAt: 0, lastSeen: 0, state: "ready", compactInProgressAt: 999_999,
+    });
+    await writeTeam(root, team);
+    const captured: CapturedSpawn[] = [];
+    const res = await attemptWake(baseReq({
+      receiptIds: [message.id],
+      now: 1_000_000,
+      spawn: fakeSpawn(4242, captured),
+    }));
+    expect(res.delivered).toBe("mailbox");
+    expect(String(res.note)).toContain("member-compacting");
+    expect(captured).toHaveLength(0);
+    const skip = readEngineEvents().find((e) => e["event"] === "wake-skipped");
+    expect(skip).toBeDefined();
+    expect(String(skip!["reason"])).toContain("member-compacting");
+    // 消息未标记 delivered（pull 兜底不丢）
+    const after = (await readMailbox(root, "default", "b")).find((m) => m.id === message.id);
+    expect(after?.deliveredAt).toBeUndefined();
+  });
+
+  it("【G-26 对照】同请求无 compactInProgressAt 标记 → 照常 wake（闸只挡压缩窗口）", async () => {
+    const message = await seedMailbox();
+    const team = newTeamState({ teamId: "default", name: "default", founderKey: "a", now: 0 });
+    team.members.push({
+      key: "b", sessionId: "sess_b", role: "worker", identity: "engine",
+      joinedAt: 0, lastSeen: 0, state: "ready",
+    });
+    await writeTeam(root, team);
+    const captured: CapturedSpawn[] = [];
+    const res = await attemptWake(baseReq({
+      receiptIds: [message.id],
+      now: 1_000_000,
+      spawn: fakeSpawn(4242, captured),
+    }));
+    expect(res.delivered).toBe("wake");
+    expect(captured).toHaveLength(1);
+  });
+
+  it("【G-26，评审 F1】compactInProgressAt 陈旧（超 COMPACT_IN_PROGRESS_STALE_MS 新鲜窗）→ fail-open 照常 wake（崩溃残留不再永久禁言）", async () => {
+    const message = await seedMailbox();
+    const team = newTeamState({ teamId: "default", name: "default", founderKey: "a", now: 0 });
+    team.members.push({
+      key: "b", sessionId: "sess_b", role: "worker", identity: "engine",
+      joinedAt: 0, lastSeen: 0, state: "ready",
+      // now=1_000_000，置位时刻 0 → 年龄 1e6 ms ≫ 新鲜窗（600s）= 置位方崩溃残留形态
+      compactInProgressAt: 0,
+    });
+    await writeTeam(root, team);
+    const captured: CapturedSpawn[] = [];
+    const res = await attemptWake(baseReq({
+      receiptIds: [message.id],
+      now: 1_000_000,
+      spawn: fakeSpawn(4242, captured),
+    }));
+    expect(res.delivered).toBe("wake");
+    expect(captured).toHaveLength(1);
+  });
+
+  it("【G-26，评审 F1】compactInProgressAt 异常未来值（时钟毛刺内仍算新鲜；野未来值 fail-open 不永久挡）", async () => {
+    const message = await seedMailbox();
+    const team = newTeamState({ teamId: "default", name: "default", founderKey: "a", now: 0 });
+    team.members.push({
+      key: "b", sessionId: "sess_b", role: "worker", identity: "engine",
+      joinedAt: 0, lastSeen: 0, state: "ready",
+      // 30s 内的未来值（时钟毛刺容差）→ 仍按新鲜处理，闸生效
+      compactInProgressAt: 1_000_000 + 30_000,
+    });
+    await writeTeam(root, team);
+    const captured: CapturedSpawn[] = [];
+    const res = await attemptWake(baseReq({
+      receiptIds: [message.id],
+      now: 1_000_000,
+      spawn: fakeSpawn(4242, captured),
+    }));
+    expect(res.delivered).toBe("mailbox");
+    expect(captured).toHaveLength(0);
+  });
+
   it("【判据 5】非 \"true\" 按关：mailbox + 原始值记入 engine.jsonl + 不写 nonce、不 spawn", async () => {
     await seedMailbox();
     for (const raw of ["TRUE", "1", "", undefined]) {
@@ -490,12 +573,16 @@ describe("MEMBER_RULES_V2（守则 v2 全文，§3.4）", () => {
 });
 
 describe("场景白名单（§9.1 新增场景 prompt 组装）", () => {
-  it("WAKE_SCENES 覆盖 v0.1.0 三场景 + v0.2 六场景 + v0.9.8 steer", () => {
+  it("WAKE_SCENES 覆盖 v0.1.0 三场景 + v0.2 六场景 + v0.9.8 steer + v0.10.1 compact-checkpoint/compact-resume", () => {
     expect(WAKE_SCENES).toEqual([
       "dispatch", "report", "message", "unblock", "idle", "cancel",
       "post-provision", "shutdown", "stale-sweep",
       // v0.9.8（S1）：steer（终止→续跑）场景标签——engine.jsonl scene 可枚举审计。
       "steer",
+      // v0.10.1（G-26）：compact 命中 checkpoint_required 闸时要求成员落检查点的唤醒。
+      "compact-checkpoint",
+      // v0.10.1（G-26，评审 F7）：压缩结束后对窗口内被跳过消息的补唤醒。
+      "compact-resume",
     ]);
   });
 

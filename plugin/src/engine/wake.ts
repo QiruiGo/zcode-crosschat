@@ -203,6 +203,7 @@ import {
   type WakeNonce,
 } from "../core/types";
 import { spawnResume, type WakeSpawnConfig } from "./resume-cli";
+import { COMPACT_IN_PROGRESS_STALE_MS } from "./compact.js";
 import { explicitSpawnConfigError, resolveZcodeSpawnConfig, type ResolvedSpawnConfig } from "./zcode-locate";
 // v0.9.8（S3）：steer 信封的 journal 指针（任务日志唯一定义点，core/archive.ts）。
 import { taskJournalPath } from "../core/archive.js";
@@ -1090,6 +1091,13 @@ export const WAKE_SCENES = [
   // v0.9.8（S1）：steer（终止→续跑）场景标签——engine.jsonl scene 字段可枚举审计；
   // 与 message 一样内嵌正文（纠偏原文必须到模型手上，见 wakePromptEmbedsMessageBody）。
   "steer",
+  // v0.10.1（G-26）：compact 命中 checkpoint_required 闸时要求成员立刻落检查点的唤醒
+  // （内嵌行动指令原文，与 message/steer 同款内嵌正文）。
+  "compact-checkpoint",
+  // v0.10.1（G-26，评审 F7）：压缩结束后对压缩窗口内被跳过的唤醒（只入箱的消息）的
+  // 补唤醒——「压缩结束后照常唤醒」由工具面显式补发，不再只靠 pull 兜底。不内嵌正文
+  // （票文是工具面组装的压缩结束摘要，见 wakePromptEmbedsMessageBody 不含本场景）。
+  "compact-resume",
 ] as const;
 
 /**
@@ -3663,6 +3671,33 @@ export async function attemptWake(req: WakeRequest): Promise<WakeResult> {
     });
     // v0.9.4（A3）：降级回执如实写「仅落邮箱（未唤醒）」——禁出现已送达/已消费。
     return attachSteer({ delivered: "mailbox", note: mailboxOnlyNote(reason) }, { skipReason: reason });
+  }
+  // v0.10.1（G-26）：**压缩进行中 → 只入箱不唤醒**。lead 正经 xc_team({action:"compact"})
+  // 代压该成员（app-server 对该会话的并发写：resume + compact + 摘要落库），此刻再
+  // spawn 唤醒回合会与之交错写（宿主不拦跨实例压缩——51-G26调研 Q2 实测）；G-16 的
+  // withSessionTurnLock 只挡 MCP 侧写工具（claim/report/dispatch），挡不住 spawn，
+  // 所以成员行 compactInProgressAt 置位时刻必须让唤醒路径直接看到。位置在成员状态
+  // 门控之后、分层闸之前：生命周期事实（这个会话此刻能不能被安全唤醒）优先于开关
+  // 读数，同一闸序纪律（1.5 的由来）。标记由 compact 工具面成功/失败都清除（finally），
+  // 清除后行为逐字节不变。消息照常落邮箱（pull 兜底不丢）；压缩结束后由 compact
+  // 工具面的补唤醒（scene compact-resume，评审 F7）补偿窗口内被跳过的唤醒。
+  //
+  // 评审 F1：标记带置位时刻（epoch ms），只认新鲜窗内的值——陈旧残留（置位方崩溃/
+  // 清理失败）超窗后 fail-open 照常走后续闸，成员不再被一个死标记永久禁言
+  // （wake 路径只读不写 team.json，残留字节由 compact 工具面的锁内清扫与 member-add
+  // 重供给复位；未来时刻留 60s 容差防时钟毛刺，野的未来值同样 fail-open 不永久挡）。
+  const compactMarkAt = target?.compactInProgressAt;
+  if (compactMarkAt !== undefined) {
+    const markAgeMs = now - compactMarkAt;
+    const markFresh = markAgeMs > -60_000 && markAgeMs <= COMPACT_IN_PROGRESS_STALE_MS;
+    if (markFresh) {
+      const reason = "member-compacting: lead 正在对该成员执行上下文压缩（xc_team compact，app-server 代写中），"
+        + "只入箱不唤醒——压缩结束后照常唤醒/由成员回合自行查收（pull 兜底不丢）";
+      await logEngineEvent(stateRoot, {
+        event: "wake-skipped", reason, scene: req.reason, teamId: req.teamId, to: toKey,
+      });
+      return attachSteer({ delivered: "mailbox", note: mailboxOnlyNote(reason) }, { skipReason: reason });
+    }
   }
 
   const pre = decideDelivery({ wakeGate: gate, ownerAbsent: req.ownerAbsent, inflight: false });

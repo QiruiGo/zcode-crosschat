@@ -343,26 +343,25 @@ describe('A5 文档：无 PreCompact，故用提醒+一键（ACCEPT15-1 文档�
 // 的存在本身由本 it 守着，文档 lane 落笔前它不许消失）。
 // ---------------------------------------------------------------------------
 
-describe('A5 版本号一致性（四处版本文件 = 0.10.0；README 自 v0.9.10 起不写死版本，没有第五处可钉）', () => {
-  it('package.json / plugin.json / marketplace.json / server.ts 四处 = 0.10.0', () => {
-    expect(JSON.parse(readRel('plugin/package.json')).version).toBe('0.10.0');
-    expect(JSON.parse(readRel('plugin/.zcode-plugin/plugin.json')).version).toBe('0.10.0');
-    expect(JSON.parse(readRel('marketplace.json')).plugins[0].version).toBe('0.10.0');
-    expect(readRel('plugin/src/mcp/server.ts')).toContain('const SERVER_VERSION = "0.10.0"');
+describe('A5 版本号一致性（四处版本文件 = 0.10.1；README 自 v0.9.10 起不写死版本，没有第五处可钉）', () => {
+  it('package.json / plugin.json / marketplace.json / server.ts 四处 = 0.10.1', () => {
+    expect(JSON.parse(readRel('plugin/package.json')).version).toBe('0.10.1');
+    expect(JSON.parse(readRel('plugin/.zcode-plugin/plugin.json')).version).toBe('0.10.1');
+    expect(JSON.parse(readRel('marketplace.json')).plugins[0].version).toBe('0.10.1');
+    expect(readRel('plugin/src/mcp/server.ts')).toContain('const SERVER_VERSION = "0.10.1"');
   });
 
   // README 自 v0.9.10 起不写死版本：安装段资产名/目录名/安装回显全是 `<版本号>` 占位——
   // 整份 README 不得再出现 zcode-crosschat-<数字>.<数字>.<数字> 形式的写死资产名/目录名
   // （负例断言；覆盖任意版本号段，不只 0.x.y——将来写回 1.0.0 也该红）。
-  // CHANGELOG 按「最新条目 + 四条历史条目」口径钉 v0.10.0/v0.9.10/v0.9.9/v0.9.8/v0.9.7 五条
-  // （v0.9.8/v0.9.9 条目由 v0.9.10 文档 lane 补录；v0.10.0 条目由 v0.10.0 文档 lane 补写）。
-  // v0.10.0 只钉 `**v0.10.0**` 这个条目头（不钉日期/摘要）——正文归文档 lane，
-  // 它写什么摘要都不该把本 it 打红；但条目消失（版本文件改了、CHANGELOG 没条目）必须红。
-  it('README 不含写死版本的资产名（/zcode-crosschat-\\d+\\.\\d+\\.\\d+/）；CHANGELOG 含 v0.10.0/v0.9.10/v0.9.9/v0.9.8/v0.9.7 五条', () => {
+  // CHANGELOG 按「最新条目 + 历史条目」口径钉 v0.10.1/v0.10.0/v0.9.10/v0.9.9/v0.9.8/v0.9.7 六条
+  // （v0.10.1 起同款纪律：条目头在场即可，正文不钉）。
+  it('README 不含写死版本的资产名（/zcode-crosschat-\\d+\\.\\d+\\.\\d+/）；CHANGELOG 含 v0.10.1/v0.10.0/v0.9.10/v0.9.9/v0.9.8/v0.9.7 六条', () => {
     const readme = readRel('README.md');
     expect(readme).not.toMatch(/zcode-crosschat-\d+\.\d+\.\d+/);
     expect(readme).toContain('8 个斜杠命令');
     const changelog = readRel('CHANGELOG.md');
+    expect(changelog).toContain('**v0.10.1**');
     expect(changelog).toContain('**v0.10.0**');
     expect(changelog).toContain('**v0.9.10**（2026-11-24，只改文档的补丁版');
     expect(changelog).toContain('**v0.9.9**（2026-11-22，steer 进程树击杀');

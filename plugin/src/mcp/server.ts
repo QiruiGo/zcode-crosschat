@@ -46,7 +46,7 @@ import { stopPeerEndpoint } from "../transport/pipe.js";
 import { GuardedStdioTransport } from "../transport/mcpstdio.js";
 
 const SERVER_NAME = "zcode-crosschat";
-const SERVER_VERSION = "0.10.0";
+const SERVER_VERSION = "0.10.1";
 
 // v0.8.1（29 红队 M01 修复）：xc_doctor 的 action 形状在**入口模块**构建——本模块是
 // bundle 入口（模块体最后求值），此处用 zod 无初始化次序风险；而 doctor-tool.ts 若自建

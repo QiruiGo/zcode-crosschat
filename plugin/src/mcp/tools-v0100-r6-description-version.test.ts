@@ -23,11 +23,17 @@ import { describe, expect, it } from "vitest";
 const SRC = join(dirname(fileURLToPath(import.meta.url)), "..");
 const REPO_ROOT = join(SRC, "..", "..");
 
-/** 任务书点名的 6 处（文件 → 行号 → 该处应出现的版本号）。 */
+/** 任务书点名的 6 处（文件 → 行号 → 该处应出现的版本号）。
+ *  v0.10.1（G-26）：tools-team.ts 的 xc_team 描述行整体下移（2002 → 2339）——下移
+ *  主因是新增约 312 行的 handleTeamCompact 块（action=compact 的闸门/协议/审计实现），
+ *  TeamShape/TeamActionArgs 增补 compact/force 字段只是次因（评审 F19：原注释把主因
+ *  归为字段增补，与实际代码结构不符）；评审修复轮补唤醒/锁内复验等实现使行号进一步
+ *  下移到 2565，对抗检验 3a/3b 的未来值守卫块再下移到 2594。行号随实际代码更新，
+ *  内容断言不变。 */
 const PINNED: Array<{ file: string; line: number; what: string }> = [
   { file: "plugin/src/mcp/tools-tasks.ts", line: 131, what: "xc_report urgent 参数 describe" },
   { file: "plugin/src/mcp/tools-tasks.ts", line: 1464, what: "xc_report 工具描述" },
-  { file: "plugin/src/mcp/tools-team.ts", line: 2002, what: "xc_team 描述 duty" },
+  { file: "plugin/src/mcp/tools-team.ts", line: 2594, what: "xc_team 描述 duty" },
   { file: "plugin/src/mcp/tools-identify.ts", line: 931, what: "xc_identify duty 参数 describe" },
   { file: "plugin/src/mcp/tools-overview.ts", line: 1431, what: "xc_overview 描述 duty/headlessTurn（两处）" },
   { file: "plugin/src/mcp/tools-overview.ts", line: 1435, what: "xc_overview status 视图描述" },
@@ -120,12 +126,22 @@ describe("v0.10.0 集成员·R6：工具描述里的版本号", () => {
     }
   });
 
+  // v0.10.1（评审 F17）：xc_team 描述第一行的动作枚举必须含 compact——此前漏了它，
+  // 与 TeamShape 枚举、同串后文 compact 段落及 README/SKILL 的动作清单不一致。
+  it("xc_team 描述第一行的动作枚举含 compact（与 TeamShape.action 枚举一致）", () => {
+    const firstLine = readRepo("plugin/src/mcp/tools-team.ts")
+      .split("\n")
+      .find((line) => line.includes("Command family in one tool (actions:"));
+    expect(firstLine, "xc_team 描述第一行（actions 枚举行）不存在").toBeDefined();
+    expect(firstLine!).toContain("unblock/checkpoint/compact");
+  });
+
   it("这 6 处合共 7 个版本标签（1431 行有两处：duty 与 headlessTurn）", () => {
     // 防「行号漂移后只改到一处」：逐处数标签个数。
     const expected: Array<[string, number, number]> = [
       ["plugin/src/mcp/tools-tasks.ts", 131, 1],
       ["plugin/src/mcp/tools-tasks.ts", 1464, 1],
-      ["plugin/src/mcp/tools-team.ts", 2002, 1],
+      ["plugin/src/mcp/tools-team.ts", 2594, 1],
       ["plugin/src/mcp/tools-identify.ts", 931, 1],
       ["plugin/src/mcp/tools-overview.ts", 1431, 2],
       ["plugin/src/mcp/tools-overview.ts", 1435, 1],

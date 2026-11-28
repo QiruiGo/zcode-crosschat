@@ -36,9 +36,12 @@ import { readFile, stat } from "node:fs/promises";
 import { z } from "zod";
 import { attemptWake } from "../engine/wake.js";
 import { bootstrapTimeoutFromEnv, provisionMember, ProvisionError } from "../engine/provision.js";
-import { LockBusyError, withRegistryThenTeamLocks, withTeamLock } from "../core/lock.js";
+// v0.10.1（G-26）：主控代成员压缩的协议客户端（app-server 瞬态 keeper）。
+import { COMPACT_IN_PROGRESS_STALE_MS, compactMemberSession, type CompactOutcome } from "../engine/compact.js";
+import { engineHolderIsHeadless } from "../core/config.js";
+import { LockBusyError, SessionTurnBusyError, withRegistryThenTeamLocks, withSessionTurnLock, withTeamLock } from "../core/lock.js";
 import { logEngineEvent } from "../core/log.js";
-import { appendMailbox, createMessage, readMailbox, urgentFirst } from "../core/mailbox.js";
+import { appendMailbox, createMessage, readMailbox, readUnreadMailbox, urgentFirst } from "../core/mailbox.js";
 import { bindName, readSession, writeSession } from "../core/registry.js";
 import { sanitizeKey, validateMemberName } from "../core/sanitize.js";
 import { getTask, leadKeyOf, memberOpenTasks, newTeamState, readTeam, repoolUnclaimedTasksLocked, sortTasksForBoard, transitionTask, unblockTask, writeTeam, provisionStaleAfterMs, sweepStaleProvisioningLocked } from "../core/teamstate.js";
@@ -54,6 +57,7 @@ import {
   checkpointStamp,
   checkpointUnreadRef,
   currentUnreadMessages,
+  latestCheckpoint,
   writeCheckpoint,
   type CapacityView,
   type CheckpointWriteResult,
@@ -66,7 +70,9 @@ import {
   MAX_LEAD_HISTORY,
   OPEN_TASK_STATUSES,
   TERMINAL_TASK_STATUSES,
+  memberIdentity,
   memberState,
+  plausibleLivenessTs,
   sanitizeDuty,
 } from "../core/types.js";
 import type { LeadHistoryEntry, MemberState, TeamMember, TeamMessage, TeamState } from "../core/types.js";
@@ -102,19 +108,26 @@ export function blocksWake(provisionState: MemberState): boolean {
 export const IDLE_REASONS = ["no-claimable-task", "inbox-empty", "blocked-only"] as const;
 
 export const TeamShape = {
-  action: z.enum(["init", "transfer", "release", "member-add", "member-stop", "idle", "cancel", "unblock", "checkpoint"]),
+  action: z.enum(["init", "transfer", "release", "member-add", "member-stop", "idle", "cancel", "unblock", "checkpoint", "compact"]),
   takeover: z.boolean().optional().describe("仅 action=init：接管现任 lead（用户明确指令时；R-1/F-4）"),
   to: z.string().min(1).optional().describe("action=transfer：移交目标"),
-  name: z.string().min(1).optional().describe("action=member-add/member-stop：成员名"),
+  name: z.string().min(1).optional().describe("action=member-add/member-stop/compact：成员名"),
   model: z.string().optional().describe("action=member-add：模型 id（缺省用 member_model 配置，再缺省用枚举首个；显式指定但枚举里不存在 → 显式报错并列可用 modelId，不静默取首个）"),
   reasoningLevel: z.string().optional().describe("action=member-add：推理档位"),
-  note: z.string().optional().describe("action=member-add：备注（仅审计）；action=checkpoint：写进检查点第 7 章的一句话"),
+  note: z.string().optional().describe("action=member-add：备注（仅审计）；action=checkpoint：写进检查点第 7 章的一句话；action=compact：传给宿主的压缩说明（摘要保留重点），缺省用内置默认句"),
   contextChars: z.number().int().positive().optional().describe("action=member-add：该成员上下文字符数声明（预算刻度，R-18；缺省 XC_CONTEXT_CHARS/200k）"),
   reason: z.string().optional().describe("action=transfer/member-stop：原因（入审计）"),
   // v0.10.0（组 D / G-25）：供给时一并声明该成员的职能（与 xc_identify 的 duty 同字段
   // 同口径：一句话、≤120 字符、控制字符清洗；缺省=不声明，重供给时保留既有声明）。
   duty: z.string().max(2000).optional().describe(
     "action=member-add：该成员的职能声明（一句话说明它负责什么；最长 120 字符，控制字符清掉；缺省=不声明/保留既有声明。写入 team.json 成员行，xc_overview 与 handoff 花名册可见）",
+  ),
+  // v0.10.1（G-26）：压缩退出开关与无检查点强压。
+  compact: z.boolean().optional().describe(
+    "action=member-add：该成员是否允许主控压缩其上下文（xc_team compact 的退出开关；缺省 true=允许，false=退出——lead 对它发起 compact 恒拒 compact_opted_out。写入 team.json 成员行；旧成员行无该字段按允许处理）",
+  ),
+  force: z.boolean().optional().describe(
+    "action=compact：无新检查点也强压（跳过 checkpoint_required 闸；默认说明前会加「该成员未落新检查点——」前缀。成员回合进行中/退出压缩等其余闸不因此放行）",
   ),
   taskId: z.string().min(1).optional().describe("action=cancel/unblock：任务 id"),
   summary: z.string().min(1).optional().describe("action=idle：空闲摘要（守则 v2 第 3 条）"),
@@ -305,7 +318,7 @@ interface MemberAddPlan {
   swept: string[];
 }
 
-async function memberAdd(deps: ToolDeps, args: { name: string; model?: string; reasoningLevel?: string; note?: string; contextChars?: number; duty?: string }, me: BoundIdentity): Promise<ToolResult> {
+async function memberAdd(deps: ToolDeps, args: { name: string; model?: string; reasoningLevel?: string; note?: string; contextChars?: number; duty?: string; compact?: boolean }, me: BoundIdentity): Promise<ToolResult> {
   const { stateRoot, workspace, env } = deps;
   // v0.10.0（组 D / G-25）：职能声明清洗（与 xc_identify 同一纯函数；控制字符清掉、
   // ≤120 字符；声明为空 = 不声明）。锁外快洗，零副作用。
@@ -399,6 +412,17 @@ async function memberAdd(deps: ToolDeps, args: { name: string; model?: string; r
           // v0.10.0（组 D / G-25）：重供给时可（重）声明职能；未声明则 spread 保留
           // 既有 duty——「同键重新供给不丢」（G-25 设计建议 3）。
           ...(duty !== undefined ? { duty } : {}),
+          // v0.10.1（G-26）：重供给时可（重）声明压缩退出开关；未声明则 spread 保留
+          // 既有 compact（与 duty 同款「不丢」口径）。
+          ...(args.compact !== undefined ? { compact: args.compact } : {}),
+          // v0.10.1（评审 F1）：瞬态「压缩进行中」标记**绝不随重供给存活**——布尔标记
+          // 时代它无时间戳/无清扫/无超时失效，旧 lead MCP server 崩溃即永久残留，且
+          // `...existing` spread 会把残留带进新供给行（同键重供给正是 removed/failed
+          // 成员的唯一常规恢复路径），成员从此只入箱不唤醒。显式复位：JSON 落盘时
+          // undefined 键不出现，新供给行干净（旧键按未知字段自然丢弃，无兼容分支——
+          // 该形态从未随发布版本落盘）。陈旧残留的另两层兜底：compact 工具面置位时
+          // 的锁内清扫 + 唤醒路径对超窗标记 fail-open（wake.ts）。
+          compactInProgressAt: undefined,
         }
       : {
           key,
@@ -412,6 +436,7 @@ async function memberAdd(deps: ToolDeps, args: { name: string; model?: string; r
           lastSeen: now,
           ...(args.contextChars === undefined ? {} : { contextChars: args.contextChars }),
           ...(duty === undefined ? {} : { duty }),
+          ...(args.compact === undefined ? {} : { compact: args.compact }),
         };
     if (existing === undefined) team.members.push(record);
     else team.members[team.members.indexOf(existing)] = record;
@@ -574,6 +599,8 @@ async function memberAdd(deps: ToolDeps, args: { name: string; model?: string; r
         // v0.10.0（组 D / G-25）：本次（重）声明的职能回显（缺省 = 未声明；
         // 未声明时既有 duty 仍在成员行里，重供给不丢）。
         ...(duty !== undefined ? { duty } : {}),
+        // v0.10.1（G-26）：本次（重）声明的压缩退出开关回显（缺省 = 未声明，按允许）。
+        ...(args.compact !== undefined ? { compact: args.compact } : {}),
         // v0.9.6（R2）：model 块与 reasoningFallback 都带**实际生效**档位（缺省配置
         // 首试即成功；降级路径如实披露 from→to，不再虚报所配档位）。
         model: { providerId: result.providerId, modelId: result.modelId, reasoningLevel: result.reasoningLevel },
@@ -1007,7 +1034,7 @@ async function memberStop(deps: ToolDeps, args: { name: string; reason?: string;
 
 /** 队内成员工具核心（原 member-tools.ts 的 registerMemberTools 两个 handler 主体）。 */
 export interface MemberToolCore {
-  xc_member_add(args: { name: string; model?: string; reasoningLevel?: string; note?: string; contextChars?: number; duty?: string }, connectionKey: string): Promise<ToolResult>;
+  xc_member_add(args: { name: string; model?: string; reasoningLevel?: string; note?: string; contextChars?: number; duty?: string; compact?: boolean }, connectionKey: string): Promise<ToolResult>;
   xc_member_stop(args: { name: string; reason?: string; archive?: boolean }, connectionKey: string): Promise<ToolResult>;
 }
 
@@ -1602,7 +1629,7 @@ export function createLeadToolCore(deps: ToolDepsLike): LeadToolCore {
 
 /** xc_team 的 action 载荷（按 action 收窄；未用字段忽略）。 */
 export type TeamActionArgs = {
-  action: "init" | "transfer" | "release" | "member-add" | "member-stop" | "idle" | "cancel" | "unblock" | "checkpoint";
+  action: "init" | "transfer" | "release" | "member-add" | "member-stop" | "idle" | "cancel" | "unblock" | "checkpoint" | "compact";
   takeover?: boolean;
   to?: string;
   name?: string;
@@ -1612,6 +1639,9 @@ export type TeamActionArgs = {
   contextChars?: number;
   // v0.10.0（组 D / G-25）：action=member-add 的职能声明（可选；同 xc_identify duty）。
   duty?: string;
+  // v0.10.1（G-26）：action=member-add 的压缩退出开关；action=compact 的强压开关。
+  compact?: boolean;
+  force?: boolean;
   reason?: string;
   taskId?: string;
   summary?: string;
@@ -1929,6 +1959,559 @@ export async function handleTeamUnblock(deps: ToolDeps, args: { taskId: string; 
   });
 }
 
+// ---------------------------------------------------------------------------
+// v0.10.1（G-26）：action=compact —— 主控代成员会话执行上下文压缩
+// ---------------------------------------------------------------------------
+
+/** 检查点新鲜度缺省窗（分钟；任务书契约 N=30）。 */
+export const COMPACT_CHECKPOINT_MAX_AGE_MIN_DEFAULT = 30;
+
+/**
+ * v0.10.1（对抗检验 3a/3b）：检查点时刻的**未来容差**（ms）——`latestCheckpoint` 的
+ * `createdAt`（front-matter 优先、mtime 回退）晚于 now 超过它即判**不可信时刻**：
+ * 负年龄会让「now - createdAt ≤ 窗宽」恒真、过期检查点恒判新鲜。
+ * 触发面有两条：① 伪造 front-matter / utimes（同机伪造前提）；② **无伪造触发**——
+ * 检查点写入后系统时钟回拨超窗宽，旧文件的时刻读成未来。与同仓纪律对齐：
+ * `types.ts LIVENESS_TS_FUTURE_SKEW_MS`（活性时刻的未来容差）与 compact 标记
+ * `compactInProgressAt` 的 -60s 容差同款口径（60s 足够吸收正常时钟毛刺）。
+ */
+export const CHECKPOINT_TS_FUTURE_SKEW_MS = 60_000;
+
+/** 闸 6 的时刻可信性判据（纯函数，测试锚点）：createdAt 早于 now 至多容差内 → 可信。 */
+export function checkpointAgeTrustworthy(createdAt: number, now: number): boolean {
+  return now - createdAt >= -CHECKPOINT_TS_FUTURE_SKEW_MS;
+}
+
+/** 检查点新鲜度环境变量（可选；非正数/非有限值回落缺省，防御同 maxMembersFromEnv）。 */
+export function compactCheckpointMaxAgeMinutes(env: NodeJS.ProcessEnv, fallback = COMPACT_CHECKPOINT_MAX_AGE_MIN_DEFAULT): number {
+  const raw = env["XC_COMPACT_CHECKPOINT_MAX_AGE_MIN"];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+/** 缺省压缩说明（任务书契约原文；给了 note 就不用它）。 */
+export const DEFAULT_COMPACT_INSTRUCTIONS =
+  "这是主控发起的上下文压缩。摘要必须保留：当前任务与验收标准、已完成与未完成项、关键文件路径与已知的坑、下一步。";
+
+/** force 前缀（任务书契约原文）。 */
+const COMPACT_FORCE_PREFIX = "该成员未落新检查点——";
+
+/** 组装传给宿主的压缩说明：note 优先；force 时加前缀（纯函数，测试锚点）。 */
+export function buildCompactInstructions(note: string | undefined, force: boolean | undefined): string {
+  const body = note !== undefined && note.trim() !== "" ? note : DEFAULT_COMPACT_INSTRUCTIONS;
+  return force === true ? `${COMPACT_FORCE_PREFIX}${body}` : body;
+}
+
+/**
+ * v0.10.1（评审 F7）：压缩结束后的补唤醒——压缩窗口内到达的消息被 wake.ts 的
+ * compactInProgressAt 闸跳过（只入箱不 spawn），压缩结束后若无人补发唤醒，成员可能
+ * 长期带未读闲置（「压缩结束后照常唤醒」此前无机制支撑）。本函数对「超出压缩前
+ * 未读基线」的未读消息尽力补发一次 attemptWake（scene `compact-resume`）；
+ * attemptWake 自身的闸（成员状态/分层/在途/容量）照常生效——被闸挡下也只是落邮箱，
+ * pull 兜底不丢消息。best-effort：读失败/唤醒失败一律不抛（不得掩盖压缩本身的结果）。
+ *
+ * 基线口径：只补**压缩窗口内到达**的消息（超出 baselineUnreadIds 的未读）；压缩前
+ * 就已未读的消息属既有状态，由派单回执/看门狗补醒等既有机制负责（不在这里重复补）。
+ * excludeIds：本函数不该当作「新到消息」的 id（成功路径的被压通知本身——契约是不唤醒
+ * 投递，通知由成员下一回合自然查收）。
+ */
+async function catchUpWakeAfterCompact(
+  stateRoot: string,
+  teamId: string,
+  toAgentKey: string,
+  toSessionId: string,
+  workspace: string,
+  env: NodeJS.ProcessEnv,
+  baselineUnreadIds: ReadonlySet<string>,
+  excludeIds: ReadonlySet<string>,
+  finishedNote: string,
+  byAgentKey: string,
+): Promise<{ messageIds: string[]; delivered: "wake" | "mailbox" } | undefined> {
+  let arrivedIds: string[];
+  try {
+    arrivedIds = (await readUnreadMailbox(stateRoot, teamId, toAgentKey))
+      .map((m) => m.id)
+      .filter((id) => !baselineUnreadIds.has(id) && !excludeIds.has(id));
+  } catch {
+    return undefined; // 邮箱读失败：不虚构补醒（pull 兜底不丢消息）
+  }
+  if (arrivedIds.length === 0) return undefined;
+  const ticket =
+    `你的上下文压缩（主控 ${byAgentKey} 经 xc_team compact 发起）${finishedNote}。`
+    + `压缩期间有 ${arrivedIds.length} 条消息到达并已放进你的邮箱（当时为避免并发写，唤醒被跳过）。`
+    + "请查收处理未读（xc_read({scope:\"inbox\"})），名下任务照常推进。";
+  try {
+    const sent = await attemptWake({
+      stateRoot,
+      teamId,
+      toAgentKey,
+      toSessionId,
+      workspace,
+      reason: "compact-resume",
+      receiptIds: arrivedIds,
+      ticket,
+      env,
+    });
+    return { messageIds: arrivedIds, delivered: sent.delivered === "wake" ? "wake" : "mailbox" };
+  } catch {
+    return undefined; // 唤醒失败不掩盖主结果；消息已在邮箱，pull 兜底
+  }
+}
+
+/**
+ * v0.10.1（G-26）：`xc_team({action:"compact", name, note?, force?})` —— 主控（lead）
+ * 对一个**引擎供给的空闲成员**发起上下文压缩：插件自起 app-server 实例
+ * （`session/resume` → `session/compact`），等完成事件拿压缩前后 token 数。
+ *
+ * 闸门顺序（命中即返回，后面的不执行）：
+ * 1. 调用方不是主控 → `not_lead`（member-add 同款判定：无团队/非 leadKey）；
+ * 2. 成员不存在 → `unknown_member`；目标是自己 → `self_not_allowed`；已停机成员
+ *    （state=removed，评审 F3）→ `member_removed`（member-stop/dispatch 同语义：
+ *    会话已不在，压什么）；
+ * 3. 供给中/供给失败（state=provisioning|failed，评审 F4）→ `member_provisioning`
+ *    （准确状态 + 重试指引，不误报成交互式接管）；交互式会话（非引擎供给，或 engine
+ *    粘滞标但当前持有者非无头——steer 的 classifySteerTarget / engineHolderIsHeadless
+ *    同源判据）→ `interactive_unsupported`；
+ * 4. 成员退出压缩（成员行 `compact:false`）→ `compact_opted_out`；
+ * 5. 成员忙（评审 F6：成员行 `compactInProgressAt` 在新鲜窗内 = 另一路 compact 在跑
+ *    → `member_busy`；会话记录 liveness=running ∧ 时刻可信——插件自己的活性视图，
+ *    派单忙闲闸/§16.8 告警忙闸同款判据；宿主不拦跨实例压缩，这一关必须由插件把）
+ *    → `member_busy`；
+ * 6. 无新检查点（最新检查点的 createdAt——front-matter 优先、mtime 回退，与
+ *    xc_overview/handoff 展示同一真源，评审 F25——不在
+ *    `XC_COMPACT_CHECKPOINT_MAX_AGE_MIN`（缺省 30）分钟内）且未给 `force`
+ *    → 先给该成员发一条**会唤醒**的消息（要求它立刻 `xc_team checkpoint`、
+ *    落完保持空闲），然后返回 `checkpoint_required`，提示主控等它回到空闲后重试；
+ * 7. 协议调用失败或超时（180s 等完成）→ `compact_failed` 带根因。turn 锁竞争
+ *    （SessionTurnBusyError）与团队锁等待耗尽（LockBusyError，评审 F6）都映射
+ *    `member_busy`，不误报 compact_failed。
+ *
+ * 副作用（成功）：`member-compacted` 审计（谁/对谁/前后 token/force/检查点路径）+
+ * 该成员邮箱一条**不唤醒**的通知（被谁何时压缩、token 变化、检查点路径或无检查点的
+ * force 说明、下回合指引，评审 F15 按有无检查点分叉措辞）+ 补唤醒（评审 F7：压缩
+ * 窗口内到达、其唤醒被标记闸跳过的消息，scene `compact-resume` 补发一次 attemptWake；
+ * 失败路径同样补偿后才报 compact_failed）。压缩全程：G-16 `withSessionTurnLock`
+ * 挡住对该 sid 的 MCP 侧写 + 成员行 `compactInProgressAt`（置位时刻，评审 F1）
+ * 标记挡住唤醒路径（wake.ts 成员状态门控：新鲜窗内只入箱不 spawn，超窗 fail-open）；
+ * 置位在团队锁内做 lead/在册/标记/活性的权威复验（评审 F14/F6/F13 缩窗）并顺路清扫
+ * 陈旧残留；无论成功失败都解除（finally，清标记自兜错不掩盖主结果，评审 F5）。
+ */
+export async function handleTeamCompact(
+  deps: ToolDeps,
+  args: { name: string; note?: string; force?: boolean },
+  connectionKey: string,
+): Promise<ToolResult> {
+  return runTeamTool(async () => {
+    const { stateRoot, workspace, env } = deps;
+    const me = identityStore.require(connectionKey);
+    const key = sanitizeKey(args.name);
+    if (key === "") throw invalidParamsError(`name ${JSON.stringify(args.name)} sanitizes to an empty key`);
+    const now = Date.now();
+
+    // ---- 闸 1：lead-only（member-add 同款判定与信封）----
+    const team = await readTeam(stateRoot, me.teamId);
+    if (team === undefined) {
+      throw new ToolError({
+        error: "not_lead",
+        agentKey: me.agentKey,
+        message: 'no team on disk; register first (xc_identify) or run xc_team init to become lead',
+      });
+    }
+    if (leadKeyOf(team) !== me.agentKey) {
+      throw new ToolError({
+        error: "not_lead",
+        agentKey: me.agentKey,
+        leadKey: leadKeyOf(team),
+        message: `only the team lead ("${leadKeyOf(team)}") can compact a member's context`,
+      });
+    }
+    // ---- 闸 2：成员在册 + 不是自己 + 不对已停机成员压 ----
+    const member = team.members.find((m) => m.key === key);
+    if (member === undefined) {
+      throw new ToolError({
+        error: "unknown_member",
+        name: key,
+        teamId: team.teamId,
+        message: `no member "${key}" in team "${team.teamId}"`,
+      });
+    }
+    if (key === me.agentKey) {
+      throw new ToolError({
+        error: "self_not_allowed",
+        name: key,
+        message: `cannot compact your own context via xc_team compact ("${key}" is the caller); run /compact yourself instead`,
+      });
+    }
+    // 评审 F3：removed 成员（member-stop 只置 state 不清 sessionId）按「不存在」拒绝，
+    // 与 member-stop 的 member_removed（assertStopAuthorized）及 dispatch 的生命周期闸
+    // 同语义——否则它能一路走到 resume+compact、落审计、还给它已停机的邮箱投通知。
+    if (memberState(member) === "removed") {
+      throw new ToolError({
+        error: "member_removed",
+        name: key,
+        teamId: team.teamId,
+        message: `member "${key}" is already removed (xc_team member-stop) — its session is gone, nothing to compact; `
+          + "re-provision with xc_team {action:\"member-add\"} (the only revival path for a removed name) if you want the name back",
+      });
+    }
+    // ---- 闸 3：供给中/供给失败不压（评审 F4：准确报 member_provisioning，不误报成
+    //      交互式接管——半途真引擎成员 sessionId=""，下方的 engineHolderIsHeadless
+    //      空 sid 判 false 会把它误分类 interactive_unsupported，让 lead 误以为成员被
+    //      交互式接管；member-stop :797-801 同款准确状态 + 重试指引）----
+    const lifecycleState = memberState(member);
+    if (lifecycleState === "provisioning" || lifecycleState === "failed") {
+      throw new ToolError({
+        error: "member_provisioning",
+        name: key,
+        teamId: team.teamId,
+        memberState: lifecycleState,
+        message: lifecycleState === "provisioning"
+          ? `member "${key}" is provisioning right now (no engine holder yet) — retry after it turns ready`
+          : `member "${key}"'s provisioning failed (state=failed) — fix the root cause, re-provision with `
+            + "xc_team {action:\"member-add\"}, then retry compact",
+      });
+    }
+    // ---- 闸 3（续）：交互式会话不压（steer 同源判据：identity 粘滞标 + 无头持有者）----
+    if (memberIdentity(member) !== "engine" || !engineHolderIsHeadless(stateRoot, member)) {
+      throw new ToolError({
+        error: "interactive_unsupported",
+        name: key,
+        message: `member "${key}" is not currently held by an engine-supplied headless session `
+          + "(identity≠engine, or the row's current sid holder is not headless — V098-01 holder check); "
+          + "compacting an interactive session would rewrite the user's context and is refused",
+      });
+    }
+    // ---- 闸 4：成员退出压缩（成员行 compact:false；absent = 允许）----
+    if (member.compact === false) {
+      throw new ToolError({
+        error: "compact_opted_out",
+        name: key,
+        message: `member "${key}" opted out of context compaction (member row compact:false); `
+          + "re-provision with xc_team {action:\"member-add\", compact:true} to re-enable",
+      });
+    }
+    // ---- 闸 5：成员忙（插件自己的活性视图；宿主不拦跨实例压缩）----
+    // 评审 F6 前半：无锁闸先读成员行的压缩标记（新鲜窗内）——并发二次 compact 在此
+    // 直接收 member_busy，不进 turn 锁；锁内的权威重验见下方置位块。
+    const gateMarkAt = member.compactInProgressAt;
+    const gateCompacting = gateMarkAt !== undefined
+      && now - gateMarkAt > -60_000
+      && now - gateMarkAt <= COMPACT_IN_PROGRESS_STALE_MS;
+    if (gateCompacting) {
+      throw new ToolError({
+        error: "member_busy",
+        name: key,
+        message: `member "${key}" is being compacted by another xc_team compact (compactInProgressAt is fresh) — `
+          + "wait for that compaction to finish, then retry",
+      });
+    }
+    let record;
+    try {
+      record = await readSession(stateRoot, member.sessionId);
+    } catch {
+      record = undefined; // 记录缺失/损坏：按空闲处理（与派单忙闸/steer 同口径，不猜进程状态）
+    }
+    const turnInProgress = record?.liveness === "running" && plausibleLivenessTs(record.livenessTs, now);
+    if (turnInProgress) {
+      throw new ToolError({
+        error: "member_busy",
+        name: key,
+        message: `member "${key}" has a turn in progress (session liveness=running, ts plausible) — `
+          + "the host does not refuse cross-instance compaction, so the plugin must gate it: wait for the turn to end, then retry",
+      });
+    }
+    // ---- 闸 6：检查点新鲜度（latestCheckpoint 的 createdAt：front-matter 优先、mtime
+    //      回退——评审 F25：与 xc_overview status/handoff 展示的检查点年龄同一真源，
+    //      不再另取 stat().mtimeMs 两口径；文件被外部触碰/复制时分叉的是展示自洽性
+    //      不是本闸；force 可跳过）----
+    const latest = await latestCheckpoint(stateRoot, key, now);
+    const checkpointPath = latest !== null ? latest.path : undefined;
+    const checkpointAgeMin = latest !== null ? Math.max(0, Math.round((now - latest.createdAt) / 60_000)) : undefined;
+    const maxAgeMinutes = compactCheckpointMaxAgeMinutes(env);
+    // 对抗检验 3a/3b：未来时刻守卫——createdAt/mtime 晚于 now 超 60s 容差 = 不可信时刻
+    // （负年龄会让 ≤窗宽 判据恒真；时钟回拨可无伪造触发）→ 按超窗处理（判不新鲜，
+    // 要求重落 / force），payload 与审计如实披露 skew。
+    const checkpointTsFutureSkewMs = latest !== null && !checkpointAgeTrustworthy(latest.createdAt, now)
+      ? Math.round(latest.createdAt - now)
+      : undefined;
+    const checkpointFresh = latest !== null
+      && checkpointTsFutureSkewMs === undefined
+      && now - latest.createdAt <= maxAgeMinutes * 60_000;
+    if (!checkpointFresh && args.force !== true) {
+      // 命中闸 6：给成员发一条**会唤醒**的消息（要求立刻落检查点），然后如实拒绝。
+      const instructions = buildCompactInstructions(args.note, args.force);
+      const wakeText =
+        `主控 ${me.agentKey} 要求你立刻执行 xc_team({action:"checkpoint", note:"<当前进度与下一步>"}) 落一份新检查点。\n`
+        + `背景：主控准备压缩你的上下文（xc_team compact）。压缩说明将按：${instructions}\n`
+        + "落完检查点后保持空闲、不要领取新任务；主控看到你回到空闲后会压缩你的上下文，完成后会再通知你。";
+      const message = createMessage(me.agentKey, key, wakeText, { deliveryClaimedAt: now });
+      await appendMailbox(stateRoot, me.teamId, key, message);
+      let delivered: "wake" | "mailbox" = "mailbox";
+      if (member.sessionId.trim() !== "") {
+        const sent = await attemptWake({
+          stateRoot,
+          teamId: me.teamId,
+          toAgentKey: key,
+          toSessionId: member.sessionId,
+          workspace,
+          reason: "compact-checkpoint",
+          receiptIds: [message.id],
+          ticket: wakeText,
+          env,
+        });
+        delivered = sent.delivered;
+      }
+      await logEngineEvent(stateRoot, {
+        event: "member-compact-checkpoint-required",
+        teamId: me.teamId,
+        name: key,
+        by: me.agentKey,
+        ...(checkpointPath !== undefined ? { checkpointPath } : {}),
+        ...(checkpointAgeMin !== undefined ? { checkpointAgeMin } : {}),
+        ...(checkpointTsFutureSkewMs !== undefined ? { checkpointTsFutureSkewMs } : {}),
+        delivered,
+        maxAgeMinutes,
+      });
+      throw new ToolError({
+        error: "checkpoint_required",
+        name: key,
+        ...(checkpointPath !== undefined ? { checkpointPath } : {}),
+        ...(checkpointAgeMin !== undefined ? { checkpointAgeMin } : {}),
+        ...(checkpointTsFutureSkewMs !== undefined ? { checkpointTsFutureSkewMs } : {}),
+        maxAgeMinutes,
+        checkpointRequested: true,
+        checkpointRequestDelivered: delivered,
+        message: `member "${key}" has no checkpoint written within ${maxAgeMinutes} min `
+          + `${checkpointPath === undefined ? "(no checkpoint on disk)" : `(latest: ${checkpointPath})`}; `
+          + (checkpointTsFutureSkewMs !== undefined
+            ? `its timestamp reads ${Math.round(checkpointTsFutureSkewMs / 1000)}s in the future (clock skew or untrusted stamp) and is treated as stale; `
+            : "")
+          + `a checkpoint request was sent to it (${delivered === "wake" ? "wake attempted" : "mailbox only"}). `
+          + "Wait for the member to write one and go idle, then retry xc_team compact (or pass force:true to compact anyway).",
+      });
+    }
+
+    // ---- 过闸：代压（turn 锁外层挡 MCP 侧写；compactInProgressAt 标记挡唤醒路径）----
+    const instructions = buildCompactInstructions(args.note, args.force);
+    // 评审 F7：压缩前邮箱未读基线——结束后超出基线的未读 = 压缩窗口内到达的消息
+    // （其唤醒被标记闸跳过、只入箱），由补唤醒机制补偿（见 catchUpWakeAfterCompact）。
+    let baselineUnreadIds: ReadonlySet<string>;
+    try {
+      baselineUnreadIds = new Set((await readUnreadMailbox(stateRoot, me.teamId, key)).map((m) => m.id));
+    } catch {
+      baselineUnreadIds = new Set<string>(); // 读失败按空基线（宁多补醒一次，不漏）
+    }
+    let outcome: CompactOutcome | undefined;
+    try {
+      outcome = await withSessionTurnLock(stateRoot, member.sessionId, async (): Promise<CompactOutcome> => {
+        // 置进行中标记（团队锁内；G-16 锁序：turn 锁外层、团队锁内层，tools-tasks.ts 同款）。
+        // 评审 F14：闸面读盘与置位之间隔着多个 await，lead 可能被 transfer、成员可能被
+        // stop/重供给换 sid（TOCTOU）——置位前在团队锁内**权威复验**授权与在册
+        // （member-stop assertStopAuthorized 的锁内副本同款纪律：锁内闸兜底）。
+        // 评审 F13：闸 5（读盘判空闲）到此置位之间存在毫秒~秒级 TOCTOU 窗口，turn 锁
+        // 挡不住 attemptWake 的 spawn——锁内重读 liveness 把可利用窗口缩到「锁内两次
+        // 读盘」量级；残余窗口在本架构内无法彻底关闭，按 fail-open 纪律明示接受
+        // （PROTOCOL §17 已写明：普通/urgent 唤醒仍可能与随后的 resume+compact 交错，
+        // 概率极低且消息不丢）。
+        await withTeamLock(stateRoot, me.teamId, async () => {
+          const marked = await readTeam(stateRoot, me.teamId);
+          if (marked === undefined || leadKeyOf(marked) !== me.agentKey) {
+            throw new ToolError({
+              error: "not_lead",
+              agentKey: me.agentKey,
+              ...(marked !== undefined ? { leadKey: leadKeyOf(marked) } : {}),
+              message: `lead changed while preparing the compact — "${me.agentKey}" is no longer the lead of team "${me.teamId}"`,
+            });
+          }
+          const row = marked.members.find((m) => m.key === key);
+          if (row === undefined) {
+            throw new ToolError({
+              error: "unknown_member",
+              name: key,
+              teamId: me.teamId,
+              message: `member "${key}" left the team while preparing the compact (stopped or swept)`,
+            });
+          }
+          // 评审 F6：锁内重验压缩标记（闸 5 的无锁读只是预检）——本成员已有新鲜标记
+          // 即另一路 compact 在进行，收 member_busy，绝不进二次压缩。
+          const rowMarkAt = row.compactInProgressAt;
+          const rowCompacting = rowMarkAt !== undefined
+            && now - rowMarkAt > -60_000
+            && now - rowMarkAt <= COMPACT_IN_PROGRESS_STALE_MS;
+          if (rowCompacting) {
+            throw new ToolError({
+              error: "member_busy",
+              name: key,
+              message: `member "${key}" is being compacted by another xc_team compact (compactInProgressAt is fresh) — `
+                + "wait for that compaction to finish, then retry",
+            });
+          }
+          // 评审 F13 缩窗：锁内复验活性（判据与闸 5 逐字同源）——普通/urgent 唤醒若
+          // 恰在此刻 spawn 出回合，这里能拦住绝大多数交错；残余竞态明示接受。
+          let lockedRecord;
+          try {
+            lockedRecord = await readSession(stateRoot, member.sessionId);
+          } catch {
+            lockedRecord = undefined; // 记录缺失/损坏：按空闲处理（与闸 5 同口径）
+          }
+          if (lockedRecord?.liveness === "running" && plausibleLivenessTs(lockedRecord.livenessTs, Date.now())) {
+            throw new ToolError({
+              error: "member_busy",
+              name: key,
+              message: `member "${key}" has a turn in progress (session liveness=running, ts plausible) — `
+                + "the host does not refuse cross-instance compaction, so the plugin must gate it: wait for the turn to end, then retry",
+            });
+          }
+          // 评审 F1 锁内清扫：顺路清掉全队陈旧的压缩标记（超新鲜窗/异常未来值）——
+          // 崩溃残留形态（lead 的 MCP server 崩、标记无人清）在唤醒路径已 fail-open，
+          // 这里把残留字节真正复位；与置位同一次 writeTeam 落盘，零额外开销。
+          for (const m of marked.members) {
+            const at = m.compactInProgressAt;
+            if (at !== undefined && (now - at > COMPACT_IN_PROGRESS_STALE_MS || now - at <= -60_000)) {
+              delete m.compactInProgressAt;
+            }
+          }
+          row.compactInProgressAt = Date.now();
+          await writeTeam(stateRoot, marked);
+        });
+        try {
+          return await compactMemberSession({
+            sessionId: member.sessionId,
+            workspace,
+            env,
+            instructions,
+          });
+        } finally {
+          // 无论成功失败都解除（G-26 契约；标记清除即唤醒路径恢复放行）。
+          // 评审 F5：清标记须**自兜错**——这把团队锁一旦抛（15s 等待耗尽/磁盘错误），
+          // 不得顶替 compactMemberSession 的真实结果被外层报成 compact_failed；
+          // 标记若因此残留，由新鲜窗 fail-open（wake.ts）+ 置位时锁内清扫 + member-add
+          // 重供给复位三层兜底（评审 F1）。落审计 best-effort（磁盘连审计也写不进时
+          // 不再放大故障）。
+          try {
+            await withTeamLock(stateRoot, me.teamId, async () => {
+              const marked = await readTeam(stateRoot, me.teamId);
+              const row = marked?.members.find((m) => m.key === key);
+              if (marked !== undefined && row !== undefined) {
+                delete row.compactInProgressAt;
+                await writeTeam(stateRoot, marked);
+              }
+            });
+          } catch (clearErr) {
+            const clearDetail = String(clearErr instanceof Error ? clearErr.message : clearErr);
+            try {
+              await logEngineEvent(stateRoot, {
+                event: "member-compact-flag-clear-failed",
+                teamId: me.teamId,
+                name: key,
+                by: me.agentKey,
+                error: clearDetail.slice(0, 500),
+              });
+            } catch {
+              /* 审计面也失败：静默——主结果不受影响，残留标记走三层兜底 */
+            }
+          }
+        }
+      });
+    } catch (err) {
+      // 评审 F6 后半：turn 锁被另一活进程持有（SessionTurnBusyError）或团队锁等待
+      // 耗尽（LockBusyError，15s——并发二次 compact 的本进程等待路径）都映射为契约
+      // 的 member_busy，不再被误报成 compact_failed。
+      if (err instanceof SessionTurnBusyError || err instanceof LockBusyError) {
+        throw new ToolError({
+          error: "member_busy",
+          name: key,
+          message: `member "${key}"'s session is being written by another live process — retry when it settles`,
+        });
+      }
+      // 锁内复验抛出的既有契约错误（not_lead/unknown_member/member_busy）原样透传：
+      // 无审计、不改写语义（失败=无副作用纪律）。
+      if (err instanceof ToolError) throw err;
+      // 评审 F7 失败路径补偿：压缩窗口内到达的消息（其唤醒被标记闸跳过）也要补醒，
+      // 之后才如实报失败。
+      await catchUpWakeAfterCompact(
+        stateRoot, me.teamId, key, member.sessionId, workspace, env, baselineUnreadIds,
+        new Set<string>(), "已失败（详情见主控的 compact 回执）", me.agentKey,
+      );
+      const detail = String(err instanceof Error ? err.message : err);
+      await logEngineEvent(stateRoot, {
+        event: "member-compact-failed",
+        teamId: me.teamId,
+        name: key,
+        by: me.agentKey,
+        error: detail.slice(0, 500),
+        ...(checkpointPath !== undefined ? { checkpointPath } : {}),
+        ...(args.force === true ? { force: true } : {}),
+      });
+      throw new ToolError({
+        error: "compact_failed",
+        name: key,
+        detail: detail.slice(0, 500),
+        message: `compaction of member "${key}" failed: ${detail}`,
+      });
+    }
+
+    // ---- 成功：审计 + 不唤醒的通知 + 回执 ----
+    const tokensSummary =
+      outcome.preCompactTokenCount !== undefined && outcome.postCompactTokenCount !== undefined
+        ? `${outcome.preCompactTokenCount} → ${outcome.postCompactTokenCount}`
+        : "unknown";
+    await logEngineEvent(stateRoot, {
+      event: "member-compacted",
+      teamId: me.teamId,
+      name: key,
+      by: me.agentKey,
+      ...(outcome.preCompactTokenCount !== undefined ? { preCompactTokenCount: outcome.preCompactTokenCount } : {}),
+      ...(outcome.postCompactTokenCount !== undefined ? { postCompactTokenCount: outcome.postCompactTokenCount } : {}),
+      ...(outcome.truePostCompactTokenCount !== undefined ? { truePostCompactTokenCount: outcome.truePostCompactTokenCount } : {}),
+      ...(outcome.operationId !== undefined ? { operationId: outcome.operationId } : {}),
+      ...(checkpointPath !== undefined ? { checkpointPath } : {}),
+      ...(args.force === true ? { force: true } : {}),
+    });
+    const noticeText =
+      `你的上下文已被主控 ${me.agentKey} 于 ${new Date(now).toISOString()} 压缩（xc_team compact，`
+      + `${args.force === true ? "force" : "有新检查点"}）。`
+      + `token ${tokensSummary}。`
+      // 评审 F15：force 且磁盘无检查点时前后半句自相矛盾（「无，本次 force 未依据检查点」
+      // 接「先读该检查点」）——按有无检查点分叉措辞。
+      + (checkpointPath !== undefined
+        ? `最新检查点：${checkpointPath}。下一回合先读该检查点再继续（xc_read({scope:"handoff"}) 亦可）。`
+        : `最新检查点：无（本次 force 未依据检查点）。下一回合先查收邮箱未读并按任务板续作（接手包 xc_read({scope:"handoff"}) 亦可）。`)
+      + "邮箱里的未读照常处理。";
+    const notice = createMessage(me.agentKey, key, noticeText, { deliveryClaimedAt: now });
+    await appendMailbox(stateRoot, me.teamId, key, notice);
+    // 评审 F7 成功路径补偿：压缩窗口内到达的消息（不含刚投的通知本身——契约是不唤醒
+    // 投递）补发一次唤醒，成员不再带未读闲置。
+    const catchUp = await catchUpWakeAfterCompact(
+      stateRoot, me.teamId, key, member.sessionId, workspace, env, baselineUnreadIds,
+      new Set([notice.id]),
+      args.force === true ? "已完成（force，无新鲜检查点依据）" : "已完成",
+      me.agentKey,
+    );
+    return okResult(
+      `Member "${key}" context compacted by lead: tokens ${tokensSummary}`
+        + `${outcome.truePostCompactTokenCount !== undefined ? ` (host truePost ${outcome.truePostCompactTokenCount})` : ""}`
+        + `${checkpointPath !== undefined ? `; checkpoint ${checkpointPath}` : "; no checkpoint on disk (force)"}`
+        + `; notice left in its mailbox (no wake); audit member-compacted.`
+        + `${catchUp !== undefined ? ` Catch-up wake (${catchUp.delivered}) sent for ${catchUp.messageIds.length} message(s) that arrived during the compact window (scene compact-resume).` : ""}`,
+      {
+        name: key,
+        sessionId: member.sessionId,
+        ...(outcome.preCompactTokenCount !== undefined ? { preCompactTokenCount: outcome.preCompactTokenCount } : {}),
+        ...(outcome.postCompactTokenCount !== undefined ? { postCompactTokenCount: outcome.postCompactTokenCount } : {}),
+        ...(outcome.truePostCompactTokenCount !== undefined ? { truePostCompactTokenCount: outcome.truePostCompactTokenCount } : {}),
+        ...(outcome.operationId !== undefined ? { operationId: outcome.operationId } : {}),
+        ...(checkpointPath !== undefined ? { checkpointPath } : {}),
+        ...(args.force === true ? { force: true } : {}),
+        noticeMessageId: notice.id,
+        ...(catchUp !== undefined ? { catchUpWake: catchUp } : {}),
+        durationMs: outcome.durationMs,
+      },
+    );
+  });
+}
+
 /** xc_team 工具层（action 分发到对应核心实现；无 lead/成员等调用者限制之外的重排）。 */
 export async function handleTeam(deps: ToolDeps, args: TeamActionArgs, connectionKey: string): Promise<ToolResult> {
   const core = createLeadToolCore(deps);
@@ -1951,6 +2534,8 @@ export async function handleTeam(deps: ToolDeps, args: TeamActionArgs, connectio
         ...(args.contextChars !== undefined ? { contextChars: args.contextChars } : {}),
         // v0.10.0（组 D / G-25）：供给时一并声明职能（可选；与 xc_identify duty 同字段）。
         ...(args.duty !== undefined ? { duty: args.duty } : {}),
+        // v0.10.1（G-26）：供给时一并声明压缩退出开关（可选；缺省允许）。
+        ...(args.compact !== undefined ? { compact: args.compact } : {}),
       }, connectionKey);
     case "member-stop":
       if (args.name === undefined) throw new ToolError({ error: "invalid_params", message: "action=member-stop requires \"name\"" });
@@ -1977,6 +2562,13 @@ export async function handleTeam(deps: ToolDeps, args: TeamActionArgs, connectio
       return handleTeamUnblock(deps, { taskId: args.taskId, ...(args.unblockNote !== undefined ? { unblockNote: args.unblockNote } : {}) }, connectionKey);
     case "checkpoint":
       return handleTeamCheckpoint(deps, { ...(args.note !== undefined ? { note: args.note } : {}) }, connectionKey);
+    case "compact":
+      if (args.name === undefined) throw new ToolError({ error: "invalid_params", message: "action=compact requires \"name\"" });
+      return handleTeamCompact(deps, {
+        name: args.name,
+        ...(args.note !== undefined ? { note: args.note } : {}),
+        ...(args.force !== undefined ? { force: args.force } : {}),
+      }, connectionKey);
   }
 }
 
@@ -1997,12 +2589,13 @@ export function registerTeamTools(
   registry: PrimaryRegistry,
 ): void {
   const description =
-    "Command family in one tool (actions: init/transfer/release/member-add/member-stop/idle/cancel/unblock/checkpoint). " +
+    "Command family in one tool (actions: init/transfer/release/member-add/member-stop/idle/cancel/unblock/checkpoint/compact). " +
     "action=init becomes lead (takeover:true ONLY on explicit user instruction); transfer/release move/drop the metadata lead role; " +
     "member-add provisions an engine member (lead only; duty (optional, v0.10.0) declares what the member is responsible for — one line, <=120 chars, kept on the team.json member row and shown on xc_overview member rows / the xc_read handoff roster); member-stop removes a member, requeues its open tasks and returns its unclaimed dispatches (pending tasks reserved via `to`) to the shared pending pool — both with creator receipts — and (default archive:true) writes .crosschat/archive/<name>/ first (C4); " +
     "idle reports idleness to the lead; cancel cancels a task (lead or creator); unblock releases a blocked task back to its preBlocked status (lead/creator/claimant) with an unblock-notice to the claimant; " +
     "checkpoint writes a 7-section handoff checkpoint to .crosschat/checkpoints/<you>/<ISO>.md server-side (keeps the newest 20 per member; note goes into section 7); " +
-    "there is no PreCompact hook on this platform, so use it before accepting compression or handing over.";
+    "there is no PreCompact hook on this platform, so use it before accepting compression or handing over; " +
+    "compact (lead only, v0.10.1) compacts an idle engine member's context via a transient app-server (session/resume + session/compact): gates run in order not_lead/unknown_member/self_not_allowed/member_removed/interactive_unsupported (state=provisioning/failed reports member_provisioning instead)/compact_opted_out/member_busy/checkpoint_required (a fresh checkpoint within XC_COMPACT_CHECKPOINT_MAX_AGE_MIN, default 30 min, else a wake asking the member to run xc_team checkpoint first — force:true skips this gate)/compact_failed; success returns pre/post token counts and the checkpoint path used, the member gets a mailbox notice (no wake) and a catch-up wake (scene compact-resume) for messages that arrived during the compact window.";
   const handler = async (args: Record<string, unknown>, extra: unknown): Promise<ToolResult> =>
     handleTeam(deps, args as unknown as TeamActionArgs, connectionKeyOf(extra));
   server.tool("xc_team", description, TeamShape, handler);

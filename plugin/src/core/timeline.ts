@@ -106,6 +106,14 @@ export const TIMELINE_FAMILY_BY_EVENT: Readonly<Record<string, TimelineFamily>> 
   'member-archive-failed': 'member',
   'member-provision-timeout': 'member',
   'member-takeover': 'member',
+  // v0.10.1（G-26）：主控代成员上下文压缩（compact 动作的审计事件族）。
+  'member-compacted': 'member',
+  'member-compact-failed': 'member',
+  'member-compact-checkpoint-required': 'member',
+  // v0.10.1（评审 F5）：压缩收尾清「进行中」标记自身失败（团队锁等待耗尽/磁盘错误）
+  // ——清标记自兜错不掩盖压缩主结果，但失败事实留痕可诊断（残留由新鲜窗 fail-open
+  // + 置位时锁内清扫 + member-add 重供给复位三层兜底）。
+  'member-compact-flag-clear-failed': 'member',
   // v0.9（G-9，PROTOCOL §12.4）：会话活性迁移（core/liveness.ts 冻结命名）。
   'session-running': 'liveness',
   'session-idle': 'liveness',

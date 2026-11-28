@@ -281,6 +281,33 @@ export interface TeamMember {
    * - absent = 旧 team.json（v0.9.10 之前落盘）或从未声明——一切照常，无兼容分支。
    */
   duty?: string;
+  /**
+   * v0.10.1（G-26）：**压缩退出开关**（成员对自己的上下文压缩说「不」）。
+   *
+   * - `false` = 该成员退出压缩：lead 的 `xc_team({action:"compact"})` 对它恒拒
+   *   （`compact_opted_out`）；`true`/absent = 允许（缺省允许——absent 即旧 team.json
+   *   无该字段的成员行，按允许处理，无兼容分支）；
+   * - 经 `xc_team({action:"member-add", compact:...})` 设置（可选参数，缺省不动既有值）；
+   * - 读取侧宽容增量：非布尔值整字段丢弃（§11.1 纪律，同 duty/contextChars）。
+   */
+  compact?: boolean;
+  /**
+   * v0.10.1（G-26）：**压缩进行中标记的置位时刻**（epoch ms；瞬态，不属配置）——
+   * lead 正经 `xc_team({action:"compact"})` 代压该成员期间置位（team.json 落盘），
+   * 成功/失败都清除。唤醒路径（engine/wake.ts 成员状态门控）见它在新鲜窗内
+   * （`COMPACT_IN_PROGRESS_STALE_MS`，engine/compact.ts）就**只入箱不唤醒**：
+   * 代压是 app-server 对该会话的并发写，再 spawn 唤醒回合会与之交错写（宿主不拦
+   * 跨实例压缩，Q2 实测）；G-16 的 withSessionTurnLock 只挡 MCP 侧写工具，挡不住
+   * spawn，所以标记必须让唤醒路径直接看到。
+   *
+   * 为什么是时间戳而不是布尔（评审 F1）：无时间戳的布尔标记一旦置位方（lead 的
+   * MCP server）中途崩溃就永久残留——成员从此只入箱不唤醒，且同键重供给的
+   * `...existing` spread 会把残留带进新供给行，唯一常规恢复路径也失效。时间戳 +
+   * 新鲜窗让唤醒路径对陈旧残留 fail-open（超窗照常唤醒），工具面置位时的锁内
+   * 清扫与 member-add 重供给的显式复位负责把残留字节清掉（三层兜底）。
+   * absent = 不在压缩；陈旧值（超窗/异常未来值）按 absent 对待（fail-open）。
+   */
+  compactInProgressAt?: number;
 }
 
 /**
@@ -902,6 +929,13 @@ function coerceMember(value: unknown): TeamMember | undefined {
   // 不整文件拒绝）；**不在读盘侧重新清洗**（清洗属写入侧 sanitizeDuty 的职责，
   // 与 contextChars/stopReason 同款宽容语义）。旧 team.json 无该字段 → absent。
   const duty = optionalString(value['duty']);
+  // v0.10.1（G-26）：compact 退出开关宽容读取（非布尔值整字段丢弃；absent = 允许）；
+  // compactInProgressAt 置位时刻宽容读取（非有限数整字段丢弃；absent = 不在压缩）。
+  // 注：早期实现曾用布尔 `compactInProgress`，从未随任何发布版本落盘（v0.10.1 尚未
+  // 发布），此处不为其留兼容分支——旧键按未知字段自然丢弃（§11.1 纪律）。
+  const compactRaw = value['compact'];
+  const compact = compactRaw === true || compactRaw === false ? compactRaw : undefined;
+  const compactInProgressAt = optionalFinite(value['compactInProgressAt']);
   return {
     key,
     sessionId,
@@ -916,6 +950,8 @@ function coerceMember(value: unknown): TeamMember | undefined {
     ...(error === undefined ? {} : { error }),
     ...(contextChars === undefined ? {} : { contextChars }),
     ...(duty === undefined || duty.trim() === '' ? {} : { duty }),
+    ...(compact === undefined ? {} : { compact }),
+    ...(compactInProgressAt === undefined ? {} : { compactInProgressAt }),
   };
 }
 
